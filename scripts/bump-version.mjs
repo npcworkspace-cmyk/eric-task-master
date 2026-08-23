@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const packagePath = resolve(root, 'package.json');
+const lockPath = resolve(root, 'package-lock.json');
 const packageJson = JSON.parse(await readFile(packagePath, 'utf8'));
 const current = packageJson.version;
 const requested = process.argv[2];
@@ -26,6 +27,14 @@ function nextVersion(value, instruction) {
 const next = nextVersion(current, requested);
 packageJson.version = next;
 await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+const lock = JSON.parse(await readFile(lockPath, 'utf8'));
+lock.version = next;
+if (!lock.packages?.['']) {
+  throw new Error('package-lock.json is missing the root package record');
+}
+lock.packages[''].version = next;
+await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 
 const replacements = [
   ['src/contracts.mjs', `export const VERSION = '${current}';`, `export const VERSION = '${next}';`],

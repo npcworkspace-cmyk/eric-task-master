@@ -1,5 +1,18 @@
+import {
+  fetchAndVerifyManagerIdentity,
+  trustedManagerFetch,
+  verifyPairingManagerIdentity
+} from './manager-identity.js';
+import { runSessionTransfer } from './session-transfer.js';
+import {
+  PROFILE_CLOSE_REQUEST_TIMEOUT_MS,
+  PROFILE_OPEN_REQUEST_TIMEOUT_MS,
+  SESSION_TRANSFER_REQUEST_TIMEOUT_MS
+} from './operation-timeouts.js';
+
 const DEFAULT_MANAGER_ORIGIN = 'http://127.0.0.1:19946';
 const PROFILE_MODES = ['fast', 'human', 'adaptive'];
+const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 
 const ui = Object.freeze({
   connectionDot: document.querySelector('#connection-dot'),
@@ -7,6 +20,7 @@ const ui = Object.freeze({
   managerOrigin: document.querySelector('#manager-origin'),
   saveOrigin: document.querySelector('#save-origin'),
   discoverManager: document.querySelector('#discover-manager'),
+  pairingCode: document.querySelector('#pairing-code'),
   pairExtension: document.querySelector('#pair-extension'),
   workspace: document.querySelector('#workspace'),
   newProfileName: document.querySelector('#new-profile-name'),
@@ -25,6 +39,7 @@ const ui = Object.freeze({
 
 let managerOrigin = DEFAULT_MANAGER_ORIGIN;
 let extensionToken = '';
+let trustedManagerIdentity = null;
 let profiles = [];
 let activeSite = null;
 
@@ -51,22 +66,41 @@ function normalizeLoopbackOrigin(value) {
   return url.origin;
 }
 
-async function request(path, { method = 'GET', body, authenticated = true, timeoutMs = 5000 } = {}) {
+async function request(path, {
+  method = 'GET',
+  body,
+  authenticated = true,
+  timeoutMs = 5000,
+  headers: extraHeaders = {}
+} = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  const headers = { Accept: 'application/json' };
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (authenticated) {
-    if (!extensionToken) throw new Error('请先配对 Manager');
-    headers.Authorization = `Bearer ${extensionToken}`;
-  }
   try {
-    const response = await fetch(new URL(path, managerOrigin), {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal
-    });
+    const response = authenticated
+      ? await trustedManagerFetch({
+        origin: managerOrigin,
+        version: EXTENSION_VERSION,
+        extensionId: chrome.runtime.id,
+        trustedIdentity: trustedManagerIdentity,
+        token: extensionToken,
+        path,
+        method,
+        body,
+        headers: extraHeaders,
+        signal: controller.signal
+      })
+      : await fetch(new URL(path, managerOrigin), {
+        method,
+        headers: {
+          Accept: 'application/json',
+          'X-Taskmaster-Extension-Id': chrome.runtime.id,
+          ...extraHeaders,
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' })
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        redirect: 'error',
+        signal: controller.signal
+      });
     const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
     if (!response.ok) {
       const error = new Error(payload?.message || payload?.error?.message || `请求失败 (${response.status})`);
@@ -77,6 +111,17 @@ async function request(path, { method = 'GET', body, authenticated = true, timeo
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function verifyTrustedManagerIdentity() {
+  if (!trustedManagerIdentity || !extensionToken) throw new Error('请先配对 Manager');
+  return fetchAndVerifyManagerIdentity({
+    origin: managerOrigin,
+    version: EXTENSION_VERSION,
+    extensionId: chrome.runtime.id,
+    expectedIdentity: trustedManagerIdentity,
+    signal: AbortSignal.timeout(5000)
+  });
 }
 
 function unpackList(payload, key) {
@@ -91,7 +136,7 @@ async function discover() {
   setMessage('');
   try {
     await request('/v1/health', { authenticated: false, timeoutMs: 2500 });
-    setConnection(extensionToken ? 'connected' : 'discovering', extensionToken ? '已连接' : '已发现，等待配对');
+    setConnection(extensionToken ? 'connected' : 'discovering', extensionToken ? '已连接' : '已发现，等待授权码');
     ui.pairExtension.textContent = extensionToken ? '重新配对' : '配对';
     if (extensionToken) {
       await refreshProfiles();
@@ -107,10 +152,26 @@ async function discover() {
 }
 
 async function pair() {
+  const enteredCode = ui.pairingCode.value.trim();
+  if (!enteredCode) {
+    setMessage('请先输入 Agent 显示的一次性配对码', 'error');
+    ui.pairingCode.focus();
+    return;
+  }
   ui.pairExtension.disabled = true;
   setMessage('正在建立本机配对…');
   try {
-    const challengePayload = await request('/v1/pair/challenge', { authenticated: false });
+    const { pairing, identity: verifiedIdentity } = await verifyPairingManagerIdentity({
+      pairingCode: enteredCode,
+      origin: managerOrigin,
+      version: EXTENSION_VERSION,
+      extensionId: chrome.runtime.id,
+      signal: AbortSignal.timeout(5000)
+    });
+    const challengePayload = await request('/v1/pair/challenge', {
+      authenticated: false,
+      headers: { 'X-Taskmaster-Pairing-Code': pairing.pairingCode }
+    });
     const challenge = challengePayload?.challenge;
     if (typeof challenge !== 'string' || !challenge) throw new Error('Manager 未返回有效配对挑战');
     const paired = await request('/v1/pair/extension', {
@@ -118,6 +179,7 @@ async function pair() {
       authenticated: false,
       body: {
         challenge,
+        pairingCode: pairing.pairingCode,
         extensionId: chrome.runtime.id,
         name: 'Eric Task Master'
       }
@@ -125,7 +187,9 @@ async function pair() {
     const token = paired?.token || paired?.extensionToken;
     if (typeof token !== 'string' || !token) throw new Error('Manager 未返回扩展令牌');
     extensionToken = token;
-    await chrome.storage.local.set({ managerOrigin, extensionToken });
+    trustedManagerIdentity = verifiedIdentity;
+    ui.pairingCode.value = '';
+    await chrome.storage.local.set({ managerOrigin, extensionToken, trustedManagerIdentity });
     setConnection('connected', '已连接');
     setMessage('配对成功', 'success');
     showWorkspace(true);
@@ -227,7 +291,8 @@ async function refreshProfiles() {
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
       extensionToken = '';
-      await chrome.storage.local.remove('extensionToken');
+      trustedManagerIdentity = null;
+      await chrome.storage.local.remove(['extensionToken', 'trustedManagerIdentity']);
       setConnection('discovering', '配对已失效');
       showWorkspace(false);
     }
@@ -274,16 +339,16 @@ async function renameProfile(profile) {
 async function setProfileOpen(profile, shouldOpen) {
   try {
     const operation = shouldOpen ? 'open' : 'close';
-    await request(`/v1/profiles/${encodeURIComponent(profile.id)}/${operation}`, { method: 'POST' });
+    await request(`/v1/profiles/${encodeURIComponent(profile.id)}/${operation}`, {
+      method: 'POST',
+      timeoutMs: shouldOpen ? PROFILE_OPEN_REQUEST_TIMEOUT_MS : PROFILE_CLOSE_REQUEST_TIMEOUT_MS
+    });
     setMessage(shouldOpen ? 'Profile 正在打开' : 'Profile 已关闭', 'success');
     await refreshProfiles();
   } catch (error) {
     setMessage(error.message, 'error');
+    await refreshProfiles().catch(() => {});
   }
-}
-
-function sitePermissionPattern(url) {
-  return `${url.protocol}//${url.hostname}/*`;
 }
 
 function mapCookie(cookie) {
@@ -321,34 +386,32 @@ function readLocalStorageForTransfer() {
 
 async function syncCurrentSite() {
   const profileId = ui.sessionProfile.value;
-  if (!profileId || !activeSite) return setMessage('请选择 Profile，并打开一个 HTTP 网站', 'error');
+  if (!profileId) return setMessage('请选择 Profile，并打开一个 HTTP 网站', 'error');
   ui.syncSession.disabled = true;
   setMessage('等待当前网站授权…');
-  let cookies = [];
-  let localStorageEntries = [];
   try {
-    const granted = await chrome.permissions.request({ origins: [sitePermissionPattern(activeSite.url)] });
-    if (!granted) throw new Error('未授予当前网站权限');
-
-    cookies = (await chrome.cookies.getAll({ url: activeSite.url.href })).map(mapCookie);
-    const execution = await chrome.scripting.executeScript({
-      target: { tabId: activeSite.tabId },
-      func: readLocalStorageForTransfer
-    });
-    localStorageEntries = Array.isArray(execution?.[0]?.result) ? execution[0].result : [];
-
-    const response = await request(`/v1/profiles/${encodeURIComponent(profileId)}/session`, {
-      method: 'POST',
-      timeoutMs: 30000,
-      body: {
-        origin: activeSite.url.origin,
-        cookies,
-        localStorage: localStorageEntries,
-        source: {
-          extensionId: chrome.runtime.id,
-          tabUrl: activeSite.url.origin
-        }
-      }
+    const response = await runSessionTransfer({
+      profileId,
+      extensionId: chrome.runtime.id,
+      inspectActiveSite,
+      verifyManagerIdentity: verifyTrustedManagerIdentity,
+      requestPermission: (origin) => chrome.permissions.request({ origins: [origin] }),
+      removePermission: (origin) => chrome.permissions.remove({ origins: [origin] }),
+      containsPermission: (origin) => chrome.permissions.contains({ origins: [origin] }),
+      readCookies: async (site) => (
+        await chrome.cookies.getAll({ url: site.url.href })
+      ).map(mapCookie),
+      readLocalStorage: async (site) => {
+        const execution = await chrome.scripting.executeScript({
+          target: { tabId: site.tabId },
+          func: readLocalStorageForTransfer
+        });
+        return Array.isArray(execution?.[0]?.result) ? execution[0].result : [];
+      },
+      sendSession: ({ profileId: selectedProfileId, bundle }) => request(
+        `/v1/profiles/${encodeURIComponent(selectedProfileId)}/session`,
+        { method: 'POST', timeoutMs: SESSION_TRANSFER_REQUEST_TIMEOUT_MS, body: bundle }
+      )
     });
     const status = response?.status;
     const messages = {
@@ -361,8 +424,6 @@ async function syncCurrentSite() {
   } catch (error) {
     setMessage(error.message, 'error');
   } finally {
-    cookies.splice(0, cookies.length);
-    localStorageEntries.splice(0, localStorageEntries.length);
     ui.syncSession.disabled = !profiles.length || !activeSite;
   }
 }
@@ -379,15 +440,17 @@ async function inspectActiveSite() {
     ui.currentOrigin.textContent = '当前页面不可同步';
   }
   renderProfiles();
+  return activeSite;
 }
 
 async function saveOrigin() {
   try {
     managerOrigin = normalizeLoopbackOrigin(ui.managerOrigin.value);
     extensionToken = '';
+    trustedManagerIdentity = null;
     ui.managerOrigin.value = managerOrigin;
     await chrome.storage.local.set({ managerOrigin });
-    await chrome.storage.local.remove('extensionToken');
+    await chrome.storage.local.remove(['extensionToken', 'trustedManagerIdentity']);
     setMessage('地址已保存，请重新配对', 'success');
     await discover();
   } catch (error) {
@@ -396,30 +459,62 @@ async function saveOrigin() {
 }
 
 async function openDashboard() {
-  const url = new URL('/dashboard', managerOrigin);
-  if (extensionToken) url.hash = `token=${encodeURIComponent(extensionToken)}`;
-  await chrome.tabs.create({ url: url.href });
+  try {
+    const authorization = await request('/v1/dashboard/authorize', {
+      method: 'POST',
+      body: {}
+    });
+    const url = new URL('/dashboard', managerOrigin);
+    url.hash = new URLSearchParams({ code: authorization.code }).toString();
+    await chrome.tabs.create({ url: url.href });
+  } catch (error) {
+    setMessage(error.message, 'error');
+  }
 }
 
 async function initialize() {
-  const stored = await chrome.storage.local.get(['managerOrigin', 'extensionToken']);
+  if (typeof chrome.storage.local.setAccessLevel === 'function') {
+    await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
+  }
+  const stored = await chrome.storage.local.get([
+    'managerOrigin',
+    'extensionToken',
+    'trustedManagerIdentity'
+  ]);
   try {
     managerOrigin = normalizeLoopbackOrigin(stored.managerOrigin || DEFAULT_MANAGER_ORIGIN);
   } catch {
     managerOrigin = DEFAULT_MANAGER_ORIGIN;
   }
   extensionToken = typeof stored.extensionToken === 'string' ? stored.extensionToken : '';
+  trustedManagerIdentity = stored.trustedManagerIdentity &&
+    stored.trustedManagerIdentity.origin === managerOrigin &&
+    stored.trustedManagerIdentity.version === EXTENSION_VERSION
+    ? stored.trustedManagerIdentity
+    : null;
+  if (extensionToken && !trustedManagerIdentity) {
+    extensionToken = '';
+    await chrome.storage.local.remove(['extensionToken', 'trustedManagerIdentity']);
+  }
   ui.managerOrigin.value = managerOrigin;
   await inspectActiveSite();
   await discover();
 }
 
-ui.saveOrigin.addEventListener('click', saveOrigin);
-ui.discoverManager.addEventListener('click', discover);
-ui.pairExtension.addEventListener('click', pair);
-ui.createProfile.addEventListener('click', createProfile);
-ui.refreshProfiles.addEventListener('click', refreshProfiles);
-ui.syncSession.addEventListener('click', syncCurrentSite);
-ui.openDashboard.addEventListener('click', openDashboard);
+const initialized = initialize();
 
-void initialize();
+function afterInitialize(handler) {
+  return (...args) => {
+    void initialized
+      .then(() => handler(...args))
+      .catch((error) => setMessage(error.message || '控制面板初始化失败', 'error'));
+  };
+}
+
+ui.saveOrigin.addEventListener('click', afterInitialize(saveOrigin));
+ui.discoverManager.addEventListener('click', afterInitialize(discover));
+ui.pairExtension.addEventListener('click', afterInitialize(pair));
+ui.createProfile.addEventListener('click', afterInitialize(createProfile));
+ui.refreshProfiles.addEventListener('click', afterInitialize(refreshProfiles));
+ui.syncSession.addEventListener('click', afterInitialize(syncCurrentSite));
+ui.openDashboard.addEventListener('click', afterInitialize(openDashboard));

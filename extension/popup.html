@@ -29,7 +29,11 @@
         </div>
         <div class="inline actions">
           <button id="discover-manager" class="secondary grow" type="button">重新发现</button>
-          <button id="pair-extension" class="primary grow" type="button">配对</button>
+        </div>
+        <label for="pairing-code">一次性配对码</label>
+        <div class="inline">
+          <input id="pairing-code" type="text" inputmode="text" autocomplete="one-time-code" maxlength="96" placeholder="粘贴 Agent 显示的身份绑定配对码">
+          <button id="pair-extension" class="primary" type="button">配对</button>
         </div>
       </section>
 

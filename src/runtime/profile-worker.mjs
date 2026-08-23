@@ -1,3 +1,5 @@
+import { redactSensitiveText } from '../lib/redaction.mjs';
+
 function safeSend(message) {
   if (typeof process.send !== 'function' || !process.connected) return;
   try {
@@ -49,7 +51,10 @@ export async function runOpenProfile(profile, {
   } catch (error) {
     safeSend({
       type: 'error',
-      error: { code: error?.code || 'PROFILE_OPEN_FAILED', message: String(error?.message || 'Profile failed to open').slice(0, 2_000) }
+      error: {
+        code: error?.code || 'PROFILE_OPEN_FAILED',
+        message: redactSensitiveText(error?.message || 'Profile failed to open').slice(0, 2_000)
+      }
     });
   } finally {
     clearInterval(heartbeat);

@@ -23,10 +23,10 @@
       <section id="token-panel" class="token-panel hidden">
         <div>
           <h1>连接本机 Manager</h1>
-          <p>从扩展打开 Dashboard 会自动完成授权；也可以在这里输入本机会话令牌。</p>
+          <p>请从扩展或 <code>taskmaster connect</code> 打开本页；授权短码只能使用一次。</p>
         </div>
         <form id="token-form">
-          <input id="manager-token" type="password" autocomplete="off" placeholder="Manager token" required>
+          <input id="manager-token" type="password" autocomplete="off" placeholder="一次性 Dashboard 授权短码" required>
           <button class="button primary" type="submit">连接</button>
         </form>
       </section>
@@ -89,7 +89,6 @@
       <pre id="result-evidence"></pre>
       <div id="result-output-row" class="result-output hidden">
         <code id="result-output"></code>
-        <button id="copy-output" class="button small" type="button">复制输出目录</button>
       </div>
     </dialog>
     <script type="module" src="/dashboard/dashboard.js"></script>

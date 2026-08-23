@@ -1,0 +1,41 @@
+name: cross-platform-verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-24.04]
+        node: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - if: runner.os == 'Linux'
+        run: npx playwright install --with-deps chromium
+      - if: runner.os != 'Linux'
+        run: npx playwright install chromium
+      - run: npm run check
+        env:
+          TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskmaster-${{ runner.os }}-node-${{ matrix.node }}
+          path: artifacts
+          if-no-files-found: ignore

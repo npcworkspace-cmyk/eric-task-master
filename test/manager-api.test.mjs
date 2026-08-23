@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createManager } from '../src/manager.mjs';
+import { VERSION } from '../src/contracts.mjs';
 
 const EXTENSION_ORIGIN = `chrome-extension://${'a'.repeat(32)}`;
 
@@ -28,7 +29,7 @@ async function managerFixture(t) {
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Task Master</title>');
 
   const tasks = new Map();
-  const calls = { open: [], close: [], imports: [] };
+  const calls = { open: [], close: [], imports: [], resumes: [] };
   let taskService;
   const buildTaskService = ({ profileStore }) => taskService = {
     async list() {
@@ -52,6 +53,13 @@ async function managerFixture(t) {
     async cancel(id) {
       const task = await this.get(id);
       task.state = 'cancelled';
+      return task;
+    },
+    async resume(id, body, caller) {
+      const task = await this.get(id);
+      calls.resumes.push({ id, body, caller });
+      task.state = 'queued';
+      task.attempt = 2;
       return task;
     },
     async openProfile(id) {
@@ -79,7 +87,7 @@ async function managerFixture(t) {
       }
       return {
         status: 'partial',
-        verification: 'storage_imported_not_login_verified',
+        verification: 'storage_replaced_not_login_verified',
         cookieCount: bundle.cookies.length,
         localStorageCount: bundle.localStorage.length
       };
@@ -103,9 +111,19 @@ async function managerFixture(t) {
   return { root, manager, taskService, calls, baseUrl: manager.baseUrl };
 }
 
-async function pair(baseUrl) {
+async function pair(baseUrl, managerToken) {
+  const approval = await json(await fetch(`${baseUrl}/v1/pair/authorize`, {
+    method: 'POST',
+    headers: headers(managerToken),
+    body: '{}'
+  }));
+  assert.equal(approval.response.status, 201);
+  assert.match(approval.body.pairingCode, /^ETM1\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/);
   const challengeResult = await json(await fetch(`${baseUrl}/v1/pair/challenge`, {
-    headers: { origin: EXTENSION_ORIGIN }
+    headers: {
+      origin: EXTENSION_ORIGIN,
+      'x-taskmaster-pairing-code': approval.body.pairingCode
+    }
   }));
   assert.equal(challengeResult.response.status, 200);
   assert.equal(
@@ -115,7 +133,11 @@ async function pair(baseUrl) {
   const pairResult = await json(await fetch(`${baseUrl}/v1/pair/extension`, {
     method: 'POST',
     headers: { origin: EXTENSION_ORIGIN, 'content-type': 'application/json' },
-    body: JSON.stringify({ challenge: challengeResult.body.challenge, name: 'Test panel' })
+    body: JSON.stringify({
+      challenge: challengeResult.body.challenge,
+      pairingCode: approval.body.pairingCode,
+      name: 'Test panel'
+    })
   }));
   assert.equal(pairResult.response.status, 201);
   return pairResult.body.token;
@@ -126,16 +148,20 @@ test('manager serves loopback health/dashboard and persists its token', async (t
   const health = await json(await fetch(`${baseUrl}/v1/health`));
   assert.equal(health.response.status, 200);
   assert.equal(health.body.ok, true);
-  assert.equal(health.body.version, '0.0.1');
+  assert.equal(health.body.version, VERSION);
   assert.equal(health.body.host, '127.0.0.1');
 
   const dashboard = await fetch(`${baseUrl}/dashboard`);
   assert.equal(dashboard.status, 200);
   assert.match(await dashboard.text(), /Task Master/);
-  assert.match(manager.dashboardUrl, /#token=/);
+  assert.equal(manager.dashboardUrl, `${baseUrl}/dashboard`);
+  assert.equal(manager.dashboardUrl.includes(manager.token), false);
 
   const storedConfig = JSON.parse(await readFile(join(manager.dataDir, 'config.json'), 'utf8'));
   assert.equal(storedConfig.managerToken, manager.token);
+  assert.equal(storedConfig.managerIdentity.algorithm, 'Ed25519');
+  assert.equal(health.body.identityFingerprint, storedConfig.managerIdentity.fingerprint);
+  assert.equal(JSON.stringify(health.body).includes(storedConfig.managerIdentity.privateKey), false);
   await assert.rejects(
     createManager({ host: '0.0.0.0', dataDir: join(manager.dataDir, 'invalid') }),
     /must bind to 127\.0\.0\.1/
@@ -143,7 +169,7 @@ test('manager serves loopback health/dashboard and persists its token', async (t
 });
 
 test('manager requires auth and pairs only a Chrome extension origin', async (t) => {
-  const { baseUrl } = await managerFixture(t);
+  const { manager, baseUrl } = await managerFixture(t);
   const unauthorized = await json(await fetch(`${baseUrl}/v1/profiles`));
   assert.equal(unauthorized.response.status, 401);
   assert.equal(unauthorized.body.error.code, 'AUTH_REQUIRED');
@@ -154,11 +180,11 @@ test('manager requires auth and pairs only a Chrome extension origin', async (t)
   assert.equal(webChallenge.response.status, 403);
   assert.equal(webChallenge.response.headers.get('access-control-allow-origin'), null);
 
-  const extensionToken = await pair(baseUrl);
+  const extensionToken = await pair(baseUrl, manager.token);
   const bearerWithoutOrigin = await json(await fetch(`${baseUrl}/v1/profiles`, {
     headers: { authorization: `Bearer ${extensionToken}` }
   }));
-  assert.equal(bearerWithoutOrigin.response.status, 200);
+  assert.equal(bearerWithoutOrigin.response.status, 403);
 
   const listed = await json(await fetch(`${baseUrl}/v1/profiles`, {
     headers: headers(extensionToken, EXTENSION_ORIGIN)
@@ -235,7 +261,7 @@ test('session import is extension-only, origin scoped, and never echoes authenti
     body: JSON.stringify({ name: 'Session target' })
   }));
   const profileId = profileResult.body.profile.id;
-  const extensionToken = await pair(baseUrl);
+  const extensionToken = await pair(baseUrl, manager.token);
   const bundle = {
     origin: 'https://example.com',
     cookies: [{ name: 'session', value: 'top-secret', domain: '.example.com', path: '/' }],
@@ -248,7 +274,7 @@ test('session import is extension-only, origin scoped, and never echoes authenti
     headers: headers(manager.token),
     body: JSON.stringify(bundle)
   }));
-  assert.equal(managerAttempt.response.status, 401);
+  assert.equal(managerAttempt.response.status, 403);
 
   const imported = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/session`, {
     method: 'POST',
@@ -259,7 +285,7 @@ test('session import is extension-only, origin scoped, and never echoes authenti
   assert.deepEqual(imported.body, {
     profileId,
     status: 'partial',
-    verification: 'storage_imported_not_login_verified',
+    verification: 'storage_replaced_not_login_verified',
     cookieCount: 1,
     localStorageCount: 1
   });
@@ -298,6 +324,7 @@ test('task routes delegate to taskService and strip private task fields', async 
   assert.equal(created.response.status, 202);
   assert.equal(created.body.task.state, 'queued');
   assert.equal(created.body.task.modulePath, undefined);
+  assert.equal(created.body.task.input, undefined);
 
   const taskId = created.body.task.id;
   const fetched = await json(await fetch(`${baseUrl}/v1/tasks/${taskId}`, {
@@ -305,6 +332,15 @@ test('task routes delegate to taskService and strip private task fields', async 
   }));
   assert.equal(fetched.response.status, 200);
   assert.equal(fetched.body.task.id, taskId);
+
+  const resumed = await json(await fetch(`${baseUrl}/v1/tasks/${taskId}/resume`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify({ resumeKey: 'manager-resume-0001' })
+  }));
+  assert.equal(resumed.response.status, 202);
+  assert.equal(resumed.body.task.attempt, 2);
+  assert.match(resumed.body.notice, /unknown/i);
 
   const cancelled = await json(await fetch(`${baseUrl}/v1/tasks/${taskId}/cancel`, {
     method: 'POST',

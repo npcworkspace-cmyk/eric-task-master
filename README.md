@@ -1,35 +1,67 @@
-# eric-task-master
+# Eric Task Master
 
-`eric-task-master` is a Playwright-first browser task runtime. Agents submit goals and task modules; Playwright owns every browser action. A lightweight extension in the user's everyday Chromium browser acts only as a control panel and an explicit session-transfer bridge.
+Eric Task Master is a Playwright-first browser task system for AI Agents. It gives Agents durable browser Profiles, isolated task windows, progress and recovery, optional human-paced behavior, and reusable task Skills without making the everyday browser the automation engine.
 
-Version: **0.0.1**
+Version: **0.0.2**
 
-## Product boundary
+## What it enables
 
-- Playwright is the only web execution layer.
-- The real-browser extension never clicks, types, scrapes, or navigates on behalf of a task.
-- Persistent Playwright profiles isolate accounts and concurrent agents.
-- The local manager owns profile locks, task lifecycle, progress, recovery, outputs, and cleanup.
-- Site-specific logic belongs in specialized Skills or task modules, not in the core runtime.
+- Multiple Agents can work in separate persistent browser Profiles without stealing each other's tabs, focus, or login state.
+- Short and long browser tasks keep a durable task ID, progress, heartbeat, checkpoint, artifacts, cancellation, and automatic window cleanup.
+- `fast`, `human`, and `adaptive` behavior can be selected per Profile or per task; deterministic data work stays fast by default.
+- A lightweight Chromium extension manages Playwright Profiles and lets the user explicitly copy the current site's session into a chosen Profile.
+- Standard MCP tools let supported Agent hosts discover and use the same Task Master after one registration flow.
+- Specialized Skills can add site or workflow logic as verified task types while reusing the same Profile, task, progress, evidence, and cleanup foundation.
 
-## First local run
+The three layers are deliberately separate:
+
+1. **Playwright + Manager** — reliable browser execution, isolation, lifecycle, and outputs.
+2. **Real-browser panel** — Profile settings and user-approved current-site session transfer only.
+3. **MCP + Skills** — simple Agent tools and reusable workflow-specific task modules.
+
+## One fixed start
+
+Requires Node.js 20 or newer. From the project root run:
 
 ```bash
 node scripts/taskmaster.mjs connect --json
 ```
 
-This one fixed command installs the lockfile-pinned Node dependencies and Playwright Chromium when missing, starts the local manager, and runs the built-in acceptance suite. Load `extension/` as an unpacked Chromium extension to use the real-browser control panel.
+This fixed command installs lockfile-pinned dependencies and Playwright Chromium when missing, starts the local Manager at `http://127.0.0.1:19946`, runs the real-browser acceptance suite, and transactionally registers the STDIO MCP server in detected supported Agent hosts. If a host reports `registered_pending_restart`, reload that host once.
 
-Agents use this same launcher from the project root. The bundled Skill exposes the identical command from its own directory, so a new Agent never needs to discover a second entry point.
+Load [`extension/`](./extension/) as an unpacked extension in a Chromium browser. Enter the single `ETM1...` pairing code returned by `connect`; it includes a SHA-256 Manager identity fingerprint. The extension verifies a fresh signed local challenge before it sends that code or any extension/session credential, and keeps the public identity pin in trusted extension storage. The extension does not click, type, navigate, or scrape web pages for tasks.
 
-The Manager uses the independent fixed address `http://127.0.0.1:19946`. In the extension, click **Discover**, then **Pair**. Create a persistent Profile or select an existing one. To reuse a website login, open that signed-in website in the everyday browser and click **Sync current site login**; session-only cookies are retained in the destination Profile for at most 12 hours and the site may invalidate them sooner.
+After MCP discovery, an Agent follows one small loop:
 
-The control panel can create, rename, open, close, and configure Profiles. Browser tasks run in isolated Playwright windows and close those windows during task cleanup. The Manager itself can be stopped safely with:
+1. Check `taskmaster_status` and list Profiles.
+2. List installed task types.
+3. Start a task with an idempotency key and keep its task ID.
+4. Wait or reconnect to that same task ID.
+5. If it failed with a checkpoint, explicitly resume that same ID with a stable resume key; never submit a duplicate.
+6. Read its compact evidence and declared artifacts.
+
+MCP starts Manager automatically on the first tool call if it is not already running. A disconnected wait does not destroy the browser task, and task windows close when cleanup settles.
+
+Worker code cannot declare success by itself. Manager first verifies the result contract, every declared Agent-visible artifact, browser closure, Worker exit, and Profile lease release. Failed checkpointed work keeps its original task ID, input, module snapshot, output, attempt history, and can be resumed explicitly after a Manager restart without blindly replaying an unknown website action.
+
+## Product boundary
+
+- Browser execution is pure Playwright; the extension is a control and consent surface.
+- Account state stays in local persistent Profiles. Session transfer is limited to the active site and requires an explicit user click.
+- Session transfer verifies the pinned Manager before reading cookies or LocalStorage, rejects tab/origin drift, replaces rather than merges the destination origin, rolls back on failure, and revokes its temporary site permission.
+- Core Task Master stays site-agnostic. Selectors, pagination, parsing, rate-limit policy, and business rules belong in specialized Skills or single-file task modules.
+- Agent-visible APIs do not return Manager credentials, cookies, Profile directories, module paths, or local output paths.
+
+Agents should start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Developers can read [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md).
+
+Run the complete local delivery gate with:
+
+```bash
+npm run check
+```
+
+Stop the local Manager safely with:
 
 ```bash
 node scripts/taskmaster.mjs manager stop --json
 ```
-
-Run the complete delivery gate with `npm run check`.
-
-Read [ARCHITECTURE.md](./ARCHITECTURE.md) for the component contract. Agents should use the bundled Skill at `skills/eric-task-master/` instead of reconstructing the protocol.

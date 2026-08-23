@@ -87,3 +87,24 @@ test('adaptive mode slows after a signal and does not retry failed actions', asy
   assert.deepEqual(failures, ['click']);
   assert.ok(sleeps.length > 0);
 });
+
+test('an action exception stays pending because the website outcome is unknown', async () => {
+  const { locator, page } = fixture();
+  const events = [];
+  let externalApplied = false;
+  locator.click = async () => {
+    externalApplied = true;
+    throw new Error('navigation timed out after submission');
+  };
+  const action = createActionHelper({
+    page,
+    onEffect: async (event) => {
+      events.push(event);
+      return event.sequence ?? 1;
+    }
+  });
+
+  await assert.rejects(action.click('#submit'), BehaviorActionError);
+  assert.equal(externalApplied, true);
+  assert.deepEqual(events.map((event) => event.state), ['started']);
+});

@@ -16,11 +16,19 @@ async function initialize() {
   if (typeof chrome.storage.local.setAccessLevel === 'function') {
     await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   }
-  const stored = await chrome.storage.local.get(['managerOrigin', 'extensionToken']);
+  const stored = await chrome.storage.local.get([
+    'managerOrigin',
+    'extensionToken',
+    'trustedManagerIdentity'
+  ]);
   if (!stored.managerOrigin) {
     await chrome.storage.local.set({ managerOrigin: DEFAULT_MANAGER_ORIGIN });
   }
-  await setBadge(stored.extensionToken ? 'discovering' : 'disconnected');
+  const trusted = stored.trustedManagerIdentity?.origin === (stored.managerOrigin || DEFAULT_MANAGER_ORIGIN);
+  if (stored.extensionToken && !trusted) {
+    await chrome.storage.local.remove(['extensionToken', 'trustedManagerIdentity']);
+  }
+  await setBadge(stored.extensionToken && trusted ? 'discovering' : 'disconnected');
 }
 
 chrome.runtime.onInstalled.addListener(() => {

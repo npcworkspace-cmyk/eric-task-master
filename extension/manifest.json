@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Eric Task Master",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Control Playwright profiles and explicitly transfer the current site's session.",
   "permissions": [
     "activeTab",
@@ -10,8 +10,7 @@
     "storage"
   ],
   "host_permissions": [
-    "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://127.0.0.1/*"
   ],
   "optional_host_permissions": [
     "http://*/*",

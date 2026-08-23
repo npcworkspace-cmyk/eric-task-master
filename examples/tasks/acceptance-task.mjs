@@ -1,7 +1,21 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-export const meta = { name: 'full-playwright-acceptance', version: 1 };
+export const meta = Object.freeze({
+  name: 'full-playwright-acceptance',
+  version: '1.0.0',
+  description: 'Built-in deterministic browser action acceptance task.',
+  inputSchema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['url', 'uploadPath'],
+    properties: {
+      url: { type: 'string', minLength: 8, maxLength: 4096 },
+      uploadPath: { type: 'string', minLength: 1, maxLength: 4096 },
+      expectedSession: { type: 'boolean' }
+    }
+  }
+});
 
 export async function run({ page, context, input, outputDir, action, progress, checkpoint }) {
   if (!input?.url || !input?.uploadPath) {
@@ -83,7 +97,9 @@ export async function run({ page, context, input, outputDir, action, progress, c
     summary: `Playwright acceptance passed (${evidence.length}/${evidence.length})`,
     evidence: [
       ...evidence,
-      { kind: 'report', value: reportPath }
+      { kind: 'artifact', file: path.basename(reportPath), agentVisible: true },
+      { kind: 'artifact', file: path.basename(screenshotPath), agentVisible: true },
+      { kind: 'artifact', file: path.basename(downloadPath), agentVisible: true }
     ]
   };
 }

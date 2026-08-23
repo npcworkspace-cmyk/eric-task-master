@@ -1,10 +1,23 @@
 import http from 'node:http';
 import os from 'node:os';
+import { mkdir } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { JsonStore } from './lib/json-store.mjs';
+import { ManagerLock } from './lib/manager-lock.mjs';
+import {
+  createManagerIdentityProof,
+  createPairingApprovalCode,
+  createPairingCode,
+  generateManagerIdentity,
+  MANAGER_SERVICE,
+  parsePairingCode,
+  validateIdentityNonce,
+  validateManagerIdentity
+} from './lib/manager-identity.mjs';
 import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
+import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 import {
   HttpError,
   corsHeaders,
@@ -26,8 +39,12 @@ import {
 } from './contracts.mjs';
 
 const PAIRING_CHALLENGE_TTL_MS = 60_000;
-const MANAGER_NAME = 'eric-task-master';
+const PAIRING_APPROVAL_TTL_MS = 2 * 60_000;
+const DASHBOARD_APPROVAL_TTL_MS = 2 * 60_000;
+const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60_000;
+const MANAGER_NAME = MANAGER_SERVICE;
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+const RESUME_NOTICE = 'Resume is explicit: the task module must inspect its checkpoint and current site state before repeating any action whose external outcome is unknown.';
 
 function defaultDataDirectory() {
   if (process.env.ERIC_TASK_MASTER_HOME) return resolve(process.env.ERIC_TASK_MASTER_HOME);
@@ -78,6 +95,34 @@ function isLoopbackRequestHost(hostHeader) {
 function publicExtension(extension) {
   const { tokenHash: _tokenHash, ...safe } = extension;
   return safe;
+}
+
+function publicAgent(agent) {
+  return { clientId: agent.clientId, name: agent.name };
+}
+
+function validateClientId(value) {
+  if (typeof value !== 'string' || !/^[a-zA-Z0-9._:-]{1,128}$/.test(value)) {
+    throw new HttpError(
+      400,
+      'INVALID_CLIENT_ID',
+      'clientId must contain 1-128 letters, numbers, dots, underscores, colons, or hyphens'
+    );
+  }
+  return value;
+}
+
+function requireRole(auth, ...roles) {
+  if (!roles.includes(auth?.role)) {
+    throw new HttpError(403, 'ROLE_FORBIDDEN', 'This credential cannot perform the requested operation');
+  }
+  return auth;
+}
+
+function serviceCaller(auth) {
+  return auth?.role === 'dashboard'
+    ? { role: 'manager-admin', clientId: 'dashboard' }
+    : auth;
 }
 
 function validateProfilePatch(body) {
@@ -196,28 +241,35 @@ function safeSessionResult(profileId, result) {
 
 function errorResponse(error) {
   if (error instanceof HttpError || error instanceof ProfileStoreError) {
+    const message = redactSensitiveText(error.message);
+    const details = error.details === undefined
+      ? undefined
+      : redactSensitiveValue(error.details);
     return {
       statusCode: error.statusCode,
       body: {
         code: error.code,
-        message: error.message,
+        message,
         error: {
           code: error.code,
-          message: error.message,
-          ...(error.details === undefined ? {} : { details: error.details })
+          message,
+          ...(details === undefined ? {} : { details })
         }
       }
     };
   }
   if (Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode < 600) {
+    const message = redactSensitiveText(
+      typeof error.message === 'string' ? error.message : 'Request failed'
+    );
     return {
       statusCode: error.statusCode,
       body: {
         code: typeof error.code === 'string' ? error.code : 'REQUEST_FAILED',
-        message: typeof error.message === 'string' ? error.message : 'Request failed',
+        message,
         error: {
           code: typeof error.code === 'string' ? error.code : 'REQUEST_FAILED',
-          message: typeof error.message === 'string' ? error.message : 'Request failed'
+          message
         }
       }
     };
@@ -240,21 +292,33 @@ export async function createManager({
   taskService: suppliedTaskService,
   taskServiceFactory,
   now = () => Date.now(),
-  profileProcessAlive
+  profileProcessAlive,
+  allowedTaskRoots = [resolve(MODULE_DIRECTORY, '..')]
 } = {}) {
   assertLoopbackHost(host);
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     throw new TypeError('port must be an integer from 0 to 65535');
   }
   const resolvedDataDir = resolve(dataDir);
+  const managerLock = new ManagerLock(join(resolvedDataDir, '.manager.lock'));
+  await managerLock.acquire();
+  try {
   const configStore = new JsonStore(join(resolvedDataDir, 'config.json'), () => ({
     version: 1,
     managerToken: token(),
+    managerIdentity: generateManagerIdentity(),
     createdAt: new Date(now()).toISOString(),
-    extensions: []
+    extensions: [],
+    agents: []
   }));
   await configStore.init();
   let config = await configStore.read();
+  if (config.managerIdentity === undefined) {
+    config = await configStore.update((draft) => {
+      draft.managerIdentity = generateManagerIdentity();
+    });
+  }
+  const managerIdentity = validateManagerIdentity(config.managerIdentity);
   if (typeof config.managerToken !== 'string' || config.managerToken.length < 32) {
     config = await configStore.update((draft) => {
       draft.managerToken = token();
@@ -264,6 +328,11 @@ export async function createManager({
   if (!Array.isArray(config.extensions)) {
     config = await configStore.update((draft) => {
       draft.extensions = [];
+    });
+  }
+  if (!Array.isArray(config.agents)) {
+    config = await configStore.update((draft) => {
+      draft.agents = [];
     });
   }
 
@@ -276,14 +345,26 @@ export async function createManager({
   await profileStore.init();
 
   const stateDir = join(resolvedDataDir, 'tasks');
+  const taskInboxRoot = join(resolvedDataDir, 'task-inbox');
+  await mkdir(taskInboxRoot, { recursive: true, mode: 0o700 });
   const createdTaskService = suppliedTaskService === undefined && typeof taskServiceFactory === 'function'
-    ? await taskServiceFactory({ profileStore, stateDir })
+    ? await taskServiceFactory({
+      profileStore,
+      stateDir,
+      taskTypesFile: join(resolvedDataDir, 'task-types.json'),
+      taskTypesRoot: join(resolvedDataDir, 'task-types'),
+      allowedTaskRoots: [...allowedTaskRoots, taskInboxRoot]
+    })
     : suppliedTaskService;
   const taskService = normalizeTaskService(createdTaskService);
   const challenges = new Map();
+  const pairingApprovals = new Map();
+  const dashboardApprovals = new Map();
+  const dashboardSessions = new Map();
   let server;
   let startedAt;
   let listeningAddress;
+  let stopped = false;
 
   function currentCors(request) {
     const origin = requestOrigin(request);
@@ -301,29 +382,77 @@ export async function createManager({
     throw new HttpError(403, 'ORIGIN_NOT_ALLOWED', 'Request origin is not allowed');
   }
 
-  async function authenticate(request, { extensionOnly = false } = {}) {
+  function extensionRequestOrigin(request) {
+    const origin = requestOrigin(request);
+    const claimedId = request.headers['x-taskmaster-extension-id'];
+    const claimedOrigin = typeof claimedId === 'string' && /^[a-p]{32}$/.test(claimedId)
+      ? `chrome-extension://${claimedId}`
+      : null;
+    if (origin) {
+      if (!isChromeExtensionOrigin(origin)) return null;
+      return claimedOrigin && claimedOrigin !== origin ? null : origin;
+    }
+    // Chrome's privileged extension fetch may omit Origin. The one-time pairing
+    // approval authenticates first contact; subsequent calls also require the
+    // private extension token bound to this claimed, strictly validated ID.
+    return claimedOrigin;
+  }
+
+  async function authenticate(request) {
     const bearer = parseBearer(request);
     if (!bearer) throw new HttpError(401, 'AUTH_REQUIRED', 'Bearer token is required');
     const origin = requestOrigin(request);
-    if (!extensionOnly && secureEqual(bearer, config.managerToken)) {
-      return { role: 'manager' };
+    if (secureEqual(bearer, config.managerToken)) {
+      return { role: 'manager-admin', clientId: 'manager-admin' };
     }
     const hashed = tokenHash(bearer);
+    const agent = config.agents.find((item) => secureEqual(item.tokenHash, hashed));
+    if (agent) {
+      return { role: 'agent', clientId: agent.clientId, agent };
+    }
+    const dashboard = dashboardSessions.get(hashed);
+    if (dashboard) {
+      if (dashboard.expiresAt <= now()) {
+        dashboardSessions.delete(hashed);
+      } else {
+        return { role: 'dashboard', clientId: dashboard.clientId };
+      }
+    }
     const extension = config.extensions.find((item) => secureEqual(item.tokenHash, hashed));
     if (!extension) throw new HttpError(401, 'INVALID_TOKEN', 'Bearer token is invalid');
-    return { role: 'extension', extension };
+    if (extensionRequestOrigin(request) !== extension.origin) {
+      throw new HttpError(403, 'EXTENSION_ORIGIN_MISMATCH', 'Extension credential origin does not match');
+    }
+    return { role: 'extension', clientId: `extension:${extension.id}`, extension };
   }
 
   async function pairExtension(request, response, cors) {
-    const origin = requestOrigin(request);
-    if (!isChromeExtensionOrigin(origin)) {
+    const origin = extensionRequestOrigin(request);
+    if (!origin) {
       throw new HttpError(403, 'EXTENSION_ORIGIN_REQUIRED', 'Chrome extension origin is required');
     }
     const body = await readJson(request, { maxBytes: 16 * 1024 });
     const challengeValue = typeof body.challenge === 'string' ? body.challenge : '';
+    const pairingCode = typeof body.pairingCode === 'string' ? body.pairingCode : '';
+    let parsedPairing;
+    try {
+      parsedPairing = parsePairingCode(pairingCode, managerIdentity.fingerprint);
+    } catch {
+      throw new HttpError(401, 'INVALID_PAIRING_CODE', 'Pairing code is invalid or expired');
+    }
     const pending = challenges.get(challengeValue);
     challenges.delete(challengeValue);
-    if (!pending || pending.origin !== origin || pending.expiresAt < now()) {
+    const approval = pairingApprovals.get(pairingCode);
+    pairingApprovals.delete(pairingCode);
+    if (
+      !pending ||
+      pending.origin !== origin ||
+      pending.expiresAt < now() ||
+      !approval ||
+      approval.expiresAt < now() ||
+      !secureEqual(pending.approvalHash, tokenHash(pairingCode)) ||
+      !secureEqual(parsedPairing.approvalCode, approval.approvalCode)
+    ) {
       throw new HttpError(401, 'INVALID_PAIRING_CHALLENGE', 'Pairing challenge is invalid or expired');
     }
     const extensionId = origin.slice('chrome-extension://'.length);
@@ -368,21 +497,146 @@ export async function createManager({
         host,
         port: listeningAddress?.port ?? port,
         pid: process.pid,
-        startedAt
+        startedAt,
+        identityFingerprint: managerIdentity.fingerprint
+      }, cors);
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v1/identity/challenge') {
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      let nonce;
+      try {
+        nonce = validateIdentityNonce(body.nonce);
+      } catch {
+        throw new HttpError(400, 'INVALID_IDENTITY_NONCE', 'A 256-bit base64url nonce is required');
+      }
+      sendJson(response, 200, createManagerIdentityProof(managerIdentity, {
+        service: MANAGER_NAME,
+        version: VERSION,
+        apiVersion: API_VERSION,
+        host,
+        port: listeningAddress?.port ?? port,
+        nonce
+      }), cors);
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v1/agents/issue') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin');
+      const body = await readJson(request, { maxBytes: 16 * 1024 });
+      const clientId = validateClientId(body.clientId);
+      const name = typeof body.name === 'string' && body.name.trim()
+        ? body.name.trim().slice(0, 80)
+        : clientId;
+      const agentToken = token();
+      const agent = {
+        credentialId: randomBytes(12).toString('hex'),
+        clientId,
+        name,
+        tokenHash: tokenHash(agentToken),
+        createdAt: new Date(now()).toISOString()
+      };
+      config = await configStore.update((draft) => {
+        draft.agents = Array.isArray(draft.agents) ? draft.agents : [];
+        draft.agents.push(agent);
+        let remainingForClient = 8;
+        draft.agents = draft.agents.reverse().filter((item) => (
+          item.clientId !== clientId || remainingForClient-- > 0
+        )).reverse();
+      });
+      sendJson(response, 201, { agentToken, agent: publicAgent(agent) }, cors);
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v1/pair/authorize') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin');
+      await readJson(request, { maxBytes: 4 * 1024 });
+      for (const [code, approval] of pairingApprovals) {
+        if (approval.expiresAt < now()) pairingApprovals.delete(code);
+      }
+      while (pairingApprovals.size >= 8) pairingApprovals.delete(pairingApprovals.keys().next().value);
+      const approvalCode = createPairingApprovalCode();
+      const pairingCode = createPairingCode(approvalCode, managerIdentity.fingerprint);
+      pairingApprovals.set(pairingCode, {
+        approvalCode,
+        expiresAt: now() + PAIRING_APPROVAL_TTL_MS
+      });
+      sendJson(response, 201, {
+        pairingCode,
+        expiresInMs: PAIRING_APPROVAL_TTL_MS
+      }, cors);
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v1/dashboard/authorize') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'extension');
+      await readJson(request, { maxBytes: 4 * 1024 });
+      for (const [code, approval] of dashboardApprovals) {
+        if (approval.expiresAt <= now()) dashboardApprovals.delete(code);
+      }
+      while (dashboardApprovals.size >= 8) dashboardApprovals.delete(dashboardApprovals.keys().next().value);
+      const code = randomBytes(24).toString('base64url');
+      dashboardApprovals.set(code, {
+        expiresAt: now() + DASHBOARD_APPROVAL_TTL_MS,
+        clientId: `dashboard:${auth.clientId}`
+      });
+      sendJson(response, 201, { code, expiresInMs: DASHBOARD_APPROVAL_TTL_MS }, cors);
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v1/dashboard/session') {
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      const code = typeof body.code === 'string' ? body.code : '';
+      const approval = dashboardApprovals.get(code);
+      dashboardApprovals.delete(code);
+      if (!approval || approval.expiresAt <= now()) {
+        throw new HttpError(401, 'INVALID_DASHBOARD_CODE', 'Dashboard authorization code is invalid or expired');
+      }
+      for (const [hash, session] of dashboardSessions) {
+        if (session.expiresAt <= now()) dashboardSessions.delete(hash);
+      }
+      while (dashboardSessions.size >= 8) dashboardSessions.delete(dashboardSessions.keys().next().value);
+      const dashboardToken = token();
+      dashboardSessions.set(tokenHash(dashboardToken), {
+        expiresAt: now() + DASHBOARD_SESSION_TTL_MS,
+        clientId: approval.clientId
+      });
+      sendJson(response, 201, {
+        dashboardToken,
+        expiresInMs: DASHBOARD_SESSION_TTL_MS
       }, cors);
       return;
     }
 
     if (request.method === 'GET' && url.pathname === '/v1/pair/challenge') {
-      const origin = requestOrigin(request);
-      if (!isChromeExtensionOrigin(origin)) {
+      const origin = extensionRequestOrigin(request);
+      if (!origin) {
         throw new HttpError(403, 'EXTENSION_ORIGIN_REQUIRED', 'Chrome extension origin is required');
       }
       for (const [value, pending] of challenges) {
         if (pending.expiresAt < now() || pending.origin === origin) challenges.delete(value);
       }
+      const pairingCode = request.headers['x-taskmaster-pairing-code'];
+      let parsedPairing;
+      try {
+        parsedPairing = parsePairingCode(pairingCode, managerIdentity.fingerprint);
+      } catch {
+        parsedPairing = null;
+      }
+      const approval = parsedPairing ? pairingApprovals.get(pairingCode) : null;
+      if (!approval || approval.expiresAt < now()) {
+        throw new HttpError(401, 'PAIRING_APPROVAL_REQUIRED', 'A valid one-time pairing approval is required');
+      }
       const challenge = token();
-      challenges.set(challenge, { origin, expiresAt: now() + PAIRING_CHALLENGE_TTL_MS });
+      challenges.set(challenge, {
+        origin,
+        approvalHash: tokenHash(pairingCode),
+        expiresAt: now() + PAIRING_CHALLENGE_TTL_MS
+      });
       sendJson(response, 200, { challenge, expiresInMs: PAIRING_CHALLENGE_TTL_MS }, cors);
       return;
     }
@@ -404,22 +658,27 @@ export async function createManager({
     const profileMatch = /^\/v1\/profiles\/([^/]+)$/.exec(url.pathname);
     const profileActionMatch = /^\/v1\/profiles\/([^/]+)\/(open|close|session)$/.exec(url.pathname);
     const taskMatch = /^\/v1\/tasks\/([^/]+)$/.exec(url.pathname);
-    const taskActionMatch = /^\/v1\/tasks\/([^/]+)\/(cancel)$/.exec(url.pathname);
+    const taskActionMatch = /^\/v1\/tasks\/([^/]+)\/(cancel|resume)$/.exec(url.pathname);
+    const taskArtifactsMatch = /^\/v1\/tasks\/([^/]+)\/artifacts$/.exec(url.pathname);
+    const taskArtifactMatch = /^\/v1\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname);
 
     if (request.method === 'GET' && url.pathname === '/v1/profiles') {
-      await authenticate(request);
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
       const profiles = (await profileStore.list()).map(publicProfile);
       sendJson(response, 200, { profiles }, cors);
       return;
     }
     if (request.method === 'POST' && url.pathname === '/v1/profiles') {
-      await authenticate(request);
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
       const profile = await profileStore.create(validateProfileCreate(await readJson(request)));
       sendJson(response, 201, { profile: publicProfile(profile) }, cors);
       return;
     }
     if (profileMatch && request.method === 'PATCH') {
-      await authenticate(request);
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
       const profileId = decodeURIComponent(profileMatch[1]);
       const profile = await profileStore.update(
         profileId,
@@ -429,7 +688,8 @@ export async function createManager({
       return;
     }
     if (profileMatch && request.method === 'DELETE') {
-      await authenticate(request);
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
       const profileId = decodeURIComponent(profileMatch[1]);
       const removed = await profileStore.remove(profileId);
       sendJson(response, 200, { removed: publicProfile(removed) }, cors);
@@ -438,8 +698,9 @@ export async function createManager({
     if (profileActionMatch && request.method === 'POST') {
       const profileId = decodeURIComponent(profileActionMatch[1]);
       const actionName = profileActionMatch[2];
-      const auth = await authenticate(request, { extensionOnly: actionName === 'session' });
+      const auth = await authenticate(request);
       if (actionName === 'session') {
+        requireRole(auth, 'extension');
         const bundle = validatedSessionBundle(await readJson(request), auth.extension);
         const importSession = requireTaskMethod(taskService, 'importSession');
         await profileStore.get(profileId);
@@ -457,43 +718,112 @@ export async function createManager({
         return;
       }
 
+      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
+
       if (actionName === 'open') {
         await profileStore.recoverExpiredLeases();
         await profileStore.get(profileId);
         const openProfile = requireTaskMethod(taskService, 'openProfile');
-        await openProfile(profileId);
+        await openProfile(profileId, serviceCaller(auth));
         sendJson(response, 200, { profile: publicProfile(await profileStore.get(profileId)) }, cors);
         return;
       }
 
       await profileStore.get(profileId);
       const closeProfile = requireTaskMethod(taskService, 'closeProfile');
-      await closeProfile(profileId);
+      await closeProfile(profileId, serviceCaller(auth));
       sendJson(response, 200, { profile: publicProfile(await profileStore.get(profileId)) }, cors);
       return;
     }
 
+    if (request.method === 'GET' && url.pathname === '/v1/task-types') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const result = await requireTaskMethod(taskService, 'listTaskTypes')(serviceCaller(auth));
+      sendJson(response, 200, result, cors);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/task-types/install') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin');
+      const installed = await requireTaskMethod(taskService, 'installTaskType')(
+        await readJson(request, { maxBytes: 32 * 1024 }),
+        auth
+      );
+      sendJson(response, 201, { taskType: installed }, cors);
+      return;
+    }
+
     if (request.method === 'GET' && url.pathname === '/v1/tasks') {
-      await authenticate(request);
-      const tasks = await requireTaskMethod(taskService, 'list')();
-      sendJson(response, 200, { tasks: tasks.map(publicTask) }, cors);
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const rawLimit = url.searchParams.get('limit');
+      const limit = rawLimit === null ? 50 : Number(rawLimit);
+      const cursor = url.searchParams.get('cursor');
+      const result = await requireTaskMethod(taskService, 'list')({ caller: serviceCaller(auth), limit, cursor });
+      const page = Array.isArray(result) ? { tasks: result, nextCursor: null } : result;
+      sendJson(response, 200, {
+        tasks: page.tasks.map(publicTask),
+        nextCursor: page.nextCursor ?? null
+      }, cors);
       return;
     }
     if (request.method === 'POST' && url.pathname === '/v1/tasks') {
-      await authenticate(request);
-      const task = await requireTaskMethod(taskService, 'create')(await readJson(request));
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent');
+      const task = await requireTaskMethod(taskService, 'create')(await readJson(request), auth);
       sendJson(response, 202, { task: publicTask(task) }, cors);
       return;
     }
+    if (taskArtifactsMatch && request.method === 'GET') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const artifacts = await requireTaskMethod(taskService, 'listArtifacts')(
+        decodeURIComponent(taskArtifactsMatch[1]),
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, { artifacts }, cors);
+      return;
+    }
+    if (taskArtifactMatch && request.method === 'GET') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const rawOffset = url.searchParams.get('offset');
+      const rawMaxBytes = url.searchParams.get('maxBytes');
+      const artifact = await requireTaskMethod(taskService, 'readArtifact')(
+        decodeURIComponent(taskArtifactMatch[1]),
+        decodeURIComponent(taskArtifactMatch[2]),
+        {
+          offset: rawOffset === null ? 0 : Number(rawOffset),
+          maxBytes: rawMaxBytes === null ? 48 * 1024 : Number(rawMaxBytes)
+        },
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, artifact, cors);
+      return;
+    }
     if (taskMatch && request.method === 'GET') {
-      await authenticate(request);
-      const task = await requireTaskMethod(taskService, 'get')(decodeURIComponent(taskMatch[1]));
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const task = await requireTaskMethod(taskService, 'get')(decodeURIComponent(taskMatch[1]), serviceCaller(auth));
       sendJson(response, 200, { task: publicTask(task) }, cors);
       return;
     }
     if (taskActionMatch && request.method === 'POST') {
-      await authenticate(request);
-      const task = await requireTaskMethod(taskService, 'cancel')(decodeURIComponent(taskActionMatch[1]));
+      const auth = await authenticate(request);
+      const taskId = decodeURIComponent(taskActionMatch[1]);
+      if (taskActionMatch[2] === 'resume') {
+        requireRole(auth, 'manager-admin', 'agent');
+        const task = await requireTaskMethod(taskService, 'resume')(
+          taskId,
+          await readJson(request, { maxBytes: 4 * 1024 }),
+          serviceCaller(auth)
+        );
+        sendJson(response, 202, { task: publicTask(task), notice: RESUME_NOTICE }, cors);
+        return;
+      }
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const task = await requireTaskMethod(taskService, 'cancel')(taskId, serviceCaller(auth));
       sendJson(response, 200, { task: publicTask(task) }, cors);
       return;
     }
@@ -522,38 +852,49 @@ export async function createManager({
 
   async function start() {
     if (server?.listening) return api;
+    if (stopped) throw new Error('Manager instance has already been stopped');
     server = http.createServer((request, response) => void handle(request, response));
-    await new Promise((resolveStart, rejectStart) => {
-      const onError = (error) => {
-        server.off('listening', onListening);
-        rejectStart(error);
-      };
-      const onListening = () => {
-        server.off('error', onError);
-        resolveStart();
-      };
-      server.once('error', onError);
-      server.once('listening', onListening);
-      server.listen(port, host);
-    });
+    try {
+      await new Promise((resolveStart, rejectStart) => {
+        const onError = (error) => {
+          server.off('listening', onListening);
+          rejectStart(error);
+        };
+        const onListening = () => {
+          server.off('error', onError);
+          resolveStart();
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen(port, host);
+      });
+    } catch (error) {
+      stopped = true;
+      await managerLock.release().catch(() => {});
+      throw error;
+    }
     listeningAddress = server.address();
     startedAt = new Date(now()).toISOString();
     return api;
   }
 
   async function stop() {
-    if (!server?.listening) return;
+    if (stopped) return;
     let serviceError;
     try {
       await taskService.close?.();
     } catch (error) {
       serviceError = error;
     } finally {
-      await new Promise((resolveStop, rejectStop) => {
-        server.close((error) => error ? rejectStop(error) : resolveStop());
-        server.closeAllConnections?.();
-      });
+      if (server?.listening) {
+        await new Promise((resolveStop, rejectStop) => {
+          server.close((error) => error ? rejectStop(error) : resolveStop());
+          server.closeAllConnections?.();
+        });
+      }
       listeningAddress = undefined;
+      stopped = true;
+      await managerLock.release().catch(() => {});
     }
     if (serviceError) throw serviceError;
   }
@@ -578,11 +919,15 @@ export async function createManager({
     },
     get dashboardUrl() {
       return listeningAddress
-        ? `http://${host}:${listeningAddress.port}/dashboard#token=${encodeURIComponent(config.managerToken)}`
+        ? `http://${host}:${listeningAddress.port}/dashboard`
         : null;
     }
   };
   return api;
+  } catch (error) {
+    await managerLock.release().catch(() => {});
+    throw error;
+  }
 }
 
 export async function startManager(options) {

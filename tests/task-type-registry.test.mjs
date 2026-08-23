@@ -1,0 +1,241 @@
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { TaskTypeRegistry } from '../src/lib/task-type-registry.mjs';
+
+async function fixture(t, { inspectionTimeoutMs = 500 } = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-task-types-'));
+  const allowed = path.join(root, 'allowed');
+  const snapshotRoot = path.join(root, 'snapshots');
+  const filePath = path.join(root, 'task-types.json');
+  await mkdir(allowed);
+  const registry = new TaskTypeRegistry({
+    filePath,
+    snapshotRoot,
+    allowedRoots: [allowed],
+    seedTypes: [],
+    inspectionTimeoutMs
+  });
+  await registry.list();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return { root, allowed, snapshotRoot, filePath, registry };
+}
+
+async function writeModule(directory, filename, source) {
+  const modulePath = path.join(directory, filename);
+  await writeFile(modulePath, source, 'utf8');
+  return modulePath;
+}
+
+test('a short-lived inspector accepts a valid task module and bounded metadata', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const modulePath = await writeModule(allowed, 'valid.mjs', [
+    'export const meta = {',
+    '  title: "Readable task",',
+    '  description: "A valid inspector fixture",',
+    '  version: "1.2.3",',
+    '  readOnly: true,',
+    '  inputSchema: { type: "object", additionalProperties: false, properties: { url: { type: "string", minLength: 8 } } }',
+    '};',
+    'export async function run() { return { summary: "ok", evidence: [] }; }',
+    ''
+  ].join('\n'));
+
+  const installed = await registry.install({ name: 'valid', modulePath });
+  assert.equal(installed.name, 'valid');
+  assert.equal(installed.title, 'Readable task');
+  assert.equal(installed.version, '1.2.3');
+  assert.equal(installed.readOnly, true);
+  assert.equal(installed.inputSchema.properties.url.minLength, 8);
+  assert.match(installed.sha256, /^[a-f0-9]{64}$/);
+});
+
+test('top-level process.exit is contained to the inspector process', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const exiting = await writeModule(allowed, 'exit.mjs', [
+    'process.exit(23);',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+
+  await assert.rejects(
+    registry.install({ name: 'exiting', modulePath: exiting }),
+    { code: 'INVALID_TASK_MODULE' }
+  );
+
+  const healthy = await writeModule(
+    allowed,
+    'healthy.mjs',
+    'export async function run() { return { summary: "still alive", evidence: [] }; }\n'
+  );
+  assert.equal((await registry.install({ name: 'healthy', modulePath: healthy })).name, 'healthy');
+});
+
+test('top-level module exceptions fail closed inside the inspector', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const throwing = await writeModule(allowed, 'throwing.mjs', [
+    'throw new Error("top-level fixture failure");',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  await assert.rejects(
+    registry.install({ name: 'throwing', modulePath: throwing }),
+    (error) => error?.code === 'INVALID_TASK_MODULE'
+      && !error.message.includes('top-level fixture failure')
+  );
+});
+
+test('top-level await forever times out closed without poisoning later installs', async (t) => {
+  const { allowed, registry } = await fixture(t, { inspectionTimeoutMs: 150 });
+  const waiting = await writeModule(allowed, 'forever.mjs', [
+    'setInterval(() => {}, 1_000);',
+    'await new Promise(() => {});',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  const startedAt = Date.now();
+  await assert.rejects(
+    registry.install({ name: 'forever', modulePath: waiting }),
+    { code: 'TASK_MODULE_INSPECTION_TIMEOUT' }
+  );
+  assert.ok(Date.now() - startedAt < 2_000);
+
+  const healthy = await writeModule(
+    allowed,
+    'after-timeout.mjs',
+    'export async function run() { return { summary: "ok", evidence: [] }; }\n'
+  );
+  assert.equal((await registry.install({ name: 'after-timeout', modulePath: healthy })).name, 'after-timeout');
+});
+
+test('inspector result size and JSON shape fail closed', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const oversized = await writeModule(allowed, 'oversized.mjs', [
+    'export const meta = { description: "x".repeat(100 * 1024) };',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  await assert.rejects(
+    registry.install({ name: 'oversized', modulePath: oversized }),
+    { code: 'INVALID_TASK_METADATA' }
+  );
+
+  const cyclic = await writeModule(allowed, 'cyclic.mjs', [
+    'const meta = {};',
+    'meta.self = meta;',
+    'export { meta };',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  await assert.rejects(
+    registry.install({ name: 'cyclic', modulePath: cyclic }),
+    { code: 'INVALID_TASK_METADATA' }
+  );
+});
+
+test('snapshot is hashed again after inspection before registration', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const mutating = await writeModule(allowed, 'mutating.mjs', [
+    'import { writeFileSync } from "node:fs";',
+    'import { fileURLToPath } from "node:url";',
+    'export const meta = { title: "Mutating" };',
+    'export async function run() {}',
+    'writeFileSync(fileURLToPath(import.meta.url), "export async function run() {}\\n");',
+    ''
+  ].join('\n'));
+  await assert.rejects(
+    registry.install({ name: 'mutating', modulePath: mutating }),
+    { code: 'TASK_SNAPSHOT_CHANGED' }
+  );
+});
+
+test('same SHA is idempotent while same-name different content is a 409 conflict', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const modulePath = await writeModule(
+    allowed,
+    'stable.mjs',
+    'export const meta = { version: "1" }; export async function run() {}\n'
+  );
+  const first = await registry.install({ name: 'stable', modulePath });
+  const repeated = await registry.install({ name: 'stable', modulePath });
+  assert.deepEqual(repeated, first);
+
+  await writeFile(
+    modulePath,
+    'export const meta = { version: "2" }; export async function run() {}\n',
+    'utf8'
+  );
+  await assert.rejects(
+    registry.install({ name: 'stable', modulePath, allowUpdate: true }),
+    (error) => error?.code === 'TASK_TYPE_CONFLICT' && error?.statusCode === 409
+  );
+  await writeFile(modulePath, 'process.exit(31); export async function run() {}\n', 'utf8');
+  await assert.rejects(
+    registry.install({ name: 'stable', modulePath }),
+    (error) => error?.code === 'TASK_TYPE_CONFLICT' && error?.statusCode === 409
+  );
+  assert.equal((await registry.list())[0].sha256, first.sha256);
+});
+
+test('concurrent same-name different installs publish exactly one snapshot record', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const firstPath = await writeModule(
+    allowed,
+    'race-a.mjs',
+    'export const meta = { version: "a" }; export async function run() {}\n'
+  );
+  const secondPath = await writeModule(
+    allowed,
+    'race-b.mjs',
+    'export const meta = { version: "b" }; export async function run() {}\n'
+  );
+  const outcomes = await Promise.allSettled([
+    registry.install({ name: 'raced', modulePath: firstPath }),
+    registry.install({ name: 'raced', modulePath: secondPath })
+  ]);
+  const fulfilled = outcomes.filter((outcome) => outcome.status === 'fulfilled');
+  const rejected = outcomes.filter((outcome) => outcome.status === 'rejected');
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.code, 'TASK_TYPE_CONFLICT');
+  assert.equal(rejected[0].reason.statusCode, 409);
+  const listed = await registry.list();
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].sha256, fulfilled[0].value.sha256);
+});
+
+test('seed initialization explicitly updates a same-name built-in task', async (t) => {
+  const { allowed, snapshotRoot, filePath } = await fixture(t);
+  const modulePath = await writeModule(
+    allowed,
+    'seed.mjs',
+    'export const meta = { version: "1" }; export async function run() {}\n'
+  );
+  const firstRegistry = new TaskTypeRegistry({
+    filePath,
+    snapshotRoot,
+    allowedRoots: [allowed],
+    seedTypes: [{ name: 'seed', modulePath }]
+  });
+  const first = (await firstRegistry.list())[0];
+
+  await writeFile(
+    modulePath,
+    'export const meta = { version: "2" }; export async function run() {}\n',
+    'utf8'
+  );
+  const updatedRegistry = new TaskTypeRegistry({
+    filePath,
+    snapshotRoot,
+    allowedRoots: [allowed],
+    seedTypes: [{ name: 'seed', modulePath }]
+  });
+  const updated = (await updatedRegistry.list())[0];
+  assert.equal(updated.version, '2');
+  assert.notEqual(updated.sha256, first.sha256);
+
+  const persisted = JSON.parse(await readFile(filePath, 'utf8'));
+  assert.equal(persisted.types[0].sha256, updated.sha256);
+});

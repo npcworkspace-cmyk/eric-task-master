@@ -1,16 +1,52 @@
 import { fork } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { lstat, mkdir, open, readdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isBehaviorMode, TERMINAL_TASK_STATES } from '../contracts.mjs';
+import { isBehaviorMode, publicTask, TERMINAL_TASK_STATES } from '../contracts.mjs';
+import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
+import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
 const PROFILE_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
 const IMPORT_WORKER = fileURLToPath(new URL('./import-session-worker.mjs', import.meta.url));
+const PROJECT_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const ACCEPTANCE_TASK = fileURLToPath(new URL('../../examples/tasks/acceptance-task.mjs', import.meta.url));
+const READ_PAGE_TASK = fileURLToPath(new URL('../../examples/tasks/read-page-task.mjs', import.meta.url));
+const DURABLE_DELAY_TASK = fileURLToPath(new URL('../../examples/tasks/durable-delay-task.mjs', import.meta.url));
 const LEASE_TTL_MS = 60_000;
 const HEARTBEAT_TIMEOUT_MS = 65_000;
 const DIAGNOSTIC_GRACE_MS = 15_000;
+const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const MAX_ARTIFACTS = 100;
+const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
+const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
+const MAX_ATTEMPTS = 100;
+const RESUME_KEY_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
+
+export const TASK_SERVICE_DEADLINES = Object.freeze({
+  profileOpenMs: 30_000,
+  profileCloseMs: 10_000,
+  sessionImportMs: 90_000,
+  sessionImportRollbackGraceMs: 15_000
+});
+
+const ARTIFACT_MIME_TYPES = Object.freeze({
+  '.csv': 'text/csv',
+  '.htm': 'text/html',
+  '.html': 'text/html',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.json': 'application/json',
+  '.jsonl': 'application/x-ndjson',
+  '.log': 'text/plain',
+  '.md': 'text/markdown',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.tsv': 'text/tab-separated-values',
+  '.txt': 'text/plain',
+  '.webp': 'image/webp'
+});
 
 export class TaskServiceError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -29,11 +65,182 @@ function clone(value) {
   return structuredClone(value);
 }
 
+function callerIdentity(caller = {}) {
+  if (caller.role === 'manager-admin') {
+    return { role: 'manager-admin', clientId: caller.clientId || 'manager-admin' };
+  }
+  if (caller.role === 'agent' && typeof caller.clientId === 'string' && caller.clientId) {
+    return { role: 'agent', clientId: caller.clientId };
+  }
+  throw new TaskServiceError('TASK_ACCESS_DENIED', 'Task operation is not allowed for this caller', 403);
+}
+
+function profileCallerIdentity(caller = {}) {
+  if (
+    ['manager-admin', 'agent', 'extension'].includes(caller.role) &&
+    typeof caller.clientId === 'string' && caller.clientId
+  ) {
+    return { role: caller.role, clientId: caller.clientId };
+  }
+  throw new TaskServiceError('PROFILE_ACCESS_DENIED', 'Profile operation is not allowed for this caller', 403);
+}
+
+function canAccess(task, caller) {
+  return caller.role === 'manager-admin' || task.ownerClientId === caller.clientId;
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, stableValue(value[key])])
+  );
+}
+
+function inputSchemaError(location, message) {
+  throw new TaskServiceError(
+    'TASK_INPUT_SCHEMA_FAILED',
+    `Task input ${location} ${message}`,
+    400
+  );
+}
+
+function validateTaskInput(value, schema, location = '$', depth = 0) {
+  if (!schema || typeof schema !== 'object') return;
+  if (depth > 20) inputSchemaError(location, 'is nested too deeply');
+  if (Array.isArray(schema.enum) && !schema.enum.some((item) => JSON.stringify(item) === JSON.stringify(value))) {
+    inputSchemaError(location, 'is not one of the allowed values');
+  }
+  const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  if (types.length) {
+    const actual = value === null
+      ? 'null'
+      : Array.isArray(value)
+        ? 'array'
+        : Number.isInteger(value)
+          ? 'integer'
+          : typeof value === 'number'
+            ? 'number'
+            : typeof value;
+    const matches = types.includes(actual) || (actual === 'integer' && types.includes('number'));
+    if (!matches) inputSchemaError(location, `must be ${types.join(' or ')}`);
+  }
+  if (typeof value === 'string') {
+    if (Number.isSafeInteger(schema.minLength) && value.length < schema.minLength) {
+      inputSchemaError(location, `must contain at least ${schema.minLength} characters`);
+    }
+    if (Number.isSafeInteger(schema.maxLength) && value.length > schema.maxLength) {
+      inputSchemaError(location, `must contain at most ${schema.maxLength} characters`);
+    }
+    if (typeof schema.pattern === 'string' && !(new RegExp(schema.pattern, 'u')).test(value)) {
+      inputSchemaError(location, 'does not match the required pattern');
+    }
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) inputSchemaError(location, `must be at least ${schema.minimum}`);
+    if (typeof schema.maximum === 'number' && value > schema.maximum) inputSchemaError(location, `must be at most ${schema.maximum}`);
+  }
+  if (Array.isArray(value)) {
+    if (Number.isSafeInteger(schema.minItems) && value.length < schema.minItems) inputSchemaError(location, `must contain at least ${schema.minItems} items`);
+    if (Number.isSafeInteger(schema.maxItems) && value.length > schema.maxItems) inputSchemaError(location, `must contain at most ${schema.maxItems} items`);
+    if (schema.items && typeof schema.items === 'object') {
+      value.forEach((item, index) => validateTaskInput(item, schema.items, `${location}[${index}]`, depth + 1));
+    }
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    for (const key of required) {
+      if (!Object.hasOwn(value, key)) inputSchemaError(`${location}.${key}`, 'is required');
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (Object.hasOwn(properties, key)) {
+        validateTaskInput(item, properties[key], `${location}.${key}`, depth + 1);
+      } else if (schema.additionalProperties === false) {
+        inputSchemaError(`${location}.${key}`, 'is not supported');
+      } else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+        validateTaskInput(item, schema.additionalProperties, `${location}.${key}`, depth + 1);
+      }
+    }
+  }
+}
+
+function requestHash(value) {
+  return createHash('sha256').update(JSON.stringify(stableValue(value))).digest('hex');
+}
+
+function encodeCursor(task) {
+  return Buffer.from(JSON.stringify({ id: task.id }), 'utf8').toString('base64url');
+}
+
+function decodeCursor(value) {
+  if (typeof value !== 'string' || !value || value.length > 512) {
+    throw new TaskServiceError('INVALID_TASK_CURSOR', 'Task cursor is invalid');
+  }
+  try {
+    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+    if (!decoded || typeof decoded.id !== 'string' || !/^task_[a-f0-9]{32}$/.test(decoded.id)) throw new Error();
+    return decoded.id;
+  } catch {
+    throw new TaskServiceError('INVALID_TASK_CURSOR', 'Task cursor is invalid');
+  }
+}
+
+function inside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function artifactId(taskIdValue, relativePath) {
+  return `artifact_${createHash('sha256')
+    .update(taskIdValue)
+    .update('\0')
+    .update(relativePath)
+    .digest('hex')
+    .slice(0, 32)}`;
+}
+
+function declaredArtifactFiles(task) {
+  const evidence = Array.isArray(task.result?.evidence) ? task.result.evidence : [];
+  const seen = new Set();
+  const files = [];
+  for (const item of evidence) {
+    if (
+      !item ||
+      item.kind !== 'artifact' ||
+      item.agentVisible === false ||
+      typeof item.file !== 'string' ||
+      !item.file ||
+      item.file.includes('\0') ||
+      path.isAbsolute(item.file)
+    ) continue;
+    const normalized = path.normalize(item.file);
+    if (normalized === '.' || normalized === '..' || normalized.startsWith(`..${path.sep}`)) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    files.push(normalized);
+    if (files.length >= MAX_ARTIFACTS) break;
+  }
+  return files;
+}
+
+function artifactMimeType(filePath) {
+  return ARTIFACT_MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+}
+
+function isTextMimeType(mimeType) {
+  return mimeType.startsWith('text/') || [
+    'application/json',
+    'application/x-ndjson',
+    'image/svg+xml'
+  ].includes(mimeType);
+}
+
 function sanitizeError(error, fallbackCode = 'TASK_FAILED') {
   return {
-    code: error?.code || fallbackCode,
-    message: String(error?.message || 'Task failed').slice(0, 2_000),
-    ...(error?.screenshot ? { screenshot: error.screenshot } : {})
+    code: redactSensitiveText(error?.code || fallbackCode).slice(0, 200),
+    message: redactSensitiveText(error?.message || 'Task failed').slice(0, 2_000),
+    ...(error?.screenshot ? { screenshot: redactSensitiveText(error.screenshot) } : {})
   };
 }
 
@@ -62,17 +269,21 @@ async function atomicJson(filePath, value) {
 }
 
 function publicRecord(task) {
-  const {
-    leaseOwner: _leaseOwner,
-    leaseHeld: _leaseHeld,
-    workerPid: _workerPid,
-    ...safe
-  } = task;
-  return clone(safe);
+  return clone(publicTask(task));
 }
 
 function taskId() {
   return `task_${randomUUID().replaceAll('-', '')}`;
+}
+
+function defaultProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
 }
 
 export function createTaskService({
@@ -80,22 +291,125 @@ export function createTaskService({
   profileStore,
   workerFactory = defaultWorkerFactory,
   heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
-  diagnosticGraceMs = DIAGNOSTIC_GRACE_MS
+  diagnosticGraceMs = DIAGNOSTIC_GRACE_MS,
+  sessionImportTimeoutMs = TASK_SERVICE_DEADLINES.sessionImportMs,
+  sessionImportRollbackGraceMs = TASK_SERVICE_DEADLINES.sessionImportRollbackGraceMs,
+  taskTypeRegistry,
+  taskTypesFile,
+  taskTypesRoot,
+  allowedTaskRoots = [PROJECT_ROOT],
+  artifactValidationHook = null,
+  processAlive = defaultProcessAlive,
+  seedTaskTypes = [
+    { name: 'acceptance', modulePath: ACCEPTANCE_TASK },
+    { name: 'read-page', modulePath: READ_PAGE_TASK },
+    { name: 'durable-delay', modulePath: DURABLE_DELAY_TASK }
+  ]
 } = {}) {
   if (!stateDir) throw new TypeError('stateDir is required');
   if (!profileStore?.get || !profileStore?.acquireLease || !profileStore?.releaseLease) {
     throw new TypeError('profileStore with get/acquireLease/releaseLease is required');
+  }
+  if (artifactValidationHook !== null && typeof artifactValidationHook !== 'function') {
+    throw new TypeError('artifactValidationHook must be a function when provided');
+  }
+  if (typeof processAlive !== 'function') throw new TypeError('processAlive must be a function');
+  if (!Number.isFinite(sessionImportTimeoutMs) || sessionImportTimeoutMs <= 0) {
+    throw new TypeError('sessionImportTimeoutMs must be positive');
+  }
+  if (!Number.isFinite(sessionImportRollbackGraceMs) || sessionImportRollbackGraceMs <= 0) {
+    throw new TypeError('sessionImportRollbackGraceMs must be positive');
   }
 
   const root = path.resolve(stateDir);
   const tasks = new Map();
   const children = new Map();
   const openProfiles = new Map();
+  const openingProfiles = new Map();
   const persistChains = new Map();
+  const registry = taskTypeRegistry || new TaskTypeRegistry({
+    filePath: taskTypesFile || path.join(path.dirname(root), 'task-types.json'),
+    snapshotRoot: taskTypesRoot || path.join(path.dirname(root), 'task-types'),
+    allowedRoots: allowedTaskRoots,
+    seedTypes: seedTaskTypes
+  });
+  let createTail = Promise.resolve();
   const ready = initialize();
+
+  function normalizeAttemptHistory(task) {
+    task.attempt = Number.isSafeInteger(task.attempt) && task.attempt >= 1
+      ? Math.min(task.attempt, MAX_ATTEMPTS)
+      : 1;
+    task.history = Array.isArray(task.history)
+      ? task.history.filter((entry) => (
+        entry && typeof entry === 'object' &&
+        Number.isSafeInteger(entry.attempt) && entry.attempt >= 1 && entry.attempt <= MAX_ATTEMPTS
+      )).slice(-MAX_ATTEMPTS)
+      : [];
+  }
+
+  function beginAttemptHistory(task, { resumed = false, checkpointSavedAt = null } = {}) {
+    normalizeAttemptHistory(task);
+    const startedAt = nowIso();
+    task.history.push({
+      attempt: task.attempt,
+      resumed,
+      startedAt,
+      ...(checkpointSavedAt ? { checkpointSavedAt } : {})
+    });
+    task.history = task.history.slice(-MAX_ATTEMPTS);
+    return startedAt;
+  }
+
+  function finishAttemptHistory(task) {
+    normalizeAttemptHistory(task);
+    let record = [...task.history].reverse().find((entry) => entry.attempt === task.attempt);
+    if (!record) {
+      record = { attempt: task.attempt, resumed: task.attempt > 1, startedAt: task.startedAt || task.createdAt || nowIso() };
+      task.history.push(record);
+    }
+    record.finishedAt ||= task.finishedAt || nowIso();
+    record.state = task.state;
+    if (typeof task.error?.code === 'string') record.errorCode = task.error.code;
+  }
+
+  async function reconcileInterruptedCleanup(task) {
+    if (task.cleanup?.settled === true) return true;
+    if (task.cleanup?.managerRestartObserved !== true) return false;
+    if (await processAlive(task.workerPid)) return false;
+    let profile;
+    try {
+      profile = await profileStore.get(task.profileId);
+    } catch {
+      return false;
+    }
+    if (profile?.lease?.ownerId === task.leaseOwner) {
+      // The recorded Worker is gone and this interrupted task still owns the
+      // lease. Release it directly instead of waiting for an unrelated Profile
+      // open or another Manager restart to run expiry recovery.
+      try {
+        await profileStore.releaseLease(task.profileId, task.leaseOwner);
+        profile = await profileStore.get(task.profileId);
+      } catch {
+        return false;
+      }
+      if (profile?.lease?.ownerId === task.leaseOwner) return false;
+    }
+    task.leaseHeld = false;
+    task.cleanup = {
+      ...(task.cleanup || {}),
+      browserClosed: true,
+      leaseReleased: true,
+      workerExited: true,
+      settled: true,
+      managerRestartObserved: true
+    };
+    return true;
+  }
 
   async function initialize() {
     await mkdir(root, { recursive: true, mode: 0o700 });
+    await registry.list();
     const entries = await readdir(root, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory() || !entry.name.startsWith('task_')) continue;
@@ -107,6 +421,7 @@ export function createTaskService({
         continue;
       }
       if (!task || task.id !== entry.name || typeof task.profileId !== 'string') continue;
+      normalizeAttemptHistory(task);
       const cleanupComplete = Boolean(task.cleanup?.workerExited && task.cleanup?.leaseReleased);
       if (!TERMINAL_TASK_STATES.has(task.state) || !cleanupComplete) {
         task.state = 'failed';
@@ -122,6 +437,8 @@ export function createTaskService({
         task.finishedAt ||= nowIso();
         task.updatedAt = nowIso();
         task.leaseHeld = false;
+        await reconcileInterruptedCleanup(task);
+        finishAttemptHistory(task);
         await atomicJson(filePath, task);
       }
       tasks.set(task.id, task);
@@ -142,8 +459,88 @@ export function createTaskService({
 
   function update(task, patch) {
     Object.assign(task, patch, { updatedAt: nowIso() });
-    void persist(task);
-    return task;
+    return persist(task).then(() => task);
+  }
+
+  async function awaitTaskPersistence(id) {
+    while (true) {
+      const pending = persistChains.get(id);
+      if (!pending) return;
+      await pending;
+      if (persistChains.get(id) === pending) return;
+    }
+  }
+
+  function completionGateFailure(message) {
+    return new TaskServiceError('TASK_COMPLETION_GATE_FAILED', message, 409);
+  }
+
+  function requiredArtifactPaths(task) {
+    const evidence = task.result.evidence;
+    const required = [];
+    const seen = new Set();
+    for (const item of evidence) {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.kind !== 'string' || !item.kind) {
+        throw completionGateFailure('Task result evidence must contain bounded objects with a kind');
+      }
+      if (item.kind !== 'artifact' || item.agentVisible === false) continue;
+      if (item.agentVisible !== undefined && item.agentVisible !== true) {
+        throw completionGateFailure('Declared artifact visibility must be a boolean');
+      }
+      if (
+        typeof item.file !== 'string' || !item.file || item.file.includes('\0') ||
+        path.isAbsolute(item.file)
+      ) {
+        throw completionGateFailure('Agent-visible artifacts must use relative output filenames');
+      }
+      const normalized = path.normalize(item.file);
+      if (normalized === '.' || normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
+        throw completionGateFailure('Agent-visible artifacts must remain inside the task output directory');
+      }
+      if (!seen.has(normalized)) {
+        seen.add(normalized);
+        required.push(normalized);
+      }
+      if (required.length > MAX_ARTIFACTS) {
+        throw completionGateFailure(`Task result declares more than ${MAX_ARTIFACTS} agent-visible artifacts`);
+      }
+    }
+    return required;
+  }
+
+  async function verifyCompletionGate(task) {
+    if (!task.result || typeof task.result !== 'object' || Array.isArray(task.result)) {
+      throw completionGateFailure('Task worker did not return a result object');
+    }
+    if (typeof task.result.summary !== 'string' || !task.result.summary.trim() || task.result.summary.length > 4_000) {
+      throw completionGateFailure('Task result must include a bounded non-empty summary');
+    }
+    if (!Array.isArray(task.result.evidence) || task.result.evidence.length > 1_000) {
+      throw completionGateFailure('Task result evidence must be a bounded array');
+    }
+    if (task.cleanup?.browserClosed !== true) {
+      throw completionGateFailure('Task browser cleanup was not confirmed');
+    }
+    if (task.cleanup?.workerExited !== true || task.cleanup?.leaseReleased !== true) {
+      throw completionGateFailure('Task worker and Profile lease cleanup were not confirmed');
+    }
+
+    const required = requiredArtifactPaths(task);
+    for (const relativePath of required) {
+      const declaration = artifactDeclarations(task).find((item) => (
+        item.kind === 'result' && item.relativePath === relativePath
+      ));
+      if (!declaration) throw completionGateFailure('A declared agent-visible artifact is invalid');
+      let opened;
+      try {
+        opened = await openValidatedArtifact(task, declaration);
+      } catch {
+        throw completionGateFailure('A declared agent-visible artifact is missing or unstable');
+      } finally {
+        await opened?.handle.close().catch(() => {});
+      }
+    }
+    return { verifiedAt: nowIso(), artifactCount: required.length };
   }
 
   async function releaseTaskLease(task) {
@@ -158,37 +555,78 @@ export function createTaskService({
     } catch (error) {
       task.cleanup.leaseReleaseError = sanitizeError(error, 'LEASE_RELEASE_FAILED');
     }
-    update(task, { cleanup: task.cleanup });
+    await update(task, { cleanup: task.cleanup });
   }
 
   async function finalizeTask(task, exitCode, signal) {
     const entry = children.get(task.id);
+    if (!entry && task.cleanup?.workerExited === true) return;
     if (entry?.finalized) return;
     if (entry) {
       entry.finalized = true;
       clearInterval(entry.watchdog);
       clearTimeout(entry.forceKillTimer);
+      clearTimeout(entry.hardKillTimer);
     }
     children.delete(task.id);
     task.cleanup.workerExited = true;
     task.cleanup.exitCode = exitCode;
     task.cleanup.exitSignal = signal || null;
-    if (!TERMINAL_TASK_STATES.has(task.state)) {
-      update(task, {
+    await awaitTaskPersistence(task.id);
+    const claimedCompletion = task.completionClaimed === true || task.state === 'verifying';
+    if (!claimedCompletion && !TERMINAL_TASK_STATES.has(task.state)) {
+      await update(task, {
         state: 'failed',
         error: { code: 'TASK_WORKER_EXITED', message: 'Task worker exited before reporting a terminal state' }
       });
     }
     await releaseTaskLease(task);
+    if (claimedCompletion && task.state === 'verifying') {
+      try {
+        task.completion = await verifyCompletionGate(task);
+        task.state = 'completed';
+        task.error = null;
+      } catch (error) {
+        task.state = 'failed';
+        task.error = sanitizeError(error, 'TASK_COMPLETION_GATE_FAILED');
+      }
+    }
     task.cleanup.settled = true;
-    update(task, { finishedAt: task.finishedAt || nowIso(), cleanup: task.cleanup });
+    task.finishedAt ||= nowIso();
+    finishAttemptHistory(task);
+    await update(task, {
+      state: task.state,
+      error: task.error,
+      finishedAt: task.finishedAt,
+      cleanup: task.cleanup,
+      history: task.history,
+      ...(task.completion ? { completion: task.completion } : {})
+    });
     entry?.resolveExit?.();
   }
 
   function scheduleForcedStop(task, entry) {
-    clearTimeout(entry.forceKillTimer);
+    if (entry.finalized || entry.child.exitCode !== null || entry.forceKillTimer || entry.hardKillTimer) return;
     entry.forceKillTimer = setTimeout(() => {
-      if (entry.child.exitCode === null) entry.child.kill('SIGTERM');
+      entry.forceKillTimer = null;
+      if (entry.child.exitCode !== null) return;
+      try {
+        entry.child.kill('SIGTERM');
+      } catch {
+        // The child may already be exiting; its exit/close event owns finalization.
+      }
+      if (entry.finalized || entry.child.exitCode !== null) return;
+      entry.hardKillTimer = setTimeout(() => {
+        entry.hardKillTimer = null;
+        if (entry.child.exitCode === null) {
+          try {
+            entry.child.kill('SIGKILL');
+          } catch {
+            // The close event remains the source of truth for cleanup and lease release.
+          }
+        }
+      }, Math.max(250, Math.min(5_000, diagnosticGraceMs)));
+      entry.hardKillTimer.unref?.();
     }, diagnosticGraceMs);
     entry.forceKillTimer.unref?.();
   }
@@ -203,6 +641,7 @@ export function createTaskService({
       finalized: false,
       diagnoseAt: 0,
       forceKillTimer: null,
+      hardKillTimer: null,
       watchdog: null,
       exitPromise,
       resolveExit
@@ -212,85 +651,112 @@ export function createTaskService({
     child.on('message', (message) => {
       if (!message || typeof message !== 'object') return;
       if (message.type === 'heartbeat') {
+        if (TERMINAL_TASK_STATES.has(task.state)) {
+          scheduleForcedStop(task, entry);
+          return;
+        }
         entry.diagnoseAt = 0;
         clearTimeout(entry.forceKillTimer);
         entry.forceKillTimer = null;
-        update(task, {
+        void update(task, {
           heartbeatAt: message.at || nowIso(),
           ...(message.progress ? { progress: clone(message.progress) } : {})
-        });
+        }).catch(() => {});
         void profileStore.acquireLease(task.profileId, task.leaseOwner, {
           pid: child.pid,
           ttlMs: LEASE_TTL_MS
         }).catch((error) => {
           if (TERMINAL_TASK_STATES.has(task.state)) return;
-          update(task, { state: 'failed', error: sanitizeError(error, 'LEASE_RENEWAL_FAILED') });
+          void update(task, { state: 'failed', error: sanitizeError(error, 'LEASE_RENEWAL_FAILED') }).catch(() => {});
           send(child, { type: 'cancel' });
           scheduleForcedStop(task, entry);
         });
         return;
       }
       if (message.type === 'progress' && message.progress) {
-        update(task, { progress: clone(message.progress), heartbeatAt: message.at || nowIso() });
+        void update(task, { progress: clone(message.progress), heartbeatAt: message.at || nowIso() }).catch(() => {});
         return;
       }
       if (message.type === 'state' && typeof message.state === 'string') {
-        if (!TERMINAL_TASK_STATES.has(task.state)) {
-          update(task, {
-            state: message.state,
-            ...(TERMINAL_TASK_STATES.has(message.state) ? { finishedAt: nowIso() } : {})
-          });
+        const terminal = TERMINAL_TASK_STATES.has(message.state);
+        if (message.state === 'completed') {
+          if (!TERMINAL_TASK_STATES.has(task.state)) {
+            void update(task, {
+              state: 'verifying',
+              completionClaimed: true,
+              progress: { ...task.progress, message: 'Verifying result and cleanup' }
+            }).catch(() => {});
+          }
+          scheduleForcedStop(task, entry);
+          return;
         }
+        if (!TERMINAL_TASK_STATES.has(task.state)) {
+          void update(task, {
+            state: message.state,
+            ...(terminal ? { finishedAt: nowIso() } : {})
+          }).catch(() => {});
+        }
+        if (terminal) scheduleForcedStop(task, entry);
         return;
       }
       if (message.type === 'checkpoint') {
-        update(task, { checkpoint: { path: message.path, savedAt: message.savedAt } });
+        void update(task, { checkpoint: { path: message.path, savedAt: message.savedAt } }).catch(() => {});
         return;
       }
       if (message.type === 'screenshot') {
-        update(task, { lastScreenshot: { path: message.path, reason: message.reason, at: nowIso() } });
+        void update(task, { lastScreenshot: { path: message.path, reason: message.reason, at: nowIso() } }).catch(() => {});
         return;
       }
       if (message.type === 'result') {
-        update(task, { result: clone(message.result) });
+        void update(task, { result: clone(redactSensitiveValue(message.result)) }).catch(() => {});
         return;
       }
       if (message.type === 'error') {
         if (!TERMINAL_TASK_STATES.has(task.state)) {
-          update(task, {
+          void update(task, {
             state: message.state === 'cancelled' ? 'cancelled' : 'failed',
             error: sanitizeError(message.error),
             finishedAt: nowIso()
-          });
+          }).catch(() => {});
         }
+        scheduleForcedStop(task, entry);
         return;
       }
       if (message.type === 'cleanup') {
         task.cleanup.browserClosed = Boolean(message.browserClosed);
-        update(task, { cleanup: task.cleanup });
+        void update(task, { cleanup: task.cleanup }).catch(() => {});
       }
     });
 
     child.once('error', (error) => {
       if (!TERMINAL_TASK_STATES.has(task.state)) {
-        update(task, { state: 'failed', error: sanitizeError(error, 'TASK_WORKER_SPAWN_FAILED') });
+        void update(task, { state: 'failed', error: sanitizeError(error, 'TASK_WORKER_SPAWN_FAILED') }).catch(() => {});
       }
-      void finalizeTask(task, null, null);
+      if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+        void finalizeTask(task, null, null);
+        return;
+      }
+      send(child, { type: 'cancel' });
+      scheduleForcedStop(task, entry);
     });
     child.once('exit', (code, signal) => void finalizeTask(task, code, signal));
+    child.once('close', (code, signal) => void finalizeTask(task, code, signal));
 
     entry.watchdog = setInterval(() => {
-      if (TERMINAL_TASK_STATES.has(task.state)) return;
+      if (TERMINAL_TASK_STATES.has(task.state)) {
+        scheduleForcedStop(task, entry);
+        return;
+      }
       const heartbeatAge = Date.now() - Date.parse(task.heartbeatAt);
       if (heartbeatAge <= heartbeatTimeoutMs) return;
       if (!entry.diagnoseAt) {
         entry.diagnoseAt = Date.now();
-        update(task, {
+        void update(task, {
           progress: {
             ...task.progress,
             message: 'Worker heartbeat delayed; capturing diagnostics'
           }
-        });
+        }).catch(() => {});
         send(child, {
           type: 'diagnose',
           reason: 'heartbeat-timeout',
@@ -299,11 +765,11 @@ export function createTaskService({
         return;
       }
       if (Date.now() - entry.diagnoseAt >= diagnosticGraceMs) {
-        update(task, {
+        void update(task, {
           state: 'failed',
           error: { code: 'TASK_HEARTBEAT_TIMEOUT', message: 'Task worker stopped reporting heartbeats' },
           finishedAt: nowIso()
-        });
+        }).catch(() => {});
         send(child, { type: 'cancel' });
         scheduleForcedStop(task, entry);
       }
@@ -311,40 +777,166 @@ export function createTaskService({
     entry.watchdog.unref?.();
   }
 
-  async function create(body = {}) {
+  async function launchTaskAttempt(task, profile) {
+    await update(task, { state: 'acquiring_profile' });
+    try {
+      await profileStore.acquireLease(task.profileId, task.leaseOwner, {
+        pid: process.pid,
+        ttlMs: LEASE_TTL_MS
+      });
+      task.leaseHeld = true;
+    } catch (error) {
+      task.state = 'failed';
+      task.error = sanitizeError(error, 'PROFILE_LEASE_FAILED');
+      task.finishedAt = nowIso();
+      await releaseTaskLease(task);
+      task.cleanup.browserClosed = true;
+      task.cleanup.workerExited = true;
+      task.cleanup.settled = true;
+      finishAttemptHistory(task);
+      await update(task, {
+        state: task.state,
+        error: task.error,
+        finishedAt: task.finishedAt,
+        cleanup: task.cleanup,
+        history: task.history
+      });
+      return;
+    }
+
+    let child;
+    try {
+      child = workerFactory(TASK_WORKER, 'task');
+      attachTaskWorker(task, child);
+      await update(task, { state: 'starting_browser', startedAt: nowIso(), workerPid: child.pid });
+      await profileStore.acquireLease(task.profileId, task.leaseOwner, {
+        pid: child.pid,
+        ttlMs: LEASE_TTL_MS
+      });
+      send(child, {
+        type: 'start',
+        config: {
+          taskId: task.id,
+          profile,
+          modulePath: task.modulePath,
+          input: clone(task.input),
+          behavior: task.behavior,
+          outputDir: task.outputDir,
+          checkpointPath: path.join(root, task.id, 'checkpoint.json'),
+          heartbeatMs: 20_000,
+          ...(task.timeoutMs ? { timeoutMs: task.timeoutMs } : {})
+        }
+      });
+    } catch (error) {
+      await update(task, {
+        state: 'failed',
+        error: sanitizeError(error, 'TASK_WORKER_SPAWN_FAILED'),
+        finishedAt: nowIso()
+      });
+      child?.kill?.('SIGTERM');
+      await releaseTaskLease(task);
+      if (!child) {
+        task.cleanup.browserClosed = true;
+        task.cleanup.workerExited = true;
+        task.cleanup.settled = true;
+        finishAttemptHistory(task);
+        await update(task, { cleanup: task.cleanup, history: task.history });
+      }
+    }
+  }
+
+  async function create(body = {}, caller = {}) {
+    const operation = createTail.then(() => createSerialized(body, caller));
+    createTail = operation.catch(() => {});
+    return operation;
+  }
+
+  async function createSerialized(body = {}, suppliedCaller = {}) {
     await ready;
+    const caller = callerIdentity(suppliedCaller);
+    const allowed = new Set([
+      'profileId',
+      'taskType',
+      'input',
+      'behavior',
+      'timeoutMs',
+      'idempotencyKey'
+    ]);
+    const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+    if (unknown.length) {
+      throw new TaskServiceError('INVALID_TASK_CREATE', `Unsupported task fields: ${unknown.join(', ')}`);
+    }
     if (typeof body.profileId !== 'string' || !body.profileId) {
       throw new TaskServiceError('PROFILE_REQUIRED', 'profileId is required');
     }
-    if (typeof body.modulePath !== 'string' || !body.modulePath) {
-      throw new TaskServiceError('TASK_MODULE_REQUIRED', 'modulePath is required');
+    if (typeof body.taskType !== 'string' || !body.taskType) {
+      throw new TaskServiceError('TASK_TYPE_REQUIRED', 'taskType is required');
     }
-    const modulePath = path.resolve(body.modulePath);
-    try {
-      const moduleStats = await stat(modulePath);
-      if (!moduleStats.isFile()) throw new Error();
-    } catch {
-      throw new TaskServiceError('TASK_MODULE_NOT_FOUND', 'Task module was not found', 404);
+    if (
+      typeof body.idempotencyKey !== 'string' ||
+      !/^[a-zA-Z0-9._:-]{1,128}$/.test(body.idempotencyKey)
+    ) {
+      throw new TaskServiceError(
+        'IDEMPOTENCY_KEY_REQUIRED',
+        'idempotencyKey must contain 1-128 letters, numbers, dots, underscores, colons, or hyphens'
+      );
     }
 
     const profile = await profileStore.get(body.profileId);
+    const taskType = await registry.resolve(body.taskType);
     const behavior = body.behavior || profile.defaultBehavior || 'fast';
     if (!isBehaviorMode(behavior)) {
       throw new TaskServiceError('INVALID_BEHAVIOR_MODE', 'behavior must be fast, human, or adaptive');
     }
-    if (body.timeoutMs !== undefined && (!Number.isSafeInteger(body.timeoutMs) || body.timeoutMs < 1_000)) {
-      throw new TaskServiceError('INVALID_TASK_TIMEOUT', 'timeoutMs must be an integer of at least 1000');
+    if (
+      body.timeoutMs !== undefined &&
+      (!Number.isSafeInteger(body.timeoutMs) || body.timeoutMs < 1_000 || body.timeoutMs > MAX_TASK_TIMEOUT_MS)
+    ) {
+      throw new TaskServiceError('INVALID_TASK_TIMEOUT', 'timeoutMs must be an integer from 1000 to 86400000');
+    }
+    const input = body.input ?? {};
+    validateTaskInput(input, taskType.inputSchema);
+    const hash = requestHash({
+      profileId: body.profileId,
+      taskType: body.taskType,
+      taskTypeSha256: taskType.sha256,
+      behavior,
+      timeoutMs: body.timeoutMs ?? null,
+      input
+    });
+    const existing = [...tasks.values()].find((task) => (
+      task.ownerClientId === caller.clientId && task.idempotencyKey === body.idempotencyKey
+    ));
+    if (existing) {
+      if (existing.requestHash !== hash) {
+        throw new TaskServiceError(
+          'IDEMPOTENCY_CONFLICT',
+          'The idempotency key is already bound to a different task request',
+          409
+        );
+      }
+      return publicRecord(existing);
     }
 
     const id = taskId();
     const taskRoot = path.join(root, id);
     const outputDir = path.join(taskRoot, 'output');
-    const checkpointPath = path.join(taskRoot, 'checkpoint.json');
     await mkdir(outputDir, { recursive: true, mode: 0o700 });
     const task = {
       id,
       profileId: body.profileId,
+      taskType: taskType.name,
+      taskTypeSha256: taskType.sha256,
+      modulePath: taskType.modulePath,
+      ownerClientId: caller.clientId,
+      idempotencyKey: body.idempotencyKey,
+      requestHash: hash,
       behavior,
+      input: clone(input),
+      timeoutMs: body.timeoutMs ?? null,
+      attempt: 1,
+      history: [],
+      resumeKeys: [],
       state: 'queued',
       progress: { current: 0, total: null, message: 'Queued' },
       heartbeatAt: nowIso(),
@@ -360,83 +952,434 @@ export function createTaskService({
       leaseOwner: `task:${id}`,
       leaseHeld: false
     };
+    beginAttemptHistory(task);
     tasks.set(id, task);
     await persist(task);
-    update(task, { state: 'acquiring_profile' });
+    await launchTaskAttempt(task, profile);
+    await awaitTaskPersistence(id);
+    return publicRecord(task);
+  }
 
-    try {
-      await profileStore.acquireLease(task.profileId, task.leaseOwner, {
-        pid: process.pid,
-        ttlMs: LEASE_TTL_MS
-      });
-      task.leaseHeld = true;
-    } catch (error) {
-      update(task, { state: 'failed', error: sanitizeError(error, 'PROFILE_LEASE_FAILED'), finishedAt: nowIso() });
-      await releaseTaskLease(task);
-      task.cleanup.browserClosed = true;
-      task.cleanup.workerExited = true;
-      task.cleanup.settled = true;
-      update(task, { cleanup: task.cleanup });
-      return publicRecord(task);
+  async function verifyResumeCheckpoint(task) {
+    const expected = path.join(root, task.id, 'checkpoint.json');
+    if (
+      typeof task.checkpoint?.path !== 'string' ||
+      path.resolve(task.checkpoint.path) !== path.resolve(expected)
+    ) {
+      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint is unavailable or invalid', 409);
     }
-
-    let child;
+    let handle;
     try {
-      child = workerFactory(TASK_WORKER, 'task');
-      attachTaskWorker(task, child);
-      update(task, { state: 'starting_browser', startedAt: nowIso(), workerPid: child.pid });
-      await profileStore.acquireLease(task.profileId, task.leaseOwner, {
-        pid: child.pid,
-        ttlMs: LEASE_TTL_MS
-      });
-      send(child, {
-        type: 'start',
-        config: {
-          taskId: id,
-          profile,
-          modulePath,
-          input: body.input ?? {},
-          behavior,
-          outputDir,
-          checkpointPath,
-          heartbeatMs: 20_000,
-          ...(body.timeoutMs ? { timeoutMs: body.timeoutMs } : {})
-        }
-      });
-    } catch (error) {
-      update(task, { state: 'failed', error: sanitizeError(error, 'TASK_WORKER_SPAWN_FAILED'), finishedAt: nowIso() });
-      child?.kill?.('SIGTERM');
-      await releaseTaskLease(task);
-      if (!child) {
-        task.cleanup.browserClosed = true;
-        task.cleanup.workerExited = true;
-        task.cleanup.settled = true;
-        update(task, { cleanup: task.cleanup });
+      const before = await lstat(expected, { bigint: true });
+      if (
+        !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
+        before.size <= 0n || before.size > BigInt(MAX_CHECKPOINT_BYTES)
+      ) throw new Error('invalid checkpoint');
+      handle = await open(expected, 'r');
+      const opened = await handle.stat({ bigint: true });
+      if (!sameFileIdentity(before, opened) || opened.size !== before.size || opened.mtimeNs !== before.mtimeNs) {
+        throw new Error('checkpoint changed');
+      }
+      const source = await handle.readFile();
+      const after = await handle.stat({ bigint: true });
+      if (!sameFileIdentity(opened, after) || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs) {
+        throw new Error('checkpoint changed');
+      }
+      const record = JSON.parse(source.toString('utf8'));
+      if (
+        !record || typeof record !== 'object' || Array.isArray(record) ||
+        typeof record.savedAt !== 'string' || !record.savedAt || !Object.hasOwn(record, 'data')
+      ) throw new Error('invalid checkpoint record');
+      return { savedAt: record.savedAt, sha256: createHash('sha256').update(source).digest('hex') };
+    } catch {
+      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint is unavailable or unstable', 409);
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  async function verifyResumeModule(task) {
+    if (typeof task.modulePath !== 'string' || typeof task.taskTypeSha256 !== 'string') {
+      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task module snapshot metadata is unavailable', 409);
+    }
+    try {
+      const before = await lstat(task.modulePath, { bigint: true });
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) throw new Error('invalid module');
+      const source = await readFile(task.modulePath);
+      const after = await lstat(task.modulePath, { bigint: true });
+      if (
+        !sameFileIdentity(before, after) || before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
+        createHash('sha256').update(source).digest('hex') !== task.taskTypeSha256
+      ) throw new Error('module changed');
+    } catch {
+      throw new TaskServiceError('TASK_MODULE_CHANGED', 'Task module snapshot changed or is unavailable', 409);
+    }
+  }
+
+  async function verifyResumeContext(task) {
+    if (!Object.hasOwn(task, 'input') || !task.input || typeof task.input !== 'object' || Array.isArray(task.input)) {
+      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task input required for resume is unavailable', 409);
+    }
+    if (
+      task.timeoutMs !== null && task.timeoutMs !== undefined &&
+      (!Number.isSafeInteger(task.timeoutMs) || task.timeoutMs < 1_000)
+    ) {
+      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task timeout required for resume is invalid', 409);
+    }
+    const expectedOutput = path.join(root, task.id, 'output');
+    if (typeof task.outputDir !== 'string' || path.resolve(task.outputDir) !== path.resolve(expectedOutput)) {
+      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task output context required for resume is unavailable', 409);
+    }
+    const outputStats = await lstat(expectedOutput).catch(() => null);
+    if (!outputStats?.isDirectory() || outputStats.isSymbolicLink()) {
+      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task output context required for resume is unavailable', 409);
+    }
+  }
+
+  async function resume(id, body = {}, caller = {}) {
+    const operation = createTail.then(() => resumeSerialized(id, body, caller));
+    createTail = operation.catch(() => {});
+    return operation;
+  }
+
+  async function resumeSerialized(id, body = {}, suppliedCaller = {}) {
+    await ready;
+    const caller = callerIdentity(suppliedCaller);
+    const task = tasks.get(id);
+    if (!task || task.ownerClientId !== caller.clientId) {
+      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'resumeKey')) {
+      throw new TaskServiceError('INVALID_TASK_RESUME', 'Resume accepts only resumeKey');
+    }
+    if (typeof body.resumeKey !== 'string' || !RESUME_KEY_PATTERN.test(body.resumeKey)) {
+      throw new TaskServiceError(
+        'RESUME_KEY_REQUIRED',
+        'resumeKey must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
+      );
+    }
+    const keyHash = requestHash({ taskId: task.id, ownerClientId: task.ownerClientId, resumeKey: body.resumeKey });
+    task.resumeKeys = Array.isArray(task.resumeKeys) ? task.resumeKeys : [];
+    if (task.resumeKeys.some((entry) => entry?.keyHash === keyHash)) return publicRecord(task);
+    if (task.state !== 'failed') {
+      throw new TaskServiceError('TASK_NOT_RESUMABLE', 'Only a failed terminal task can be resumed explicitly', 409);
+    }
+    if (task.cleanup?.settled !== true && task.cleanup?.managerRestartObserved === true) {
+      if (await reconcileInterruptedCleanup(task)) await update(task, { cleanup: task.cleanup });
+    }
+    if (task.cleanup?.settled !== true) {
+      throw new TaskServiceError('TASK_CLEANUP_NOT_SETTLED', 'Task cleanup must settle before resume', 409);
+    }
+    if (!task.checkpoint) {
+      throw new TaskServiceError('TASK_CHECKPOINT_REQUIRED', 'Task has no checkpoint to resume', 409);
+    }
+    normalizeAttemptHistory(task);
+    if (task.attempt >= MAX_ATTEMPTS) {
+      throw new TaskServiceError('TASK_ATTEMPT_LIMIT_REACHED', `Task cannot exceed ${MAX_ATTEMPTS} attempts`, 409);
+    }
+    await verifyResumeContext(task);
+    await verifyResumeModule(task);
+    const checkpoint = await verifyResumeCheckpoint(task);
+    const profile = await profileStore.get(task.profileId);
+
+    task.attempt += 1;
+    task.resumeKeys.push({ keyHash, attempt: task.attempt, requestedAt: nowIso() });
+    task.resumeKeys = task.resumeKeys.slice(-MAX_ATTEMPTS);
+    task.state = 'queued';
+    task.progress = {
+      current: Number(task.progress?.current) || 0,
+      total: Number.isFinite(task.progress?.total) ? task.progress.total : null,
+      message: `Resume attempt ${task.attempt} queued from checkpoint`
+    };
+    task.heartbeatAt = nowIso();
+    task.result = null;
+    task.error = null;
+    task.completion = null;
+    task.completionClaimed = false;
+    task.cleanup = { browserClosed: false, leaseReleased: false, workerExited: false, settled: false };
+    task.startedAt = null;
+    task.finishedAt = null;
+    task.workerPid = null;
+    task.leaseHeld = false;
+    task.lastScreenshot = null;
+    beginAttemptHistory(task, { resumed: true, checkpointSavedAt: checkpoint.savedAt });
+    await persist(task);
+    await launchTaskAttempt(task, profile);
+    await awaitTaskPersistence(task.id);
+    return publicRecord(task);
+  }
+
+  async function list({ caller: suppliedCaller = {}, limit = 50, cursor = null } = {}) {
+    await ready;
+    const caller = callerIdentity(suppliedCaller);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new TaskServiceError('INVALID_TASK_LIMIT', 'Task list limit must be from 1 to 100');
+    }
+    await Promise.all([...tasks.keys()].map(awaitTaskPersistence));
+    const visible = [...tasks.values()]
+      .filter((task) => canAccess(task, caller))
+      .sort((left, right) => (
+        right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
+      ));
+    let start = 0;
+    if (cursor) {
+      const cursorId = decodeCursor(cursor);
+      const index = visible.findIndex((task) => task.id === cursorId);
+      if (index === -1) throw new TaskServiceError('INVALID_TASK_CURSOR', 'Task cursor is invalid');
+      start = index + 1;
+    }
+    const page = visible.slice(start, start + limit);
+    return {
+      tasks: page.map(publicRecord),
+      nextCursor: start + limit < visible.length ? encodeCursor(page.at(-1)) : null
+    };
+  }
+
+  async function get(id, suppliedCaller = {}) {
+    await ready;
+    const caller = callerIdentity(suppliedCaller);
+    const task = tasks.get(id);
+    if (!task || !canAccess(task, caller)) {
+      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    }
+    await awaitTaskPersistence(id);
+    return publicRecord(task);
+  }
+
+  async function getInternal(id) {
+    await ready;
+    const task = tasks.get(id);
+    if (!task) throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    await awaitTaskPersistence(id);
+    return clone(task);
+  }
+
+  function artifactDeclarations(task) {
+    const declarations = declaredArtifactFiles(task).map((relativePath) => ({
+      relativePath,
+      kind: 'result'
+    }));
+    if (typeof task.lastScreenshot?.path === 'string') {
+      const relativePath = path.relative(task.outputDir, task.lastScreenshot.path);
+      if (
+        relativePath &&
+        !path.isAbsolute(relativePath) &&
+        relativePath !== '..' &&
+        !relativePath.startsWith(`..${path.sep}`) &&
+        !declarations.some((item) => item.relativePath === relativePath)
+      ) {
+        // A diagnostic screenshot is the last-resort evidence for an Agent. Reserve
+        // capacity for it even when a task declares the maximum number of outputs.
+        declarations.unshift({ relativePath, kind: 'diagnostic-screenshot' });
       }
     }
-    return publicRecord(task);
+    return declarations.slice(0, MAX_ARTIFACTS).map(({ relativePath, kind }) => ({
+      id: artifactId(task.id, relativePath),
+      relativePath,
+      name: path.basename(relativePath).slice(0, 255),
+      kind,
+      mimeType: artifactMimeType(relativePath),
+      agentVisible: true
+    }));
   }
 
-  async function list() {
-    await ready;
-    return [...tasks.values()]
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .map(publicRecord);
+  function sameFileIdentity(left, right) {
+    return typeof left?.dev === 'bigint' && typeof left?.ino === 'bigint' &&
+      typeof right?.dev === 'bigint' && typeof right?.ino === 'bigint' &&
+      left.ino > 0n && right.ino > 0n &&
+      left.dev === right.dev && left.ino === right.ino;
   }
 
-  async function get(id) {
+  async function validatedOutputRoot(task) {
+    const canonicalStateRoot = await realpath(root);
+    const taskRoot = path.join(root, task.id);
+    const taskRootStats = await lstat(taskRoot);
+    if (!taskRootStats.isDirectory() || taskRootStats.isSymbolicLink()) {
+      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+    }
+    const canonicalTaskRoot = await realpath(taskRoot);
+    if (!inside(canonicalStateRoot, canonicalTaskRoot)) {
+      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+    }
+    const outputRootStats = await lstat(task.outputDir);
+    if (!outputRootStats.isDirectory() || outputRootStats.isSymbolicLink()) {
+      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+    }
+    const canonicalOutputRoot = await realpath(task.outputDir);
+    if (!inside(canonicalTaskRoot, canonicalOutputRoot)) {
+      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+    }
+    return canonicalOutputRoot;
+  }
+
+  async function openValidatedArtifact(task, declaration) {
+    let handle;
+    try {
+      const resolvedOutputRoot = path.resolve(task.outputDir);
+      const candidate = path.resolve(resolvedOutputRoot, declaration.relativePath);
+      if (!inside(resolvedOutputRoot, candidate)) {
+        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+      }
+      const canonicalOutputRoot = await validatedOutputRoot(task);
+      const before = await lstat(candidate, { bigint: true });
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.ino <= 0n) {
+        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+      }
+      await artifactValidationHook?.({ stage: 'after-lstat', taskId: task.id, candidate });
+
+      handle = await open(candidate, 'r');
+      const opened = await handle.stat({ bigint: true });
+      if (
+        !opened.isFile() || opened.nlink !== 1n || opened.ino <= 0n ||
+        opened.size > BigInt(Number.MAX_SAFE_INTEGER) || !sameFileIdentity(before, opened)
+      ) {
+        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+      }
+      const canonical = await realpath(candidate);
+      if (!inside(canonicalOutputRoot, canonical)) {
+        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+      }
+      const [current, canonicalStats] = await Promise.all([
+        lstat(candidate, { bigint: true }),
+        lstat(canonical, { bigint: true })
+      ]);
+      if (
+        !current.isFile() || current.isSymbolicLink() || current.nlink !== 1n ||
+        !canonicalStats.isFile() || canonicalStats.isSymbolicLink() || canonicalStats.nlink !== 1n ||
+        !sameFileIdentity(opened, current) || !sameFileIdentity(opened, canonicalStats)
+      ) {
+        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+      }
+      await artifactValidationHook?.({ stage: 'after-validation', taskId: task.id, candidate });
+      const { relativePath: _relativePath, ...publicDeclaration } = declaration;
+      return {
+        handle,
+        stats: opened,
+        artifact: { ...publicDeclaration, sizeBytes: Number(opened.size) }
+      };
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      if (error instanceof TaskServiceError) throw error;
+      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+    }
+  }
+
+  async function collectArtifacts(task) {
+    const artifacts = [];
+    for (const declaration of artifactDeclarations(task)) {
+      let opened;
+      try {
+        opened = await openValidatedArtifact(task, declaration);
+        artifacts.push(opened.artifact);
+      } catch {
+        // Missing or unstable declared artifacts are omitted rather than exposing a partial path.
+      } finally {
+        await opened?.handle.close().catch(() => {});
+      }
+    }
+    return artifacts;
+  }
+
+  async function listArtifacts(id, suppliedCaller = {}) {
     await ready;
+    const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task) throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
-    return publicRecord(task);
+    if (!task || !canAccess(task, caller)) {
+      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    }
+    await awaitTaskPersistence(id);
+    const artifacts = await collectArtifacts(task);
+    return artifacts;
   }
 
-  async function cancel(id) {
+  async function readArtifact(id, requestedArtifactId, options = {}, suppliedCaller = {}) {
     await ready;
+    const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task) throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    if (!task || !canAccess(task, caller)) {
+      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    }
+    await awaitTaskPersistence(id);
+    if (typeof requestedArtifactId !== 'string' || !/^artifact_[a-f0-9]{32}$/.test(requestedArtifactId)) {
+      throw new TaskServiceError('INVALID_ARTIFACT_ID', 'Artifact ID is invalid');
+    }
+    const offset = options.offset ?? 0;
+    const maxBytes = options.maxBytes ?? MAX_ARTIFACT_CHUNK_BYTES;
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new TaskServiceError('INVALID_ARTIFACT_OFFSET', 'Artifact offset must be a non-negative integer');
+    }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_ARTIFACT_CHUNK_BYTES) {
+      throw new TaskServiceError(
+        'INVALID_ARTIFACT_LIMIT',
+        `Artifact maxBytes must be from 1 to ${MAX_ARTIFACT_CHUNK_BYTES}`
+      );
+    }
+    const declaration = artifactDeclarations(task).find((candidate) => candidate.id === requestedArtifactId);
+    if (!declaration) {
+      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
+    }
+
+    let opened;
+    try {
+      opened = await openValidatedArtifact(task, declaration);
+      const { handle, stats, artifact } = opened;
+      const sizeBytes = Number(stats.size);
+      if (offset > sizeBytes) {
+        throw new TaskServiceError('ARTIFACT_OFFSET_OUT_OF_RANGE', 'Artifact offset exceeds its size', 416);
+      }
+      const requestedBytes = Math.min(maxBytes, sizeBytes - offset);
+      const buffer = Buffer.alloc(requestedBytes);
+      const { bytesRead } = requestedBytes
+        ? await handle.read(buffer, 0, requestedBytes, offset)
+        : { bytesRead: 0 };
+      const afterRead = await handle.stat({ bigint: true });
+      if (
+        !afterRead.isFile() || afterRead.nlink !== 1n ||
+        !sameFileIdentity(stats, afterRead) ||
+        afterRead.size !== stats.size || afterRead.mtimeNs !== stats.mtimeNs
+      ) {
+        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact changed while it was being read', 404);
+      }
+      let consumed = bytesRead;
+      let encoding = 'base64';
+      let chunk = buffer.subarray(0, bytesRead).toString('base64');
+      if (isTextMimeType(artifact.mimeType)) {
+        for (let trim = 0; trim <= Math.min(3, bytesRead); trim += 1) {
+          const candidate = buffer.subarray(0, bytesRead - trim);
+          if (candidate.length === 0 && bytesRead > 0) continue;
+          try {
+            chunk = new TextDecoder('utf-8', { fatal: true }).decode(candidate);
+            consumed = candidate.length;
+            encoding = 'utf8';
+            break;
+          } catch {
+            // Back up to a UTF-8 boundary; arbitrary offsets fall back to bounded base64.
+          }
+        }
+      }
+      const nextOffset = offset + consumed;
+      return {
+        artifact,
+        offset,
+        nextOffset,
+        eof: nextOffset >= sizeBytes,
+        encoding,
+        chunk
+      };
+    } finally {
+      await opened?.handle.close().catch(() => {});
+    }
+  }
+
+  async function cancel(id, suppliedCaller = {}) {
+    await ready;
+    const caller = callerIdentity(suppliedCaller);
+    const task = tasks.get(id);
+    if (!task || !canAccess(task, caller)) {
+      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    }
     if (TERMINAL_TASK_STATES.has(task.state)) return publicRecord(task);
-    update(task, {
+    await update(task, {
       state: 'cancelled',
       progress: { ...task.progress, message: 'Cancellation requested' },
       finishedAt: nowIso()
@@ -450,9 +1393,23 @@ export function createTaskService({
       task.cleanup.browserClosed = true;
       task.cleanup.workerExited = true;
       task.cleanup.settled = true;
-      update(task, { cleanup: task.cleanup });
+      finishAttemptHistory(task);
+      await update(task, { cleanup: task.cleanup, history: task.history });
     }
     return publicRecord(task);
+  }
+
+  async function installTaskType(input, suppliedCaller = {}) {
+    const caller = callerIdentity(suppliedCaller);
+    if (caller.role !== 'manager-admin') {
+      throw new TaskServiceError('TASK_TYPE_INSTALL_FORBIDDEN', 'Only Manager admin can install task types', 403);
+    }
+    return registry.install(input);
+  }
+
+  async function listTaskTypes(suppliedCaller = {}) {
+    callerIdentity(suppliedCaller);
+    return { taskTypes: await registry.list() };
   }
 
   async function importSession(profileId, bundle) {
@@ -469,23 +1426,44 @@ export function createTaskService({
       await profileStore.acquireLease(profileId, ownerId, { pid: child.pid, ttlMs: 120_000 });
       const result = await new Promise((resolve, reject) => {
         let settled = false;
+        let timeoutRequested = false;
+        let hardStopTimer;
         const timer = setTimeout(() => {
-          child.kill('SIGTERM');
-          reject(new TaskServiceError('SESSION_IMPORT_TIMEOUT', 'Session import timed out', 504));
-        }, 90_000);
+          timeoutRequested = true;
+          send(child, { type: 'cancel' });
+          hardStopTimer = setTimeout(() => {
+            child.kill('SIGKILL');
+            done(reject)(new TaskServiceError(
+              'SESSION_IMPORT_ROLLBACK_FAILED',
+              'Session import timed out and rollback could not be confirmed',
+              500
+            ));
+          }, sessionImportRollbackGraceMs);
+        }, sessionImportTimeoutMs);
         const done = (callback) => (value) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          clearTimeout(hardStopTimer);
           callback(value);
         };
         child.once('error', done(reject));
-        child.once('exit', done(() => reject(
-          new TaskServiceError('SESSION_IMPORT_EXITED', 'Session import worker exited before returning a result', 500)
-        )));
+        child.once('exit', done(() => reject(new TaskServiceError(
+          timeoutRequested ? 'SESSION_IMPORT_ROLLBACK_FAILED' : 'SESSION_IMPORT_EXITED',
+          timeoutRequested
+            ? 'Session import timed out and rollback could not be confirmed'
+            : 'Session import worker exited before returning a result',
+          500
+        ))));
         child.on('message', (message) => {
           if (message?.type === 'result') done(resolve)(message.result);
-          if (message?.type === 'error') done(reject)(Object.assign(new Error(message.error?.message), message.error));
+          if (message?.type === 'error') {
+            if (timeoutRequested && message.error?.code !== 'SESSION_IMPORT_ROLLBACK_FAILED') {
+              done(reject)(new TaskServiceError('SESSION_IMPORT_TIMEOUT', 'Session import timed out', 504));
+            } else {
+              done(reject)(Object.assign(new Error(message.error?.message), message.error));
+            }
+          }
         });
         send(child, { type: 'import', config: { profile, bundle } });
       });
@@ -496,7 +1474,7 @@ export function createTaskService({
         sessionCookieRetentionHours: Number(result.sessionCookieRetentionHours) || 0,
         verification: typeof result.verification === 'string'
           ? result.verification
-          : 'storage_imported_not_login_verified',
+          : 'storage_replaced_not_login_verified',
         message: result.status === 'verified'
           ? 'Session was imported and verified'
           : 'Session material was imported; account login still requires site-level verification'
@@ -508,15 +1486,48 @@ export function createTaskService({
     }
   }
 
-  async function openProfile(profileId) {
+  async function openProfile(
+    profileId,
+    suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
+  ) {
     await ready;
+    const caller = profileCallerIdentity(suppliedCaller);
     const existing = openProfiles.get(profileId);
-    if (existing) return { status: 'open', profileId, pid: existing.child.pid };
-    const ownerId = `profile-open:${profileId}`;
+    if (existing) {
+      if (caller.role !== 'manager-admin' && existing.ownerClientId !== caller.clientId) {
+        throw new TaskServiceError('PROFILE_IN_USE', 'Profile is open for another client', 409);
+      }
+      return { status: 'open', profileId, pid: existing.child.pid };
+    }
+    const pending = openingProfiles.get(profileId);
+    if (pending) {
+      if (caller.role !== 'manager-admin' && pending.ownerClientId !== caller.clientId) {
+        throw new TaskServiceError('PROFILE_IN_USE', 'Profile is opening for another client', 409);
+      }
+      return pending.promise;
+    }
+    const operation = openProfileSingle(profileId, caller.clientId);
+    openingProfiles.set(profileId, { promise: operation, ownerClientId: caller.clientId });
+    try {
+      return await operation;
+    } finally {
+      if (openingProfiles.get(profileId)?.promise === operation) openingProfiles.delete(profileId);
+    }
+  }
+
+  async function openProfileSingle(profileId, ownerClientId) {
+    const ownerId = `profile-open:${ownerClientId}:${profileId}:${randomUUID().replaceAll('-', '')}`;
     const profile = await profileStore.get(profileId);
     await profileStore.acquireLease(profileId, ownerId, { pid: process.pid, ttlMs: 5 * 60_000 });
     const child = workerFactory(PROFILE_WORKER, 'profile-open');
-    const entry = { child, ownerId, released: false, renewal: null, lastHeartbeatAt: Date.now() };
+    const entry = {
+      child,
+      ownerId,
+      ownerClientId,
+      released: false,
+      renewal: null,
+      lastHeartbeatAt: Date.now()
+    };
     openProfiles.set(profileId, entry);
 
     const release = async () => {
@@ -534,7 +1545,10 @@ export function createTaskService({
 
     try {
       const result = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new TaskServiceError('PROFILE_OPEN_TIMEOUT', 'Profile did not open in time', 504)), 30_000);
+        const timer = setTimeout(
+          () => reject(new TaskServiceError('PROFILE_OPEN_TIMEOUT', 'Profile did not open in time', 504)),
+          TASK_SERVICE_DEADLINES.profileOpenMs
+        );
         child.on('message', (message) => {
           if (message?.type === 'ready') {
             clearTimeout(timer);
@@ -568,15 +1582,29 @@ export function createTaskService({
     }
   }
 
-  async function closeProfile(profileId) {
+  async function closeProfile(
+    profileId,
+    suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
+  ) {
+    const caller = profileCallerIdentity(suppliedCaller);
+    const pending = openingProfiles.get(profileId);
+    if (pending) {
+      if (caller.role !== 'manager-admin' && pending.ownerClientId !== caller.clientId) {
+        throw new TaskServiceError('PROFILE_IN_USE', 'Profile is opening for another client', 409);
+      }
+      await pending.promise.catch(() => {});
+    }
     const entry = openProfiles.get(profileId);
     if (!entry) return { status: 'closed', profileId };
+    if (caller.role !== 'manager-admin' && entry.ownerClientId !== caller.clientId) {
+      throw new TaskServiceError('PROFILE_IN_USE', 'Profile is open for another client', 409);
+    }
     send(entry.child, { type: 'close' });
     await new Promise((resolve) => {
       const timer = setTimeout(() => {
         entry.child.kill('SIGTERM');
         resolve();
-      }, 10_000);
+      }, TASK_SERVICE_DEADLINES.profileCloseMs);
       entry.child.once('exit', () => {
         clearTimeout(timer);
         resolve();
@@ -597,8 +1625,11 @@ export function createTaskService({
     await Promise.allSettled([
       ...[...tasks.values()]
         .filter((task) => !TERMINAL_TASK_STATES.has(task.state))
-        .map((task) => cancel(task.id)),
-      ...[...openProfiles.keys()].map(closeProfile)
+        .map((task) => cancel(task.id, { role: 'manager-admin', clientId: 'manager-admin' })),
+      ...[...openProfiles.keys()].map((profileId) => closeProfile(
+        profileId,
+        { role: 'manager-admin', clientId: 'manager-admin' }
+      ))
     ]);
     if (exitingWorkers.length > 0) {
       await Promise.race([
@@ -616,5 +1647,20 @@ export function createTaskService({
     }
   }
 
-  return Object.freeze({ list, create, get, cancel, importSession, openProfile, closeProfile, close });
+  return Object.freeze({
+    list,
+    create,
+    get,
+    getInternal,
+    listArtifacts,
+    readArtifact,
+    cancel,
+    resume,
+    installTaskType,
+    listTaskTypes,
+    importSession,
+    openProfile,
+    closeProfile,
+    close
+  });
 }

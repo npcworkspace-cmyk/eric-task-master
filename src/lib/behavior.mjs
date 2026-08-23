@@ -41,7 +41,9 @@ export function createActionHelper({
   mode = 'fast',
   random = Math.random,
   sleep = defaultSleep,
+  abortSignal,
   onFailure = async () => {},
+  onEffect = async () => undefined,
   timing = DEFAULT_HUMAN_TIMING
 } = {}) {
   if (!page) throw new TypeError('page is required');
@@ -49,28 +51,55 @@ export function createActionHelper({
 
   let adaptiveSlowdown = 0;
 
+  const throwIfAborted = () => {
+    if (!abortSignal?.aborted) return;
+    throw abortSignal.reason instanceof Error ? abortSignal.reason : new Error('Task execution was aborted');
+  };
+
   const usesHumanTiming = () => mode === 'human' || (mode === 'adaptive' && adaptiveSlowdown > 0);
 
   async function pause(range) {
     if (usesHumanTiming()) await sleep(numberBetween(range, random));
   }
 
-  async function execute(operation, callback) {
+  function signal(kind) {
+    if (mode !== 'adaptive') return;
+    if (['dynamic', 'rate_limit', 'timeout', 'occluded', 'navigation_unknown'].includes(kind)) {
+      adaptiveSlowdown = Math.max(adaptiveSlowdown, kind === 'rate_limit' ? 8 : 3);
+    }
+  }
+
+  async function execute(operation, callback, effectOperation = operation) {
+    throwIfAborted();
+    const sequence = await onEffect({ state: 'started', operation: effectOperation });
+    let result;
     try {
       await pause(timing.beforeAction);
-      const result = await callback();
+      throwIfAborted();
+      result = await callback();
+      throwIfAborted();
       await pause(timing.afterAction);
+      throwIfAborted();
       if (mode === 'adaptive' && adaptiveSlowdown > 0) adaptiveSlowdown -= 1;
-      return result;
     } catch (cause) {
+      // Playwright cannot prove that a failed click/navigation did not reach the
+      // website. Keep the started record pending; a later attempt must inspect
+      // real state and resolve the unknown outcome explicitly.
       if (mode === 'adaptive') adaptiveSlowdown = Math.max(adaptiveSlowdown, 3);
-      try {
-        await onFailure({ operation, error: cause });
-      } catch {
-        // Diagnostic failure must not replace the original browser error.
+      if (!abortSignal?.aborted) {
+        try {
+          await onFailure({ operation, error: cause });
+        } catch {
+          // Diagnostic failure must not replace the original browser error.
+        }
       }
       throw new BehaviorActionError(operation, cause);
     }
+    // If this durable terminal write fails, the preceding `started` record stays
+    // pending. That is deliberately safer than falsely recording a failed action
+    // after its external effect may already have succeeded.
+    await onEffect({ state: 'succeeded', operation: effectOperation, sequence });
+    return result;
   }
 
   return Object.freeze({
@@ -82,20 +111,20 @@ export function createActionHelper({
       return usesHumanTiming() ? 'human' : 'fast';
     },
 
-    signal(kind) {
-      if (mode !== 'adaptive') return;
-      if (['dynamic', 'rate_limit', 'timeout', 'occluded', 'navigation_unknown'].includes(kind)) {
-        adaptiveSlowdown = Math.max(adaptiveSlowdown, kind === 'rate_limit' ? 8 : 3);
-      }
-    },
+    signal,
 
     async run(name, callback) {
       if (typeof callback !== 'function') throw new TypeError('action.run callback is required');
-      return execute(name || 'custom', callback);
+      return execute(name || 'custom', callback, 'custom');
     },
 
     async goto(url, options = {}) {
-      return execute('goto', () => page.goto(url, options));
+      return execute('goto', async () => {
+        const response = await page.goto(url, options);
+        const status = response?.status?.();
+        if (status === 429 || (status === 503 && response?.headers?.()['retry-after'])) signal('rate_limit');
+        return response;
+      });
     },
 
     async click(target, options = {}) {

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { bootstrapNextAction, playwrightInstallArguments } from './bootstrap-policy.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -36,8 +37,17 @@ function run(command, commandArgs, code) {
 
 async function bootstrapConnect() {
   if (args[0] !== 'connect') return;
-  const playwrightPackage = resolve(root, 'node_modules', 'playwright', 'package.json');
-  if (!existsSync(playwrightPackage)) {
+  const expectedDependencies = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')).dependencies || {};
+  const installedDependenciesMatch = Object.entries(expectedDependencies).every(([name, version]) => {
+    const packagePath = resolve(root, 'node_modules', ...name.split('/'), 'package.json');
+    if (!existsSync(packagePath)) return false;
+    try {
+      return JSON.parse(readFileSync(packagePath, 'utf8')).version === version;
+    } catch {
+      return false;
+    }
+  });
+  if (!installedDependenciesMatch) {
     reportBootstrap('bootstrap-progress', { step: 'install-node-dependencies' });
     await run(
       'npm',
@@ -45,9 +55,10 @@ async function bootstrapConnect() {
       'DEPENDENCY_INSTALL_FAILED'
     );
   }
+  const playwrightPackage = resolve(root, 'node_modules', 'playwright', 'package.json');
   if (!existsSync(playwrightPackage)) {
-    const error = new Error('Playwright was not installed after npm ci');
-    error.code = 'PLAYWRIGHT_NOT_INSTALLED';
+    const error = new Error('Runtime dependencies were not installed after npm ci');
+    error.code = 'RUNTIME_DEPENDENCIES_NOT_INSTALLED';
     throw error;
   }
 
@@ -56,7 +67,7 @@ async function bootstrapConnect() {
     reportBootstrap('bootstrap-progress', { step: 'install-playwright-chromium' });
     await run(
       process.execPath,
-      [resolve(root, 'node_modules', 'playwright', 'cli.js'), 'install', 'chromium'],
+      playwrightInstallArguments(resolve(root, 'node_modules', 'playwright', 'cli.js')),
       'BROWSER_INSTALL_FAILED'
     );
   }
@@ -86,7 +97,7 @@ try {
       code: error.code || 'TASKMASTER_BOOTSTRAP_FAILED',
       message: error.message
     },
-    nextAction: 'Confirm network access and Node.js 20+, then rerun the exact same connect command once.'
+    nextAction: bootstrapNextAction(error)
   })}\n`);
   process.exit(1);
 }

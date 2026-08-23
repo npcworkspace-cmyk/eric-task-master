@@ -1,13 +1,22 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startManager } from './manager.mjs';
 import { createTaskService } from './runtime/task-service.mjs';
-import { DEFAULT_HOST, DEFAULT_PORT, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
+import { createRegistrar } from './registration/index.mjs';
+import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
+import {
+  createIdentityNonce,
+  MANAGER_SERVICE,
+  validateManagerIdentityPin,
+  verifyManagerIdentityProof
+} from './lib/manager-identity.mjs';
+import { redactSensitiveText } from './lib/redaction.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -21,9 +30,15 @@ Usage:
   taskmaster profiles create --name NAME [--behavior MODE] [--headless]
   taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE]
   taskmaster profiles open|close|delete PROFILE_ID
+  taskmaster task-types list [--json]
+  taskmaster task-types install --type NAME --module PATH [--json]
   taskmaster task list [--json]
-  taskmaster task run --profile ID --module PATH [--input JSON] [--behavior MODE]
+  taskmaster task run --profile ID --type TYPE [--module PATH] [--input JSON] [--request-key KEY]
   taskmaster task status|follow|cancel TASK_ID [--json]
+  taskmaster task resume TASK_ID --resume-key KEY [--detach] [--json]
+  taskmaster artifacts list TASK_ID [--json]
+  taskmaster artifacts read TASK_ID --artifact ARTIFACT_ID [--offset N] [--max-bytes N]
+  taskmaster mcp status|register|unregister|rollback [--json]
   taskmaster extension-path [--json]
 
 Task run follows progress until terminal state by default.`;
@@ -89,20 +104,61 @@ function formatHuman(value) {
   return JSON.stringify(value, null, 2);
 }
 
-async function readManagerToken(stateDir) {
+async function readManagerCredentials(stateDir) {
+  let config;
   try {
-    const config = JSON.parse(await readFile(join(stateDir, 'config.json'), 'utf8'));
-    if (typeof config.managerToken === 'string' && config.managerToken.length >= 32) {
-      return config.managerToken;
-    }
+    config = JSON.parse(await readFile(join(stateDir, 'config.json'), 'utf8'));
   } catch {
     // The caller reports a stable connection error below.
   }
-  throw cliError(
-    'MANAGER_TOKEN_UNAVAILABLE',
-    'Manager authentication token is unavailable',
-    'Run the fixed connect command once.'
-  );
+  if (typeof config?.managerToken !== 'string' || config.managerToken.length < 32) {
+    throw cliError(
+      'MANAGER_TOKEN_UNAVAILABLE',
+      'Manager authentication token is unavailable',
+      'Run the fixed connect command once.'
+    );
+  }
+  let identity;
+  try {
+    identity = validateManagerIdentityPin(config.managerIdentity);
+  } catch {
+    throw cliError(
+      'MANAGER_IDENTITY_INVALID',
+      'Manager public identity pin is unavailable or invalid',
+      'Restore the original Manager state or run the fixed connect command with a fresh state directory.'
+    );
+  }
+  return { token: config.managerToken, identity };
+}
+
+async function verifyManagerEndpoint(config, identity, timeoutMs = 2_500) {
+  const nonce = createIdentityNonce();
+  let proof;
+  try {
+    proof = await requestJson(config.baseUrl, '/v1/identity/challenge', {
+      method: 'POST',
+      body: { nonce },
+      timeoutMs
+    });
+    verifyManagerIdentityProof(proof, identity, {
+      service: MANAGER_SERVICE,
+      version: VERSION,
+      apiVersion: API_VERSION,
+      host: config.host,
+      port: config.port,
+      nonce
+    });
+  } catch (error) {
+    if (error?.code === 'MANAGER_UNREACHABLE') throw error;
+    throw cliError(
+      typeof error?.code === 'string' && error.code.startsWith('MANAGER_IDENTITY_')
+        ? error.code
+        : 'MANAGER_IDENTITY_UNVERIFIED',
+      'The service on the Manager port did not prove the pinned Manager identity.',
+      'Stop the untrusted local service or restore the original Manager state, then retry.'
+    );
+  }
+  return proof;
 }
 
 async function requestJson(baseUrl, pathname, { method = 'GET', body, token, timeoutMs = 10_000 } = {}) {
@@ -118,7 +174,11 @@ async function requestJson(baseUrl, pathname, { method = 'GET', body, token, tim
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
-    throw cliError('MANAGER_UNREACHABLE', `Manager request failed: ${error.message}`, 'Retry the fixed connect command once.');
+    throw cliError(
+      'MANAGER_UNREACHABLE',
+      redactSensitiveText(`Manager request failed: ${error.message}`),
+      'Retry the fixed connect command once.'
+    );
   }
   const text = await response.text();
   let payload = {};
@@ -131,7 +191,10 @@ async function requestJson(baseUrl, pathname, { method = 'GET', body, token, tim
   }
   if (!response.ok) {
     const detail = payload.error || payload;
-    throw cliError(detail.code || `HTTP_${response.status}`, detail.message || `Manager returned ${response.status}`);
+    throw cliError(
+      detail.code || `HTTP_${response.status}`,
+      redactSensitiveText(detail.message || `Manager returned ${response.status}`)
+    );
   }
   return payload;
 }
@@ -188,8 +251,15 @@ async function ensureManager(config) {
     stdio: 'ignore',
     windowsHide: true
   });
+  const spawnFailure = new Promise((_, reject) => {
+    child.once('error', () => reject(cliError(
+      'MANAGER_START_FAILED',
+      'Manager process could not be started',
+      'Check the Node.js runtime and retry the fixed connect command once.'
+    )));
+  });
   child.unref();
-  return { health: await waitForManager(config), started: true };
+  return { health: await Promise.race([waitForManager(config), spawnFailure]), started: true };
 }
 
 async function serve(config, json) {
@@ -198,8 +268,8 @@ async function serve(config, json) {
     port: config.port,
     dataDir: config.stateDir,
     dashboardDir: resolve(ROOT, 'dashboard'),
-    taskServiceFactory({ profileStore, stateDir }) {
-      return createTaskService({ profileStore, stateDir });
+    taskServiceFactory(taskOptions) {
+      return createTaskService(taskOptions);
     }
   });
   await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
@@ -227,10 +297,36 @@ async function loadInput(raw) {
   return JSON.parse(raw);
 }
 
+async function stageTaskModule(config, modulePath) {
+  const requested = isAbsolute(modulePath) ? modulePath : resolve(modulePath);
+  const metadata = await lstat(requested).catch(() => null);
+  if (!metadata?.isFile() || metadata.isSymbolicLink() || !requested.toLowerCase().endsWith('.mjs')) {
+    throw cliError('INVALID_TASK_MODULE', 'Task module must be a regular .mjs file');
+  }
+  if (metadata.size < 1 || metadata.size > 2 * 1024 * 1024) {
+    throw cliError('INVALID_TASK_MODULE_SIZE', 'Task module must contain 1 byte to 2 MiB');
+  }
+  const source = await readFile(requested);
+  const sha256 = createHash('sha256').update(source).digest('hex');
+  const inbox = join(config.stateDir, 'task-inbox');
+  const staged = join(inbox, `${sha256}.mjs`);
+  await mkdir(inbox, { recursive: true, mode: 0o700 });
+  await writeFile(staged, source, { flag: 'wx', mode: 0o600 }).catch((error) => {
+    if (error?.code !== 'EEXIST') throw error;
+  });
+  const stagedSource = await readFile(staged);
+  if (createHash('sha256').update(stagedSource).digest('hex') !== sha256) {
+    throw cliError('TASK_MODULE_STAGE_CONFLICT', 'Staged task module failed its integrity check');
+  }
+  return staged;
+}
+
 async function apiContext(options) {
   const config = settings(options);
   await ensureManager(config);
-  return { config, token: await readManagerToken(config.stateDir) };
+  const credentials = await readManagerCredentials(config.stateDir);
+  await verifyManagerEndpoint(config, credentials.identity);
+  return { config, token: credentials.token, identity: credentials.identity };
 }
 
 async function followTask(context, taskId, json, options = {}) {
@@ -263,7 +359,9 @@ async function followTask(context, taskId, json, options = {}) {
 async function connect(options, json) {
   const config = settings(options);
   const connection = await ensureManager(config);
-  const token = await readManagerToken(config.stateDir);
+  const credentials = await readManagerCredentials(config.stateDir);
+  await verifyManagerEndpoint(config, credentials.identity);
+  const token = credentials.token;
   const acceptanceFile = join(config.stateDir, `acceptance-${VERSION}.json`);
   let acceptance;
   if (!options['force-acceptance'] && existsSync(acceptanceFile)) {
@@ -292,14 +390,42 @@ async function connect(options, json) {
   } else {
     acceptance = { ...acceptance, cached: true };
   }
+  const registration = options['skip-mcp-registration']
+    ? { ok: true, command: 'install', skipped: true, results: [] }
+    : await createRegistrar({
+      home: options.home,
+      stateDir: options['registration-state-dir'],
+      entrypoint: resolve(ROOT, 'src', 'mcp', 'stdio.mjs')
+    }).install();
+  if (!registration.ok) {
+    throw cliError(
+      'MCP_REGISTRATION_FAILED',
+      'Task Master could not safely register one or more detected Agent hosts.',
+      'Read the registration result, resolve the named conflict, and rerun connect once.'
+    );
+  }
+  const pairing = await requestJson(config.baseUrl, '/v1/pair/authorize', {
+    method: 'POST', body: {}, token
+  });
+  const dashboardAuthorization = await requestJson(config.baseUrl, '/v1/dashboard/authorize', {
+    method: 'POST', body: {}, token
+  });
   const result = {
     ok: true,
     version: VERSION,
     manager: { ...connection.health, startedNow: connection.started },
     acceptance,
+    mcpRegistration: registration,
+    extensionPairing: {
+      pairingCode: pairing.pairingCode,
+      expiresInMs: pairing.expiresInMs,
+      nextAction: 'Enter this one-time code in the Task Master extension panel.'
+    },
     extensionPath: resolve(ROOT, 'extension'),
-    dashboard: `${config.baseUrl}/dashboard`,
-    nextAction: 'List profiles, then ask for the browser task.'
+    dashboard: `${config.baseUrl}/dashboard#${new URLSearchParams({ code: dashboardAuthorization.code })}`,
+    nextAction: registration.results?.some((item) => item.status === 'registered_pending_restart')
+      ? 'Restart or reload the registered Agent host once, then use Task Master MCP tools.'
+      : 'List profiles, then ask for the browser task.'
   };
   emit(result, json);
   return result;
@@ -317,6 +443,8 @@ async function stopManager(options, json) {
     }
     throw error;
   }
+  const credentials = await readManagerCredentials(config.stateDir);
+  await verifyManagerEndpoint(config, credentials.identity);
   let recorded;
   try {
     recorded = JSON.parse(await readFile(join(config.stateDir, 'manager.json'), 'utf8'));
@@ -398,12 +526,22 @@ async function taskCommand(action, args, options, json) {
   }
   if (action === 'run') {
     if (!options.profile) throw cliError('PROFILE_ID_REQUIRED', '--profile is required');
-    if (!options.module) throw cliError('TASK_MODULE_REQUIRED', '--module is required');
-    const modulePath = isAbsolute(options.module) ? options.module : resolve(options.module);
+    if (!options.type) throw cliError('TASK_TYPE_REQUIRED', '--type is required');
+    if (options.module) {
+      const modulePath = await stageTaskModule(context.config, options.module);
+      await requestJson(context.config.baseUrl, '/v1/task-types/install', {
+        method: 'POST',
+        body: { name: options.type, modulePath },
+        token: context.token
+      });
+    }
+    const idempotencyKey = options['request-key'] || `cli-${randomUUID()}`;
+    emit({ event: 'task-submitting', taskType: options.type, idempotencyKey }, json);
     const body = {
       profileId: options.profile,
-      modulePath,
+      taskType: options.type,
       input: await loadInput(options.input),
+      idempotencyKey,
       ...(options.behavior ? { behavior: options.behavior } : {}),
       ...(options.timeout ? { timeoutMs: Number(options.timeout) } : {})
     };
@@ -419,6 +557,20 @@ async function taskCommand(action, args, options, json) {
   }
   const taskId = args[0];
   if (!taskId) throw cliError('TASK_ID_REQUIRED', `task ${action} requires a task ID`);
+  if (action === 'resume') {
+    if (!options['resume-key']) throw cliError('RESUME_KEY_REQUIRED', 'task resume requires --resume-key KEY');
+    const result = await requestJson(
+      context.config.baseUrl,
+      `/v1/tasks/${encodeURIComponent(taskId)}/resume`,
+      { method: 'POST', body: { resumeKey: options['resume-key'] }, token: context.token }
+    );
+    emit({ ok: true, event: 'task-resumed', ...result }, json);
+    if (options.detach) return;
+    const terminal = await followTask(context, taskId, json, options);
+    emit({ ok: terminal.state === 'completed', event: 'task-finished', task: terminal }, json);
+    if (terminal.state !== 'completed') process.exitCode = 1;
+    return;
+  }
   if (action === 'status') {
     const result = await requestJson(context.config.baseUrl, `/v1/tasks/${encodeURIComponent(taskId)}`, { token: context.token });
     emit({ ok: true, ...result }, json);
@@ -438,6 +590,85 @@ async function taskCommand(action, args, options, json) {
     return;
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown task command: ${action}`);
+}
+
+async function taskTypeCommand(action, options, json) {
+  const context = await apiContext(options);
+  if (action === 'list') {
+    const result = await requestJson(context.config.baseUrl, '/v1/task-types', { token: context.token });
+    emit({ ok: true, ...result }, json);
+    return;
+  }
+  if (action === 'install') {
+    if (!options.type) throw cliError('TASK_TYPE_REQUIRED', '--type is required');
+    if (!options.module) throw cliError('TASK_MODULE_REQUIRED', '--module is required');
+    const modulePath = await stageTaskModule(context.config, options.module);
+    const result = await requestJson(context.config.baseUrl, '/v1/task-types/install', {
+      method: 'POST',
+      body: { name: options.type, modulePath },
+      token: context.token
+    });
+    emit({ ok: true, ...result }, json);
+    return;
+  }
+  throw cliError('UNKNOWN_COMMAND', `Unknown task-types command: ${action}`);
+}
+
+async function artifactCommand(action, args, options, json) {
+  const taskId = args[0];
+  if (!taskId) throw cliError('TASK_ID_REQUIRED', `artifacts ${action} requires a task ID`);
+  const context = await apiContext(options);
+  if (action === 'list') {
+    const result = await requestJson(
+      context.config.baseUrl,
+      `/v1/tasks/${encodeURIComponent(taskId)}/artifacts`,
+      { token: context.token }
+    );
+    emit({ ok: true, ...result }, json);
+    return;
+  }
+  if (action === 'read') {
+    const artifactId = options.artifact || args[1];
+    if (!artifactId) throw cliError('ARTIFACT_ID_REQUIRED', 'artifacts read requires --artifact ARTIFACT_ID');
+    const query = new URLSearchParams({
+      offset: String(options.offset ?? 0),
+      maxBytes: String(options['max-bytes'] ?? 48 * 1024)
+    });
+    const result = await requestJson(
+      context.config.baseUrl,
+      `/v1/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}?${query}`,
+      { token: context.token }
+    );
+    emit({ ok: true, ...result }, json);
+    return;
+  }
+  throw cliError('UNKNOWN_COMMAND', `Unknown artifacts command: ${action}`);
+}
+
+async function mcpCommand(action, options, json) {
+  const registrar = createRegistrar({
+    ...(options.home ? { home: options.home } : {}),
+    ...(options['registration-state-dir'] ? { stateDir: options['registration-state-dir'] } : {}),
+    entrypoint: resolve(ROOT, 'src', 'mcp', 'stdio.mjs')
+  });
+  const common = {
+    dryRun: options['dry-run'] === true || options['dry-run'] === 'true',
+    ...(options.hosts ? { hostKeys: options.hosts } : {})
+  };
+  const result = action === 'status'
+    ? await registrar.status(common)
+    : action === 'register'
+      ? await registrar.install(common)
+      : action === 'unregister'
+        ? await registrar.uninstall(common)
+        : action === 'rollback'
+          ? await registrar.rollback({
+            dryRun: common.dryRun,
+            ...(options.transaction ? { transactionId: options.transaction } : {})
+          })
+          : (() => { throw cliError('UNKNOWN_COMMAND', `Unknown mcp command: ${action}`); })();
+  emit(result, json);
+  if (!result.ok) process.exitCode = 2;
 }
 
 async function main() {
@@ -461,7 +692,10 @@ async function main() {
     throw cliError('UNKNOWN_COMMAND', `Unknown manager command: ${action}`);
   }
   if (command === 'profiles') return profileCommand(positionals.shift() || 'list', positionals, options, json);
+  if (command === 'task-types') return taskTypeCommand(positionals.shift() || 'list', options, json);
   if (command === 'task') return taskCommand(positionals.shift() || 'list', positionals, options, json);
+  if (command === 'artifacts') return artifactCommand(positionals.shift() || 'list', positionals, options, json);
+  if (command === 'mcp') return mcpCommand(positionals.shift() || 'status', options, json);
   if (command === 'status') {
     const config = settings(options);
     emit({ ok: true, manager: await health(config) }, json);
@@ -478,8 +712,13 @@ main().catch((error) => {
   const { options } = parseArgs(process.argv.slice(2));
   const payload = {
     ok: false,
-    error: { code: error.code || 'TASKMASTER_FAILED', message: error.message },
-    nextAction: error.nextAction || 'Read the error, correct the stated cause, and retry the same command once.'
+    error: {
+      code: error.code || 'TASKMASTER_FAILED',
+      message: redactSensitiveText(error.message)
+    },
+    nextAction: redactSensitiveText(
+      error.nextAction || 'Read the error, correct the stated cause, and retry the same command once.'
+    )
   };
   if (options.json === true || options.json === 'true') {
     process.stderr.write(`${JSON.stringify(payload)}\n`);

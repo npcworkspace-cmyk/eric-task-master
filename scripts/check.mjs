@@ -18,15 +18,32 @@ async function staticChecks() {
   invariant(packageJson.version === VERSION, 'package.json version drift');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock.json version drift');
   invariant(manifest.version === VERSION, 'extension manifest version drift');
-  invariant(Object.keys(packageJson.dependencies || {}).join(',') === 'playwright', 'Playwright must be the only runtime dependency');
+  invariant(
+    JSON.stringify(Object.keys(packageJson.dependencies || {}).sort()) ===
+      JSON.stringify(['@modelcontextprotocol/server', 'playwright', 'zod'].sort()),
+    'Runtime dependency boundary drift'
+  );
+  invariant(
+    JSON.stringify(Object.keys(packageJson.devDependencies || {}).sort()) ===
+      JSON.stringify(['@modelcontextprotocol/client']),
+    'MCP protocol test dependency boundary drift'
+  );
+  invariant(!packageJson.dependencies?.['@modelcontextprotocol/sdk'], 'Legacy monolithic MCP SDK is forbidden');
   invariant(manifest.manifest_version === 3, 'extension must use Manifest V3');
   invariant(!manifest.content_scripts, 'extension must not register content scripts');
   invariant(!(manifest.permissions || []).includes('debugger'), 'extension must not request debugger');
   invariant(manifest.action?.default_icon?.['128'] === 'icons/icon-128.png', 'extension icon contract drift');
   await access(resolve(ROOT, 'scripts', 'taskmaster.mjs'));
-  const launcher = await readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8');
+  const [launcher, bootstrapPolicy] = await Promise.all([
+    readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8')
+  ]);
   invariant(launcher.includes("['ci', '--ignore-scripts', '--no-audit', '--no-fund']"), 'fixed launcher lacks dependency bootstrap');
-  invariant(launcher.includes("'install', 'chromium'"), 'fixed launcher lacks Chromium bootstrap');
+  invariant(
+    launcher.includes('playwrightInstallArguments(') &&
+      bootstrapPolicy.includes("'install'") && bootstrapPolicy.includes("'chromium'"),
+    'fixed launcher lacks Chromium bootstrap'
+  );
   await Promise.all([16, 32, 48, 128].map((size) => (
     access(resolve(ROOT, 'extension', 'icons', `icon-${size}.png`))
   )));

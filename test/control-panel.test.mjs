@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { VERSION } from '../src/contracts.mjs';
+import {
+  PROFILE_CLOSE_REQUEST_TIMEOUT_MS,
+  PROFILE_OPEN_REQUEST_TIMEOUT_MS,
+  SESSION_TRANSFER_REQUEST_TIMEOUT_MS
+} from '../extension/operation-timeouts.js';
+import { TASK_SERVICE_DEADLINES } from '../src/runtime/task-service.mjs';
 
 const root = new URL('../', import.meta.url);
 
@@ -11,31 +18,69 @@ async function text(path) {
 test('extension is a minimal Manifest V3 control plane', async () => {
   const manifest = JSON.parse(await text('extension/manifest.json'));
   assert.equal(manifest.manifest_version, 3);
-  assert.equal(manifest.version, '0.0.1');
+  assert.equal(manifest.version, VERSION);
   assert.equal(manifest.background.service_worker, 'service-worker.js');
   assert.equal(manifest.action.default_popup, 'popup.html');
   assert.equal('content_scripts' in manifest, false);
   assert.equal('devtools_page' in manifest, false);
   assert.deepEqual(new Set(manifest.permissions), new Set(['activeTab', 'cookies', 'scripting', 'storage']));
-  assert.deepEqual(new Set(manifest.host_permissions), new Set(['http://127.0.0.1/*', 'http://localhost/*']));
+  assert.deepEqual(new Set(manifest.host_permissions), new Set(['http://127.0.0.1/*']));
   assert.deepEqual(new Set(manifest.optional_host_permissions), new Set(['http://*/*', 'https://*/*']));
 });
 
 test('session transfer requires the popup user gesture and stays origin scoped', async () => {
-  const source = await text('extension/popup.js');
-  assert.match(source, /syncSession\.addEventListener\('click', syncCurrentSite\)/);
-  assert.match(source, /chrome\.permissions\.request\(\{ origins:/);
-  assert.match(source, /chrome\.cookies\.getAll\(\{ url: activeSite\.url\.href \}\)/);
-  assert.match(source, /chrome\.scripting\.executeScript/);
-  assert.match(source, /origin: activeSite\.url\.origin/);
-  assert.match(source, /hostOnly: Boolean\(cookie\.hostOnly\)/);
-  assert.match(source, /session: Boolean\(cookie\.session\)/);
-  assert.match(source, /mapped\.expirationDate = cookie\.expirationDate/);
-  assert.match(source, /tabUrl: activeSite\.url\.origin/);
+  const [popup, transfer] = await Promise.all([
+    text('extension/popup.js'),
+    text('extension/session-transfer.js')
+  ]);
+  const source = `${popup}\n${transfer}`;
+  assert.match(popup, /syncSession\.addEventListener\('click', afterInitialize\(syncCurrentSite\)\)/);
+  assert.match(popup, /chrome\.permissions\.request\(\{ origins:/);
+  assert.match(popup, /chrome\.permissions\.remove\(\{ origins:/);
+  assert.match(popup, /chrome\.permissions\.contains\(\{ origins:/);
+  assert.match(popup, /chrome\.cookies\.getAll\(\{ url: site\.url\.href \}\)/);
+  assert.match(popup, /chrome\.scripting\.executeScript/);
+  assert.match(transfer, /await verifyManagerIdentity\(\)/);
+  assert.match(transfer, /assertUnchanged\(selected, await inspectActiveSite\(\)\)/);
+  assert.match(transfer, /origin: selected\.url\.origin/);
+  assert.match(popup, /hostOnly: Boolean\(cookie\.hostOnly\)/);
+  assert.match(popup, /session: Boolean\(cookie\.session\)/);
+  assert.match(popup, /mapped\.expirationDate = cookie\.expirationDate/);
+  assert.match(transfer, /tabUrl: selected\.url\.origin/);
+  assert.match(popup, /timeoutMs: shouldOpen \? PROFILE_OPEN_REQUEST_TIMEOUT_MS : PROFILE_CLOSE_REQUEST_TIMEOUT_MS/);
+  assert.match(popup, /timeoutMs: SESSION_TRANSFER_REQUEST_TIMEOUT_MS/);
   assert.doesNotMatch(source, /登录态已同步并验证/);
-  assert.match(source, /\/session`/);
+  assert.match(popup, /\/session`/);
   assert.doesNotMatch(source, /chrome\.storage\.local\.set\(\{[^}]*cookies/is);
   assert.doesNotMatch(source, /console\.(?:log|info|debug|warn|error)/);
+});
+
+test('extension request deadlines exceed every corresponding Manager operation deadline', () => {
+  assert.ok(PROFILE_OPEN_REQUEST_TIMEOUT_MS > TASK_SERVICE_DEADLINES.profileOpenMs);
+  assert.ok(PROFILE_CLOSE_REQUEST_TIMEOUT_MS > TASK_SERVICE_DEADLINES.profileCloseMs);
+  assert.ok(
+    SESSION_TRANSFER_REQUEST_TIMEOUT_MS >
+    TASK_SERVICE_DEADLINES.sessionImportMs + TASK_SERVICE_DEADLINES.sessionImportRollbackGraceMs
+  );
+});
+
+test('extension pairing requires a Manager-authorized one-time code', async () => {
+  const [html, source, identitySource, worker] = await Promise.all([
+    text('extension/popup.html'),
+    text('extension/popup.js'),
+    text('extension/manager-identity.js'),
+    text('extension/service-worker.js')
+  ]);
+  assert.match(html, /id="pairing-code"/);
+  assert.match(html, /maxlength="96"/);
+  assert.match(source, /X-Taskmaster-Pairing-Code/);
+  assert.match(source, /pairingCode/);
+  assert.match(source, /fetchAndVerifyManagerIdentity/);
+  assert.match(identitySource, /trustedManagerFetch/);
+  assert.match(identitySource, /Authorization: `Bearer \$\{token\}`/);
+  assert.match(worker, /TRUSTED_CONTEXTS/);
+  assert.match(source, /trustedManagerIdentity/);
+  assert.doesNotMatch(source, /url\.hash = `token=/);
 });
 
 test('extension contains no webpage automation surface', async () => {
@@ -64,6 +109,7 @@ test('popup exposes pairing, profile controls, behavior modes, session sync, and
   const html = await text('extension/popup.html');
   for (const id of [
     'discover-manager',
+    'pairing-code',
     'pair-extension',
     'create-profile',
     'profile-list',

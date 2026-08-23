@@ -1,5 +1,5 @@
-import { mkdir, rename, rm } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isBehaviorMode } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
@@ -82,18 +82,30 @@ export class ProfileStore {
   #profilesRoot;
   #now;
   #processAlive;
+  #renamePath;
+  #removePath;
 
-  constructor({ filePath, profilesRoot, now = () => Date.now(), processAlive = isProcessAlive }) {
+  constructor({
+    filePath,
+    profilesRoot,
+    now = () => Date.now(),
+    processAlive = isProcessAlive,
+    renamePath = rename,
+    removePath = rm
+  }) {
     if (!profilesRoot) throw new TypeError('profilesRoot is required');
     this.#store = new JsonStore(filePath, { version: 1, profiles: [] });
     this.#profilesRoot = profilesRoot;
     this.#now = now;
     this.#processAlive = processAlive;
+    this.#renamePath = renamePath;
+    this.#removePath = removePath;
   }
 
   async init() {
     await mkdir(this.#profilesRoot, { recursive: true, mode: 0o700 });
     await this.#store.init();
+    await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
   }
 
@@ -205,7 +217,6 @@ export class ProfileStore {
   }
 
   async remove(profileId) {
-    let removed;
     const profile = await this.get(profileId);
     if (profile.lease || profile.state !== 'idle') {
       throw new ProfileStoreError(
@@ -228,33 +239,251 @@ export class ProfileStore {
       );
     }
     const tombstonePath = resolve(this.#profilesRoot, `.deleting-${profileId}-${randomUUID()}`);
+    const tombstoneName = tombstonePath.slice(resolve(this.#profilesRoot).length + 1);
+    const deletionOwner = `profile-delete:${randomUUID().replaceAll('-', '')}`;
+    let removed = profile;
     let moved = false;
+    let movedPhasePersisted = false;
     try {
-      await rename(expectedPath, tombstonePath);
+      await this.#store.update((data) => {
+        const current = findProfile(data, profileId);
+        if (current.lease || current.state !== 'idle') {
+          throw new ProfileStoreError(
+            'PROFILE_IN_USE',
+            `Profile ${profileId} must be idle before it can be removed`,
+            409
+          );
+        }
+        const nowMs = this.#now();
+        current.state = 'deleting';
+        current.lease = {
+          ownerId: deletionOwner,
+          pid: process.pid,
+          acquiredAt: new Date(nowMs).toISOString(),
+          heartbeatAt: new Date(nowMs).toISOString(),
+          expiresAt: new Date(nowMs + 5 * 60_000).toISOString()
+        };
+        current.deletion = {
+          tombstoneName,
+          startedAt: new Date(nowMs).toISOString(),
+          phase: 'prepared'
+        };
+        current.updatedAt = new Date(nowMs).toISOString();
+      });
+      await this.#renamePath(expectedPath, tombstonePath);
       moved = true;
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-    await this.#store.update((data) => {
-      const index = data.profiles.findIndex((item) => item.id === profileId);
-      if (index === -1) {
-        throw new ProfileStoreError('PROFILE_NOT_FOUND', `Profile ${profileId} was not found`, 404);
-      }
-      const profile = data.profiles[index];
-      if (profile.lease || profile.state !== 'idle') {
+      await this.#store.update((data) => {
+        const current = findProfile(data, profileId);
+        if (
+          current.state !== 'deleting' ||
+          current.lease?.ownerId !== deletionOwner ||
+          current.deletion?.tombstoneName !== tombstoneName
+        ) {
+          throw new ProfileStoreError('PROFILE_DELETE_RACE', 'Profile deletion state changed concurrently', 409);
+        }
+        current.deletion.phase = 'moved';
+        current.updatedAt = new Date(this.#now()).toISOString();
+      });
+      movedPhasePersisted = true;
+      try {
+        await this.#removePath(tombstonePath, { recursive: true, force: true });
+      } catch (error) {
         throw new ProfileStoreError(
-          'PROFILE_IN_USE',
-          `Profile ${profileId} must be idle before it can be removed`,
-          409
+          'PROFILE_DELETE_IO_FAILED',
+          `Profile ${profileId} data could not be removed: ${error?.message || 'filesystem error'}`,
+          500
         );
       }
-      [removed] = data.profiles.splice(index, 1);
-    }).catch(async (error) => {
-      if (moved) await rename(tombstonePath, expectedPath).catch(() => {});
+      if (await this.#pathStats(tombstonePath)) {
+        throw new ProfileStoreError(
+          'PROFILE_DELETE_IO_FAILED',
+          `Profile ${profileId} data still exists after deletion`,
+          500
+        );
+      }
+      await this.#store.update((data) => {
+        const index = data.profiles.findIndex((item) => item.id === profileId);
+        if (index === -1) {
+          throw new ProfileStoreError('PROFILE_NOT_FOUND', `Profile ${profileId} was not found`, 404);
+        }
+        const current = data.profiles[index];
+        if (
+          current.state !== 'deleting' ||
+          current.lease?.ownerId !== deletionOwner ||
+          current.deletion?.tombstoneName !== tombstoneName ||
+          current.deletion?.phase !== 'moved'
+        ) {
+          throw new ProfileStoreError('PROFILE_DELETE_RACE', 'Profile deletion state changed concurrently', 409);
+        }
+        [removed] = data.profiles.splice(index, 1);
+      });
+    } catch (error) {
+      if (!movedPhasePersisted && moved) {
+        await this.#renamePath(tombstonePath, expectedPath).catch(() => {});
+      }
+      if (!movedPhasePersisted) {
+        const expectedExists = Boolean(await this.#pathStats(expectedPath));
+        const tombstoneExists = Boolean(await this.#pathStats(tombstonePath));
+        await this.#store.update((data) => {
+          const current = data.profiles.find((item) => item.id === profileId);
+          if (current?.lease?.ownerId !== deletionOwner) return;
+          current.state = expectedExists && !tombstoneExists ? 'idle' : 'error';
+          current.lease = null;
+          if (expectedExists && !tombstoneExists) delete current.deletion;
+          current.updatedAt = new Date(this.#now()).toISOString();
+        }).catch(() => {});
+      }
       throw error;
-    });
-    if (moved) await rm(tombstonePath, { recursive: true, force: true });
+    }
     return structuredClone(removed);
+  }
+
+  async #recoverInterruptedDeletions() {
+    const snapshot = await this.#store.read();
+    for (const profile of snapshot.profiles) {
+      if (!profile.deletion?.tombstoneName) continue;
+      const expectedPath = resolve(this.#profilesRoot, profile.id);
+      const tombstonePath = resolve(this.#profilesRoot, profile.deletion.tombstoneName);
+      const valid = /^profile_[a-f0-9]{32}$/.test(profile.id) &&
+        /^\.deleting-profile_[a-f0-9]{32}-[a-f0-9-]{36}$/.test(profile.deletion.tombstoneName) &&
+        tombstonePath.startsWith(`${resolve(this.#profilesRoot)}${sep}`);
+      if (!valid) {
+        await this.#store.update((data) => {
+          const current = data.profiles.find((item) => item.id === profile.id);
+          if (current?.deletion?.tombstoneName === profile.deletion.tombstoneName) {
+            current.state = 'error';
+            current.lease = null;
+          }
+        });
+        continue;
+      }
+      const expectedExists = Boolean(await this.#pathStats(expectedPath));
+      const tombstoneExists = Boolean(await this.#pathStats(tombstonePath));
+      if (profile.deletion.phase === 'moved') {
+        if (!expectedExists && tombstoneExists) {
+          try {
+            await this.#removePath(tombstonePath, { recursive: true, force: true });
+          } catch (error) {
+            throw new ProfileStoreError(
+              'PROFILE_DELETE_RECOVERY_FAILED',
+              `Profile ${profile.id} tombstone could not be removed: ${error?.message || 'filesystem error'}`,
+              500
+            );
+          }
+        }
+        const canonicalAfter = Boolean(await this.#pathStats(expectedPath));
+        const tombstoneAfter = Boolean(await this.#pathStats(tombstonePath));
+        if (!canonicalAfter && !tombstoneAfter) {
+          await this.#store.update((data) => {
+            const index = data.profiles.findIndex((item) => item.id === profile.id);
+            if (index === -1) return;
+            const current = data.profiles[index];
+            if (
+              current.deletion?.tombstoneName === profile.deletion.tombstoneName &&
+              current.deletion?.phase === 'moved'
+            ) {
+              data.profiles.splice(index, 1);
+            }
+          });
+          continue;
+        }
+        if (canonicalAfter && !tombstoneAfter) {
+          await this.#markDeletionRecovered(profile);
+          continue;
+        }
+        await this.#markDeletionError(profile);
+        continue;
+      }
+
+      let recovered = expectedExists && !tombstoneExists;
+      if (!expectedExists && tombstoneExists) {
+        await this.#renamePath(tombstonePath, expectedPath);
+        recovered = true;
+      }
+      if (recovered) await this.#markDeletionRecovered(profile);
+      else await this.#markDeletionError(profile);
+    }
+    await this.#recoverOrphanTombstones();
+  }
+
+  async #pathStats(filePath) {
+    try {
+      return await lstat(filePath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  async #markDeletionRecovered(profile) {
+    await this.#store.update((data) => {
+      const current = data.profiles.find((item) => item.id === profile.id);
+      if (current?.deletion?.tombstoneName !== profile.deletion.tombstoneName) return;
+      current.state = 'idle';
+      current.lease = null;
+      delete current.deletion;
+      current.updatedAt = new Date(this.#now()).toISOString();
+    });
+  }
+
+  async #markDeletionError(profile) {
+    await this.#store.update((data) => {
+      const current = data.profiles.find((item) => item.id === profile.id);
+      if (current?.deletion?.tombstoneName !== profile.deletion.tombstoneName) return;
+      current.state = 'error';
+      current.lease = null;
+      current.updatedAt = new Date(this.#now()).toISOString();
+    });
+  }
+
+  async #recoverOrphanTombstones() {
+    const entries = await readdir(this.#profilesRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      const match = /^\.deleting-(profile_[a-f0-9]{32})-[a-f0-9-]{36}$/.exec(entry.name);
+      if (!match) continue;
+      const tombstonePath = resolve(this.#profilesRoot, entry.name);
+      const tombstoneStats = await this.#pathStats(tombstonePath);
+      if (!tombstoneStats) continue;
+      if (!tombstoneStats.isDirectory() || tombstoneStats.isSymbolicLink()) {
+        throw new ProfileStoreError(
+          'PROFILE_DELETE_RECOVERY_FAILED',
+          `Profile deletion tombstone ${entry.name} is not a regular directory`,
+          500
+        );
+      }
+      const data = await this.#store.read();
+      const profile = data.profiles.find((item) => item.id === match[1]);
+      if (profile?.deletion?.tombstoneName === entry.name) continue;
+      const expectedPath = resolve(this.#profilesRoot, match[1]);
+      const expectedExists = Boolean(await this.#pathStats(expectedPath));
+      if (profile && !expectedExists) {
+        await this.#renamePath(tombstonePath, expectedPath);
+        await this.#store.update((currentData) => {
+          const current = currentData.profiles.find((item) => item.id === profile.id);
+          if (!current || current.deletion) return;
+          current.state = 'idle';
+          current.lease = null;
+          current.updatedAt = new Date(this.#now()).toISOString();
+        });
+        continue;
+      }
+      try {
+        await this.#removePath(tombstonePath, { recursive: true, force: true });
+      } catch (error) {
+        throw new ProfileStoreError(
+          'PROFILE_DELETE_RECOVERY_FAILED',
+          `Orphan Profile tombstone ${entry.name} could not be removed: ${error?.message || 'filesystem error'}`,
+          500
+        );
+      }
+      if (await this.#pathStats(tombstonePath)) {
+        throw new ProfileStoreError(
+          'PROFILE_DELETE_RECOVERY_FAILED',
+          `Orphan Profile tombstone ${entry.name} still exists after cleanup`,
+          500
+        );
+      }
+    }
   }
 
   async acquireLease(profileId, ownerId, options = {}) {
@@ -271,6 +500,9 @@ export class ProfileStore {
     }
 
     const existing = await this.get(profileId);
+    if (existing.state === 'deleting' || existing.deletion) {
+      throw new ProfileStoreError('PROFILE_IN_USE', `Profile ${profileId} is being deleted`, 409);
+    }
     if (existing.lease && existing.lease.ownerId !== ownerId) {
       const expired = Date.parse(existing.lease.expiresAt) <= this.#now();
       const alive = await this.#processAlive(existing.lease.pid);

@@ -1,6 +1,6 @@
 {
   "name": "eric-task-master",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Playwright-first browser task runtime with a real-browser control panel.",
   "type": "module",
   "private": true,
@@ -16,10 +16,19 @@
     "acceptance": "node scripts/acceptance.mjs",
     "check": "node scripts/check.mjs",
     "generate:icons": "node scripts/generate-icons.mjs",
+    "mcp": "node src/mcp/stdio.mjs",
+    "mcp:register": "node scripts/register-mcp.mjs install --json",
+    "mcp:status": "node scripts/register-mcp.mjs status --json",
+    "mcp:unregister": "node scripts/register-mcp.mjs uninstall --json",
     "version:bump": "node scripts/bump-version.mjs",
     "test": "node --test --test-concurrency=1"
   },
   "dependencies": {
-    "playwright": "1.62.1"
+    "@modelcontextprotocol/server": "2.0.0",
+    "playwright": "1.62.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
   }
 }

@@ -3,6 +3,10 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { createActionHelper } from '../lib/behavior.mjs';
+import { createCooldownHelper } from '../lib/cooldown.mjs';
+import { createEffectJournal } from '../lib/effect-journal.mjs';
+import { createOutputBudget } from '../lib/output-budget.mjs';
+import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 20_000;
 const DEFAULT_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
@@ -33,10 +37,7 @@ function safeSend(message) {
 }
 
 function errorPayload(error, screenshot = null) {
-  const message = String(error?.message || 'Task failed')
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, '$1[REDACTED]')
-    .replace(/([?&](?:access_token|api_key|auth|password|session|token)=)[^&#\s]+/gi, '$1[REDACTED]')
-    .replace(/((?:set-)?cookie\s*:\s*)[^\r\n]+/gi, '$1[REDACTED]');
+  const message = redactSensitiveText(error?.message || 'Task failed');
   return {
     code: error?.code || 'TASK_FAILED',
     message: message.slice(0, 2_000),
@@ -64,21 +65,38 @@ async function withDeadline(promise, milliseconds) {
   }
 }
 
+export async function closeTaskBrowserContext(context, timeoutMs = 10_000) {
+  try {
+    await withDeadline(context?.close?.() || Promise.resolve(), timeoutMs);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 let activePage = null;
 let activeProgress = { current: 0, total: null, message: 'Starting browser' };
+let activeOutputBudget = null;
 
-async function captureFailure(page, outputDir, reason) {
+async function captureFailure(page, outputDir, reason, outputBudget = activeOutputBudget) {
   if (!page || page.isClosed?.()) return null;
   const screenshotsDir = path.join(outputDir, 'screenshots');
-  await mkdir(screenshotsDir, { recursive: true });
   const safeReason = String(reason || 'failure').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 48);
   const screenshotPath = path.join(screenshotsDir, `${Date.now()}-${safeReason}.png`);
+  let releaseReservation = () => {};
+  let captured = false;
   try {
+    await outputBudget?.assertSafeRoot?.();
+    await mkdir(screenshotsDir, { recursive: true });
+    releaseReservation = await outputBudget?.reserveDiagnostic?.(screenshotPath) || releaseReservation;
     await withDeadline(page.screenshot({ path: screenshotPath, fullPage: false }), 8_000);
+    captured = true;
     safeSend({ type: 'screenshot', path: screenshotPath, reason: safeReason });
     return screenshotPath;
   } catch {
     return null;
+  } finally {
+    if (!captured) releaseReservation();
   }
 }
 
@@ -90,8 +108,8 @@ function normalizeResult(result) {
     throw error;
   }
   const normalized = {
-    summary: String(result.summary || 'Task completed').slice(0, 4_000),
-    evidence: Array.isArray(result.evidence) ? result.evidence : []
+    summary: redactSensitiveText(result.summary || 'Task completed').slice(0, 4_000),
+    evidence: Array.isArray(result.evidence) ? redactSensitiveValue(result.evidence) : []
   };
   const encoded = JSON.stringify(normalized);
   if (Buffer.byteLength(encoded) > 256 * 1024) {
@@ -112,6 +130,28 @@ export async function runTaskWorker(config, {
   let heartbeatTimer = null;
   let timeoutTimer = null;
   let lastScreenshot = null;
+  let cancellationListener = null;
+  let browserClosed = false;
+  let outputBudget = null;
+  let effectJournal = null;
+  let stopBudgetChecks = () => {};
+  let rejectBudget;
+  let budgetFailure = null;
+  const budgetPromise = new Promise((_, reject) => {
+    rejectBudget = reject;
+  });
+  // The periodic check can fire before the task promise is installed in its
+  // race. Keep that rejection observed while preserving it for the race below.
+  budgetPromise.catch(() => {});
+  const executionController = new AbortController();
+  const forwardCancellation = () => {
+    if (!executionController.signal.aborted) {
+      executionController.abort(signal?.reason instanceof Error ? signal.reason : new TaskCancelledError());
+    }
+  };
+  if (signal?.aborted) forwardCancellation();
+  else signal?.addEventListener('abort', forwardCancellation, { once: true });
+  const executionSignal = executionController.signal;
 
   await mkdir(config.outputDir, { recursive: true });
   await mkdir(path.dirname(config.checkpointPath), { recursive: true });
@@ -125,7 +165,26 @@ export async function runTaskWorker(config, {
   emitHeartbeat();
 
   try {
-    if (signal?.aborted) throw new TaskCancelledError();
+    if (executionSignal.aborted) throw new TaskCancelledError();
+    outputBudget = await createOutputBudget({
+      root: config.outputDir,
+      limits: config.outputBudget
+    });
+    activeOutputBudget = outputBudget;
+    await outputBudget.assertWithinBudget();
+    stopBudgetChecks = outputBudget.startPeriodic((error) => {
+      if (budgetFailure) return;
+      budgetFailure = error;
+      rejectBudget(error);
+    });
+    effectJournal = await createEffectJournal({
+      filePath: path.join(path.dirname(config.checkpointPath), 'effect-journal.jsonl')
+    });
+    const effects = Object.freeze({
+      pending: () => effectJournal.pending(),
+      resolveUnknown: (sequence, observedOutcome) => effectJournal.resolveUnknown(sequence, observedOutcome)
+    });
+
     safeSend({ type: 'state', state: 'starting_browser' });
     const playwright = await loadPlaywright();
     const browserName = config.profile.browser || 'chromium';
@@ -146,12 +205,8 @@ export async function runTaskWorker(config, {
     const page = pages[0] || await context.newPage();
     activePage = page;
 
-    const onAbort = () => {
-      void context?.close().catch(() => {});
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-
     const progress = async ({ current, total = null, message }) => {
+      await outputBudget.assertWithinBudget();
       const normalizedCurrent = Number(current);
       const normalizedTotal = total === null ? null : Number(total);
       if (!Number.isFinite(normalizedCurrent) || normalizedCurrent < 0) {
@@ -170,6 +225,7 @@ export async function runTaskWorker(config, {
     };
 
     const checkpoint = async (data) => {
+      await outputBudget.assertWithinBudget();
       const record = { savedAt: new Date().toISOString(), data };
       await writeJsonAtomic(config.checkpointPath, record);
       safeSend({ type: 'checkpoint', path: config.checkpointPath, savedAt: record.savedAt });
@@ -177,7 +233,16 @@ export async function runTaskWorker(config, {
     };
     checkpoint.read = async () => {
       try {
-        return JSON.parse(await readFile(config.checkpointPath, 'utf8'));
+        const record = JSON.parse(await readFile(config.checkpointPath, 'utf8'));
+        if (
+          !record || typeof record !== 'object' || Array.isArray(record) ||
+          typeof record.savedAt !== 'string' || !Object.hasOwn(record, 'data')
+        ) {
+          const error = new Error('Task checkpoint is invalid');
+          error.code = 'TASK_CHECKPOINT_INVALID';
+          throw error;
+        }
+        return record.data;
       } catch (error) {
         if (error.code === 'ENOENT') return null;
         throw error;
@@ -187,9 +252,21 @@ export async function runTaskWorker(config, {
     const action = createActionHelper({
       page,
       mode: config.behavior,
+      abortSignal: executionSignal,
+      onEffect: (event) => effectJournal.record(event),
       onFailure: async ({ operation }) => {
-        lastScreenshot = await captureFailure(page, config.outputDir, `action-${operation}`);
+        lastScreenshot = await captureFailure(page, config.outputDir, `action-${operation}`, outputBudget);
       }
+    });
+    const cooldown = createCooldownHelper({
+      signal: executionSignal,
+      onSignal: (kind) => action.signal(kind),
+      onState: async (state) => safeSend({ type: 'state', state }),
+      onProgress: async ({ durationMs, resumeAt, reason }) => progress({
+        current: activeProgress.current,
+        total: activeProgress.total,
+        message: `${reason}; resume at ${resumeAt} (${durationMs}ms)`
+      })
     });
 
     const taskUrl = pathToFileURL(config.modulePath);
@@ -209,43 +286,69 @@ export async function runTaskWorker(config, {
       input: config.input,
       outputDir: config.outputDir,
       action,
+      cooldown,
+      effects,
       progress,
       checkpoint,
-      signal
+      signal: executionSignal
     }));
     taskPromise.catch(() => {});
 
     const timeoutPromise = new Promise((_, reject) => {
-      timeoutTimer = setTimeout(() => reject(new TaskTimeoutError(timeoutMs)), timeoutMs);
+      timeoutTimer = setTimeout(() => {
+        const error = new TaskTimeoutError(timeoutMs);
+        reject(error);
+      }, timeoutMs);
     });
     const cancellationPromise = signal
-      ? new Promise((_, reject) => signal.addEventListener('abort', () => reject(new TaskCancelledError()), { once: true }))
+      ? new Promise((_, reject) => {
+        cancellationListener = () => reject(new TaskCancelledError());
+        if (signal.aborted) cancellationListener();
+        else signal.addEventListener('abort', cancellationListener, { once: true });
+      })
       : new Promise(() => {});
 
-    const result = normalizeResult(await Promise.race([taskPromise, timeoutPromise, cancellationPromise]));
+    const rawResult = await Promise.race([taskPromise, timeoutPromise, cancellationPromise, budgetPromise]);
+    await outputBudget.assertWithinBudget();
+    await effectJournal.assertSettled();
+    const result = normalizeResult(rawResult);
     safeSend({ type: 'state', state: 'verifying' });
     safeSend({ type: 'result', result });
     safeSend({ type: 'state', state: 'completed' });
     return { state: 'completed', result };
   } catch (error) {
+    // Stop cooperative task code and reject every new action before diagnostic
+    // work begins. The browser stays open only long enough for the bounded
+    // screenshot, then finally closes it unconditionally.
+    if (!executionSignal.aborted) executionController.abort(error);
     const cancelled = error instanceof TaskCancelledError || error?.code === 'TASK_CANCELLED';
     if (!cancelled && !lastScreenshot) {
-      lastScreenshot = await captureFailure(activePage, config.outputDir, error?.code || 'task-failure');
+      lastScreenshot = await captureFailure(
+        activePage,
+        config.outputDir,
+        error?.code || 'task-failure',
+        outputBudget
+      );
     }
     const state = cancelled ? 'cancelled' : 'failed';
     safeSend({ type: 'error', state, error: errorPayload(error, lastScreenshot) });
     safeSend({ type: 'state', state });
     return { state, error: errorPayload(error, lastScreenshot) };
   } finally {
+    stopBudgetChecks();
     clearInterval(heartbeatTimer);
     clearTimeout(timeoutTimer);
-    try {
-      await withDeadline(context?.close?.() || Promise.resolve(), 10_000);
-    } catch {
-      // The worker process exit is the final cleanup boundary.
-    }
+    signal?.removeEventListener('abort', forwardCancellation);
+    if (cancellationListener) signal?.removeEventListener('abort', cancellationListener);
+    // Freeze the durable effect boundary before aborting module work. An action
+    // that resumes only because cleanup fired must not overwrite a pending
+    // unknown outcome with a misleading terminal record.
+    await effectJournal?.close?.().catch(() => {});
+    if (!executionSignal.aborted) executionController.abort(new TaskCancelledError());
+    browserClosed = await closeTaskBrowserContext(context);
     activePage = null;
-    safeSend({ type: 'cleanup', browserClosed: true, at: new Date().toISOString() });
+    activeOutputBudget = null;
+    safeSend({ type: 'cleanup', browserClosed, at: new Date().toISOString() });
   }
 }
 
@@ -257,9 +360,11 @@ if (typeof process.send === 'function') {
     if (message?.type === 'start' && !started) {
       started = true;
       void runTaskWorker(message.config, { signal: controller.signal }).finally(() => {
-        setTimeout(() => {
-          if (process.connected) process.disconnect();
-        }, 10);
+        // A trusted task module may leave timers or handles alive after it times
+        // out. The child process is the isolation boundary, so it must exit after
+        // browser cleanup instead of allowing module code to outlive terminal state.
+        if (process.connected) process.disconnect();
+        setTimeout(() => process.exit(0), 100);
       });
       return;
     }

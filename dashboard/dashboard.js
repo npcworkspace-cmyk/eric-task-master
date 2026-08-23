@@ -2,7 +2,7 @@ const MODES = ['fast', 'human', 'adaptive'];
 const ACTIVE_TASK_STATES = new Set(['queued', 'acquiring_profile', 'starting_browser', 'running', 'cooling_down', 'recovering', 'verifying']);
 const ATTENTION_TASK_STATES = new Set(['waiting_user', 'failed']);
 const TERMINAL_TASK_STATES = new Set(['completed', 'failed', 'cancelled']);
-const TOKEN_KEY = 'taskmaster.managerToken';
+const TOKEN_KEY = 'taskmaster.dashboardToken';
 
 const ui = Object.freeze({
   connectionDot: document.querySelector('#connection-dot'),
@@ -27,8 +27,7 @@ const ui = Object.freeze({
   resultSummary: document.querySelector('#result-summary'),
   resultEvidence: document.querySelector('#result-evidence'),
   resultOutputRow: document.querySelector('#result-output-row'),
-  resultOutput: document.querySelector('#result-output'),
-  copyOutput: document.querySelector('#copy-output')
+  resultOutput: document.querySelector('#result-output')
 });
 
 let managerToken = '';
@@ -36,17 +35,15 @@ let profiles = [];
 let tasks = [];
 let refreshTimer = null;
 
-function consumeTokenFromLocation() {
+function consumeCodeFromLocation() {
   const url = new URL(location.href);
   const hash = new URLSearchParams(url.hash.replace(/^#/, ''));
-  const supplied = url.searchParams.get('token') || hash.get('token');
+  const supplied = hash.get('code');
   if (supplied) {
-    sessionStorage.setItem(TOKEN_KEY, supplied);
-    url.searchParams.delete('token');
     url.hash = '';
     history.replaceState(null, '', `${url.pathname}${url.search}`);
   }
-  return supplied || sessionStorage.getItem(TOKEN_KEY) || '';
+  return supplied || '';
 }
 
 function setMessage(message = '', kind = '') {
@@ -78,6 +75,20 @@ async function request(path, { method = 'GET', body } = {}) {
     throw error;
   }
   return payload;
+}
+
+async function exchangeDashboardCode(code) {
+  const response = await fetch('/v1/dashboard/session', {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || typeof payload.dashboardToken !== 'string') {
+    throw new Error(payload?.error?.message || 'Dashboard 授权短码无效或已过期');
+  }
+  managerToken = payload.dashboardToken;
+  sessionStorage.setItem(TOKEN_KEY, managerToken);
 }
 
 function unpackList(payload, key) {
@@ -195,7 +206,7 @@ function renderTasks() {
     const cancel = button('取消', 'danger', () => cancelTask(task));
     cancel.disabled = TERMINAL_TASK_STATES.has(state);
     actions.append(cancel);
-    if (task.result || task.outputDir) {
+    if (task.result || task.outputRef) {
       actions.append(button('查看结果', '', () => showTaskResult(task)));
     }
     const output = resultUrl(task);
@@ -218,27 +229,23 @@ function renderTasks() {
   }
 }
 
-function showTaskResult(task) {
+async function showTaskResult(task) {
   ui.resultTitle.textContent = task.name || task.meta?.name || task.id;
   ui.resultSummary.textContent = task.result?.summary || (task.state === 'completed' ? '任务已完成。' : '任务尚未返回摘要。');
   const evidence = task.result?.evidence ?? task.result ?? [];
   ui.resultEvidence.textContent = JSON.stringify(evidence, null, 2);
-  const hasOutput = typeof task.outputDir === 'string' && task.outputDir;
-  ui.resultOutputRow.classList.toggle('hidden', !hasOutput);
-  ui.resultOutput.textContent = hasOutput ? task.outputDir : '';
-  ui.copyOutput.dataset.path = hasOutput ? task.outputDir : '';
-  ui.resultDialog.showModal();
-}
-
-async function copyOutputDirectory() {
-  const path = ui.copyOutput.dataset.path || '';
-  if (!path) return;
+  let artifacts = [];
   try {
-    await navigator.clipboard.writeText(path);
-    setMessage('输出目录已复制', 'success');
-  } catch {
-    setMessage('浏览器未允许复制，请在结果窗口手动复制路径', 'error');
+    const payload = await request(`/v1/tasks/${encodeURIComponent(task.id)}/artifacts`);
+    artifacts = unpackList(payload, 'artifacts');
+  } catch (error) {
+    setMessage(error.message, 'error');
   }
+  ui.resultOutputRow.classList.toggle('hidden', artifacts.length === 0);
+  ui.resultOutput.textContent = artifacts
+    .map((artifact) => `${artifact.name} · ${artifact.sizeBytes} bytes · ${artifact.mimeType}`)
+    .join('\n');
+  ui.resultDialog.showModal();
 }
 
 function updateSummary() {
@@ -345,20 +352,33 @@ async function cancelTask(task) {
   }
 }
 
-function saveToken(event) {
+async function saveToken(event) {
   event.preventDefault();
-  managerToken = ui.managerToken.value.trim();
+  const code = ui.managerToken.value.trim();
   ui.managerToken.value = '';
-  if (managerToken) sessionStorage.setItem(TOKEN_KEY, managerToken);
-  void refresh();
+  if (!code) return;
+  try {
+    await exchangeDashboardCode(code);
+    await refresh();
+  } catch (error) {
+    setMessage(error.message, 'error');
+  }
 }
 
-managerToken = consumeTokenFromLocation();
+const initialCode = consumeCodeFromLocation();
+managerToken = sessionStorage.getItem(TOKEN_KEY) || '';
 ui.tokenForm.addEventListener('submit', saveToken);
 ui.createProfileForm.addEventListener('submit', createProfile);
 ui.refreshAll.addEventListener('click', refresh);
-ui.copyOutput.addEventListener('click', copyOutputDirectory);
-
-void refresh();
+void (async () => {
+  if (initialCode) {
+    try {
+      await exchangeDashboardCode(initialCode);
+    } catch (error) {
+      setMessage(error.message, 'error');
+    }
+  }
+  await refresh();
+})();
 refreshTimer = setInterval(() => void refresh(), 5000);
 window.addEventListener('pagehide', () => clearInterval(refreshTimer), { once: true });

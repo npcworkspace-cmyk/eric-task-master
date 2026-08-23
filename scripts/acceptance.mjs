@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
-import { access, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startManager } from '../src/manager.mjs';
 import { createTaskService } from '../src/runtime/task-service.mjs';
-import { TERMINAL_TASK_STATES, VERSION } from '../src/contracts.mjs';
+import { API_VERSION, TERMINAL_TASK_STATES, VERSION } from '../src/contracts.mjs';
+import {
+  createIdentityNonce,
+  MANAGER_SERVICE,
+  verifyManagerIdentityProof
+} from '../src/lib/manager-identity.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -75,6 +80,20 @@ async function waitForTask(baseUrl, token, id, timeoutMs = 120_000) {
   throw Object.assign(new Error(`Task ${id} did not finish cleanup`), { code: 'ACCEPTANCE_TASK_TIMEOUT', task });
 }
 
+async function readArtifactText(baseUrl, token, taskId, artifactId) {
+  const payload = await api(
+    baseUrl,
+    `/v1/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}?offset=0&maxBytes=${48 * 1024}`,
+    { token }
+  );
+  if (payload.encoding !== 'utf8' || !payload.eof || typeof payload.chunk !== 'string') {
+    throw Object.assign(new Error('Acceptance report was not returned as one bounded UTF-8 artifact'), {
+      code: 'INVALID_ACCEPTANCE_ARTIFACT'
+    });
+  }
+  return payload.chunk;
+}
+
 function evidenceMap(tasks) {
   const map = new Map();
   for (const task of tasks) {
@@ -86,8 +105,8 @@ function evidenceMap(tasks) {
   return map;
 }
 
-export async function runAcceptance({ baseUrl, token } = {}) {
-  if (!baseUrl || !token) throw new TypeError('runAcceptance requires baseUrl and token');
+export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
+  if (!baseUrl || !token || !stateDir) throw new TypeError('runAcceptance requires baseUrl, token, and stateDir');
   const checks = [];
   const add = (name, passed, detail) => checks.push({ name, passed: Boolean(passed), ...(detail ? { detail } : {}) });
   const fixture = await fixtureServer();
@@ -97,6 +116,22 @@ export async function runAcceptance({ baseUrl, token } = {}) {
     const health = await api(baseUrl, '/v1/health');
     add('manager health', health.ok && health.service === 'eric-task-master');
     add('version contract', health.version === VERSION && health.apiVersion === 1, health.version);
+    const localConfig = JSON.parse(await readFile(resolve(stateDir, 'config.json'), 'utf8'));
+    const nonce = createIdentityNonce();
+    const identityProof = await api(baseUrl, '/v1/identity/challenge', {
+      method: 'POST',
+      body: { nonce }
+    });
+    const managerUrl = new URL(baseUrl);
+    verifyManagerIdentityProof(identityProof, localConfig.managerIdentity, {
+      service: MANAGER_SERVICE,
+      version: VERSION,
+      apiVersion: API_VERSION,
+      host: managerUrl.hostname,
+      port: Number(managerUrl.port || 80),
+      nonce
+    });
+    add('pinned Manager identity challenge', true);
 
     const manifest = JSON.parse(await readFile(resolve(ROOT, 'extension', 'manifest.json'), 'utf8'));
     add('extension manifest', manifest.manifest_version === 3 && manifest.version === VERSION);
@@ -118,13 +153,25 @@ export async function runAcceptance({ baseUrl, token } = {}) {
     add('isolated profile creation', profile?.id && profile.state === 'idle' && profile.headless === true);
 
     const extensionOrigin = `chrome-extension://${'a'.repeat(32)}`;
+    const approval = await api(baseUrl, '/v1/pair/authorize', {
+      method: 'POST',
+      token,
+      body: {}
+    });
     const challenge = await api(baseUrl, '/v1/pair/challenge', {
-      headers: { Origin: extensionOrigin }
+      headers: {
+        Origin: extensionOrigin,
+        'X-Taskmaster-Pairing-Code': approval.pairingCode
+      }
     });
     const paired = await api(baseUrl, '/v1/pair/extension', {
       method: 'POST',
       headers: { Origin: extensionOrigin },
-      body: { challenge: challenge.challenge, name: 'Acceptance extension' }
+      body: {
+        challenge: challenge.challenge,
+        pairingCode: approval.pairingCode,
+        name: 'Acceptance extension'
+      }
     });
     add('extension challenge pairing', typeof paired.token === 'string' && paired.token.length >= 32);
 
@@ -165,22 +212,23 @@ export async function runAcceptance({ baseUrl, token } = {}) {
     add(
       'session bridge privacy and import',
       imported.status === 'partial' &&
-      imported.verification === 'storage_imported_not_login_verified' &&
+      imported.verification === 'storage_replaced_not_login_verified' &&
       imported.cookieCount === 2 &&
       imported.localStorageCount === 1 &&
       imported.sessionCookieRetentionHours === 12 &&
       !JSON.stringify(imported).includes(secretMarker)
     );
 
-    const modulePath = resolve(ROOT, 'examples', 'tasks', 'acceptance-task.mjs');
     const uploadPath = resolve(ROOT, 'test', 'fixtures', 'upload.txt');
+    const acceptanceRunId = Date.now().toString(36);
     for (const behavior of ['fast', 'human', 'adaptive']) {
       const created = await api(baseUrl, '/v1/tasks', {
         method: 'POST',
         token,
         body: {
           profileId: profile.id,
-          modulePath,
+          taskType: 'acceptance',
+          idempotencyKey: `acceptance-${acceptanceRunId}-${behavior}`,
           behavior,
           timeoutMs: 90_000,
           input: { url: fixture.url, uploadPath, expectedSession: true }
@@ -214,18 +262,31 @@ export async function runAcceptance({ baseUrl, token } = {}) {
     );
     add(
       'checkpoint and compact evidence',
-      tasks.every((task) => task.checkpoint?.path && task.result?.evidence?.length >= 10)
+      tasks.every((task) => task.checkpoint?.ref && task.result?.evidence?.length >= 10)
     );
 
     for (const task of tasks) {
-      const report = task.result?.evidence?.find((item) => item.kind === 'report')?.value;
-      if (report) await access(report);
-      const screenshot = join(task.outputDir, 'acceptance.png');
-      const download = join(task.outputDir, 'taskmaster-fixture.txt');
-      if ((await stat(screenshot)).size === 0 || (await stat(download)).size === 0) {
-        throw new Error(`Empty artifact for ${task.id}`);
+      const { artifacts } = await api(baseUrl, `/v1/tasks/${encodeURIComponent(task.id)}/artifacts`, { token });
+      const expected = new Set(['acceptance.json', 'acceptance.png', 'taskmaster-fixture.txt']);
+      const byName = new Map(artifacts.map((artifact) => [artifact.name, artifact]));
+      if ([...expected].some((name) => !byName.has(name) || byName.get(name).sizeBytes <= 0)) {
+        throw Object.assign(new Error(`Acceptance artifacts are incomplete for ${task.id}`), {
+          code: 'ACCEPTANCE_ARTIFACT_MISSING'
+        });
+      }
+      const report = JSON.parse(await readArtifactText(
+        baseUrl,
+        token,
+        task.id,
+        byName.get('acceptance.json').id
+      ));
+      if (!report.passed || report.behavior !== task.behavior) {
+        throw Object.assign(new Error(`Acceptance report does not match task ${task.id}`), {
+          code: 'ACCEPTANCE_ARTIFACT_MISMATCH'
+        });
       }
     }
+    add('bounded artifact API', true);
 
     await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE', token });
     const remaining = await api(baseUrl, '/v1/profiles', { token });
@@ -269,11 +330,16 @@ async function directRun() {
       port: 0,
       dataDir: stateDir,
       dashboardDir: resolve(ROOT, 'dashboard'),
-      taskServiceFactory({ profileStore, stateDir: tasksDir }) {
-        return createTaskService({ profileStore, stateDir: tasksDir });
+      taskServiceFactory(taskOptions) {
+        return createTaskService(taskOptions);
       }
     });
-    const result = await runAcceptance({ baseUrl: manager.baseUrl, token: manager.token });
+    const result = await runAcceptance({ baseUrl: manager.baseUrl, token: manager.token, stateDir });
+    if (process.env.TASKMASTER_ACCEPTANCE_REPORT) {
+      const reportPath = resolve(process.env.TASKMASTER_ACCEPTANCE_REPORT);
+      await mkdir(dirname(reportPath), { recursive: true });
+      await writeFile(reportPath, `${JSON.stringify(result, null, 2)}\n`);
+    }
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (!result.ok) process.exitCode = 1;
   } finally {
