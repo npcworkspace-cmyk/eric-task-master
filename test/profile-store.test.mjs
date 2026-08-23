@@ -1,0 +1,129 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { ProfileStore } from '../src/lib/profile-store.mjs';
+
+async function fixture(t, options = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'eric-task-master-profiles-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = {
+    filePath: join(root, 'profiles.json'),
+    profilesRoot: join(root, 'profiles'),
+    ...options
+  };
+  const store = new ProfileStore(config);
+  await store.init();
+  return { root, config, store };
+}
+
+test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) => {
+  const { config, store } = await fixture(t);
+  const created = await store.create({
+    name: '  Research  ',
+    defaultBehavior: 'fast',
+    headless: true,
+    browserChannel: 'chrome'
+  });
+
+  assert.equal(created.name, 'Research');
+  assert.equal(created.state, 'idle');
+  assert.equal(created.headless, true);
+  assert.equal(created.browserChannel, 'chrome');
+  assert.match(created.id, /^profile_[a-f0-9]{32}$/);
+  assert.equal(created.userDataDir, join(config.profilesRoot, created.id));
+
+  const updated = await store.update(created.id, {
+    name: 'Research primary',
+    defaultBehavior: 'adaptive',
+    headless: false,
+    browserChannel: null
+  });
+  assert.equal(updated.name, 'Research primary');
+  assert.equal(updated.defaultBehavior, 'adaptive');
+
+  await assert.rejects(
+    store.create({ name: 'research PRIMARY' }),
+    { code: 'PROFILE_NAME_EXISTS', statusCode: 409 }
+  );
+  await assert.rejects(
+    store.update(created.id, { userDataDir: 'elsewhere' }),
+    { code: 'INVALID_PROFILE_PATCH' }
+  );
+
+  const reopened = new ProfileStore(config);
+  await reopened.init();
+  assert.deepEqual(await reopened.get(created.id), updated);
+
+  const removed = await reopened.remove(created.id);
+  assert.equal(removed.id, created.id);
+  await assert.rejects(reopened.get(created.id), { code: 'PROFILE_NOT_FOUND' });
+});
+
+test('ProfileStore enforces exclusive leases and recovers only expired dead owners', async (t) => {
+  let currentTime = Date.parse('2026-08-23T00:00:00.000Z');
+  const livingPids = new Set([101]);
+  const { store } = await fixture(t, {
+    now: () => currentTime,
+    processAlive: async (pid) => livingPids.has(pid)
+  });
+  const profile = await store.create({ name: 'Lease test' });
+
+  let leased = await store.acquireLease(profile.id, 'task:one', { pid: 101, ttlMs: 1_000 });
+  assert.equal(leased.state, 'leased');
+  assert.equal(leased.lease.ownerId, 'task:one');
+  await assert.rejects(
+    store.acquireLease(profile.id, 'task:two', { pid: 202, ttlMs: 1_000 }),
+    { code: 'PROFILE_LEASED', statusCode: 409 }
+  );
+
+  currentTime += 2_000;
+  await assert.rejects(
+    store.acquireLease(profile.id, 'task:two', { pid: 202, ttlMs: 1_000 }),
+    { code: 'PROFILE_LEASED', statusCode: 409 }
+  );
+
+  livingPids.delete(101);
+  leased = await store.acquireLease(profile.id, 'task:two', { pid: 202, ttlMs: 1_000 });
+  assert.equal(leased.lease.ownerId, 'task:two');
+  await assert.rejects(
+    store.releaseLease(profile.id, 'task:one'),
+    { code: 'LEASE_OWNER_MISMATCH', statusCode: 409 }
+  );
+  assert.equal(await store.releaseLease(profile.id, 'task:two'), true);
+  assert.equal((await store.get(profile.id)).state, 'idle');
+
+  const opened = await store.acquireLease(
+    profile.id,
+    `profile-open:${profile.id}`,
+    { pid: 303, ttlMs: 1_000 }
+  );
+  assert.equal(opened.state, 'open');
+  await assert.rejects(store.remove(profile.id), { code: 'PROFILE_IN_USE', statusCode: 409 });
+  await store.releaseLease(profile.id, `profile-open:${profile.id}`);
+  assert.equal((await store.get(profile.id)).state, 'idle');
+});
+
+test('ProfileStore startup clears an expired lease after proving its process absent', async (t) => {
+  let currentTime = Date.parse('2026-08-23T00:00:00.000Z');
+  const root = await mkdtemp(join(tmpdir(), 'eric-task-master-recovery-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = {
+    filePath: join(root, 'profiles.json'),
+    profilesRoot: join(root, 'profiles'),
+    now: () => currentTime,
+    processAlive: async () => false
+  };
+  const first = new ProfileStore(config);
+  await first.init();
+  const profile = await first.create({ name: 'Recovery' });
+  await first.acquireLease(profile.id, 'task:abandoned', { pid: 404, ttlMs: 1_000 });
+
+  currentTime += 2_000;
+  const reopened = new ProfileStore(config);
+  await reopened.init();
+  const recovered = await reopened.get(profile.id);
+  assert.equal(recovered.state, 'idle');
+  assert.equal(recovered.lease, null);
+});

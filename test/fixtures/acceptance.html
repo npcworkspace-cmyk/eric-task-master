@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Task Master acceptance fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Task Master acceptance fixture</h1>
+      <label>Name <input id="name" autocomplete="off"></label>
+      <label><input id="agree" type="checkbox"> Agree</label>
+      <label>Choice
+        <select id="choice">
+          <option value="alpha">Alpha</option>
+          <option value="beta">Beta</option>
+        </select>
+      </label>
+      <label>Upload <input id="upload" type="file"></label>
+      <button id="submit" type="button">Submit</button>
+      <p id="result" aria-live="polite">Waiting</p>
+      <a id="download" download="taskmaster-fixture.txt" href="data:text/plain,taskmaster-download-ok">Download fixture</a>
+    </main>
+    <script>
+      document.querySelector('#submit').addEventListener('click', () => {
+        const name = document.querySelector('#name').value;
+        const agreed = document.querySelector('#agree').checked;
+        const choice = document.querySelector('#choice').value;
+        const upload = document.querySelector('#upload').files[0]?.name ?? 'none';
+        document.querySelector('#result').textContent = `${name}|${agreed}|${choice}|${upload}`;
+        document.cookie = 'taskmaster_fixture=accepted; SameSite=Lax';
+        localStorage.setItem('taskmaster_fixture', 'accepted');
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+import { readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const packagePath = resolve(root, 'package.json');
+const packageJson = JSON.parse(await readFile(packagePath, 'utf8'));
+const current = packageJson.version;
+const requested = process.argv[2];
+
+if (!requested) {
+  throw new Error('Usage: npm run version:bump -- <patch|minor|major|x.y.z>');
+}
+
+function nextVersion(value, instruction) {
+  if (/^\d+\.\d+\.\d+$/.test(instruction)) return instruction;
+  const parts = value.split('.').map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) throw new Error(`Invalid current version: ${value}`);
+  if (instruction === 'patch') return `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
+  if (instruction === 'minor') return `${parts[0]}.${parts[1] + 1}.0`;
+  if (instruction === 'major') return `${parts[0] + 1}.0.0`;
+  throw new Error(`Invalid bump: ${instruction}`);
+}
+
+const next = nextVersion(current, requested);
+packageJson.version = next;
+await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+const replacements = [
+  ['src/contracts.mjs', `export const VERSION = '${current}';`, `export const VERSION = '${next}';`],
+  ['README.md', `Version: **${current}**`, `Version: **${next}**`],
+  ['extension/manifest.json', `"version": "${current}"`, `"version": "${next}"`]
+];
+
+for (const [relative, from, to] of replacements) {
+  const file = resolve(root, relative);
+  try {
+    const source = await readFile(file, 'utf8');
+    if (!source.includes(from)) throw new Error(`${relative} does not contain ${from}`);
+    await writeFile(file, source.replace(from, to));
+  } catch (error) {
+    if (error.code === 'ENOENT' && relative === 'extension/manifest.json') continue;
+    throw error;
+  }
+}
+
+process.stdout.write(JSON.stringify({ previous: current, version: next }) + '\n');

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Eric Task Master Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/dashboard.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/dashboard" aria-label="Task Master 首页">
+        <span class="brand-mark">◉</span>
+        <span><strong>Eric Task Master</strong><small>Playwright Operations</small></span>
+      </a>
+      <div class="connection">
+        <span id="connection-dot" class="dot disconnected"></span>
+        <span id="connection-label">未连接</span>
+        <button id="refresh-all" class="button ghost" type="button">刷新</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="token-panel" class="token-panel hidden">
+        <div>
+          <h1>连接本机 Manager</h1>
+          <p>从扩展打开 Dashboard 会自动完成授权；也可以在这里输入本机会话令牌。</p>
+        </div>
+        <form id="token-form">
+          <input id="manager-token" type="password" autocomplete="off" placeholder="Manager token" required>
+          <button class="button primary" type="submit">连接</button>
+        </form>
+      </section>
+
+      <section class="hero">
+        <div>
+          <p class="eyebrow">LOCAL CONTROL PLANE</p>
+          <h1>浏览器任务，一眼掌握。</h1>
+          <p>管理独立 Profile、查看实时进度，并在需要时取消或接管任务。</p>
+        </div>
+        <div class="summary-grid" aria-label="任务摘要">
+          <div><strong id="profile-count">0</strong><span>Profiles</span></div>
+          <div><strong id="running-count">0</strong><span>运行中</span></div>
+          <div><strong id="attention-count">0</strong><span>需关注</span></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">PROFILES</p><h2>Playwright Profiles</h2></div>
+          <form id="create-profile-form" class="inline-form">
+            <input id="profile-name" maxlength="60" placeholder="Profile 名称" required>
+            <select id="profile-mode" aria-label="默认行为模式">
+              <option value="fast">快速</option>
+              <option value="human">拟人</option>
+              <option value="adaptive">自适应</option>
+            </select>
+            <label class="checkbox-label" title="不显示 Playwright 浏览器窗口">
+              <input id="profile-headless" type="checkbox">
+              后台运行
+            </label>
+            <button class="button primary" type="submit">创建 Profile</button>
+          </form>
+        </div>
+        <div id="profiles" class="profile-grid"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">TASKS</p><h2>任务与进度</h2></div>
+          <span id="last-refresh" class="muted">尚未刷新</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>任务</th><th>Profile</th><th>状态</th><th>进度</th><th>最近心跳</th><th>操作</th></tr></thead>
+            <tbody id="tasks"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <p id="dashboard-message" class="message" role="status" aria-live="polite"></p>
+    </main>
+
+    <dialog id="task-result-dialog">
+      <form method="dialog" class="dialog-heading">
+        <div><p class="eyebrow">TASK RESULT</p><h2 id="result-title">任务结果</h2></div>
+        <button class="button ghost" type="submit">关闭</button>
+      </form>
+      <p id="result-summary" class="result-summary"></p>
+      <pre id="result-evidence"></pre>
+      <div id="result-output-row" class="result-output hidden">
+        <code id="result-output"></code>
+        <button id="copy-output" class="button small" type="button">复制输出目录</button>
+      </div>
+    </dialog>
+    <script type="module" src="/dashboard/dashboard.js"></script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+node_modules/
+.taskmaster/
+artifacts/
+test-results/
+playwright-report/
+*.log
+.DS_Store
+Thumbs.db
