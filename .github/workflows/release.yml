@@ -1,0 +1,80 @@
+name: release-after-cross-platform-gate
+
+on:
+  workflow_run:
+    workflows: [cross-platform-release-gate]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Build reproducible release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          TAG="v${VERSION}"
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          mkdir -p dist
+          git archive --format=zip --prefix="eric-task-master-v${VERSION}/" \
+            --output="dist/eric-task-master-v${VERSION}.zip" HEAD
+          git archive --format=zip --prefix="eric-task-master-extension-v${VERSION}/" \
+            --output="dist/eric-task-master-extension-v${VERSION}.zip" HEAD:extension
+          git archive --format=zip --prefix="eric-task-master-skill-v${VERSION}/" \
+            --output="dist/eric-task-master-skill-v${VERSION}.zip" HEAD:skills/eric-task-master
+          (cd dist && sha256sum ./*.zip > SHA256SUMS)
+          printf '%s\n' "TAG=${TAG}" >> "${GITHUB_ENV}"
+      - name: Publish or verify the immutable GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_EXISTS=false
+          TAG_EXISTS=false
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+          fi
+          if TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha 2>/dev/null)"; then
+            TAG_EXISTS=true
+            if [ "${TAG_SHA}" != "${RELEASE_SHA}" ]; then
+              echo "Tag ${TAG} already points to ${TAG_SHA}, not ${RELEASE_SHA}." >&2
+              exit 1
+            fi
+          fi
+          if [ "${RELEASE_EXISTS}" = true ] && [ "${TAG_EXISTS}" != true ]; then
+            echo "Release ${TAG} exists without a resolvable tag." >&2
+            exit 1
+          fi
+          if [ "${RELEASE_EXISTS}" = true ]; then
+            gh release upload "${TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          elif [ "${TAG_EXISTS}" = true ]; then
+            gh release create "${TAG}" dist/* --verify-tag --generate-notes \
+              --title "Eric Task Master ${TAG}" --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${TAG}" dist/* --target "${RELEASE_SHA}" --generate-notes \
+              --title "Eric Task Master ${TAG}" --repo "${GITHUB_REPOSITORY}"
+          fi

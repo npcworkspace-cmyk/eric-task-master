@@ -1,6 +1,7 @@
 node_modules/
 .taskmaster/
 artifacts/
+dist/
 test-results/
 playwright-report/
 *.log

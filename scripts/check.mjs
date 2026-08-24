@@ -34,12 +34,13 @@ async function staticChecks() {
   invariant(!(manifest.permissions || []).includes('debugger'), 'extension must not request debugger');
   invariant(manifest.action?.default_icon?.['128'] === 'icons/icon-128.png', 'extension icon contract drift');
   await access(resolve(ROOT, 'scripts', 'taskmaster.mjs'));
-  const [launcher, bootstrapPolicy, taskWorker, taskService, workflow] = await Promise.all([
+  const [launcher, bootstrapPolicy, taskWorker, taskService, workflow, releaseWorkflow] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-service.mjs'), 'utf8'),
-    readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8')
+    readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
+    readFile(resolve(ROOT, '.github', 'workflows', 'release.yml'), 'utf8')
   ]);
   invariant(launcher.includes("['ci', '--ignore-scripts', '--no-audit', '--no-fund']"), 'fixed launcher lacks dependency bootstrap');
   invariant(
@@ -59,6 +60,41 @@ async function staticChecks() {
     workflow.includes('windows-latest') && workflow.includes('macos-latest') &&
       workflow.includes('ubuntu-24.04') && workflow.includes('node: [20, 22]'),
     'cross-platform release matrix drift'
+  );
+  invariant(
+    workflow.includes('actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1') &&
+      workflow.includes('actions/setup-node@820762786026740c76f36085b0efc47a31fe5020') &&
+      workflow.includes('actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0') &&
+      releaseWorkflow.includes('actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1') &&
+      releaseWorkflow.includes('actions/setup-node@820762786026740c76f36085b0efc47a31fe5020'),
+    'workflows must use the audited pinned Node 24 Actions runtime'
+  );
+  invariant(
+    releaseWorkflow.includes('workflow_run:') &&
+      releaseWorkflow.includes('workflows: [cross-platform-release-gate]') &&
+      releaseWorkflow.includes("github.event.workflow_run.conclusion == 'success'") &&
+      releaseWorkflow.includes("github.event.workflow_run.event == 'push'") &&
+      releaseWorkflow.includes("github.event.workflow_run.head_branch == 'main'") &&
+      releaseWorkflow.includes('github.event.workflow_run.head_repository.full_name == github.repository'),
+    'release workflow can bypass the trusted cross-platform gate'
+  );
+  invariant(
+    releaseWorkflow.includes('ref: ${{ github.event.workflow_run.head_sha }}') &&
+      releaseWorkflow.includes('RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}'),
+    'release workflow must package the exact verified commit'
+  );
+  invariant(
+    releaseWorkflow.includes('git archive --format=zip') &&
+      releaseWorkflow.includes('HEAD:extension') &&
+      releaseWorkflow.includes('HEAD:skills/eric-task-master') &&
+      releaseWorkflow.includes('SHA256SUMS'),
+    'release archive or checksum boundary drift'
+  );
+  invariant(
+    releaseWorkflow.includes('contents: write') &&
+      releaseWorkflow.includes('gh release create') &&
+      releaseWorkflow.includes('TAG_SHA') && releaseWorkflow.includes('RELEASE_SHA'),
+    'release publication must be scoped and immutable'
   );
   await Promise.all([
     access(resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')),
@@ -95,7 +131,7 @@ async function staticChecks() {
   );
   const popup = await readFile(resolve(ROOT, 'extension', 'popup.js'), 'utf8');
   invariant(popup.includes('http://127.0.0.1:19946'), 'extension and manager port contract drift');
-  return { passed: 21, total: 21 };
+  return { passed: 26, total: 26 };
 }
 
 function run(command, args, env = {}) {

@@ -2,7 +2,7 @@
 
 Eric Task Master is a Playwright browser task runtime for AI Agents. It turns browser work into durable, isolated jobs instead of asking an Agent to repeatedly inspect pages and improvise a new controller.
 
-Version: **1.0.1**
+Version: **1.0.2**
 
 ## What it does
 
@@ -74,7 +74,7 @@ A specialized Skill should teach discovery, platform logic, checkpoints, outputs
 npm run check
 ```
 
-The delivery gate runs static boundaries, unit/integration/security tests, real Chromium feature acceptance, and a concurrent/fault/restart commercial acceptance workload. Cross-platform CI is defined for Windows, macOS, and Linux; a platform is considered verified only when its own CI run passes.
+The delivery gate runs static boundaries, unit/integration/security tests, real Chromium feature acceptance, and a concurrent/fault/restart commercial acceptance workload. Cross-platform CI is defined for Windows, macOS, and Linux; a platform is considered verified only when its own CI run passes. A successful six-job `main` gate automatically publishes checksum-protected source, extension, and Skill archives.
 
 Start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Runtime details are in [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md).
 

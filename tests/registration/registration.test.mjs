@@ -54,6 +54,7 @@ async function fixture(platform = 'win32') {
     workbuddy: workBuddyConfig,
     hermes: join(hermesHome, 'config.yaml')
   };
+  env.TASKMASTER_CLAUDE_DESKTOP_CONFIG = paths['claude-desktop'];
 
   await write(paths.codex, [
     'model = "gpt-test"',

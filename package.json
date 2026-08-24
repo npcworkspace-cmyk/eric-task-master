@@ -1,6 +1,6 @@
 {
   "name": "eric-task-master",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Playwright-first browser task runtime with a real-browser control panel.",
   "type": "module",
   "private": true,

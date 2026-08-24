@@ -9,6 +9,7 @@ import { startManager } from '../src/manager.mjs';
 import { createTaskService } from '../src/runtime/task-service.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
+const SESSION_FIXTURE_HOST = '127.0.0.1';
 
 async function api(manager, pathname, { method = 'GET', body } = {}) {
   const response = await fetch(new URL(pathname, manager.baseUrl), {
@@ -45,12 +46,12 @@ async function startSessionFixture() {
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.2', resolve);
+    server.listen(0, SESSION_FIXTURE_HOST, resolve);
   });
   const address = server.address();
   return {
     server,
-    origin: `http://127.0.0.2:${address.port}`,
+    origin: `http://${SESSION_FIXTURE_HOST}:${address.port}`,
     async close() {
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
@@ -88,7 +89,7 @@ test('the real MV3 panel pairs, manages a Playwright Profile, and opens a scoped
     }
   });
 
-  const permissionPattern = 'http://127.0.0.2/*';
+  const permissionPattern = `http://${SESSION_FIXTURE_HOST}/*`;
   const extensionPath = path.join(root, 'extension-under-test');
   const extensionProfilePath = path.join(root, 'extension-profile');
   await cp(path.join(ROOT, 'extension'), extensionPath, { recursive: true });
@@ -265,7 +266,7 @@ test('the real MV3 panel pairs, manages a Playwright Profile, and opens a scoped
   const destinationVerifyPage = destinationVerify.pages()[0] || await destinationVerify.newPage();
   await destinationVerifyPage.goto(`${fixture.origin}/verify`);
   const destinationCookies = (await destinationVerify.cookies()).filter((cookie) => (
-    cookie.domain === '127.0.0.2'
+    cookie.domain === SESSION_FIXTURE_HOST
   ));
   const destinationStorage = await destinationVerifyPage.evaluate(() => Object.fromEntries(
     Array.from({ length: localStorage.length }, (_, index) => {
@@ -295,7 +296,9 @@ test('the real MV3 panel pairs, manages a Playwright Profile, and opens a scoped
     const list = await api(manager, '/v1/profiles');
     return list.profiles.find((item) => item.id === profile.id)?.state === 'open';
   }, 30_000);
-  await row.getByRole('button', { name: '关闭', exact: true }).click();
+  const closeButton = row.getByRole('button', { name: '关闭', exact: true });
+  await closeButton.waitFor({ state: 'visible' });
+  await closeButton.click();
   await poll(async () => {
     const list = await api(manager, '/v1/profiles');
     return list.profiles.find((item) => item.id === profile.id)?.state === 'idle';

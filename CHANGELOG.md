@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2 - 2026-08-24
+
+- Made the full Windows, macOS, and Linux gate deterministic across Node.js 20 and 22 by removing cleanup-state timing assumptions and using portable extension and registration fixtures.
+- Upgraded CI to the current official Node 24-based GitHub Actions releases.
+- Added gated CD: only a successful same-repository `main` push can publish exact-commit source, extension, and Skill archives with SHA-256 checksums as an immutable GitHub Release.
+
 ## 1.0.1 - 2026-08-24
 
 - Hardened Manager shutdown, cleanup receipts, terminal-state handling, diagnostic screenshot delivery, session-import deadlines, public output budgets, and principal isolation after adversarial review.

@@ -1,4 +1,4 @@
-# 1.0.1 release gate
+# 1.0.2 release gate
 
 Task Master uses evidence gates rather than a blanket “commercial-grade” claim. A release is deliverable only when every local mandatory gate passes from a clean checkout and platform CI passes on each platform advertised as verified.
 
@@ -33,6 +33,8 @@ npm run acceptance:commercial
 ## Cross-platform boundary
 
 The GitHub Actions matrix runs the same gate on Windows, macOS, and Linux. Local Windows success does not prove macOS. A platform becomes release-verified only after its own matrix job passes on the release commit. Until then it is “implementation audited / CI pending,” not “tested.”
+
+After all six operating-system and Node.js matrix jobs pass for a same-repository `main` push, the separate CD workflow checks out that exact verified commit and publishes three zip archives: the complete source, the unpacked extension, and the base Skill. `SHA256SUMS` is attached to the same GitHub Release. Pull requests, forks, manual CI runs, failed gates, and non-`main` branches cannot publish a release.
 
 ## Faults covered
 
