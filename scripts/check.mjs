@@ -64,7 +64,7 @@ async function staticChecks() {
   invariant(
     workflow.includes('actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1') &&
       workflow.includes('actions/setup-node@820762786026740c76f36085b0efc47a31fe5020') &&
-      workflow.includes('actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0') &&
+      workflow.includes('actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a') &&
       releaseWorkflow.includes('actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1') &&
       releaseWorkflow.includes('actions/setup-node@820762786026740c76f36085b0efc47a31fe5020'),
     'workflows must use the audited pinned Node 24 Actions runtime'
