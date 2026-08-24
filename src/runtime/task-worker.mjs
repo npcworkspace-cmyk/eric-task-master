@@ -229,15 +229,37 @@ async function captureFailure(
       await outputBudget?.assertSafeRoot?.();
       await mkdir(observationsDir, { recursive: true });
       releaseObservation = await outputBudget?.reserveDiagnostic?.(observationPath) || releaseObservation;
-      const snapshot = await withDeadline(semantic.snapshot({
-        scope: 'viewport',
-        maxNodes: 120,
-        maxTextChars: 8_000
-      }), 8_000);
+      let snapshot;
+      let unavailable = false;
+      try {
+        snapshot = await withDeadline(semantic.snapshot({
+          scope: 'viewport',
+          maxNodes: 120,
+          maxTextChars: 8_000
+        }), 8_000);
+      } catch {
+        // A transient or unsupported semantic tree must not make the entire
+        // diagnostic disappear. Keep an explicit, credential-free record so
+        // the Agent can use the screenshot and knows observation was unavailable.
+        unavailable = true;
+        snapshot = {
+          id: null,
+          url: null,
+          title: '',
+          content: '',
+          refs: [],
+          truncated: true,
+          frameErrors: 1
+        };
+      }
       await writeJsonAtomic(observationPath, {
         reason: safeReason,
         capturedAt: new Date().toISOString(),
-        snapshot
+        snapshot,
+        ...(unavailable ? {
+          unavailable: true,
+          error: { code: 'SEMANTIC_DIAGNOSTIC_UNAVAILABLE' }
+        } : {})
       });
       observationCaptured = true;
       await recordDiagnostic('observation', observationPath, outputDir, safeReason);

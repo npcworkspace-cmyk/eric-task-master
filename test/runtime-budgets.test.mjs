@@ -491,6 +491,31 @@ test('task modules cannot fall through or omit the explicit completion contract'
   }
 });
 
+test('semantic diagnostic failure leaves an explicit safe fallback beside the screenshot', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-semantic-diagnostic-fallback-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const browser = fakeBrowser();
+  const config = workerConfig(root, modulePath);
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+
+  assert.equal(outcome.state, 'failed');
+  const manifest = JSON.parse(await readFile(path.join(root, 'diagnostics.json'), 'utf8'));
+  assert.equal(typeof manifest.screenshot?.relativePath, 'string');
+  assert.equal(typeof manifest.observation?.relativePath, 'string');
+  const observation = JSON.parse(await readFile(
+    path.join(config.outputDir, manifest.observation.relativePath),
+    'utf8'
+  ));
+  assert.equal(observation.unavailable, true);
+  assert.deepEqual(observation.error, { code: 'SEMANTIC_DIAGNOSTIC_UNAVAILABLE' });
+  assert.deepEqual(observation.snapshot.refs, []);
+  assert.equal(JSON.stringify(observation).includes('page.frames'), false);
+  assert.equal(browser.wasClosed(), true);
+});
+
 test('task progress cannot move backwards within one attempt', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-progress-backwards-');
   const modulePath = path.join(root, 'task.mjs');

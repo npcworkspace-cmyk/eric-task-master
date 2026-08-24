@@ -80,12 +80,19 @@ async function waitForTask(baseUrl, token, id, timeoutMs = 120_000) {
   throw Object.assign(new Error(`Task ${id} did not finish cleanup`), { code: 'ACCEPTANCE_TASK_TIMEOUT', task });
 }
 
-async function waitForTaskState(baseUrl, token, id, expectedState, timeoutMs = 30_000) {
+async function waitForTaskState(
+  baseUrl,
+  token,
+  id,
+  expectedState,
+  timeoutMs = 30_000,
+  ready = () => true
+) {
   const deadline = Date.now() + timeoutMs;
   let task;
   while (Date.now() < deadline) {
     ({ task } = await api(baseUrl, `/v1/tasks/${encodeURIComponent(id)}`, { token }));
-    if (task.state === expectedState) return task;
+    if (task.state === expectedState && ready(task)) return task;
     if (TERMINAL_TASK_STATES.has(task.state)) break;
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
   }
@@ -402,7 +409,14 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
         input: { url: fixture.url }
       }
     });
-    const waiting = await waitForTaskState(baseUrl, token, handoffCreated.task.id, 'waiting_user');
+    const waiting = await waitForTaskState(
+      baseUrl,
+      token,
+      handoffCreated.task.id,
+      'waiting_user',
+      30_000,
+      (task) => Boolean(task.lastScreenshot?.ref && task.lastObservation?.ref)
+    );
     const waitingArtifacts = await api(
       baseUrl,
       `/v1/tasks/${encodeURIComponent(waiting.id)}/artifacts`,

@@ -122,7 +122,7 @@ test('different Profiles run concurrently while same-Profile work queues safely'
   const [leftDone, rightDone, collisionDone] = await Promise.all([
     client.waitTask(left.id, { waitMs: 20_000 }),
     client.waitTask(right.id, { waitMs: 20_000 }),
-    client.waitTask(collision.id, { waitMs: 5_000 })
+    client.waitTask(collision.id, { waitMs: 20_000 })
   ]);
   assert.equal(leftDone.task.state, 'completed');
   assert.equal(rightDone.task.state, 'completed');

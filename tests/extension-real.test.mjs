@@ -296,6 +296,7 @@ test('the real MV3 panel pairs, manages a Playwright Profile, and opens a scoped
     const list = await api(manager, '/v1/profiles');
     return list.profiles.find((item) => item.id === profile.id)?.state === 'open';
   }, 30_000);
+  await popup.locator('#refresh-profiles').click();
   const closeButton = row.getByRole('button', { name: '关闭', exact: true });
   await closeButton.waitFor({ state: 'visible' });
   await closeButton.click();
