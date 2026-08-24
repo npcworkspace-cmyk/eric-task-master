@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { runSessionImport } from '../src/runtime/import-session-worker.mjs';
+import {
+  closeSessionBrowserSession,
+  runSessionImport
+} from '../src/runtime/import-session-worker.mjs';
 
 const ORIGIN = 'https://www.example.test';
 
@@ -260,4 +266,66 @@ test('a rollback write failure is explicit and never reported as import success'
   assert.equal(error.message, 'Session import failed and the previous origin state could not be restored');
   assert.doesNotMatch(error.message, /rollback-secret|cookie-secret|storage-secret/);
   assert.equal(harness.state().closed, true);
+});
+
+test('session browser cleanup falls back to browser.close after a context timeout', async () => {
+  let browserClosed = false;
+  const browser = { async close() { browserClosed = true; } };
+  const context = {
+    browser() { return browser; },
+    async close() { await new Promise(() => {}); }
+  };
+  assert.equal(await closeSessionBrowserSession(context, 10), true);
+  assert.equal(browserClosed, true);
+
+  const unclosed = {
+    browser() { return { async close() { throw new Error('still open'); } }; },
+    async close() { throw new Error('still open'); }
+  };
+  assert.equal(await closeSessionBrowserSession(unclosed, 10), false);
+});
+
+test('session cleanup receipts require a committed state or verified rollback', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'taskmaster-session-receipt-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cleanupReceipt = {
+    kind: 'session',
+    profileId: 'profile_test',
+    ownerId: 'session-import:worker-test'
+  };
+
+  const committedPath = path.join(root, 'committed.json');
+  const committedHarness = createHarness();
+  const committed = await runSessionImport({
+    ...config(),
+    cleanupReceiptPath: committedPath,
+    cleanupReceipt
+  }, { loadPlaywright: loader(committedHarness.context) });
+  assert.equal(committed.browserClosed, true);
+  assert.equal(committed.cleanupReceiptWritten, true);
+  assert.equal(JSON.parse(await readFile(committedPath, 'utf8')).outcome, 'committed');
+
+  const rolledBackPath = path.join(root, 'rolled-back.json');
+  const rolledBackHarness = createHarness({ failImportedWrite: true });
+  const rolledBack = await runSessionImport({
+    ...config(),
+    cleanupReceiptPath: rolledBackPath,
+    cleanupReceipt
+  }, { loadPlaywright: loader(rolledBackHarness.context) }).then(() => null, (error) => error);
+  assert.equal(rolledBack.code, 'SESSION_IMPORT_FAILED');
+  assert.equal(rolledBack.browserClosed, true);
+  assert.equal(rolledBack.cleanupReceiptWritten, true);
+  assert.equal(JSON.parse(await readFile(rolledBackPath, 'utf8')).outcome, 'rolled_back');
+
+  const failedPath = path.join(root, 'rollback-failed.json');
+  const failedHarness = createHarness({ failImportedWrite: true, failRollbackWrite: true });
+  const failed = await runSessionImport({
+    ...config(),
+    cleanupReceiptPath: failedPath,
+    cleanupReceipt
+  }, { loadPlaywright: loader(failedHarness.context) }).then(() => null, (error) => error);
+  assert.equal(failed.code, 'SESSION_IMPORT_ROLLBACK_FAILED');
+  assert.equal(failed.browserClosed, true);
+  assert.equal(failed.cleanupReceiptWritten, false);
+  await assert.rejects(readFile(failedPath, 'utf8'), { code: 'ENOENT' });
 });

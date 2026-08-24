@@ -192,7 +192,7 @@ test('a real Playwright action failure returns its diagnostic screenshot through
     'diagnostic-observation'
   ]));
   const screenshotArtifact = artifacts.find((artifact) => artifact.kind === 'diagnostic-screenshot');
-  assert.equal(screenshotArtifact.mimeType, 'image/png');
+  assert.equal(screenshotArtifact.mimeType, 'image/jpeg');
   const screenshot = await client.readArtifact({
     taskId: task.id,
     artifactId: screenshotArtifact.id,
@@ -200,6 +200,9 @@ test('a real Playwright action failure returns its diagnostic screenshot through
   });
   assert.equal(screenshot.encoding, 'base64');
   assert.equal(screenshot.eof, true);
-  assert.ok(Buffer.from(screenshot.chunk, 'base64').byteLength > 100);
+  const screenshotBytes = Buffer.from(screenshot.chunk, 'base64');
+  assert.ok(screenshotBytes.byteLength > 100);
+  assert.ok(screenshotBytes.byteLength <= 48 * 1024);
+  assert.deepEqual([...screenshotBytes.subarray(0, 2)], [0xff, 0xd8]);
   await manager.profileStore.remove(profile.id);
 });

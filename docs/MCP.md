@@ -92,7 +92,7 @@ Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`
 
 - Manager JSON responses: at most 1 MiB.
 - MCP structured tool result: at most 256 KiB.
-- Artifact read chunk: at most 48 KiB.
+- Artifact read chunk: at most 48 KiB. Automatic diagnostic screenshots are complete JPEG previews within that ceiling and should be requested from offset `0` in one read; partial image chunks are never presented as images.
 - Agent-visible artifact chunks are byte-preserving; the task author must never mark credential-bearing files Agent-visible.
 - Lists: at most 100 records per MCP response.
 

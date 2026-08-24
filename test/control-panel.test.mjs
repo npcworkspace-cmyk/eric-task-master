@@ -56,11 +56,15 @@ test('session transfer requires the popup user gesture and stays origin scoped',
 });
 
 test('extension request deadlines exceed every corresponding Manager operation deadline', () => {
-  assert.ok(PROFILE_OPEN_REQUEST_TIMEOUT_MS > TASK_SERVICE_DEADLINES.profileOpenMs);
-  assert.ok(PROFILE_CLOSE_REQUEST_TIMEOUT_MS > TASK_SERVICE_DEADLINES.profileCloseMs);
+  const forcedShutdownMs = TASK_SERVICE_DEADLINES.profileCloseMs +
+    (2 * TASK_SERVICE_DEADLINES.profileKillGraceMs);
+  assert.ok(
+    PROFILE_OPEN_REQUEST_TIMEOUT_MS > TASK_SERVICE_DEADLINES.profileOpenMs + forcedShutdownMs
+  );
+  assert.ok(PROFILE_CLOSE_REQUEST_TIMEOUT_MS > forcedShutdownMs);
   assert.ok(
     SESSION_TRANSFER_REQUEST_TIMEOUT_MS >
-    TASK_SERVICE_DEADLINES.sessionImportMs + TASK_SERVICE_DEADLINES.sessionImportRollbackGraceMs
+    TASK_SERVICE_DEADLINES.sessionImportWorstCaseMs
   );
 });
 

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { access, link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,9 +20,8 @@ function fakeBrowser() {
   const page = {
     isClosed: () => closed,
     async goto() { return { status: () => 200 }; },
-    async screenshot({ path: screenshotPath }) {
-      await writeFile(screenshotPath, Buffer.from('diagnostic'));
-    },
+    async screenshot() { return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); },
+    async evaluate() { throw new Error('unexpected resize'); },
     locator() {
       return {
         async click() {}, async fill() {}, async hover() {}, async pressSequentially() {}
@@ -42,6 +42,7 @@ function workerConfig(root, modulePath, outputBudget) {
     modulePath,
     outputDir: path.join(root, 'output'),
     checkpointPath: path.join(root, 'checkpoint.json'),
+    attempt: 1,
     input: {},
     behavior: 'fast',
     profile: { userDataDir: path.join(root, 'profile') },
@@ -163,6 +164,17 @@ test('output accounting detects replacement of its root instead of following it'
   await assert.rejects(budget.assertWithinBudget(), { code: 'TASK_OUTPUT_ROOT_CHANGED' });
 });
 
+test('output accounting binds the original directory identity at a stable path', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-output-root-identity-');
+  const output = path.join(root, 'output');
+  const displaced = path.join(root, 'displaced-output');
+  await mkdir(output);
+  const budget = await createOutputBudget({ root: output });
+  await rename(output, displaced);
+  await mkdir(output);
+  await assert.rejects(budget.assertWithinBudget(), { code: 'TASK_OUTPUT_ROOT_CHANGED' });
+});
+
 test('effect journal records only safe operation metadata and exposes pending effects', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-effect-journal-');
   const filePath = path.join(root, 'internal', 'effects.jsonl');
@@ -205,6 +217,31 @@ test('effect journal records only safe operation metadata and exposes pending ef
   assert.equal(serialized.includes('https://'), false);
   assert.deepEqual((await inspectEffectJournal(filePath)).pending, []);
   await resumedJournal.close();
+});
+
+test('effect journal fails closed on malformed records and illegal state transitions', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-effect-invalid-');
+  const cases = [
+    '{"sequence":1,"operation":"click","state":"started"',
+    '{"sequence":1,"operation":"click","state":"unknown","at":"2026-08-24T00:00:00.000Z"}\n',
+    '{"sequence":1,"operation":"click","state":"succeeded","at":"2026-08-24T00:00:00.000Z"}\n',
+    [
+      '{"sequence":1,"operation":"click","state":"started","at":"2026-08-24T00:00:00.000Z"}',
+      '{"sequence":2,"operation":"click","state":"started","at":"2026-08-24T00:00:01.000Z"}',
+      ''
+    ].join('\n')
+  ];
+
+  for (const [index, source] of cases.entries()) {
+    const filePath = path.join(root, `invalid-${index}.jsonl`);
+    await writeFile(filePath, source);
+    await assert.rejects(createEffectJournal({ filePath }), {
+      code: 'TASK_EFFECT_JOURNAL_INVALID'
+    });
+    await assert.rejects(inspectEffectJournal(filePath), {
+      code: 'TASK_EFFECT_JOURNAL_INVALID'
+    });
+  }
 });
 
 test('worker blocks carried unknown effects until task logic verifies and resolves them', async (t) => {
@@ -400,6 +437,104 @@ test('checkpoint and result boundaries cannot publish output beyond the budget',
   }
 });
 
+test('an oversized checkpoint fails before replacing the last valid checkpoint', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-checkpoint-size-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ checkpoint }) {',
+    "  await checkpoint({ cursor: 'last-valid' });",
+    "  await checkpoint({ bulk: 'x'.repeat(8 * 1024 * 1024) });",
+    "  return { summary: 'must not complete', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_CHECKPOINT_TOO_LARGE');
+  assert.equal(browser.wasClosed(), true);
+  assert.deepEqual(JSON.parse(await readFile(path.join(root, 'checkpoint.json'), 'utf8')).data, {
+    cursor: 'last-valid'
+  });
+});
+
+test('task modules cannot fall through or omit the explicit completion contract', async (t) => {
+  const invalidReturns = [
+    ['undefined', ''],
+    ['empty-object', '  return {};'],
+    ['blank-summary', "  return { summary: '   ', evidence: [] };"],
+    ['missing-evidence', "  return { summary: 'looks complete' };"],
+    ['non-array-evidence', "  return { summary: 'looks complete', evidence: {} };"]
+  ];
+  for (const [label, returnLine] of invalidReturns) {
+    await t.test(label, async (t) => {
+      const root = await temporaryRoot(t, `taskmaster-result-contract-${label}-`);
+      const modulePath = path.join(root, 'task.mjs');
+      await writeFile(modulePath, [
+        'export async function run() {',
+        '  await Promise.resolve();',
+        returnLine,
+        '}',
+        ''
+      ].join('\n'));
+      const browser = fakeBrowser();
+      const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+        loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+      });
+      assert.equal(outcome.state, 'failed');
+      assert.equal(outcome.error.code, 'TASK_RESULT_INVALID');
+      assert.equal(browser.wasClosed(), true);
+    });
+  }
+});
+
+test('task progress cannot move backwards within one attempt', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-progress-backwards-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ progress }) {',
+    "  await progress({ current: 2, total: 3, message: 'Advanced' });",
+    "  await progress({ current: 1, total: 3, message: 'Moved backwards' });",
+    "  return { summary: 'must not complete', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_PROGRESS_INVALID');
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('task progress cannot shrink or remove a declared total within one attempt', async (t) => {
+  for (const [label, secondTotal] of [['shrink', '5'], ['remove', 'null']]) {
+    await t.test(label, async (t) => {
+      const root = await temporaryRoot(t, `taskmaster-progress-total-${label}-`);
+      const modulePath = path.join(root, 'task.mjs');
+      await writeFile(modulePath, [
+        'export async function run({ progress }) {',
+        "  await progress({ current: 5, total: 100, message: 'Started bounded work' });",
+        `  await progress({ current: 5, total: ${secondTotal}, message: 'Invalid total rebase' });`,
+        "  return { summary: 'must not complete', evidence: [{ kind: 'message', value: 'invalid' }] };",
+        '}',
+        ''
+      ].join('\n'));
+      const browser = fakeBrowser();
+      const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+        loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+      });
+      assert.equal(outcome.state, 'failed');
+      assert.equal(outcome.error.code, 'TASK_PROGRESS_INVALID');
+      assert.equal(browser.wasClosed(), true);
+    });
+  }
+});
+
 test('worker persists a metadata-only effect journal outside user output', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-worker-effects-');
   const modulePath = path.join(root, 'task.mjs');
@@ -416,7 +551,7 @@ test('worker persists a metadata-only effect journal outside user output', async
   const outcome = await runTaskWorker(workerConfig(root, modulePath), {
     loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
   });
-  assert.equal(outcome.state, 'completed');
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome));
   const journalPath = path.join(root, 'effect-journal.jsonl');
   const journal = await readFile(journalPath, 'utf8');
   assert.equal(journal.includes(marker), false);
@@ -456,11 +591,237 @@ test('checkpoint read returns the exact task data instead of its internal envelo
   const outcome = await runTaskWorker(workerConfig(root, modulePath), {
     loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
   });
-  assert.equal(outcome.state, 'completed');
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome));
   assert.deepEqual(JSON.parse(await readFile(path.join(root, 'checkpoint.json'), 'utf8')).data, {
     nextIndex: 2,
     stableKey: 'unit-2'
   });
+});
+
+test('a resumed worker reads only its frozen checkpoint even if the live checkpoint path changes', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-frozen-resume-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ checkpoint }) {',
+    '  const restored = await checkpoint.read();',
+    '  if (restored?.cursor !== "approved") throw new Error("unapproved resume data");',
+    '  return { summary: "frozen resume passed", evidence: [] };',
+    '}',
+    ''
+  ].join('\n'));
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const approved = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId,
+    attempt: 1,
+    savedAt,
+    data: { cursor: 'approved' }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, approved);
+  config.resumeCheckpoint = {
+    path: frozenPath,
+    sourceAttempt: 1,
+    targetAttempt: 2,
+    savedAt,
+    sha256: createHash('sha256').update(approved).digest('hex'),
+    sizeBytes: approved.byteLength
+  };
+  await writeFile(config.checkpointPath, `${JSON.stringify({
+    taskId: config.taskId,
+    attempt: 1,
+    savedAt,
+    data: { cursor: 'substituted' }
+  })}\n`);
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome));
+});
+
+test('a resumed worker fails closed when its frozen checkpoint is replaced', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-frozen-resume-tamper-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ checkpoint }) {',
+    '  await checkpoint.read();',
+    '  return { summary: "must not complete", evidence: [] };',
+    '}',
+    ''
+  ].join('\n'));
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const approved = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId,
+    attempt: 1,
+    savedAt,
+    data: { cursor: 'approved' }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, approved);
+  config.resumeCheckpoint = {
+    path: frozenPath,
+    sourceAttempt: 1,
+    targetAttempt: 2,
+    savedAt,
+    sha256: createHash('sha256').update(approved).digest('hex'),
+    sizeBytes: approved.byteLength
+  };
+  const replacement = Buffer.from(approved.toString('utf8').replace('approved', 'tampered'));
+  assert.equal(replacement.byteLength, approved.byteLength);
+  await writeFile(frozenPath, replacement);
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_CHECKPOINT_INVALID');
+});
+
+test('a resumed worker cannot complete without consuming its frozen checkpoint', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-frozen-resume-unread-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() { return { summary: "must not complete", evidence: [] }; }\n');
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const approved = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId,
+    attempt: 1,
+    savedAt,
+    data: { cursor: 'approved' }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, approved);
+  config.resumeCheckpoint = {
+    path: frozenPath,
+    sourceAttempt: 1,
+    targetAttempt: 2,
+    savedAt,
+    sha256: createHash('sha256').update(approved).digest('hex'),
+    sizeBytes: approved.byteLength
+  };
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED');
+});
+
+test('a resumed worker cannot issue a browser action before reading its checkpoint', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-frozen-resume-action-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ action }) {',
+    '  await action.goto("https://example.test/replayed");',
+    '  return { summary: "must not complete", evidence: [] };',
+    '}',
+    ''
+  ].join('\n'));
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const source = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, source);
+  config.resumeCheckpoint = {
+    path: frozenPath, sourceAttempt: 1, targetAttempt: 2, savedAt,
+    sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.byteLength
+  };
+  const browser = fakeBrowser();
+  let browserActions = 0;
+  browser.page.goto = async () => { browserActions += 1; return { status: () => 200 }; };
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED');
+  assert.equal(browserActions, 0);
+});
+
+test('a resumed worker cannot overwrite its live checkpoint before reading the frozen input', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-frozen-resume-write-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ checkpoint }) {',
+    '  await checkpoint({ cursor: 999 });',
+    '  return { summary: "must not complete", evidence: [] };',
+    '}',
+    ''
+  ].join('\n'));
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const source = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, source);
+  await writeFile(config.checkpointPath, source);
+  config.resumeCheckpoint = {
+    path: frozenPath, sourceAttempt: 1, targetAttempt: 2, savedAt,
+    sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.byteLength
+  };
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED');
+  assert.deepEqual(await readFile(config.checkpointPath), source);
+});
+
+test('a resumed worker cannot resolve an unknown effect before reading its frozen checkpoint', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-frozen-resume-effect-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ effects }) {',
+    '  const [pending] = effects.pending();',
+    "  await effects.resolveUnknown(pending.sequence, 'observed_not_applied');",
+    '  return { summary: "must not complete", evidence: [{ kind: "message", value: "unsafe" }] };',
+    '}',
+    ''
+  ].join('\n'));
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const source = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, source);
+  config.resumeCheckpoint = {
+    path: frozenPath, sourceAttempt: 1, targetAttempt: 2, savedAt,
+    sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.byteLength
+  };
+  const journalPath = path.join(path.dirname(config.checkpointPath), 'effect-journal.jsonl');
+  const journal = await createEffectJournal({ filePath: journalPath });
+  await journal.record({ state: 'started', operation: 'click' });
+  await journal.close();
+
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED');
+  assert.deepEqual((await inspectEffectJournal(journalPath)).pending.map((item) => item.sequence), [1]);
+});
+
+test('task timeout covers a browser launch that never resolves', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-launch-timeout-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() { return { summary: "unused", evidence: [] }; }\n');
+  const config = { ...workerConfig(root, modulePath), timeoutMs: 50 };
+  const startedAt = Date.now();
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({
+      chromium: { launchPersistentContext: async () => new Promise(() => {}) }
+    })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_TIMEOUT');
+  assert.equal(Date.now() - startedAt < 500, true);
 });
 
 test('worker refuses completion while a current-attempt action outcome is pending', async (t) => {

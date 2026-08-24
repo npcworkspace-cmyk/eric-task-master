@@ -132,7 +132,10 @@ function renderProfiles() {
       element('span', `state-pill ${profileState(profile)}`, profileState(profile))
     );
     const kind = profile.kind === 'ephemeral' ? '隐身临时' : '持久登录';
-    const meta = element('p', 'profile-meta', `${kind} · ID ${profile.id} · 最后使用 ${formatTime(profile.lastUsedAt)}`);
+    const accessLabel = profile.access === 'private'
+      ? (profile.createdBy ? '仅创建者 Agent' : '仅管理面板')
+      : '本机 Agent 共享';
+    const meta = element('p', 'profile-meta', `${kind} · ${accessLabel} · ID ${profile.id} · 最后使用 ${formatTime(profile.lastUsedAt)}`);
     const controls = element('div', 'profile-controls');
     const mode = document.createElement('select');
     mode.title = '默认行为模式';
@@ -153,6 +156,16 @@ function renderProfiles() {
     headlessInput.addEventListener('change', () => updateProfile(profile.id, { headless: headlessInput.checked }));
     headless.append(headlessInput, '后台运行');
 
+    const shared = element('label', 'checkbox-label');
+    shared.title = '开启后，本机其他已注册 Agent 可以使用此 Profile；任务结果仍相互隔离';
+    const sharedInput = document.createElement('input');
+    sharedInput.type = 'checkbox';
+    sharedInput.checked = profile.access !== 'private';
+    sharedInput.addEventListener('change', () => updateProfile(profile.id, {
+      access: sharedInput.checked ? 'shared' : 'private'
+    }));
+    shared.append(sharedInput, 'Agent 共享');
+
     const isOpen = ['open', 'leased', 'starting'].includes(profileState(profile));
     const isEphemeral = profile.kind === 'ephemeral';
     const rename = button('改名', 'ghost', () => renameProfile(profile));
@@ -161,7 +174,7 @@ function renderProfiles() {
     toggle.title = isEphemeral ? '隐身 Profile 仅在任务中临时启动，结束后自动销毁' : '';
     const remove = button('删除', 'danger', () => deleteProfile(profile));
     remove.disabled = profileState(profile) !== 'idle';
-    controls.append(mode, headless, rename, toggle, remove);
+    controls.append(mode, headless, shared, rename, toggle, remove);
     card.append(top, meta, controls);
     ui.profiles.append(card);
   }

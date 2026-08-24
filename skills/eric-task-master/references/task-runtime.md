@@ -30,6 +30,7 @@ export const meta = {
   name: 'example-read',
   version: '1.0.0',
   description: 'Read one bounded page.',
+  supportsResume: false,
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -73,6 +74,16 @@ export async function run({
 
 The module return value is not streamed. Persist large or durable data below `outputDir`, declare each safe relative file as an Agent-visible artifact, and return only a compact summary/evidence object. Unlisted files remain internal.
 
+The completion claim must contain a non-empty `summary` of at most 4,000 characters and 1-32 evidence items. Supported evidence shapes are:
+
+- `{ kind: 'url', value: 'https://...' }` for one HTTP(S) URL;
+- `{ kind: 'count', value: 123 }` for a non-negative finite count;
+- `{ kind: 'hash', value: '...' }` for 32-128 hexadecimal characters;
+- `{ kind: 'message' | 'note', value: '...' }` for bounded non-empty text;
+- `{ kind: 'artifact', file: 'relative/output.json', agentVisible: true }` for a regular file below `outputDir`.
+
+An optional non-empty `label` may be at most 128 characters. Manager hashes and size-anchors every declared artifact before publishing the result. A result and its result artifacts are not Agent-visible until the task reaches verified `completed`; later mutation changes the task to `failed` and blocks artifact access.
+
 ## Semantic observation and visual fallback
 
 Use ordinary Playwright locators when the workflow already knows the page. Use `semantic` when structure is unfamiliar or a stable ref is cheaper than repeatedly sending page screenshots to an Agent:
@@ -102,7 +113,7 @@ if (!submit) {
 
 Available methods are:
 
-- `semantic.snapshot(options)` → `{ id, url, title, content, refs, truncated, frameErrors }`;
+- `semantic.snapshot(options)` → `{ id, url, title, content, refs, truncated, frameErrors }`, where `frameErrors` is the numeric count of Frames that could not be observed;
 - `semantic.resolve(ref, { snapshotId })` → one exact Playwright Locator;
 - `semantic.href(ref, { snapshotId })` → an absolute HTTP(S) URL;
 - `semantic.click(ref, { snapshotId, actionOptions })`;
@@ -120,8 +131,9 @@ The supported `inputSchema` subset is deliberately small and enforced at registr
 - Use `action.goto/click/fill/type/hover/scroll/read/run` so the selected `fast`, `human`, or `adaptive` policy applies. Direct Playwright locators remain available for deterministic reads and assertions.
 - After observing content that a human-paced workflow actually reads, call `await action.read({ words: observedWordCount })`. The delay is bounded to eight seconds, returns its duration, and is zero in effective fast mode. Do not use it for deterministic bulk extraction.
 - Report progress after each meaningful, externally verifiable unit. Automatic heartbeat does not replace task progress. By default, two minutes without meaningful progress marks the task `stalled` and captures diagnostics; ten minutes of continued silence fails and cleans it up. `waiting_user` and an explicit `cooling_down` period are not treated as stalls.
-- Checkpoint after a recoverable unit. `await checkpoint(data)` stores that bounded data; `await checkpoint.read()` returns exactly the previously stored `data` object, or `null` when no checkpoint exists. It does not return an internal `{ savedAt, data }` wrapper.
-- A resume reruns `run(runtime)` in a new isolated Worker and browser context while preserving the same task ID, input, output directory, and checkpoint. Start with `const previous = await checkpoint.read()` and branch from fields such as `previous?.nextIndex`; do not assume in-memory variables from the previous attempt still exist.
+- Within one attempt, `current` cannot decrease and a declared finite `total` cannot shrink or disappear. If a finite total was declared, completion requires `current === total`.
+- Checkpoint after a recoverable unit. `await checkpoint(data)` stores that bounded data; `await checkpoint.read()` returns exactly the previously stored `data` object, or `null` when no checkpoint exists. It does not return an internal `{ savedAt, data }` wrapper. The complete checkpoint envelope is capped at 8 MiB; store bulk rows/files under `outputDir` and checkpoint only cursors, stable keys, counts, and file references.
+- A resume reruns `run(runtime)` in a new isolated Worker and browser context while preserving the same task ID, input, output directory, and checkpoint. Manager verifies and freezes one attempt-scoped checkpoint snapshot. The first executable boundary of a resumed module must be `const previous = await checkpoint.read()`. Until that read succeeds, the runtime rejects every browser `action`, `checkpoint(data)`, and `effects.resolveUnknown(...)`; `effects.pending()` remains observation-only. Branch from fields such as `previous?.nextIndex`; do not assume in-memory variables from the previous attempt still exist.
 - Make output writes idempotent with the checkpoint. For append-style results, use a deterministic per-unit filename or stable record key and rebuild the final JSONL/CSV in sorted order. A crash can happen between writing output and saving the next checkpoint, so blind `appendFile()` may duplicate the last unit after resume.
 - Inspect current page state and diagnostic evidence before retrying an unknown action outcome. Do not blindly replay writes.
 - On 429 or a site-provided cooldown, checkpoint first, then call `await cooldown({ response, attempt, fallbackMs, reason })`. It honors `Retry-After`, applies bounded exponential fallback with positive jitter, switches task state to `cooling_down`, exposes `resumeAt` in status, keeps heartbeats visible, and returns to `running` without replaying an action. Platform-specific retry limits remain in the specialized module.
@@ -135,5 +147,7 @@ The supported `inputSchema` subset is deliberately small and enforced at registr
 - Never log credentials or include them in evidence, checkpoints, artifacts, filenames, URLs, or errors.
 
 Task windows close during cleanup even when the module fails. A Manager restart marks interrupted work failed with its checkpoint preserved; it does not guess that an unknown external action is safe to replay. Resume only after cleanup settles, with one stable resume key for that explicit attempt.
+
+The task timeout covers output setup, Playwright import, browser launch, task-module import, and `run()`. Cooperative async stalls are cancelled and cleaned up. Trusted task code must not block the Node event loop with an infinite synchronous loop; if a Worker or operating system is hard-killed, the Manager fails closed and keeps the Profile unavailable unless browser cleanup can be proved.
 
 Returning from `run` is only a completion claim. Manager verifies the result shape, every declared Agent-visible artifact, browser closure, Worker exit, and Profile lease release before publishing `completed`. Missing or unstable declared output becomes `TASK_COMPLETION_GATE_FAILED`.

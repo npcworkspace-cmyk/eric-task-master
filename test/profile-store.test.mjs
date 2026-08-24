@@ -62,6 +62,16 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   await assert.rejects(reopened.get(created.id), { code: 'PROFILE_NOT_FOUND' });
 });
 
+test('ProfileStore rejects an explicitly empty access value', async (t) => {
+  const { store } = await fixture(t);
+
+  await assert.rejects(
+    store.create({ name: 'Invalid empty access' }, { access: '' }),
+    { code: 'INVALID_PROFILE_ACCESS' }
+  );
+  assert.deepEqual(await store.list(), []);
+});
+
 test('ProfileStore creates ephemeral templates and migrates pre-kind records to persistent', async (t) => {
   const { config, store } = await fixture(t);
   const temporary = await store.create({ name: 'Anonymous work', kind: 'ephemeral' });
@@ -128,6 +138,41 @@ test('ProfileStore enforces exclusive leases and recovers only expired dead owne
   assert.equal((await store.get(profile.id)).state, 'idle');
 });
 
+test('Profile access revocation is atomic with scoped lease acquisition', async (t) => {
+  const { store } = await fixture(t);
+  const profile = await store.create(
+    { name: 'Shared access race' },
+    { ownerClientId: 'agent-a', access: 'shared' }
+  );
+
+  await store.acquireLease(profile.id, 'task:agent-b', {
+    pid: 701,
+    ttlMs: 1_000,
+    authorizedClientId: 'agent-b'
+  });
+  await assert.rejects(
+    store.update(profile.id, { access: 'private' }),
+    { code: 'PROFILE_IN_USE', statusCode: 409 }
+  );
+  assert.equal((await store.get(profile.id)).access, 'shared');
+  await store.releaseLease(profile.id, 'task:agent-b');
+  assert.equal((await store.update(profile.id, { access: 'private' })).access, 'private');
+  await assert.rejects(
+    store.acquireLease(profile.id, 'task:agent-b-again', {
+      pid: 702,
+      ttlMs: 1_000,
+      authorizedClientId: 'agent-b'
+    }),
+    { code: 'PROFILE_ACCESS_DENIED', statusCode: 403 }
+  );
+  const ownerLease = await store.acquireLease(profile.id, 'task:agent-a', {
+    pid: 703,
+    ttlMs: 1_000,
+    authorizedClientId: 'agent-a'
+  });
+  assert.equal(ownerLease.lease.ownerId, 'task:agent-a');
+});
+
 test('ProfileStore startup clears an expired lease after proving its process absent', async (t) => {
   let currentTime = Date.parse('2026-08-23T00:00:00.000Z');
   const root = await mkdtemp(join(tmpdir(), 'eric-task-master-recovery-'));
@@ -149,4 +194,47 @@ test('ProfileStore startup clears an expired lease after proving its process abs
   const recovered = await reopened.get(profile.id);
   assert.equal(recovered.state, 'idle');
   assert.equal(recovered.lease, null);
+});
+
+test('ProfileStore never TTL-reclaims a session import lease without confirmed cleanup', async (t) => {
+  let currentTime = Date.parse('2026-08-23T00:00:00.000Z');
+  const root = await mkdtemp(join(tmpdir(), 'eric-task-master-cleanup-proof-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = {
+    filePath: join(root, 'profiles.json'),
+    profilesRoot: join(root, 'profiles'),
+    now: () => currentTime,
+    processAlive: async () => false
+  };
+  const first = new ProfileStore(config);
+  await first.init();
+  const profile = await first.create({ name: 'Cleanup proof' });
+  await first.acquireLease(profile.id, 'session-import:cleanup-proof', {
+    pid: 505,
+    ttlMs: 1_000,
+    cleanupRequired: true
+  });
+
+  currentTime += 2_000;
+  const reopened = new ProfileStore(config);
+  await reopened.init();
+  const blocked = await reopened.get(profile.id);
+  assert.equal(blocked.lease.ownerId, 'session-import:cleanup-proof');
+  assert.equal(blocked.lease.cleanupRequired, true);
+  await assert.rejects(
+    reopened.acquireLease(profile.id, 'task:other', { pid: 606, ttlMs: 1_000 }),
+    { code: 'PROFILE_CLEANUP_UNCONFIRMED', statusCode: 409 }
+  );
+  await reopened.markCleanupUnknown(profile.id, 'session-import:cleanup-proof');
+  assert.equal((await reopened.get(profile.id)).state, 'error');
+  await assert.rejects(
+    reopened.releaseLease(profile.id, 'session-import:cleanup-proof'),
+    { code: 'CLEANUP_PROOF_REQUIRED', statusCode: 409 }
+  );
+  assert.equal(await reopened.releaseLease(
+    profile.id,
+    'session-import:cleanup-proof',
+    { cleanupConfirmed: true }
+  ), true);
+  assert.equal((await reopened.get(profile.id)).state, 'idle');
 });

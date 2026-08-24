@@ -91,15 +91,18 @@ async function serviceFixture(t, {
   workerResult = null,
   withArtifacts = false,
   withDiagnostic = false,
+  withLostDiagnosticManifest = false,
   withMaxArtifacts = false,
   diagnosticGraceMs,
+  workerCleanupGraceMs = 100,
+  workerHardKillGraceMs = 50,
   artifactValidationHook = null
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-runtime-core-'));
   const allowed = path.join(root, 'allowed');
   await mkdir(allowed);
   const modulePath = path.join(allowed, 'fixture.mjs');
-  await writeFile(modulePath, 'export async function run() { return { summary: "ok", evidence: [] }; }\n');
+  await writeFile(modulePath, 'export async function run() { return { summary: "ok", evidence: [{ kind: "message", value: "ok" }] }; }\n');
   const profiles = fakeProfiles(root);
   const starts = [];
   const workers = [];
@@ -109,6 +112,8 @@ async function serviceFixture(t, {
     allowedTaskRoots: [allowed],
     seedTaskTypes: [],
     ...(diagnosticGraceMs === undefined ? {} : { diagnosticGraceMs }),
+    workerCleanupGraceMs,
+    workerHardKillGraceMs,
     artifactValidationHook,
     workerFactory(_workerPath, kind) {
       const worker = new FakeWorker((message, child) => {
@@ -120,7 +125,7 @@ async function serviceFixture(t, {
           }
           if (terminalWorkerOpen) {
             setImmediate(() => {
-              child.emit('message', { type: 'result', result: { summary: 'ok', evidence: [] } });
+              child.emit('message', { type: 'result', result: { summary: 'ok', evidence: [{ kind: 'message', value: 'ok' }] } });
               child.emit('message', { type: 'state', state: 'completed' });
               child.emit('message', { type: 'cleanup', browserClosed: true });
             });
@@ -129,26 +134,24 @@ async function serviceFixture(t, {
           if (terminalError) {
             setImmediate(() => {
               child.emit('message', { type: 'error', error: { message: terminalError } });
+              child.emit('message', { type: 'cleanup', browserClosed: true });
               child.finish();
             });
             return;
           }
           if (!keepWorkerOpen) setImmediate(() => void (async () => {
-            let evidence = [];
+            let evidence = [{ kind: 'message', value: 'ok' }];
             if (withArtifacts) {
               await writeFile(path.join(message.config.outputDir, 'visible.txt'), 'hello 世界 and more', 'utf8');
               await writeFile(path.join(message.config.outputDir, 'undeclared.txt'), 'must stay hidden', 'utf8');
               await writeFile(path.join(path.dirname(message.config.outputDir), 'outside.txt'), 'outside output', 'utf8');
               evidence = [
-                { kind: 'artifact', file: 'visible.txt' },
-                { kind: 'artifact', file: 'visible.txt' },
-                { kind: 'artifact', file: 'undeclared.txt', agentVisible: false },
-                { kind: 'artifact', file: '../outside.txt' }
+                { kind: 'artifact', file: 'visible.txt', agentVisible: true }
               ];
             }
             if (withMaxArtifacts) {
               evidence = [];
-              for (let index = 0; index < 100; index += 1) {
+              for (let index = 0; index < 32; index += 1) {
                 const file = `result-${String(index).padStart(3, '0')}.txt`;
                 await writeFile(path.join(message.config.outputDir, file), String(index), 'utf8');
                 evidence.push({ kind: 'artifact', file });
@@ -159,6 +162,23 @@ async function serviceFixture(t, {
               await mkdir(path.dirname(screenshot), { recursive: true });
               await writeFile(screenshot, Buffer.from('diagnostic-image'));
               child.emit('message', { type: 'screenshot', path: screenshot, reason: 'action-click' });
+            }
+            if (withLostDiagnosticManifest) {
+              const screenshot = path.join(message.config.outputDir, 'screenshots', 'lost-ipc.png');
+              const observation = path.join(message.config.outputDir, 'observations', 'lost-ipc.json');
+              await mkdir(path.dirname(screenshot), { recursive: true });
+              await mkdir(path.dirname(observation), { recursive: true });
+              await writeFile(screenshot, Buffer.from('lost-ipc-diagnostic'));
+              await writeFile(observation, '{"refs":[]}\n');
+              const at = new Date().toISOString();
+              await writeFile(path.join(path.dirname(message.config.outputDir), 'diagnostics.json'), `${JSON.stringify({
+                version: 2,
+                taskId: message.config.taskId,
+                attempt: message.config.attempt,
+                updatedAt: at,
+                screenshot: { relativePath: path.join('screenshots', 'lost-ipc.png'), reason: 'timeout', at },
+                observation: { relativePath: path.join('observations', 'lost-ipc.json'), reason: 'timeout', at }
+              })}\n`);
             }
             child.emit('message', {
               type: 'result',
@@ -299,6 +319,37 @@ test('idempotency is persistent, payload-bound, and isolated per Agent owner', a
   );
 });
 
+test('task submission enforces private Profile ownership while explicit sharing permits use', async (t) => {
+  const { profiles, service } = await serviceFixture(t);
+  profiles.profile.ownerClientId = AGENT_A.clientId;
+  profiles.profile.access = 'private';
+
+  await assert.rejects(service.create({
+    profileId: profiles.profile.id,
+    taskType: 'fixture',
+    idempotencyKey: 'profile-private-agent-b'
+  }, AGENT_B), { code: 'PROFILE_ACCESS_DENIED', statusCode: 403 });
+
+  const owned = await service.create({
+    profileId: profiles.profile.id,
+    taskType: 'fixture',
+    idempotencyKey: 'profile-private-agent-a'
+  }, AGENT_A);
+  await waitFor(async () => (await service.get(owned.id, AGENT_A)).cleanup.settled);
+
+  profiles.profile.access = 'shared';
+  const shared = await service.create({
+    profileId: profiles.profile.id,
+    taskType: 'fixture',
+    idempotencyKey: 'profile-shared-agent-b'
+  }, AGENT_B);
+  const complete = await waitFor(async () => {
+    const current = await service.get(shared.id, AGENT_B);
+    return current.cleanup.settled ? current : null;
+  });
+  assert.equal(complete.state, 'completed');
+});
+
 test('task owner scope and cursor pagination are enforced', async (t) => {
   const { service } = await serviceFixture(t);
   const created = [];
@@ -326,6 +377,23 @@ test('task owner scope and cursor pagination are enforced', async (t) => {
   assert.equal((await service.list({ caller: ADMIN, limit: 100 })).tasks.length, 6);
   await assert.rejects(service.get(created[0].id, AGENT_B), { code: 'TASK_NOT_FOUND' });
   await assert.rejects(service.cancel(created[0].id, AGENT_B), { code: 'TASK_NOT_FOUND' });
+});
+
+test('Agent principal names cannot collide with Manager-owned tasks', async (t) => {
+  const { service } = await serviceFixture(t);
+  const task = await service.create({
+    profileId: 'profile_fixture',
+    taskType: 'fixture',
+    idempotencyKey: 'manager-owned-task'
+  }, ADMIN);
+  await waitFor(async () => (await service.get(task.id, ADMIN)).cleanup.settled);
+  const forgedAgent = { role: 'agent', clientId: 'manager-admin' };
+  await assert.rejects(service.get(task.id, forgedAgent), { code: 'TASK_ACCESS_DENIED' });
+  await assert.rejects(service.cancel(task.id, forgedAgent), { code: 'TASK_ACCESS_DENIED' });
+  await assert.rejects(service.resume(task.id, { resumeKey: 'forged-resume-key' }, forgedAgent), {
+    code: 'TASK_ACCESS_DENIED'
+  });
+  assert.equal((await service.getInternal(task.id)).ownerRole, 'manager-admin');
 });
 
 test('artifact access is owner-scoped, declaration-only, path-safe, and byte-bounded', async (t) => {
@@ -389,8 +457,10 @@ test('artifact reads stay bound to the validated open file when its pathname is 
   await writeFile(replacementPath, 'outside secret must not be returned', 'utf8');
   armed = true;
 
-  const part = await fixture.service.readArtifact(task.id, artifact.id, { offset: 0, maxBytes: 48 }, AGENT_A);
-  assert.equal(part.chunk, 'hello 世界 and more');
+  await assert.rejects(
+    fixture.service.readArtifact(task.id, artifact.id, { offset: 0, maxBytes: 48 }, AGENT_A),
+    { code: 'ARTIFACT_INTEGRITY_FAILED' }
+  );
   assert.equal((await readFile(path.join(fixture.starts[0].outputDir, 'visible.txt'), 'utf8')), 'outside secret must not be returned');
 });
 
@@ -409,10 +479,13 @@ test('artifact hardlinks are omitted and cannot expose a file outside the task o
   await rm(visiblePath);
   await link(secretPath, visiblePath);
 
-  assert.deepEqual(await fixture.service.listArtifacts(task.id, AGENT_A), []);
+  await assert.rejects(
+    fixture.service.listArtifacts(task.id, AGENT_A),
+    { code: 'ARTIFACT_INTEGRITY_FAILED' }
+  );
   await assert.rejects(
     fixture.service.readArtifact(task.id, artifact.id, { offset: 0, maxBytes: 48 }, AGENT_A),
-    { code: 'ARTIFACT_NOT_FOUND' }
+    { code: 'ARTIFACT_INTEGRITY_FAILED' }
   );
 });
 
@@ -452,14 +525,15 @@ test('a child error does not release the Profile lease until the still-running w
     return current.state === 'failed' ? current : null;
   });
   assert.equal(failedBeforeExit.cleanup.leaseReleased, false);
-  const settled = await waitFor(async () => {
+  const exited = await waitFor(async () => {
     const current = await service.get(task.id, AGENT_A);
-    return current.cleanup.settled ? current : null;
+    return current.cleanup.workerExited ? current : null;
   });
-  assert.equal(settled.cleanup.workerExited, true);
-  assert.equal(settled.cleanup.leaseReleased, true);
+  assert.equal(exited.cleanup.settled, false);
+  assert.equal(exited.cleanup.leaseReleased, false);
+  assert.equal(exited.resumeAvailable, false);
   assert.deepEqual(workers[0].killSignals, ['SIGTERM']);
-  assert.equal(profiles.profile.lease, null);
+  assert.equal(profiles.profile.lease.ownerId, `task:${task.id}`);
 });
 
 test('worker error secrets are redacted before task state is persisted or returned', async (t) => {
@@ -537,7 +611,28 @@ test('diagnostic screenshots are agent-visible artifacts without exposing local 
   ]);
 });
 
-test('diagnostic screenshot keeps a reserved artifact slot at the declaration limit', async (t) => {
+test('diagnostic manifest recovers screenshot and semantic pointers after IPC loss', async (t) => {
+  const { service } = await serviceFixture(t, { withLostDiagnosticManifest: true });
+  const task = await service.create({
+    profileId: 'profile_fixture',
+    taskType: 'fixture',
+    idempotencyKey: 'diagnostic-manifest-lost-ipc'
+  }, AGENT_A);
+  const terminal = await waitFor(async () => {
+    const current = await service.get(task.id, AGENT_A);
+    return current.cleanup?.settled ? current : null;
+  });
+  assert.equal(typeof terminal.lastScreenshot?.ref, 'string');
+  assert.equal(typeof terminal.lastObservation?.ref, 'string');
+  assert.equal(JSON.stringify(terminal).includes(path.sep + 'screenshots' + path.sep), false);
+  const artifacts = await service.listArtifacts(task.id, AGENT_A);
+  assert.deepEqual(artifacts.map((artifact) => [artifact.name, artifact.kind]).sort(), [
+    ['lost-ipc.json', 'diagnostic-observation'],
+    ['lost-ipc.png', 'diagnostic-screenshot']
+  ]);
+});
+
+test('diagnostic screenshot remains visible beside the maximum completion evidence list', async (t) => {
   const { service } = await serviceFixture(t, { withDiagnostic: true, withMaxArtifacts: true });
   const task = await service.create({
     profileId: 'profile_fixture',
@@ -546,7 +641,7 @@ test('diagnostic screenshot keeps a reserved artifact slot at the declaration li
   }, AGENT_A);
   await waitFor(async () => (await service.get(task.id, AGENT_A)).cleanup.settled);
   const artifacts = await service.listArtifacts(task.id, AGENT_A);
-  assert.equal(artifacts.length, 100);
+  assert.equal(artifacts.length, 33);
   assert.equal(artifacts[0].kind, 'diagnostic-screenshot');
   assert.equal(artifacts[0].name, 'failure.png');
 });
@@ -562,12 +657,24 @@ test('manual Profile open is single-flight under concurrent callers', async (t) 
     allowedTaskRoots: [fixture.allowed],
     seedTaskTypes: [],
     workerFactory(_workerPath, kind) {
+      let openMessage;
       const child = new FakeWorker((message, worker) => {
         if (kind === 'profile-open' && message.type === 'open') {
+          openMessage = message;
           openWorkers += 1;
           setTimeout(() => worker.emit('message', { type: 'ready' }), 20);
         }
-        if (message.type === 'close') setImmediate(() => worker.finish());
+        if (message.type === 'close') setImmediate(() => void (async () => {
+          await mkdir(path.dirname(openMessage.cleanupReceiptPath), { recursive: true });
+          await writeFile(openMessage.cleanupReceiptPath, `${JSON.stringify({
+            version: 1,
+            ...openMessage.cleanupReceipt,
+            workerPid: worker.pid,
+            closedAt: new Date().toISOString()
+          })}\n`);
+          worker.emit('message', { type: 'closed', browserClosed: true, cleanupReceiptWritten: true });
+          worker.finish();
+        })());
       });
       return child;
     }

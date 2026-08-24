@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { writeCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 import { redactSensitiveText } from '../lib/redaction.mjs';
+import { SESSION_IMPORT_DEADLINES } from './session-import-deadlines.mjs';
 
 const SESSION_COOKIE_RETENTION_SECONDS = 12 * 60 * 60;
-const CLOSE_TIMEOUT_MS = 10_000;
 
 class SessionImportError extends Error {
   constructor(code, message) {
@@ -267,18 +268,43 @@ async function restoreSnapshot(context, page, origin, snapshot) {
   }
 }
 
-async function closeWithTimeout(context) {
-  if (!context) return;
+async function withDeadline(promise, timeoutMs) {
   let timer;
   try {
-    await Promise.race([
-      context.close(),
+    return await Promise.race([
+      promise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('browser context close timed out')), CLOSE_TIMEOUT_MS);
+        timer = setTimeout(() => reject(new Error('browser cleanup timed out')), timeoutMs);
       })
     ]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+export async function closeSessionBrowserSession(
+  context,
+  timeoutMs = SESSION_IMPORT_DEADLINES.closeAttemptMs
+) {
+  if (!context) return true;
+  let browser = null;
+  try {
+    browser = context.browser?.() || null;
+  } catch {
+    // The context close below still has a chance to prove cleanup.
+  }
+  try {
+    await withDeadline(context.close(), timeoutMs);
+    return true;
+  } catch {
+    if (!browser) return false;
+  }
+  if (typeof browser.close !== 'function') return false;
+  try {
+    await withDeadline(browser.close(), timeoutMs);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -293,16 +319,29 @@ function throwIfAborted(signal) {
   }
 }
 
-export async function runSessionImport({ profile, bundle }, {
+export async function runSessionImport({
+  profile,
+  bundle,
+  cleanupReceiptPath = null,
+  cleanupReceipt = null
+}, {
   loadPlaywright = () => import('playwright'),
-  signal
+  signal,
+  rollbackTimeoutMs = SESSION_IMPORT_DEADLINES.rollbackMs,
+  closeTimeoutMs = SESSION_IMPORT_DEADLINES.closeAttemptMs
 } = {}) {
-  const origin = validateBundle(bundle);
+  let origin = null;
   let context = null;
   let page = null;
   let snapshot = null;
   let mutationStarted = false;
+  let result = null;
+  let failure = null;
+  let cleanupOutcome = null;
+  let browserClosed = false;
+  let cleanupReceiptWritten = false;
   try {
+    origin = validateBundle(bundle);
     throwIfAborted(signal);
     const playwright = await loadPlaywright();
     throwIfAborted(signal);
@@ -343,9 +382,8 @@ export async function runSessionImport({ profile, bundle }, {
     }
     throwIfAborted(signal);
 
-    await closeWithTimeout(context);
-    context = null;
-    return {
+    cleanupOutcome = 'committed';
+    result = {
       status: 'partial',
       cookieCount: importedCookies.length,
       localStorageCount: bundle.localStorage.length,
@@ -353,24 +391,64 @@ export async function runSessionImport({ profile, bundle }, {
       verification: 'storage_replaced_not_login_verified'
     };
   } catch (error) {
+    failure = safeImportFailure(error);
     if (mutationStarted && context && page && snapshot) {
       try {
-        await restoreSnapshot(context, page, origin, snapshot);
-        await closeWithTimeout(context);
-        context = null;
+        await withDeadline(restoreSnapshot(context, page, origin, snapshot), rollbackTimeoutMs);
+        cleanupOutcome = 'rolled_back';
       } catch {
-        throw new SessionImportError(
+        failure = new SessionImportError(
           'SESSION_IMPORT_ROLLBACK_FAILED',
           'Session import failed and the previous origin state could not be restored'
         );
+        cleanupOutcome = null;
       }
+    } else if (!mutationStarted) {
+      // No persistent state write occurred, so the original state is already
+      // the verified rollback outcome.
+      cleanupOutcome = 'rolled_back';
     }
-    throw safeImportFailure(error);
-  } finally {
-    await closeWithTimeout(context).catch(() => {});
-    snapshot = null;
-    bundle = null;
   }
+
+  browserClosed = await closeSessionBrowserSession(context, closeTimeoutMs).catch(() => false);
+  if (browserClosed) context = null;
+  if (browserClosed && cleanupOutcome && cleanupReceiptPath && cleanupReceipt) {
+    cleanupReceiptWritten = await writeCleanupReceipt(cleanupReceiptPath, {
+      ...cleanupReceipt,
+      outcome: cleanupOutcome
+    }).then(() => true, () => false);
+  }
+  snapshot = null;
+  bundle = null;
+
+  if (failure?.code === 'SESSION_IMPORT_ROLLBACK_FAILED') {
+    failure.browserClosed = browserClosed;
+    failure.cleanupReceiptWritten = false;
+    failure.cleanupOutcome = null;
+    throw failure;
+  }
+  if (!browserClosed || (cleanupReceiptPath && !cleanupReceiptWritten)) {
+    const cleanupError = new SessionImportError(
+      'SESSION_IMPORT_CLEANUP_UNCONFIRMED',
+      'Session import browser cleanup could not be confirmed'
+    );
+    cleanupError.browserClosed = browserClosed;
+    cleanupError.cleanupReceiptWritten = cleanupReceiptWritten;
+    cleanupError.cleanupOutcome = cleanupOutcome;
+    throw cleanupError;
+  }
+  if (failure) {
+    failure.browserClosed = browserClosed;
+    failure.cleanupReceiptWritten = cleanupReceiptWritten;
+    failure.cleanupOutcome = cleanupOutcome;
+    throw failure;
+  }
+  return {
+    ...result,
+    browserClosed,
+    cleanupReceiptWritten,
+    cleanupOutcome
+  };
 }
 
 if (typeof process.send === 'function') {
@@ -389,7 +467,10 @@ if (typeof process.send === 'function') {
         type: 'error',
         error: {
           code: error?.code || 'SESSION_IMPORT_FAILED',
-          message: redactSensitiveText(error?.message || 'Session import failed').slice(0, 2_000)
+          message: redactSensitiveText(error?.message || 'Session import failed').slice(0, 2_000),
+          browserClosed: error?.browserClosed === true,
+          cleanupReceiptWritten: error?.cleanupReceiptWritten === true,
+          cleanupOutcome: typeof error?.cleanupOutcome === 'string' ? error.cleanupOutcome : null
         }
       }))
       .finally(() => {

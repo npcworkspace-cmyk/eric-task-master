@@ -31,6 +31,8 @@ const profile = {
   name: 'Fixture',
   state: 'open',
   defaultBehavior: 'fast',
+  access: 'private',
+  lastUsedAt: '2026-08-24T00:00:00.000Z',
   userDataDir: 'C:\\secret\\profile',
   lease: { token: 'do-not-return' }
 };
@@ -48,6 +50,7 @@ const client = {
   },
   async listProfiles() { return [profile]; },
   async createProfile(input) { return { ...profile, name: input.name }; },
+  async updateProfile(_profileId, patch) { return { ...profile, ...patch }; },
   async openProfile() { return profile; },
   async closeProfile() { return { ...profile, state: 'idle' }; },
   async listTaskTypes() {

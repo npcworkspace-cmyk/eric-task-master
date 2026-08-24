@@ -1,11 +1,14 @@
 import { fork } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isBehaviorMode, publicTask, TERMINAL_TASK_STATES } from '../contracts.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
+import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
+import { removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
+import { SESSION_IMPORT_DEADLINES } from './session-import-deadlines.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
 const PROFILE_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
@@ -25,15 +28,28 @@ const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MAX_ARTIFACTS = 100;
 const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
+const MAX_DIAGNOSTICS_MANIFEST_BYTES = 64 * 1024;
+const SAFE_EVIDENCE_KINDS = new Set(['artifact', 'count', 'hash', 'message', 'note', 'url']);
 const MAX_ATTEMPTS = 100;
 const RESUME_KEY_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 const HANDOFF_ID_PATTERN = /^handoff_[a-f0-9]{32}$/;
+const PROFILE_CLEANUP_QUEUE_REASON = 'Waiting for confirmed Profile cleanup';
+const PROFILE_BUSY_QUEUE_REASON = 'Waiting for Profile to become idle';
+const CLEANUP_RECONCILE_INTERVAL_MS = 2_000;
+const CLEANUP_RECONCILE_GRACE_MS = 60_000;
 
 export const TASK_SERVICE_DEADLINES = Object.freeze({
+  workerCleanupGraceMs: 30_000,
+  workerHardKillGraceMs: 5_000,
   profileOpenMs: 30_000,
-  profileCloseMs: 10_000,
-  sessionImportMs: 90_000,
-  sessionImportRollbackGraceMs: 15_000
+  profileCloseMs: 25_000,
+  profileKillGraceMs: 5_000,
+  sessionImportMs: SESSION_IMPORT_DEADLINES.operationMs,
+  sessionImportCleanupGraceMs: SESSION_IMPORT_DEADLINES.cleanupGraceMs,
+  sessionImportHardKillGraceMs: SESSION_IMPORT_DEADLINES.hardKillGraceMs,
+  sessionImportWorstCaseMs: SESSION_IMPORT_DEADLINES.managerWorstCaseMs,
+  // Compatibility alias for embedders that configured the old option name.
+  sessionImportRollbackGraceMs: SESSION_IMPORT_DEADLINES.cleanupGraceMs
 });
 
 const ARTIFACT_MIME_TYPES = Object.freeze({
@@ -74,7 +90,10 @@ function callerIdentity(caller = {}) {
   if (caller.role === 'manager-admin') {
     return { role: 'manager-admin', clientId: caller.clientId || 'manager-admin' };
   }
-  if (caller.role === 'agent' && typeof caller.clientId === 'string' && caller.clientId) {
+  if (
+    caller.role === 'agent' && typeof caller.clientId === 'string' && caller.clientId &&
+    !isReservedAgentClientId(caller.clientId)
+  ) {
     return { role: 'agent', clientId: caller.clientId };
   }
   throw new TaskServiceError('TASK_ACCESS_DENIED', 'Task operation is not allowed for this caller', 403);
@@ -83,7 +102,8 @@ function callerIdentity(caller = {}) {
 function profileCallerIdentity(caller = {}) {
   if (
     ['manager-admin', 'agent', 'extension'].includes(caller.role) &&
-    typeof caller.clientId === 'string' && caller.clientId
+    typeof caller.clientId === 'string' && caller.clientId &&
+    !(caller.role === 'agent' && isReservedAgentClientId(caller.clientId))
   ) {
     return { role: caller.role, clientId: caller.clientId };
   }
@@ -91,7 +111,40 @@ function profileCallerIdentity(caller = {}) {
 }
 
 function canAccess(task, caller) {
-  return caller.role === 'manager-admin' || task.ownerClientId === caller.clientId;
+  return caller.role === 'manager-admin' || (
+    caller.role === 'agent' && task.ownerRole === 'agent' && task.ownerClientId === caller.clientId
+  );
+}
+
+function isTaskOwner(task, caller) {
+  return task.ownerRole === caller.role && task.ownerClientId === caller.clientId;
+}
+
+function isSamePrincipal(entry, caller) {
+  return entry?.ownerRole === caller.role && entry?.ownerClientId === caller.clientId;
+}
+
+function canUseProfile(profile, caller) {
+  if (['manager-admin', 'extension'].includes(caller.role)) return true;
+  if (caller.role !== 'agent') return false;
+  return profile?.ownerClientId === caller.clientId || (profile?.access || 'shared') === 'shared';
+}
+
+function requireProfileUse(profile, caller) {
+  if (!canUseProfile(profile, caller)) {
+    throw new TaskServiceError(
+      'PROFILE_ACCESS_DENIED',
+      'This Agent is not authorized to use this Profile',
+      403
+    );
+  }
+  return profile;
+}
+
+function taskLeaseAccess(task) {
+  return task.ownerRole === 'manager-admin'
+    ? {}
+    : { authorizedClientId: task.ownerClientId };
 }
 
 function taskTypeMatchesDomain(taskType, domain) {
@@ -280,6 +333,24 @@ function sanitizeError(error, fallbackCode = 'TASK_FAILED') {
   };
 }
 
+function terminalProgress(task, state = task.state) {
+  const current = Number.isFinite(Number(task.progress?.current))
+    ? Math.max(0, Number(task.progress.current))
+    : 0;
+  const total = task.progress?.total === null || task.progress?.total === undefined
+    ? null
+    : Number(task.progress.total);
+  return {
+    current: state === 'completed' && Number.isFinite(total) ? total : current,
+    total: Number.isFinite(total) ? total : null,
+    message: state === 'completed'
+      ? 'Completed'
+      : state === 'cancelled'
+        ? 'Cancelled'
+        : 'Failed'
+  };
+}
+
 function defaultWorkerFactory(workerPath) {
   return fork(workerPath, [], {
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -298,6 +369,22 @@ function send(child, message) {
   }
 }
 
+export function sendChildMessageConfirmed(child, message) {
+  return new Promise((resolve) => {
+    if (!child?.connected || typeof child.send !== 'function') {
+      resolve(false);
+      return;
+    }
+    try {
+      // child.send() returning false means backpressure, not rejection. Only
+      // its callback confirms that the command entered the IPC channel.
+      child.send(message, undefined, undefined, (error) => resolve(!error));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 async function atomicJson(filePath, value) {
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -305,7 +392,22 @@ async function atomicJson(filePath, value) {
 }
 
 function publicRecord(task) {
-  return clone(publicTask(task));
+  const record = publicTask(task);
+  if (Array.isArray(record.result?.evidence)) {
+    record.result.evidence = record.result.evidence.map((item) => {
+      if (
+        item?.kind !== 'artifact' || typeof item.file !== 'string' ||
+        item.agentVisible === false
+      ) return item;
+      const normalized = path.normalize(item.file);
+      return {
+        kind: 'artifact',
+        ...(typeof item.label === 'string' ? { label: item.label } : {}),
+        artifactId: artifactId(task.id, normalized)
+      };
+    });
+  }
+  return clone(record);
 }
 
 function taskId() {
@@ -327,13 +429,20 @@ export function createTaskService({
   profileStore,
   workerFactory = defaultWorkerFactory,
   heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
+  profileLeaseRenewalMs = 20_000,
   diagnosticGraceMs = DIAGNOSTIC_GRACE_MS,
+  workerCleanupGraceMs = TASK_SERVICE_DEADLINES.workerCleanupGraceMs,
+  workerHardKillGraceMs = TASK_SERVICE_DEADLINES.workerHardKillGraceMs,
   progressStallMs = PROGRESS_STALL_MS,
   progressFailureMs = PROGRESS_FAILURE_MS,
   maxConcurrentTasks = 4,
   maxQueuedTasks = 100,
   sessionImportTimeoutMs = TASK_SERVICE_DEADLINES.sessionImportMs,
-  sessionImportRollbackGraceMs = TASK_SERVICE_DEADLINES.sessionImportRollbackGraceMs,
+  sessionImportCleanupGraceMs,
+  sessionImportRollbackGraceMs,
+  sessionImportHardKillGraceMs = TASK_SERVICE_DEADLINES.sessionImportHardKillGraceMs,
+  cleanupReconcileIntervalMs = CLEANUP_RECONCILE_INTERVAL_MS,
+  cleanupReconcileGraceMs = CLEANUP_RECONCILE_GRACE_MS,
   taskTypeRegistry,
   taskTypesFile,
   taskTypesRoot,
@@ -356,6 +465,15 @@ export function createTaskService({
     throw new TypeError('artifactValidationHook must be a function when provided');
   }
   if (typeof processAlive !== 'function') throw new TypeError('processAlive must be a function');
+  if (!Number.isFinite(workerCleanupGraceMs) || workerCleanupGraceMs <= 0) {
+    throw new TypeError('workerCleanupGraceMs must be positive');
+  }
+  if (!Number.isFinite(workerHardKillGraceMs) || workerHardKillGraceMs <= 0) {
+    throw new TypeError('workerHardKillGraceMs must be positive');
+  }
+  if (!Number.isFinite(profileLeaseRenewalMs) || profileLeaseRenewalMs < 10) {
+    throw new TypeError('profileLeaseRenewalMs must be at least 10');
+  }
   if (!Number.isFinite(progressStallMs) || progressStallMs < 1_000) {
     throw new TypeError('progressStallMs must be at least 1000');
   }
@@ -371,16 +489,33 @@ export function createTaskService({
   if (!Number.isFinite(sessionImportTimeoutMs) || sessionImportTimeoutMs <= 0) {
     throw new TypeError('sessionImportTimeoutMs must be positive');
   }
-  if (!Number.isFinite(sessionImportRollbackGraceMs) || sessionImportRollbackGraceMs <= 0) {
-    throw new TypeError('sessionImportRollbackGraceMs must be positive');
+  const effectiveSessionImportCleanupGraceMs = sessionImportCleanupGraceMs ??
+    sessionImportRollbackGraceMs ??
+    TASK_SERVICE_DEADLINES.sessionImportCleanupGraceMs;
+  if (!Number.isFinite(effectiveSessionImportCleanupGraceMs) || effectiveSessionImportCleanupGraceMs <= 0) {
+    throw new TypeError('sessionImportCleanupGraceMs must be positive');
+  }
+  if (!Number.isFinite(sessionImportHardKillGraceMs) || sessionImportHardKillGraceMs <= 0) {
+    throw new TypeError('sessionImportHardKillGraceMs must be positive');
+  }
+  if (!Number.isFinite(cleanupReconcileIntervalMs) || cleanupReconcileIntervalMs <= 0) {
+    throw new TypeError('cleanupReconcileIntervalMs must be positive');
+  }
+  if (!Number.isFinite(cleanupReconcileGraceMs) || cleanupReconcileGraceMs <= 0) {
+    throw new TypeError('cleanupReconcileGraceMs must be positive');
   }
 
   const root = path.resolve(stateDir);
+  const cleanupReceiptsRoot = path.join(path.dirname(root), 'cleanup-receipts');
   const tasks = new Map();
   const children = new Map();
   const openProfiles = new Map();
   const openingProfiles = new Map();
+  const activeSessionImports = new Map();
   const persistChains = new Map();
+  const cleanupReconcileTails = new Map();
+  const artifactDigestCache = new Map();
+  const finalizationFailures = new Map();
   const registry = taskTypeRegistry || new TaskTypeRegistry({
     filePath: taskTypesFile || path.join(path.dirname(root), 'task-types.json'),
     snapshotRoot: taskTypesRoot || path.join(path.dirname(root), 'task-types'),
@@ -389,9 +524,139 @@ export function createTaskService({
   });
   let createTail = Promise.resolve();
   let queueTail = Promise.resolve();
+  let cleanupReconcileTimer = null;
   let closing = false;
+  let closePromise;
   const ready = initialize();
   void ready.then(() => scheduleQueuedTasks()).catch(() => {});
+
+  function requireServiceOpen() {
+    if (closing) {
+      throw new TaskServiceError(
+        'SERVICE_CLOSING',
+        'Task service is stopping and accepts no new operations',
+        503
+      );
+    }
+  }
+
+  function taskCleanupReceiptPath(task) {
+    return path.join(root, task.id, `cleanup-attempt-${task.attempt}.json`);
+  }
+
+  function profileCleanupReceiptPath(ownerId) {
+    const digest = createHash('sha256').update(ownerId).digest('hex');
+    return path.join(cleanupReceiptsRoot, `profile-${digest}.json`);
+  }
+
+  function sessionCleanupReceiptPath(ownerId) {
+    const digest = createHash('sha256').update(ownerId).digest('hex');
+    return path.join(cleanupReceiptsRoot, `session-${digest}.json`);
+  }
+
+  async function verifyTaskCleanupReceipt(task) {
+    return verifyCleanupReceipt(taskCleanupReceiptPath(task), {
+      kind: 'task',
+      taskId: task.id,
+      attempt: task.attempt,
+      workerPid: task.workerPid
+    });
+  }
+
+  async function markCleanupUnknown(profileId, ownerId) {
+    if (typeof profileStore.markCleanupUnknown !== 'function') return;
+    await profileStore.markCleanupUnknown(profileId, ownerId).catch(() => {});
+  }
+
+  async function reconcileProfileCleanup(profile) {
+    const lease = profile?.lease;
+    if (!lease || !/^profile-open:/u.test(lease.ownerId || '')) return false;
+    if (await processAlive(lease.pid)) return false;
+    const receiptPath = profileCleanupReceiptPath(lease.ownerId);
+    const confirmed = await verifyCleanupReceipt(receiptPath, {
+      kind: 'profile',
+      profileId: profile.id,
+      ownerId: lease.ownerId,
+      workerPid: lease.pid
+    });
+    if (!confirmed) {
+      await markCleanupUnknown(profile.id, lease.ownerId);
+      return false;
+    }
+    if (!(await profileStore.releaseLease(profile.id, lease.ownerId, { cleanupConfirmed: true }))) {
+      await markCleanupUnknown(profile.id, lease.ownerId);
+      return false;
+    }
+    await removeCleanupReceipt(receiptPath).catch(() => {});
+    return true;
+  }
+
+  async function reconcileSessionCleanup(profile) {
+    const lease = profile?.lease;
+    if (!lease || !/^session-import:/u.test(lease.ownerId || '')) return false;
+    if (await processAlive(lease.pid)) return false;
+    const receiptPath = sessionCleanupReceiptPath(lease.ownerId);
+    const confirmed = await verifyCleanupReceipt(receiptPath, {
+      kind: 'session',
+      profileId: profile.id,
+      ownerId: lease.ownerId,
+      workerPid: lease.pid
+    });
+    if (!confirmed) {
+      await markCleanupUnknown(profile.id, lease.ownerId);
+      return false;
+    }
+    if (!(await profileStore.releaseLease(profile.id, lease.ownerId, { cleanupConfirmed: true }))) {
+      await markCleanupUnknown(profile.id, lease.ownerId);
+      return false;
+    }
+    await removeCleanupReceipt(receiptPath).catch(() => {});
+    return true;
+  }
+
+  async function reconcileProfileCleanups() {
+    if (typeof profileStore.list !== 'function') return;
+    const profiles = await profileStore.list();
+    for (const profile of profiles) {
+      await reconcileProfileCleanup(profile);
+      await reconcileSessionCleanup(profile);
+    }
+  }
+
+  async function reconcileTaskCleanup(profile) {
+    const lease = profile?.lease;
+    if (!lease || !/^task:/u.test(lease.ownerId || '')) return false;
+    const task = tasks.get(lease.ownerId.slice('task:'.length));
+    if (!task || await processAlive(lease.pid)) return false;
+    const reconciled = await reconcileTaskCleanupReceipt(task);
+    task.updatedAt = nowIso();
+    await persist(task);
+    return reconciled;
+  }
+
+  async function reconcileAnyCleanup(profile) {
+    if (!profile?.id) return profile;
+    const profileId = profile.id;
+    const previous = cleanupReconcileTails.get(profileId) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(async () => {
+      const current = await profileStore.get(profileId);
+      if (!current?.lease) return current;
+      const ownerId = current.lease.ownerId || '';
+      // Task leases created before cleanupRequired became durable are still
+      // recoverable when their task-bound receipt proves browser cleanup.
+      if (current.lease.cleanupRequired !== true && !/^task:/u.test(ownerId)) return current;
+      if (/^profile-open:/u.test(ownerId)) await reconcileProfileCleanup(current);
+      else if (/^session-import:/u.test(ownerId)) await reconcileSessionCleanup(current);
+      else if (/^task:/u.test(ownerId)) await reconcileTaskCleanup(current);
+      return profileStore.get(profileId);
+    });
+    cleanupReconcileTails.set(profileId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (cleanupReconcileTails.get(profileId) === operation) cleanupReconcileTails.delete(profileId);
+    }
+  }
 
   function normalizeAttemptHistory(task) {
     task.attempt = Number.isSafeInteger(task.attempt) && task.attempt >= 1
@@ -430,10 +695,17 @@ export function createTaskService({
     if (typeof task.error?.code === 'string') record.errorCode = task.error.code;
   }
 
-  async function reconcileInterruptedCleanup(task) {
+  async function reconcileTaskCleanupReceipt(task, { workerExitConfirmed = false } = {}) {
     if (task.cleanup?.settled === true) return true;
-    if (task.cleanup?.managerRestartObserved !== true) return false;
-    if (await processAlive(task.workerPid)) return false;
+    if (!workerExitConfirmed && await processAlive(task.workerPid)) return false;
+    task.cleanup = {
+      ...(task.cleanup || {}),
+      workerExited: true
+    };
+    if (!(await verifyTaskCleanupReceipt(task))) {
+      await markCleanupUnknown(task.profileId, task.leaseOwner);
+      return false;
+    }
     let profile;
     try {
       profile = await profileStore.get(task.profileId);
@@ -441,11 +713,8 @@ export function createTaskService({
       return false;
     }
     if (profile?.lease?.ownerId === task.leaseOwner) {
-      // The recorded Worker is gone and this interrupted task still owns the
-      // lease. Release it directly instead of waiting for an unrelated Profile
-      // open or another Manager restart to run expiry recovery.
       try {
-        await profileStore.releaseLease(task.profileId, task.leaseOwner);
+        await profileStore.releaseLease(task.profileId, task.leaseOwner, { cleanupConfirmed: true });
         profile = await profileStore.get(task.profileId);
       } catch {
         return false;
@@ -458,15 +727,20 @@ export function createTaskService({
       browserClosed: true,
       leaseReleased: true,
       workerExited: true,
-      settled: true,
-      managerRestartObserved: true
+      settled: true
     };
+    // Persist the durable settled state before consuming its only crash proof.
+    // If persistence fails, the receipt remains available to the next Manager.
+    await persist(task);
+    await removeCleanupReceipt(taskCleanupReceiptPath(task)).catch(() => {});
     return true;
   }
 
   async function initialize() {
     await mkdir(root, { recursive: true, mode: 0o700 });
+    await mkdir(cleanupReceiptsRoot, { recursive: true, mode: 0o700 });
     await registry.list();
+    await reconcileProfileCleanups();
     const entries = await readdir(root, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory() || !entry.name.startsWith('task_')) continue;
@@ -478,28 +752,75 @@ export function createTaskService({
         continue;
       }
       if (!task || task.id !== entry.name || typeof task.profileId !== 'string') continue;
+      task.ownerRole = task.ownerRole === 'manager-admin' || task.ownerRole === 'agent'
+        ? task.ownerRole
+        : typeof task.ownerClientId !== 'string' || ['manager-admin', 'dashboard'].includes(task.ownerClientId)
+          ? 'manager-admin'
+          : 'agent';
       normalizeAttemptHistory(task);
-      const cleanupComplete = Boolean(task.cleanup?.workerExited && task.cleanup?.leaseReleased);
+      task.supportsResume = task.supportsResume === true;
+      task.cleanup = {
+        browserClosed: false,
+        leaseReleased: false,
+        workerExited: false,
+        settled: false,
+        ...(task.cleanup || {})
+      };
+      // Never trust a stale persisted `settled` bit on its own.
+      refreshCleanupSettled(task);
       const safelyQueued = task.state === 'queued' && !task.startedAt && !task.workerPid && task.leaseHeld !== true;
-      if ((!TERMINAL_TASK_STATES.has(task.state) && !safelyQueued) || (!safelyQueued && !cleanupComplete)) {
-        task.state = 'failed';
-        task.error = {
-          code: 'TASK_INTERRUPTED_BY_MANAGER_RESTART',
-          message: 'Manager restarted before task cleanup completed; inspect the checkpoint before resuming.'
-        };
-        task.progress = {
-          ...(task.progress || { current: 0, total: null }),
-          message: 'Interrupted by Manager restart; checkpoint preserved'
-        };
-        task.cleanup = { ...(task.cleanup || {}), managerRestartObserved: true };
-        task.finishedAt ||= nowIso();
-        task.updatedAt = nowIso();
-        task.leaseHeld = false;
-        await reconcileInterruptedCleanup(task);
-        finishAttemptHistory(task);
-        await atomicJson(filePath, task);
-      }
       tasks.set(task.id, task);
+      await recoverDiagnosticsPointers(task);
+      if (!safelyQueued) {
+        if (task.cleanup.settled !== true) {
+          task.cleanup.managerRestartObserved = true;
+          await reconcileTaskCleanupReceipt(task);
+          refreshCleanupSettled(task);
+        }
+
+        const claimedCompletion = task.state === 'verifying' || task.state === 'completed' ||
+          (task.completionClaimed === true && !TERMINAL_TASK_STATES.has(task.state));
+        if (claimedCompletion && task.result && task.cleanup.settled === true) {
+          try {
+            task.completion = await verifyCompletionGate(task);
+            task.state = 'completed';
+            task.error = null;
+          } catch (error) {
+            task.state = 'failed';
+            task.error = sanitizeError(error, 'TASK_COMPLETION_INTEGRITY_FAILED');
+            task.completion = {
+              ...(task.completion || {}),
+              integrity: 'invalid',
+              invalidAt: nowIso()
+            };
+          }
+        } else if (claimedCompletion) {
+          task.state = 'failed';
+          task.error = {
+            code: 'TASK_RESTART_COMPLETION_UNVERIFIED',
+            message: 'Manager restart recovery could not re-verify the claimed completion and cleanup evidence.'
+          };
+        } else if (!TERMINAL_TASK_STATES.has(task.state)) {
+          task.state = 'failed';
+          task.error = {
+            code: 'TASK_INTERRUPTED_BY_MANAGER_RESTART',
+            message: 'Manager restarted before task cleanup completed; inspect the checkpoint before resuming.'
+          };
+        }
+
+        if (TERMINAL_TASK_STATES.has(task.state)) {
+          task.progress = terminalProgress(task, task.state);
+          task.finishedAt ||= nowIso();
+          task.health = { status: task.state, checkedAt: nowIso() };
+          finishAttemptHistory(task);
+        }
+      }
+      await refreshResumeCheckpointState(task);
+      task.updatedAt = nowIso();
+      await atomicJson(filePath, task);
+      if (task.cleanup.settled === true) {
+        await removeCleanupReceipt(taskCleanupReceiptPath(task)).catch(() => {});
+      }
     }
   }
 
@@ -518,7 +839,9 @@ export function createTaskService({
     );
     const writes = [];
     queued.forEach((task, index) => {
-      const reason = activeProfiles.has(task.profileId)
+      const reason = [PROFILE_CLEANUP_QUEUE_REASON, PROFILE_BUSY_QUEUE_REASON].includes(task.queueReason)
+        ? task.queueReason
+        : activeProfiles.has(task.profileId)
         ? 'Waiting for the Profile lease'
         : children.size >= maxConcurrentTasks
           ? 'Waiting for an execution slot'
@@ -542,12 +865,15 @@ export function createTaskService({
     const activeProfiles = new Set(
       [...children.keys()].map((id) => tasks.get(id)?.profileId).filter(Boolean)
     );
+    let cleanupBlocked = false;
+    let profileBlocked = false;
     for (const task of queuedTasks()) {
       if (capacity <= 0) break;
       if (activeProfiles.has(task.profileId)) continue;
       let profile;
       try {
         profile = await profileStore.get(task.profileId);
+        profile = await reconcileAnyCleanup(profile);
       } catch (error) {
         task.state = 'failed';
         task.health = { status: 'failed', checkedAt: nowIso() };
@@ -558,9 +884,77 @@ export function createTaskService({
         await persist(task);
         continue;
       }
-      if (profile.state !== 'idle' && profile.lease?.ownerId !== task.leaseOwner) continue;
+      const taskCaller = { role: task.ownerRole, clientId: task.ownerClientId };
+      if (!canUseProfile(profile, taskCaller)) {
+        task.state = 'failed';
+        task.health = { status: 'failed', checkedAt: nowIso() };
+        task.error = {
+          code: 'PROFILE_ACCESS_REVOKED',
+          message: 'Profile access was revoked before the queued task started'
+        };
+        task.finishedAt = nowIso();
+        task.cleanup = { browserClosed: true, leaseReleased: true, workerExited: true, settled: true };
+        finishAttemptHistory(task);
+        await persist(task);
+        continue;
+      }
+      const activeLeaseOwner = profile.lease?.ownerId || '';
+      const openProfileEntry = openProfiles.get(task.profileId);
+      const knownLiveProfileOwner = openProfileEntry?.exited !== true &&
+        openProfileEntry?.ownerId === activeLeaseOwner;
+      const knownLiveSessionOwner = activeSessionImports.get(task.profileId) === activeLeaseOwner;
+      const leaseProcessAlive = Number.isSafeInteger(profile.lease?.pid) && profile.lease.pid > 0
+        ? await processAlive(profile.lease.pid)
+        : false;
+      if (
+        profile.state !== 'idle' && profile.lease?.ownerId !== task.leaseOwner &&
+        (knownLiveProfileOwner || knownLiveSessionOwner || leaseProcessAlive)
+      ) {
+        profileBlocked = true;
+        task.queueReason = PROFILE_BUSY_QUEUE_REASON;
+        task.health = { status: 'queued', checkedAt: nowIso() };
+        await persist(task);
+        continue;
+      }
+      if (profile.state === 'error' || profile.lease?.cleanupRequired === true) {
+        task.cleanupBlockedAt ||= nowIso();
+        const cleanupGraceElapsed = Date.now() - Date.parse(task.cleanupBlockedAt) >= cleanupReconcileGraceMs;
+        if (!cleanupGraceElapsed) {
+          cleanupBlocked = true;
+          task.queueReason = PROFILE_CLEANUP_QUEUE_REASON;
+          task.health = { status: 'blocked', checkedAt: nowIso() };
+          await persist(task);
+          continue;
+        }
+        task.state = 'failed';
+        task.health = { status: 'failed', checkedAt: nowIso() };
+        task.error = {
+          code: 'PROFILE_CLEANUP_UNCONFIRMED',
+          message: 'Profile browser cleanup remained unconfirmed after the reconciliation grace period'
+        };
+        task.finishedAt = nowIso();
+        task.queuePosition = null;
+        task.queueReason = null;
+        task.cleanup = { browserClosed: true, leaseReleased: true, workerExited: true, settled: true };
+        delete task.cleanupBlockedAt;
+        finishAttemptHistory(task);
+        await persist(task);
+        continue;
+      }
+      if (profile.state !== 'idle' && profile.lease?.ownerId !== task.leaseOwner) {
+        profileBlocked = true;
+        task.queueReason = PROFILE_BUSY_QUEUE_REASON;
+        task.health = { status: 'queued', checkedAt: nowIso() };
+        await persist(task);
+        continue;
+      }
+      // Profile reads and reconciliation yield. A concurrent cancel must win
+      // over this stale queue snapshot and must never be resurrected here.
+      if (task.state !== 'queued') continue;
+      delete task.cleanupBlockedAt;
       task.queuePosition = null;
       task.queueReason = null;
+      task.health = { status: 'healthy', checkedAt: nowIso() };
       await persist(task);
       await launchTaskAttempt(task, profile);
       if (children.has(task.id)) {
@@ -569,6 +963,7 @@ export function createTaskService({
       }
     }
     await updateQueueMetadata();
+    if (cleanupBlocked || profileBlocked) scheduleCleanupReconciliation();
   }
 
   function scheduleQueuedTasks() {
@@ -576,6 +971,15 @@ export function createTaskService({
     const operation = queueTail.then(drainQueue);
     queueTail = operation.catch(() => {});
     return operation;
+  }
+
+  function scheduleCleanupReconciliation() {
+    if (closing || cleanupReconcileTimer) return;
+    cleanupReconcileTimer = setTimeout(() => {
+      cleanupReconcileTimer = null;
+      void scheduleQueuedTasks().catch(() => {});
+    }, cleanupReconcileIntervalMs);
+    cleanupReconcileTimer.unref?.();
   }
 
   function persist(task) {
@@ -613,12 +1017,50 @@ export function createTaskService({
     const required = [];
     const seen = new Set();
     for (const item of evidence) {
-      if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.kind !== 'string' || !item.kind) {
-        throw completionGateFailure('Task result evidence must contain bounded objects with a kind');
+      if (
+        !item || typeof item !== 'object' || Array.isArray(item) ||
+        !SAFE_EVIDENCE_KINDS.has(item.kind)
+      ) {
+        throw completionGateFailure('Task result evidence contains an unsupported kind');
       }
-      if (item.kind !== 'artifact' || item.agentVisible === false) continue;
+      if (
+        item.label !== undefined &&
+        (typeof item.label !== 'string' || !item.label.trim() || item.label.length > 128)
+      ) {
+        throw completionGateFailure('Task result evidence labels must be bounded non-empty strings');
+      }
+      if (item.kind === 'url') {
+        try {
+          const url = new URL(item.value);
+          if (!['http:', 'https:'].includes(url.protocol) || item.value.length > 4_096) throw new Error();
+        } catch {
+          throw completionGateFailure('URL evidence must contain one bounded HTTP(S) URL');
+        }
+        continue;
+      }
+      if (item.kind === 'count') {
+        if (typeof item.value !== 'number' || !Number.isFinite(item.value) || item.value < 0) {
+          throw completionGateFailure('Count evidence must contain a non-negative finite number');
+        }
+        continue;
+      }
+      if (item.kind === 'hash') {
+        if (typeof item.value !== 'string' || !/^[a-f0-9]{32,128}$/iu.test(item.value)) {
+          throw completionGateFailure('Hash evidence must contain 32-128 hexadecimal characters');
+        }
+        continue;
+      }
+      if (item.kind === 'message' || item.kind === 'note') {
+        if (typeof item.value !== 'string' || !item.value.trim() || item.value.length > 1_024) {
+          throw completionGateFailure('Message evidence must contain bounded non-empty text');
+        }
+        continue;
+      }
+      if (item.agentVisible === false) {
+        throw completionGateFailure('Completion evidence artifacts must be Agent-visible');
+      }
       if (item.agentVisible !== undefined && item.agentVisible !== true) {
-        throw completionGateFailure('Declared artifact visibility must be a boolean');
+        throw completionGateFailure('Declared artifact visibility must be true when provided');
       }
       if (
         typeof item.file !== 'string' || !item.file || item.file.includes('\0') ||
@@ -648,8 +1090,11 @@ export function createTaskService({
     if (typeof task.result.summary !== 'string' || !task.result.summary.trim() || task.result.summary.length > 4_000) {
       throw completionGateFailure('Task result must include a bounded non-empty summary');
     }
-    if (!Array.isArray(task.result.evidence) || task.result.evidence.length > 1_000) {
-      throw completionGateFailure('Task result evidence must be a bounded array');
+    if (
+      !Array.isArray(task.result.evidence) ||
+      task.result.evidence.length < 1 || task.result.evidence.length > 32
+    ) {
+      throw completionGateFailure('Task result evidence must contain 1-32 verifiable items');
     }
     if (task.cleanup?.browserClosed !== true) {
       throw completionGateFailure('Task browser cleanup was not confirmed');
@@ -657,38 +1102,106 @@ export function createTaskService({
     if (task.cleanup?.workerExited !== true || task.cleanup?.leaseReleased !== true) {
       throw completionGateFailure('Task worker and Profile lease cleanup were not confirmed');
     }
+    const progressCurrent = Number(task.progress?.current);
+    const progressTotal = task.progress?.total === null || task.progress?.total === undefined
+      ? null
+      : Number(task.progress.total);
+    if (
+      !Number.isFinite(progressCurrent) || progressCurrent < 0 ||
+      (progressTotal !== null && (!Number.isFinite(progressTotal) || progressTotal < 0 || progressCurrent !== progressTotal))
+    ) {
+      throw completionGateFailure('Task progress must reach its declared total before completion');
+    }
 
     const required = requiredArtifactPaths(task);
+    const artifactAnchors = [];
+    const reverifyExistingAnchors = task.state === 'completed';
     for (const relativePath of required) {
-      const declaration = artifactDeclarations(task).find((item) => (
+      const declaration = artifactDeclarations(task, { includeUnverifiedResult: true }).find((item) => (
         item.kind === 'result' && item.relativePath === relativePath
       ));
       if (!declaration) throw completionGateFailure('A declared agent-visible artifact is invalid');
       let opened;
       try {
-        opened = await openValidatedArtifact(task, declaration);
+        opened = await openValidatedArtifact(task, declaration, {
+          verifyCompletionAnchor: reverifyExistingAnchors
+        });
+        if (reverifyExistingAnchors) {
+          const existing = task.completion?.artifacts?.find((item) => item?.artifactId === declaration.id);
+          if (!existing) throw new Error('completion anchor missing');
+          artifactAnchors.push(existing);
+        } else {
+          const sha256 = await hashOpenFile(opened.handle, Number(opened.stats.size));
+          cacheArtifactDigest(task, declaration, opened.stats, sha256);
+          artifactAnchors.push({
+            artifactId: declaration.id,
+            sizeBytes: Number(opened.stats.size),
+            sha256
+          });
+        }
+        const afterHash = await opened.handle.stat({ bigint: true });
+        if (
+          !sameFileIdentity(opened.stats, afterHash) ||
+          opened.stats.size !== afterHash.size || opened.stats.mtimeNs !== afterHash.mtimeNs
+        ) throw new Error('artifact changed while hashing');
+        await assertArtifactPathIdentity(task, declaration, opened.stats);
       } catch {
         throw completionGateFailure('A declared agent-visible artifact is missing or unstable');
       } finally {
         await opened?.handle.close().catch(() => {});
       }
     }
-    return { verifiedAt: nowIso(), artifactCount: required.length };
+    return { verifiedAt: nowIso(), artifactCount: required.length, artifacts: artifactAnchors };
+  }
+
+  function refreshCleanupSettled(task) {
+    task.cleanup.settled = Boolean(
+      task.cleanup.browserClosed === true &&
+      task.cleanup.workerExited === true &&
+      task.cleanup.leaseReleased === true
+    );
+    return task.cleanup.settled;
+  }
+
+  async function taskLeaseIsAbsent(task) {
+    try {
+      const profile = await profileStore.get(task.profileId);
+      return profile?.lease?.ownerId !== task.leaseOwner;
+    } catch {
+      return false;
+    }
   }
 
   async function releaseTaskLease(task) {
-    if (!task.leaseHeld) {
-      task.cleanup.leaseReleased = true;
-      return;
-    }
-    task.leaseHeld = false;
+    let released = !task.leaseHeld && await taskLeaseIsAbsent(task);
     try {
-      await profileStore.releaseLease(task.profileId, task.leaseOwner);
-      task.cleanup.leaseReleased = true;
+      if (!released) {
+        released = await profileStore.releaseLease(task.profileId, task.leaseOwner, {
+          cleanupConfirmed: task.cleanup.browserClosed === true
+        }) === true;
+        if (!released) released = await taskLeaseIsAbsent(task);
+      }
     } catch (error) {
-      task.cleanup.leaseReleaseError = sanitizeError(error, 'LEASE_RELEASE_FAILED');
+      released = await taskLeaseIsAbsent(task);
+      if (!released) {
+        task.cleanup.leaseReleaseError = sanitizeError(error, 'LEASE_RELEASE_FAILED');
+      }
+    }
+    if (released) {
+      task.leaseHeld = false;
+      task.cleanup.leaseReleased = true;
+      delete task.cleanup.leaseReleaseError;
+    } else {
+      task.leaseHeld = true;
+      task.cleanup.leaseReleased = false;
+      task.cleanup.leaseReleaseError ||= {
+        code: 'LEASE_RELEASE_FAILED',
+        message: 'Profile lease release could not be confirmed'
+      };
+      await markCleanupUnknown(task.profileId, task.leaseOwner);
     }
     await update(task, { cleanup: task.cleanup });
+    return released;
   }
 
   async function finalizeTask(task, exitCode, signal) {
@@ -697,6 +1210,7 @@ export function createTaskService({
     if (entry?.finalized) return;
     if (entry) {
       entry.finalized = true;
+      entry.attached = false;
       clearInterval(entry.watchdog);
       clearTimeout(entry.forceKillTimer);
       clearTimeout(entry.hardKillTimer);
@@ -705,6 +1219,10 @@ export function createTaskService({
     task.cleanup.workerExited = true;
     task.cleanup.exitCode = exitCode;
     task.cleanup.exitSignal = signal || null;
+    // A heartbeat renewal that started before finalization may still be queued
+    // inside ProfileStore. Drain it before the one authoritative release so a
+    // late renewal cannot resurrect a completed task's lease.
+    await entry?.leaseRenewalTail?.catch(() => {});
     await awaitTaskPersistence(task.id);
     const claimedCompletion = task.completionClaimed === true || task.state === 'verifying';
     if (!claimedCompletion && !TERMINAL_TASK_STATES.has(task.state)) {
@@ -713,7 +1231,11 @@ export function createTaskService({
         error: { code: 'TASK_WORKER_EXITED', message: 'Task worker exited before reporting a terminal state' }
       });
     }
-    await releaseTaskLease(task);
+    if (task.cleanup?.browserClosed === true) {
+      await releaseTaskLease(task);
+    } else if (!(await reconcileTaskCleanupReceipt(task, { workerExitConfirmed: true }))) {
+      await markCleanupUnknown(task.profileId, task.leaseOwner);
+    }
     if (claimedCompletion && task.state === 'verifying') {
       try {
         task.completion = await verifyCompletionGate(task);
@@ -724,8 +1246,9 @@ export function createTaskService({
         task.error = sanitizeError(error, 'TASK_COMPLETION_GATE_FAILED');
       }
     }
-    task.cleanup.settled = true;
+    refreshCleanupSettled(task);
     task.finishedAt ||= nowIso();
+    if (TERMINAL_TASK_STATES.has(task.state)) task.progress = terminalProgress(task, task.state);
     task.health = { status: task.state, checkedAt: nowIso() };
     finishAttemptHistory(task);
     await update(task, {
@@ -737,8 +1260,35 @@ export function createTaskService({
       history: task.history,
       ...(task.completion ? { completion: task.completion } : {})
     });
+    if (task.cleanup.settled === true) {
+      await removeCleanupReceipt(taskCleanupReceiptPath(task)).catch(() => {});
+    }
     entry?.resolveExit?.();
     void scheduleQueuedTasks().catch(() => {});
+  }
+
+  async function settleTaskWorkerExit(task, entry, exitCode, signal) {
+    try {
+      await finalizeTask(task, exitCode, signal);
+    } catch (error) {
+      finalizationFailures.set(task.id, sanitizeError(error, 'TASK_FINALIZATION_PERSIST_FAILED'));
+      entry.finalized = true;
+      entry.attached = false;
+      children.delete(task.id);
+      task.state = 'failed';
+      task.error = {
+        code: 'TASK_FINALIZATION_PERSIST_FAILED',
+        message: 'Task worker exited, but its durable terminal state could not be confirmed.'
+      };
+      task.cleanup = { ...(task.cleanup || {}), settled: false };
+      task.progress = terminalProgress(task, 'failed');
+      task.health = { status: 'failed', checkedAt: nowIso() };
+      await markCleanupUnknown(task.profileId, task.leaseOwner);
+      await persist(task).catch(() => {});
+    } finally {
+      entry.resolveExit?.();
+      void scheduleQueuedTasks().catch(() => {});
+    }
   }
 
   function scheduleForcedStop(task, entry) {
@@ -761,13 +1311,22 @@ export function createTaskService({
             // The close event remains the source of truth for cleanup and lease release.
           }
         }
-      }, Math.max(250, Math.min(5_000, diagnosticGraceMs)));
+      }, workerHardKillGraceMs);
       entry.hardKillTimer.unref?.();
-    }, diagnosticGraceMs);
+    }, workerCleanupGraceMs);
     entry.forceKillTimer.unref?.();
   }
 
   function attachTaskWorker(task, child) {
+    if (
+      !child ||
+      typeof child.on !== 'function' ||
+      typeof child.once !== 'function' ||
+      typeof child.send !== 'function' ||
+      typeof child.kill !== 'function'
+    ) {
+      throw new TaskServiceError('TASK_WORKER_INVALID', 'Task worker could not be initialized', 500);
+    }
     let resolveExit;
     const exitPromise = new Promise((resolve) => {
       resolveExit = resolve;
@@ -781,11 +1340,14 @@ export function createTaskService({
       hardKillTimer: null,
       watchdog: null,
       exitPromise,
-      resolveExit
+      resolveExit,
+      leaseRenewalTail: Promise.resolve(),
+      attached: false
     };
-    children.set(task.id, entry);
 
-    child.on('message', (message) => {
+    try {
+      child.on('message', (message) => {
+      if (!entry.attached) return;
       if (!message || typeof message !== 'object') return;
       if (message.type === 'heartbeat') {
         if (TERMINAL_TASK_STATES.has(task.state)) {
@@ -796,14 +1358,19 @@ export function createTaskService({
         clearTimeout(entry.forceKillTimer);
         entry.forceKillTimer = null;
         void update(task, {
-          heartbeatAt: message.at || nowIso(),
-          ...(message.progress ? { progress: clone(message.progress) } : {})
+          heartbeatAt: message.at || nowIso()
         }).catch(() => {});
-        void profileStore.acquireLease(task.profileId, task.leaseOwner, {
-          pid: child.pid,
-          ttlMs: LEASE_TTL_MS
-        }).catch((error) => {
-          if (TERMINAL_TASK_STATES.has(task.state)) return;
+        const renewal = entry.leaseRenewalTail.then(async () => {
+          if (!entry.attached || entry.finalized) return;
+          await profileStore.acquireLease(task.profileId, task.leaseOwner, {
+            pid: child.pid,
+            ttlMs: LEASE_TTL_MS,
+            cleanupRequired: true,
+            ...taskLeaseAccess(task)
+          });
+        });
+        entry.leaseRenewalTail = renewal.catch((error) => {
+          if (entry.finalized || TERMINAL_TASK_STATES.has(task.state)) return;
           void update(task, { state: 'failed', error: sanitizeError(error, 'LEASE_RENEWAL_FAILED') }).catch(() => {});
           send(child, { type: 'cancel' });
           scheduleForcedStop(task, entry);
@@ -811,7 +1378,38 @@ export function createTaskService({
         return;
       }
       if (message.type === 'progress' && message.progress) {
-        entry.stallDiagnoseAt = 0;
+        if (task.state === 'verifying' || TERMINAL_TASK_STATES.has(task.state)) return;
+        const current = Number(message.progress.current);
+        const total = message.progress.total === null ? null : Number(message.progress.total);
+        const progressMessage = typeof message.progress.message === 'string'
+          ? redactSensitiveText(message.progress.message).slice(0, 500)
+          : '';
+        const previousCurrent = Number(task.progress?.current) || 0;
+        const previousTotal = task.progress?.total === null || task.progress?.total === undefined
+          ? null
+          : Number(task.progress.total);
+        if (
+          !Number.isFinite(current) || current < 0 || current < previousCurrent ||
+          (total !== null && (!Number.isFinite(total) || total < current)) ||
+          (previousTotal !== null && (total === null || total < previousTotal)) ||
+          !progressMessage.trim()
+        ) {
+          void update(task, {
+            state: 'failed',
+            error: {
+              code: 'TASK_PROGRESS_INVALID',
+              message: 'Task worker reported invalid or backwards progress'
+            },
+            finishedAt: nowIso(),
+            progress: terminalProgress(task, 'failed'),
+            health: { status: 'failed', checkedAt: nowIso() }
+          }).catch(() => {});
+          send(child, { type: 'cancel' });
+          scheduleForcedStop(task, entry);
+          return;
+        }
+        const advanced = current > previousCurrent;
+        if (advanced) entry.stallDiagnoseAt = 0;
         const at = message.at || nowIso();
         const healthStatus = task.state === 'waiting_user'
           ? 'waiting_user'
@@ -819,10 +1417,12 @@ export function createTaskService({
             ? 'cooling_down'
             : 'healthy';
         void update(task, {
-          progress: clone(message.progress),
-          progressAt: at,
+          progress: { current, total, message: progressMessage },
           heartbeatAt: at,
-          health: { status: healthStatus, checkedAt: at }
+          ...(advanced ? {
+            progressAt: at,
+            health: { status: healthStatus, checkedAt: at }
+          } : {})
         }).catch(() => {});
         return;
       }
@@ -855,6 +1455,8 @@ export function createTaskService({
       }
       if (message.type === 'state' && typeof message.state === 'string') {
         const terminal = TERMINAL_TASK_STATES.has(message.state);
+        const resumedFromCooldown = task.state === 'cooling_down' && message.state === 'running';
+        if (resumedFromCooldown) entry.stallDiagnoseAt = 0;
         if (message.state === 'completed') {
           if (!TERMINAL_TASK_STATES.has(task.state)) {
             void update(task, {
@@ -872,24 +1474,43 @@ export function createTaskService({
             ...(message.state === 'cooling_down'
               ? { health: { status: 'cooling_down', checkedAt: nowIso() } }
               : message.state === 'running' || message.state === 'recovering'
-                ? { health: { status: 'healthy', checkedAt: nowIso() } }
+                ? {
+                    health: { status: 'healthy', checkedAt: nowIso() },
+                    ...(resumedFromCooldown ? { progressAt: nowIso() } : {})
+                  }
                 : {}),
-            ...(terminal ? { finishedAt: nowIso() } : {})
+            ...(terminal ? {
+              finishedAt: nowIso(),
+              progress: terminalProgress(task, message.state)
+            } : {})
           }).catch(() => {});
         }
         if (terminal) scheduleForcedStop(task, entry);
         return;
       }
       if (message.type === 'checkpoint') {
-        void update(task, { checkpoint: { path: message.path, savedAt: message.savedAt } }).catch(() => {});
+        void update(task, {
+          checkpoint: {
+            path: message.path,
+            attempt: message.attempt,
+            savedAt: message.savedAt,
+            sha256: message.sha256,
+            sizeBytes: message.sizeBytes
+          },
+          resumeCheckpointValid: false
+        }).catch(() => {});
         return;
       }
       if (message.type === 'screenshot') {
-        void update(task, { lastScreenshot: { path: message.path, reason: message.reason, at: nowIso() } }).catch(() => {});
+        void update(task, {
+          lastScreenshot: { path: message.path, reason: message.reason, at: nowIso(), attempt: task.attempt }
+        }).catch(() => {});
         return;
       }
       if (message.type === 'observation') {
-        void update(task, { lastObservation: { path: message.path, reason: message.reason, at: nowIso() } }).catch(() => {});
+        void update(task, {
+          lastObservation: { path: message.path, reason: message.reason, at: nowIso(), attempt: task.attempt }
+        }).catch(() => {});
         return;
       }
       if (message.type === 'behavior' && message.behavior) {
@@ -921,10 +1542,12 @@ export function createTaskService({
       }
       if (message.type === 'error') {
         if (!TERMINAL_TASK_STATES.has(task.state)) {
+          const nextState = message.state === 'cancelled' ? 'cancelled' : 'failed';
           void update(task, {
-            state: message.state === 'cancelled' ? 'cancelled' : 'failed',
+            state: nextState,
             error: sanitizeError(message.error),
-            finishedAt: nowIso()
+            finishedAt: nowIso(),
+            progress: terminalProgress(task, nextState)
           }).catch(() => {});
         }
         scheduleForcedStop(task, entry);
@@ -936,21 +1559,31 @@ export function createTaskService({
       }
     });
 
-    child.once('error', (error) => {
+      child.once('error', (error) => {
+      if (!entry.attached) return;
       if (!TERMINAL_TASK_STATES.has(task.state)) {
-        void update(task, { state: 'failed', error: sanitizeError(error, 'TASK_WORKER_SPAWN_FAILED') }).catch(() => {});
+        void update(task, {
+          state: 'failed',
+          error: sanitizeError(error, 'TASK_WORKER_SPAWN_FAILED'),
+          progress: terminalProgress(task, 'failed')
+        }).catch(() => {});
       }
       if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
-        void finalizeTask(task, null, null);
+        void settleTaskWorkerExit(task, entry, null, null);
         return;
       }
       send(child, { type: 'cancel' });
       scheduleForcedStop(task, entry);
     });
-    child.once('exit', (code, signal) => void finalizeTask(task, code, signal));
-    child.once('close', (code, signal) => void finalizeTask(task, code, signal));
+      child.once('exit', (code, signal) => {
+        if (entry.attached) void settleTaskWorkerExit(task, entry, code, signal);
+      });
+      child.once('close', (code, signal) => {
+        if (entry.attached) void settleTaskWorkerExit(task, entry, code, signal);
+      });
 
-    entry.watchdog = setInterval(() => {
+      entry.watchdog = setInterval(() => {
+      if (!entry.attached) return;
       if (TERMINAL_TASK_STATES.has(task.state)) {
         scheduleForcedStop(task, entry);
         return;
@@ -977,7 +1610,8 @@ export function createTaskService({
             state: 'failed',
             health: { status: 'failed', checkedAt: nowIso() },
             error: { code: 'TASK_HEARTBEAT_TIMEOUT', message: 'Task worker stopped reporting heartbeats' },
-            finishedAt: nowIso()
+            finishedAt: nowIso(),
+            progress: terminalProgress(task, 'failed')
           }).catch(() => {});
           send(child, { type: 'cancel' });
           scheduleForcedStop(task, entry);
@@ -1018,7 +1652,8 @@ export function createTaskService({
             code: 'TASK_PROGRESS_STALLED',
             message: 'Task remained live but did not report meaningful progress before the stall deadline'
           },
-          finishedAt: nowIso()
+          finishedAt: nowIso(),
+          progress: terminalProgress(task, 'failed')
         }).catch(() => {});
         send(child, { type: 'cancel' });
         scheduleForcedStop(task, entry);
@@ -1027,46 +1662,71 @@ export function createTaskService({
       5_000,
       Math.max(100, Math.floor(Math.min(heartbeatTimeoutMs, progressStallMs) / 3))
     ));
-    entry.watchdog.unref?.();
+      entry.watchdog.unref?.();
+      entry.attached = true;
+      children.set(task.id, entry);
+      return entry;
+    } catch (error) {
+      entry.attached = false;
+      clearInterval(entry.watchdog);
+      throw error;
+    }
   }
 
   async function launchTaskAttempt(task, profile) {
-    await update(task, { state: 'acquiring_profile' });
-    try {
-      await profileStore.acquireLease(task.profileId, task.leaseOwner, {
-        pid: process.pid,
-        ttlMs: LEASE_TTL_MS
-      });
-      task.leaseHeld = true;
-    } catch (error) {
-      task.state = 'failed';
-      task.error = sanitizeError(error, 'PROFILE_LEASE_FAILED');
-      task.finishedAt = nowIso();
-      await releaseTaskLease(task);
-      task.cleanup.browserClosed = true;
-      task.cleanup.workerExited = true;
-      task.cleanup.settled = true;
-      finishAttemptHistory(task);
-      await update(task, {
-        state: task.state,
-        error: task.error,
-        finishedAt: task.finishedAt,
-        cleanup: task.cleanup,
-        history: task.history
-      });
-      return;
-    }
-
+    if (task.state !== 'queued') return;
+    const acquiringAt = nowIso();
+    await update(task, {
+      state: 'acquiring_profile',
+      progress: { current: 0, total: null, message: 'Acquiring Profile' },
+      progressAt: acquiringAt,
+      heartbeatAt: acquiringAt,
+      health: { status: 'healthy', checkedAt: acquiringAt }
+    });
     let child;
+    let entry;
+    let startSent = false;
+    let failureCode = 'TASK_WORKER_SPAWN_FAILED';
     try {
+      if (task.state === 'cancelled') {
+        throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before worker launch', 409);
+      }
+      const cleanupReceiptPath = taskCleanupReceiptPath(task);
+      await rm(cleanupReceiptPath, { force: true });
       child = workerFactory(TASK_WORKER, 'task');
-      attachTaskWorker(task, child);
-      await update(task, { state: 'starting_browser', startedAt: nowIso(), workerPid: child.pid });
+      entry = attachTaskWorker(task, child);
+      if (task.state === 'cancelled') {
+        throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before Profile acquisition', 409);
+      }
+      if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+        throw new TaskServiceError('TASK_WORKER_SPAWN_FAILED', 'Task worker has no valid process ID', 500);
+      }
+      failureCode = 'PROFILE_LEASE_FAILED';
       await profileStore.acquireLease(task.profileId, task.leaseOwner, {
         pid: child.pid,
-        ttlMs: LEASE_TTL_MS
+        ttlMs: LEASE_TTL_MS,
+        cleanupRequired: true,
+        ...taskLeaseAccess(task)
       });
-      send(child, {
+      task.leaseHeld = true;
+      if (task.state === 'cancelled') {
+        throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before browser startup', 409);
+      }
+      failureCode = 'TASK_WORKER_START_FAILED';
+      const startingAt = nowIso();
+      await update(task, {
+        state: 'starting_browser',
+        startedAt: startingAt,
+        workerPid: child.pid,
+        progress: { current: 0, total: null, message: 'Starting browser' },
+        progressAt: startingAt,
+        heartbeatAt: startingAt,
+        health: { status: 'healthy', checkedAt: startingAt }
+      });
+      if (task.state === 'cancelled') {
+        throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before its start command', 409);
+      }
+      startSent = await sendChildMessageConfirmed(child, {
         type: 'start',
         config: {
           taskId: task.id,
@@ -1076,22 +1736,48 @@ export function createTaskService({
           behavior: task.behavior,
           outputDir: task.outputDir,
           checkpointPath: path.join(root, task.id, 'checkpoint.json'),
+          ...(task.resumeInput ? { resumeCheckpoint: clone(task.resumeInput) } : {}),
+          cleanupReceiptPath,
+          attempt: task.attempt,
           heartbeatMs: 20_000,
           ...(task.timeoutMs ? { timeoutMs: task.timeoutMs } : {})
         }
       });
+      if (!startSent) {
+        throw new TaskServiceError('TASK_WORKER_START_FAILED', 'Task worker did not accept its start command', 500);
+      }
     } catch (error) {
-      await update(task, {
-        state: 'failed',
-        error: sanitizeError(error, 'TASK_WORKER_SPAWN_FAILED'),
-        finishedAt: nowIso()
-      });
-      child?.kill?.('SIGTERM');
-      await releaseTaskLease(task);
-      if (!child) {
+      const hasWorkerPid = Number.isSafeInteger(child?.pid) && child.pid > 0;
+      if (task.state !== 'cancelled') {
+        await update(task, {
+          state: 'failed',
+          error: sanitizeError(error, failureCode),
+          progress: terminalProgress(task, 'failed'),
+          finishedAt: nowIso(),
+          ...(hasWorkerPid ? { workerPid: child.pid, startedAt: task.startedAt || nowIso() } : {})
+        });
+      }
+      if (!startSent) {
         task.cleanup.browserClosed = true;
-        task.cleanup.workerExited = true;
-        task.cleanup.settled = true;
+        await releaseTaskLease(task);
+      }
+      try {
+        child?.kill?.('SIGKILL');
+      } catch {
+        // Startup never reached the task module; durable cleanup state remains fail-closed below.
+      }
+      if (entry) {
+        if (!(await waitForEntry(entry.exitPromise, workerHardKillGraceMs))) {
+          if (!(await processAlive(child.pid))) {
+            await finalizeTask(task, child.exitCode, 'SIGKILL');
+          } else {
+            scheduleForcedStop(task, entry);
+          }
+        }
+      } else {
+        task.cleanup.workerExited = !Number.isSafeInteger(child?.pid) || child.pid <= 0 ||
+          child.exitCode !== null || !(await processAlive(child.pid));
+        refreshCleanupSettled(task);
         finishAttemptHistory(task);
         await update(task, { cleanup: task.cleanup, history: task.history });
       }
@@ -1099,6 +1785,7 @@ export function createTaskService({
   }
 
   async function create(body = {}, caller = {}) {
+    requireServiceOpen();
     const operation = createTail.then(() => createSerialized(body, caller));
     createTail = operation.catch(() => {});
     return operation;
@@ -1106,6 +1793,7 @@ export function createTaskService({
 
   async function createSerialized(body = {}, suppliedCaller = {}) {
     await ready;
+    requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
     const allowed = new Set([
       'profileId',
@@ -1135,7 +1823,7 @@ export function createTaskService({
       );
     }
 
-    const profile = await profileStore.get(body.profileId);
+    const profile = requireProfileUse(await profileStore.get(body.profileId), caller);
     const taskType = await registry.resolve(body.taskType);
     const behavior = body.behavior || profile.defaultBehavior || 'fast';
     if (!isBehaviorMode(behavior)) {
@@ -1153,12 +1841,13 @@ export function createTaskService({
       profileId: body.profileId,
       taskType: body.taskType,
       taskTypeSha256: taskType.sha256,
+      supportsResume: taskType.supportsResume === true,
       behavior,
       timeoutMs: body.timeoutMs ?? null,
       input
     });
     const existing = [...tasks.values()].find((task) => (
-      task.ownerClientId === caller.clientId && task.idempotencyKey === body.idempotencyKey
+      isTaskOwner(task, caller) && task.idempotencyKey === body.idempotencyKey
     ));
     if (existing) {
       if (existing.requestHash !== hash) {
@@ -1168,7 +1857,7 @@ export function createTaskService({
           409
         );
       }
-      return publicRecord(existing);
+      return readPublicRecord(existing);
     }
     if (queuedTasks().length >= maxQueuedTasks) {
       throw new TaskServiceError('TASK_QUEUE_FULL', 'Task queue reached its configured capacity', 429);
@@ -1183,7 +1872,9 @@ export function createTaskService({
       profileId: body.profileId,
       taskType: taskType.name,
       taskTypeSha256: taskType.sha256,
+      supportsResume: taskType.supportsResume === true,
       modulePath: taskType.modulePath,
+      ownerRole: caller.role,
       ownerClientId: caller.clientId,
       idempotencyKey: body.idempotencyKey,
       requestHash: hash,
@@ -1206,6 +1897,8 @@ export function createTaskService({
       cooldown: null,
       outputDir,
       checkpoint: null,
+      resumeInput: null,
+      resumeCheckpointValid: false,
       result: null,
       error: null,
       cleanup: { browserClosed: false, leaseReleased: false, workerExited: false, settled: false },
@@ -1224,14 +1917,8 @@ export function createTaskService({
     return publicRecord(task);
   }
 
-  async function verifyResumeCheckpoint(task) {
+  async function inspectResumeCheckpoint(task) {
     const expected = path.join(root, task.id, 'checkpoint.json');
-    if (
-      typeof task.checkpoint?.path !== 'string' ||
-      path.resolve(task.checkpoint.path) !== path.resolve(expected)
-    ) {
-      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint is unavailable or invalid', 409);
-    }
     let handle;
     try {
       const before = await lstat(expected, { bigint: true });
@@ -1252,14 +1939,207 @@ export function createTaskService({
       const record = JSON.parse(source.toString('utf8'));
       if (
         !record || typeof record !== 'object' || Array.isArray(record) ||
-        typeof record.savedAt !== 'string' || !record.savedAt || !Object.hasOwn(record, 'data')
+        record.taskId !== task.id || record.attempt !== task.attempt ||
+        typeof record.savedAt !== 'string' || Number.isNaN(Date.parse(record.savedAt)) ||
+        !Object.hasOwn(record, 'data')
       ) throw new Error('invalid checkpoint record');
-      return { savedAt: record.savedAt, sha256: createHash('sha256').update(source).digest('hex') };
+      return {
+        path: expected,
+        attempt: record.attempt,
+        savedAt: record.savedAt,
+        sha256: createHash('sha256').update(source).digest('hex'),
+        sizeBytes: source.byteLength,
+        source
+      };
     } catch {
       throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint is unavailable or unstable', 409);
     } finally {
       await handle?.close().catch(() => {});
     }
+  }
+
+  async function inspectDiagnosticFile(task, entry, kind) {
+    if (
+      !entry || typeof entry !== 'object' || Array.isArray(entry) ||
+      typeof entry.relativePath !== 'string' || !entry.relativePath || entry.relativePath.includes('\0') ||
+      path.isAbsolute(entry.relativePath) ||
+      typeof entry.reason !== 'string' || !entry.reason.trim() || entry.reason.length > 64 ||
+      typeof entry.at !== 'string' || Number.isNaN(Date.parse(entry.at))
+    ) return null;
+    const relativePath = path.normalize(entry.relativePath);
+    if (
+      relativePath === '.' || relativePath === '..' || relativePath.startsWith(`..${path.sep}`) ||
+      (kind === 'screenshot' && !['.png', '.jpg', '.jpeg'].includes(path.extname(relativePath).toLowerCase())) ||
+      (kind === 'observation' && path.extname(relativePath).toLowerCase() !== '.json')
+    ) return null;
+    const candidate = path.resolve(task.outputDir, relativePath);
+    if (!inside(path.resolve(task.outputDir), candidate)) return null;
+    let handle;
+    try {
+      const before = await lstat(candidate, { bigint: true });
+      if (
+        !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
+        before.size <= 0n || before.size > BigInt(64 * 1024 * 1024)
+      ) return null;
+      const outputRoot = await realpath(task.outputDir);
+      const canonicalCandidate = await realpath(candidate);
+      if (!inside(outputRoot, canonicalCandidate)) return null;
+      handle = await open(candidate, 'r');
+      const opened = await handle.stat({ bigint: true });
+      if (!sameFileIdentity(before, opened) || opened.size !== before.size || opened.mtimeNs !== before.mtimeNs) {
+        return null;
+      }
+      return { path: candidate, reason: entry.reason, at: entry.at };
+    } catch {
+      return null;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  async function inspectDiagnosticsManifest(task) {
+    const manifestPath = path.join(root, task.id, 'diagnostics.json');
+    let handle;
+    try {
+      const before = await lstat(manifestPath, { bigint: true });
+      if (
+        !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
+        before.size <= 0n || before.size > BigInt(MAX_DIAGNOSTICS_MANIFEST_BYTES)
+      ) return null;
+      handle = await open(manifestPath, 'r');
+      const opened = await handle.stat({ bigint: true });
+      if (!sameFileIdentity(before, opened) || opened.size !== before.size || opened.mtimeNs !== before.mtimeNs) {
+        return null;
+      }
+      const record = JSON.parse((await handle.readFile()).toString('utf8'));
+      const after = await handle.stat({ bigint: true });
+      if (
+        !sameFileIdentity(opened, after) || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs ||
+        record?.version !== 2 || record.taskId !== task.id || record.attempt !== task.attempt
+      ) return null;
+      const screenshot = await inspectDiagnosticFile(task, record.screenshot, 'screenshot');
+      const observation = await inspectDiagnosticFile(task, record.observation, 'observation');
+      if (screenshot) screenshot.attempt = record.attempt;
+      if (observation) observation.attempt = record.attempt;
+      return screenshot || observation ? { screenshot, observation } : null;
+    } catch {
+      return null;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  async function recoverDiagnosticsPointers(task) {
+    const diagnostics = await inspectDiagnosticsManifest(task);
+    if (!diagnostics) return false;
+    let changed = false;
+    for (const [manifestKey, taskKey] of [
+      ['screenshot', 'lastScreenshot'],
+      ['observation', 'lastObservation']
+    ]) {
+      const candidate = diagnostics[manifestKey];
+      if (!candidate) continue;
+      const existingAt = Date.parse(task[taskKey]?.at || '');
+      if (!task[taskKey] || Number.isNaN(existingAt) || Date.parse(candidate.at) > existingAt) {
+        task[taskKey] = candidate;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  async function refreshResumeCheckpointState(task) {
+    if (
+      task.supportsResume !== true || task.state !== 'failed' ||
+      task.cleanup?.settled !== true
+    ) {
+      task.resumeCheckpointValid = false;
+      task.resumeCheckpointError = null;
+      return false;
+    }
+    try {
+      // A resumed attempt may durably replace checkpoint.json and then lose its
+      // IPC notification. An older pointer must not hide that newer, valid
+      // generation; inspectResumeCheckpoint still requires the current attempt.
+      const checkpoint = task.checkpoint === null || task.checkpoint === undefined ||
+        task.checkpoint.attempt !== task.attempt
+        ? await inspectResumeCheckpoint(task)
+        : await verifyResumeCheckpoint(task);
+      const { source: _source, ...pointer } = checkpoint;
+      task.checkpoint = pointer;
+      task.resumeCheckpointValid = true;
+      task.resumeCheckpointError = null;
+      return true;
+    } catch (error) {
+      task.resumeCheckpointValid = false;
+      task.resumeCheckpointError = sanitizeError(error, 'TASK_CHECKPOINT_INVALID');
+      return false;
+    }
+  }
+
+  async function recoverResumeCheckpointPointer(task) {
+    if (task.checkpoint?.attempt === task.attempt) return false;
+    let checkpoint;
+    try {
+      checkpoint = await inspectResumeCheckpoint(task);
+    } catch {
+      return false;
+    }
+    const { source: _source, ...pointer } = checkpoint;
+    task.checkpoint = pointer;
+    task.resumeCheckpointValid = true;
+    await update(task, { checkpoint: task.checkpoint, resumeCheckpointValid: true });
+    return true;
+  }
+
+  async function verifyResumeCheckpoint(task) {
+    const expected = path.join(root, task.id, 'checkpoint.json');
+    if (
+      typeof task.checkpoint?.path !== 'string' ||
+      path.resolve(task.checkpoint.path) !== path.resolve(expected)
+    ) {
+      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint is unavailable or invalid', 409);
+    }
+    const current = await inspectResumeCheckpoint(task);
+    if (
+      (typeof task.checkpoint.sha256 === 'string' && task.checkpoint.sha256 !== current.sha256) ||
+      (Number.isSafeInteger(task.checkpoint.sizeBytes) && task.checkpoint.sizeBytes !== current.sizeBytes) ||
+      (typeof task.checkpoint.savedAt === 'string' && task.checkpoint.savedAt !== current.savedAt)
+    ) {
+      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint changed after it was recorded', 409);
+    }
+    return current;
+  }
+
+  async function createResumeInput(task, checkpoint) {
+    const targetAttempt = task.attempt + 1;
+    const source = checkpoint.source;
+    if (!Buffer.isBuffer(source)) {
+      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint could not be frozen for resume', 409);
+    }
+    const snapshotPath = path.join(
+      root,
+      task.id,
+      `resume-input-attempt-${targetAttempt}-${randomUUID()}.json`
+    );
+    let handle;
+    try {
+      handle = await open(snapshotPath, 'wx', 0o600);
+      await handle.writeFile(source);
+      await handle.sync();
+    } catch {
+      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint could not be frozen for resume', 409);
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+    return {
+      path: snapshotPath,
+      sourceAttempt: task.attempt,
+      targetAttempt,
+      savedAt: checkpoint.savedAt,
+      sha256: checkpoint.sha256,
+      sizeBytes: checkpoint.sizeBytes
+    };
   }
 
   async function verifyResumeModule(task) {
@@ -1301,6 +2181,7 @@ export function createTaskService({
   }
 
   async function resume(id, body = {}, caller = {}) {
+    requireServiceOpen();
     const operation = createTail.then(() => resumeSerialized(id, body, caller));
     createTail = operation.catch(() => {});
     return operation;
@@ -1308,9 +2189,10 @@ export function createTaskService({
 
   async function resumeSerialized(id, body = {}, suppliedCaller = {}) {
     await ready;
+    requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task || task.ownerClientId !== caller.clientId) {
+    if (!task || !isTaskOwner(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'resumeKey')) {
@@ -1322,18 +2204,26 @@ export function createTaskService({
         'resumeKey must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
       );
     }
-    const keyHash = requestHash({ taskId: task.id, ownerClientId: task.ownerClientId, resumeKey: body.resumeKey });
+    const keyHash = requestHash({
+      taskId: task.id,
+      ownerRole: task.ownerRole,
+      ownerClientId: task.ownerClientId,
+      resumeKey: body.resumeKey
+    });
     task.resumeKeys = Array.isArray(task.resumeKeys) ? task.resumeKeys : [];
-    if (task.resumeKeys.some((entry) => entry?.keyHash === keyHash)) return publicRecord(task);
+    if (task.resumeKeys.some((entry) => entry?.keyHash === keyHash)) return readPublicRecord(task);
     if (task.state !== 'failed') {
       throw new TaskServiceError('TASK_NOT_RESUMABLE', 'Only a failed terminal task can be resumed explicitly', 409);
     }
-    if (task.cleanup?.settled !== true && task.cleanup?.managerRestartObserved === true) {
-      if (await reconcileInterruptedCleanup(task)) await update(task, { cleanup: task.cleanup });
+    if (task.supportsResume !== true) {
+      throw new TaskServiceError('TASK_NOT_RESUMABLE', 'This task type does not support checkpoint resume', 409);
     }
+    await reconcileTaskForRead(task);
+    await awaitTaskPersistence(task.id);
     if (task.cleanup?.settled !== true) {
       throw new TaskServiceError('TASK_CLEANUP_NOT_SETTLED', 'Task cleanup must settle before resume', 409);
     }
+    await recoverResumeCheckpointPointer(task);
     if (!task.checkpoint) {
       throw new TaskServiceError('TASK_CHECKPOINT_REQUIRED', 'Task has no checkpoint to resume', 409);
     }
@@ -1344,15 +2234,16 @@ export function createTaskService({
     await verifyResumeContext(task);
     await verifyResumeModule(task);
     const checkpoint = await verifyResumeCheckpoint(task);
-    const profile = await profileStore.get(task.profileId);
+    const resumeInput = await createResumeInput(task, checkpoint);
+    const profile = requireProfileUse(await profileStore.get(task.profileId), caller);
 
     task.attempt += 1;
     task.resumeKeys.push({ keyHash, attempt: task.attempt, requestedAt: nowIso() });
     task.resumeKeys = task.resumeKeys.slice(-MAX_ATTEMPTS);
     task.state = 'queued';
     task.progress = {
-      current: Number(task.progress?.current) || 0,
-      total: Number.isFinite(task.progress?.total) ? task.progress.total : null,
+      current: 0,
+      total: null,
       message: `Resume attempt ${task.attempt} queued from checkpoint`
     };
     task.heartbeatAt = nowIso();
@@ -1367,6 +2258,9 @@ export function createTaskService({
     task.leaseHeld = false;
     task.lastScreenshot = null;
     task.lastObservation = null;
+    await rm(path.join(root, task.id, 'diagnostics.json'), { force: true });
+    task.resumeCheckpointValid = true;
+    task.resumeInput = resumeInput;
     task.progressAt = nowIso();
     task.health = { status: 'healthy', checkedAt: nowIso() };
     task.behaviorState = {
@@ -1402,8 +2296,9 @@ export function createTaskService({
       start = index + 1;
     }
     const page = visible.slice(start, start + limit);
+    const records = await Promise.all(page.map(readPublicRecord));
     return {
-      tasks: page.map(publicRecord),
+      tasks: records,
       nextCursor: start + limit < visible.length ? encodeCursor(page.at(-1)) : null
     };
   }
@@ -1415,8 +2310,69 @@ export function createTaskService({
     if (!task || !canAccess(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
-    await awaitTaskPersistence(id);
+    return readPublicRecord(task);
+  }
+
+  async function readPublicRecord(task) {
+    await awaitTaskPersistence(task.id);
+    await reconcileTaskForRead(task);
+    await awaitTaskPersistence(task.id);
+    // Finalization may make cleanup settled while the first reconciliation is
+    // awaiting an older persistence generation. Re-check that exact terminal
+    // transition before publishing a record so `cleanup.settled: true` can
+    // never be paired with a stale false `resumeAvailable` value.
+    if (
+      task.supportsResume === true && task.state === 'failed' && task.checkpoint &&
+      task.cleanup?.settled === true && task.resumeCheckpointValid !== true
+    ) {
+      await reconcileTaskForRead(task);
+      await awaitTaskPersistence(task.id);
+    }
     return publicRecord(task);
+  }
+
+  async function reconcileTaskForRead(task) {
+    let changed = await recoverDiagnosticsPointers(task);
+    if (taskCleanupNeedsReconciliation(task)) {
+      try {
+        const profile = await profileStore.get(task.profileId);
+        await reconcileAnyCleanup(profile);
+      } catch {
+        // The persisted task remains explicitly unsettled; callers can time out
+        // and retry without receiving a false completion.
+      }
+    }
+    const previousResumeState = task.resumeCheckpointValid;
+    const previousCheckpoint = JSON.stringify(task.checkpoint);
+    const previousResumeError = JSON.stringify(task.resumeCheckpointError || null);
+    await refreshResumeCheckpointState(task);
+    changed ||= previousResumeState !== task.resumeCheckpointValid ||
+      previousCheckpoint !== JSON.stringify(task.checkpoint) ||
+      previousResumeError !== JSON.stringify(task.resumeCheckpointError || null);
+    if (task.state === 'completed' && task.completion?.integrity !== 'invalid') {
+      try {
+        await verifyCompletionGate(task);
+      } catch {
+        const invalidAt = nowIso();
+        task.state = 'failed';
+        task.error = {
+          code: 'TASK_COMPLETION_INTEGRITY_FAILED',
+          message: 'Previously verified completion evidence is missing, changed, or unstable.'
+        };
+        task.completion = { ...(task.completion || {}), integrity: 'invalid', invalidAt };
+        task.progress = terminalProgress(task, 'failed');
+        task.health = { status: 'failed', checkedAt: invalidAt };
+        finishAttemptHistory(task);
+        changed = true;
+      }
+    }
+    if (changed) await persist(task);
+  }
+
+  function taskCleanupNeedsReconciliation(task) {
+    return task.cleanup?.settled !== true && (
+      task.cleanup?.workerExited === true || task.cleanup?.managerRestartObserved === true
+    );
   }
 
   async function getInternal(id) {
@@ -1427,12 +2383,13 @@ export function createTaskService({
     return clone(task);
   }
 
-  function artifactDeclarations(task) {
-    const declarations = declaredArtifactFiles(task).map((relativePath) => ({
-      relativePath,
-      kind: 'result'
-    }));
-    if (typeof task.lastScreenshot?.path === 'string') {
+  function artifactDeclarations(task, { includeUnverifiedResult = false } = {}) {
+    const resultVerified = task.state === 'completed' && task.completion?.integrity !== 'invalid' &&
+      typeof task.completion?.verifiedAt === 'string';
+    const declarations = resultVerified || includeUnverifiedResult
+      ? declaredArtifactFiles(task).map((relativePath) => ({ relativePath, kind: 'result' }))
+      : [];
+    if (task.lastScreenshot?.attempt === task.attempt && typeof task.lastScreenshot?.path === 'string') {
       const relativePath = path.relative(task.outputDir, task.lastScreenshot.path);
       if (
         relativePath &&
@@ -1446,7 +2403,7 @@ export function createTaskService({
         declarations.unshift({ relativePath, kind: 'diagnostic-screenshot' });
       }
     }
-    if (typeof task.lastObservation?.path === 'string') {
+    if (task.lastObservation?.attempt === task.attempt && typeof task.lastObservation?.path === 'string') {
       const relativePath = path.relative(task.outputDir, task.lastObservation.path);
       if (
         relativePath &&
@@ -1475,6 +2432,57 @@ export function createTaskService({
       left.dev === right.dev && left.ino === right.ino;
   }
 
+  async function hashOpenFile(handle, sizeBytes) {
+    const digest = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, sizeBytes)));
+    let offset = 0;
+    while (offset < sizeBytes) {
+      const length = Math.min(buffer.length, sizeBytes - offset);
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      if (bytesRead <= 0) throw new Error('artifact ended while hashing');
+      digest.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    return digest.digest('hex');
+  }
+
+  function artifactDigestKey(task, declaration, stats) {
+    return [
+      task.id,
+      declaration.id,
+      stats.dev,
+      stats.ino,
+      stats.size,
+      stats.mtimeNs
+    ].join(':');
+  }
+
+  function cacheArtifactDigest(task, declaration, stats, digest) {
+    const key = artifactDigestKey(task, declaration, stats);
+    artifactDigestCache.delete(key);
+    artifactDigestCache.set(key, digest);
+    while (artifactDigestCache.size > 1_024) {
+      artifactDigestCache.delete(artifactDigestCache.keys().next().value);
+    }
+    return digest;
+  }
+
+  async function cachedArtifactDigest(task, declaration, handle, stats) {
+    const key = artifactDigestKey(task, declaration, stats);
+    const cached = artifactDigestCache.get(key);
+    if (cached) {
+      artifactDigestCache.delete(key);
+      artifactDigestCache.set(key, cached);
+      return cached;
+    }
+    return cacheArtifactDigest(
+      task,
+      declaration,
+      stats,
+      await hashOpenFile(handle, Number(stats.size))
+    );
+  }
+
   async function validatedOutputRoot(task) {
     const canonicalStateRoot = await realpath(root);
     const taskRoot = path.join(root, task.id);
@@ -1497,7 +2505,24 @@ export function createTaskService({
     return canonicalOutputRoot;
   }
 
-  async function openValidatedArtifact(task, declaration) {
+  async function assertArtifactPathIdentity(task, declaration, expectedStats) {
+    const candidate = path.resolve(task.outputDir, declaration.relativePath);
+    const canonicalOutputRoot = await validatedOutputRoot(task);
+    const [current, canonical] = await Promise.all([
+      lstat(candidate, { bigint: true }),
+      realpath(candidate)
+    ]);
+    if (!inside(canonicalOutputRoot, canonical)) throw new Error('artifact path escaped output');
+    const canonicalStats = await lstat(canonical, { bigint: true });
+    if (
+      !current.isFile() || current.isSymbolicLink() || current.nlink !== 1n ||
+      !canonicalStats.isFile() || canonicalStats.isSymbolicLink() || canonicalStats.nlink !== 1n ||
+      !sameFileIdentity(expectedStats, current) || !sameFileIdentity(expectedStats, canonicalStats) ||
+      expectedStats.size !== current.size || expectedStats.mtimeNs !== current.mtimeNs
+    ) throw new Error('artifact path changed while being verified');
+  }
+
+  async function openValidatedArtifact(task, declaration, { verifyCompletionAnchor = true } = {}) {
     let handle;
     try {
       const resolvedOutputRoot = path.resolve(task.outputDir);
@@ -1536,6 +2561,32 @@ export function createTaskService({
         throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
       }
       await artifactValidationHook?.({ stage: 'after-validation', taskId: task.id, candidate });
+      if (
+        verifyCompletionAnchor && declaration.kind === 'result' &&
+        Array.isArray(task.completion?.artifacts)
+      ) {
+        const anchor = Array.isArray(task.completion?.artifacts)
+          ? task.completion.artifacts.find((item) => item?.artifactId === declaration.id)
+          : null;
+        if (
+          !anchor || !Number.isSafeInteger(anchor.sizeBytes) || anchor.sizeBytes !== Number(opened.size) ||
+          typeof anchor.sha256 !== 'string' ||
+          anchor.sha256 !== await cachedArtifactDigest(task, declaration, handle, opened)
+        ) {
+          throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed after verification', 409);
+        }
+        const afterHash = await handle.stat({ bigint: true });
+        if (
+          !sameFileIdentity(opened, afterHash) || opened.size !== afterHash.size || opened.mtimeNs !== afterHash.mtimeNs
+        ) {
+          throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed while being verified', 409);
+        }
+        try {
+          await assertArtifactPathIdentity(task, declaration, opened);
+        } catch {
+          throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence path changed after verification', 409);
+        }
+      }
       const { relativePath: _relativePath, ...publicDeclaration } = declaration;
       return {
         handle,
@@ -1556,7 +2607,8 @@ export function createTaskService({
       try {
         opened = await openValidatedArtifact(task, declaration);
         artifacts.push(opened.artifact);
-      } catch {
+      } catch (error) {
+        if (error?.code === 'ARTIFACT_INTEGRITY_FAILED') throw error;
         // Missing or unstable declared artifacts are omitted rather than exposing a partial path.
       } finally {
         await opened?.handle.close().catch(() => {});
@@ -1573,6 +2625,11 @@ export function createTaskService({
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     await awaitTaskPersistence(id);
+    await reconcileTaskForRead(task);
+    await awaitTaskPersistence(id);
+    if (task.completion?.integrity === 'invalid') {
+      throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed after verification', 409);
+    }
     const artifacts = await collectArtifacts(task);
     return artifacts;
   }
@@ -1585,6 +2642,11 @@ export function createTaskService({
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     await awaitTaskPersistence(id);
+    await reconcileTaskForRead(task);
+    await awaitTaskPersistence(id);
+    if (task.completion?.integrity === 'invalid') {
+      throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed after verification', 409);
+    }
     if (typeof requestedArtifactId !== 'string' || !/^artifact_[a-f0-9]{32}$/.test(requestedArtifactId)) {
       throw new TaskServiceError('INVALID_ARTIFACT_ID', 'Artifact ID is invalid');
     }
@@ -1663,11 +2725,11 @@ export function createTaskService({
     if (!task || !canAccess(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
-    if (TERMINAL_TASK_STATES.has(task.state)) return publicRecord(task);
+    if (TERMINAL_TASK_STATES.has(task.state)) return readPublicRecord(task);
     await update(task, {
       state: 'cancelled',
       health: { status: 'cancelled', checkedAt: nowIso() },
-      progress: { ...task.progress, message: 'Cancellation requested' },
+      progress: terminalProgress(task, 'cancelled'),
       finishedAt: nowIso()
     });
     const entry = children.get(id);
@@ -1678,7 +2740,7 @@ export function createTaskService({
       await releaseTaskLease(task);
       task.cleanup.browserClosed = true;
       task.cleanup.workerExited = true;
-      task.cleanup.settled = true;
+      refreshCleanupSettled(task);
       finishAttemptHistory(task);
       await update(task, { cleanup: task.cleanup, history: task.history });
     }
@@ -1688,6 +2750,7 @@ export function createTaskService({
 
   async function continueTask(id, body = {}, suppliedCaller = {}) {
     await ready;
+    requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
     if (!task || !canAccess(task, caller)) {
@@ -1709,7 +2772,9 @@ export function createTaskService({
       throw new TaskServiceError('INVALID_TASK_CONTINUE', 'note must contain at most 2000 characters');
     }
     const entry = children.get(id);
-    if (!entry || !send(entry.child, { type: 'continue', requestId, note: body.note || '' })) {
+    if (!entry || !(await sendChildMessageConfirmed(entry.child, {
+      type: 'continue', requestId, note: body.note || ''
+    }))) {
       throw new TaskServiceError('TASK_WORKER_UNAVAILABLE', 'Task worker is unavailable for continuation', 409);
     }
     task.userRequest = {
@@ -1729,6 +2794,7 @@ export function createTaskService({
   }
 
   async function installTaskType(input, suppliedCaller = {}) {
+    requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
     if (caller.role !== 'manager-admin') {
       throw new TaskServiceError('TASK_TYPE_INSTALL_FORBIDDEN', 'Only Manager admin can install task types', 403);
@@ -1737,6 +2803,7 @@ export function createTaskService({
   }
 
   async function installTaskPack(input = {}, suppliedCaller = {}) {
+    requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
     if (caller.role !== 'manager-admin') {
       throw new TaskServiceError('TASK_PACK_INSTALL_FORBIDDEN', 'Only Manager admin can install Task Packs', 403);
@@ -1796,7 +2863,9 @@ export function createTaskService({
 
   async function importSession(profileId, bundle) {
     await ready;
-    const profile = await profileStore.get(profileId);
+    requireServiceOpen();
+    let profile = await profileStore.get(profileId);
+    profile = await reconcileAnyCleanup(profile);
     if ((profile.kind || 'persistent') === 'ephemeral') {
       throw new TaskServiceError(
         'EPHEMERAL_PROFILE_SESSION_UNSUPPORTED',
@@ -1808,70 +2877,205 @@ export function createTaskService({
       throw new TaskServiceError('PROFILE_IN_USE', 'Target profile must be idle before session import', 409);
     }
     const ownerId = `session-import:${randomUUID().replaceAll('-', '')}`;
-    await profileStore.acquireLease(profileId, ownerId, { pid: process.pid, ttlMs: 120_000 });
-    let child;
+    const cleanupReceiptPath = sessionCleanupReceiptPath(ownerId);
+    await rm(cleanupReceiptPath, { force: true });
+    let child = null;
+    let leaseAcquired = false;
+    let workerExited = false;
+    let workerExit = null;
+    let hardKilled = false;
+    let cleanupHandled = false;
+    let workerTerminationHandled = false;
+    let importSent = false;
+    let resolveExit;
+    const exitPromise = new Promise((resolve) => { resolveExit = resolve; });
     try {
       child = workerFactory(IMPORT_WORKER, 'session-import');
-      await profileStore.acquireLease(profileId, ownerId, { pid: child.pid, ttlMs: 120_000 });
-      const result = await new Promise((resolve, reject) => {
-        let settled = false;
+      if (
+        !child ||
+        typeof child.once !== 'function' ||
+        typeof child.on !== 'function' ||
+        typeof child.send !== 'function' ||
+        typeof child.kill !== 'function'
+      ) {
+        throw new TaskServiceError('SESSION_IMPORT_WORKER_INVALID', 'Session import worker could not be initialized', 500);
+      }
+      child.once('exit', (code, signal) => {
+        workerExited = true;
+        workerExit = { code, signal: signal || null };
+        resolveExit(workerExit);
+      });
+      await profileStore.acquireLease(profileId, ownerId, {
+        pid: child.pid,
+        ttlMs: sessionImportTimeoutMs + effectiveSessionImportCleanupGraceMs +
+          (2 * sessionImportHardKillGraceMs) + 60_000,
+        cleanupRequired: true
+      });
+      leaseAcquired = true;
+      activeSessionImports.set(profileId, ownerId);
+      let finishTerminal;
+      const terminalPromise = new Promise((resolve) => {
+        let terminalSettled = false;
         let timeoutRequested = false;
+        let timer;
         let hardStopTimer;
-        const timer = setTimeout(() => {
+        const finish = (value) => {
+          if (terminalSettled) return;
+          terminalSettled = true;
+          clearTimeout(timer);
+          clearTimeout(hardStopTimer);
+          resolve({ ...value, timeoutRequested });
+        };
+        finishTerminal = finish;
+        child.once('exit', (code, signal) => finish({ kind: 'exit', code, signal: signal || null }));
+        child.once('error', (error) => finish({ kind: 'worker-error', error }));
+        child.on('message', (message) => {
+          if (message?.type === 'result') finish({ kind: 'result', result: message.result });
+          if (message?.type === 'error') finish({ kind: 'error', error: message.error });
+        });
+        timer = setTimeout(() => {
           timeoutRequested = true;
           send(child, { type: 'cancel' });
           hardStopTimer = setTimeout(() => {
+            hardKilled = true;
+            finish({ kind: 'hard-kill' });
             child.kill('SIGKILL');
-            done(reject)(new TaskServiceError(
-              'SESSION_IMPORT_ROLLBACK_FAILED',
-              'Session import timed out and rollback could not be confirmed',
-              500
-            ));
-          }, sessionImportRollbackGraceMs);
+          }, effectiveSessionImportCleanupGraceMs);
         }, sessionImportTimeoutMs);
-        const done = (callback) => (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          clearTimeout(hardStopTimer);
-          callback(value);
-        };
-        child.once('error', done(reject));
-        child.once('exit', done(() => reject(new TaskServiceError(
-          timeoutRequested ? 'SESSION_IMPORT_ROLLBACK_FAILED' : 'SESSION_IMPORT_EXITED',
-          timeoutRequested
-            ? 'Session import timed out and rollback could not be confirmed'
-            : 'Session import worker exited before returning a result',
-          500
-        ))));
-        child.on('message', (message) => {
-          if (message?.type === 'result') done(resolve)(message.result);
-          if (message?.type === 'error') {
-            if (timeoutRequested && message.error?.code !== 'SESSION_IMPORT_ROLLBACK_FAILED') {
-              done(reject)(new TaskServiceError('SESSION_IMPORT_TIMEOUT', 'Session import timed out', 504));
-            } else {
-              done(reject)(Object.assign(new Error(message.error?.message), message.error));
-            }
+        if (workerExited) {
+          finish({ kind: 'exit', ...workerExit });
+        }
+      });
+      if (!workerExited) {
+        importSent = await sendChildMessageConfirmed(child, {
+          type: 'import',
+          config: {
+            profile,
+            bundle,
+            cleanupReceiptPath,
+            cleanupReceipt: { kind: 'session', profileId, ownerId }
           }
         });
-        send(child, { type: 'import', config: { profile, bundle } });
-      });
-      return {
-        status: result.status === 'verified' ? 'verified' : 'partial',
-        cookieCount: Number(result.cookieCount) || 0,
-        localStorageCount: Number(result.localStorageCount) || 0,
-        sessionCookieRetentionHours: Number(result.sessionCookieRetentionHours) || 0,
-        verification: typeof result.verification === 'string'
-          ? result.verification
-          : 'storage_replaced_not_login_verified',
-        message: result.status === 'verified'
-          ? 'Session was imported and verified'
-          : 'Session material was imported; account login still requires site-level verification'
-      };
+        if (!importSent) {
+          finishTerminal({
+            kind: 'worker-error',
+            error: new TaskServiceError('SESSION_IMPORT_SEND_FAILED', 'Session import worker is unavailable', 500)
+          });
+        }
+      }
+      const terminal = await terminalPromise;
+
+      if (!workerExited) {
+        if (terminal.kind === 'hard-kill') {
+          await waitForEntry(exitPromise, sessionImportHardKillGraceMs);
+        } else if (!(await waitForEntry(exitPromise, sessionImportHardKillGraceMs))) {
+          hardKilled = true;
+          child.kill?.('SIGKILL');
+          await waitForEntry(exitPromise, sessionImportHardKillGraceMs);
+        }
+      }
+      workerTerminationHandled = true;
+
+      const rawErrorCode = terminal.kind === 'error' ? terminal.error?.code : null;
+      const expectedOutcomes = terminal.kind === 'result'
+        ? ['committed']
+        : terminal.kind === 'error' && rawErrorCode !== 'SESSION_IMPORT_ROLLBACK_FAILED'
+          ? ['rolled_back']
+          : ['committed', 'rolled_back'];
+      let receiptConfirmed = false;
+      if (workerExited && !hardKilled && rawErrorCode !== 'SESSION_IMPORT_ROLLBACK_FAILED') {
+        for (const outcome of expectedOutcomes) {
+          receiptConfirmed = await verifyCleanupReceipt(cleanupReceiptPath, {
+            kind: 'session',
+            profileId,
+            ownerId,
+            workerPid: child.pid,
+            outcome
+          });
+          if (receiptConfirmed) break;
+        }
+      }
+      if (receiptConfirmed) {
+        receiptConfirmed = await profileStore.releaseLease(profileId, ownerId, {
+          cleanupConfirmed: true
+        }).catch(() => false);
+        if (receiptConfirmed) await removeCleanupReceipt(cleanupReceiptPath).catch(() => {});
+      }
+      if (!receiptConfirmed) await markCleanupUnknown(profileId, ownerId);
+      cleanupHandled = true;
+
+      if (terminal.kind === 'result') {
+        if (!receiptConfirmed) {
+          throw new TaskServiceError(
+            'SESSION_IMPORT_CLEANUP_UNCONFIRMED',
+            'Session import completed but browser cleanup could not be confirmed',
+            500
+          );
+        }
+        const result = terminal.result || {};
+        return {
+          status: result.status === 'verified' ? 'verified' : 'partial',
+          cookieCount: Number(result.cookieCount) || 0,
+          localStorageCount: Number(result.localStorageCount) || 0,
+          sessionCookieRetentionHours: Number(result.sessionCookieRetentionHours) || 0,
+          verification: typeof result.verification === 'string'
+            ? result.verification
+            : 'storage_replaced_not_login_verified',
+          message: result.status === 'verified'
+            ? 'Session was imported and verified'
+            : 'Session material was imported; account login still requires site-level verification'
+        };
+      }
+      if (terminal.kind === 'error') {
+        if (terminal.timeoutRequested && rawErrorCode !== 'SESSION_IMPORT_ROLLBACK_FAILED') {
+          throw new TaskServiceError('SESSION_IMPORT_TIMEOUT', 'Session import timed out', 504);
+        }
+        throw Object.assign(new Error(terminal.error?.message), terminal.error);
+      }
+      if (terminal.timeoutRequested || terminal.kind === 'hard-kill') {
+        throw new TaskServiceError(
+          'SESSION_IMPORT_ROLLBACK_FAILED',
+          'Session import timed out and rollback could not be confirmed',
+          500
+        );
+      }
+      if (terminal.kind === 'worker-error') throw terminal.error;
+      throw new TaskServiceError(
+        'SESSION_IMPORT_EXITED',
+        'Session import worker exited before returning a result',
+        500
+      );
+    } catch (error) {
+      if (child && !leaseAcquired && !importSent) {
+        child.kill?.('SIGKILL');
+        workerTerminationHandled = true;
+      } else if (child && !workerExited && !workerTerminationHandled) {
+        if (importSent) send(child, { type: 'cancel' });
+        const gracefulMs = importSent
+          ? effectiveSessionImportCleanupGraceMs
+          : sessionImportHardKillGraceMs;
+        if (!(await waitForEntry(exitPromise, gracefulMs))) {
+          hardKilled = importSent;
+          child.kill?.('SIGKILL');
+          await waitForEntry(exitPromise, sessionImportHardKillGraceMs);
+        }
+      }
+      if (!cleanupHandled && !importSent) {
+        if (!leaseAcquired) {
+          cleanupHandled = true;
+        } else {
+          const released = await profileStore.releaseLease(profileId, ownerId, {
+            cleanupConfirmed: true
+          }).catch(() => false);
+          cleanupHandled = released === true;
+        }
+      }
+      if (!cleanupHandled) await markCleanupUnknown(profileId, ownerId);
+      throw error;
     } finally {
-      child?.kill?.('SIGTERM');
-      await profileStore.releaseLease(profileId, ownerId).catch(() => {});
       bundle = null;
+      if (activeSessionImports.get(profileId) === ownerId) activeSessionImports.delete(profileId);
+      void scheduleQueuedTasks().catch(() => {});
     }
   }
 
@@ -1880,23 +3084,47 @@ export function createTaskService({
     suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
   ) {
     await ready;
+    requireServiceOpen();
     const caller = profileCallerIdentity(suppliedCaller);
+    let requestedProfile = requireProfileUse(await profileStore.get(profileId), caller);
+    requestedProfile = await reconcileAnyCleanup(requestedProfile);
+    requireProfileUse(requestedProfile, caller);
     const existing = openProfiles.get(profileId);
     if (existing) {
-      if (caller.role !== 'manager-admin' && existing.ownerClientId !== caller.clientId) {
+      if (caller.role !== 'manager-admin' && !isSamePrincipal(existing, caller)) {
         throw new TaskServiceError('PROFILE_IN_USE', 'Profile is open for another client', 409);
       }
-      return { status: 'open', profileId, pid: existing.child.pid };
+      if (!existing.exited) {
+        return { status: 'open', profileId, pid: existing.child.pid };
+      }
+      // Never report a dead manual worker as an open browser. A valid cleanup
+      // receipt permits the old entry to release and a new worker to start;
+      // missing or invalid proof keeps the Profile quarantined explicitly.
+      await existing.cleanupReportPromise;
+      if (!(await existing.release())) {
+        await markCleanupUnknown(profileId, existing.ownerId);
+        throw new TaskServiceError(
+          'PROFILE_CLEANUP_UNCONFIRMED',
+          'The previous Profile browser exited without confirmed cleanup; the Profile remains blocked',
+          409
+        );
+      }
+      requestedProfile = await reconcileAnyCleanup(await profileStore.get(profileId));
+      requireProfileUse(requestedProfile, caller);
     }
     const pending = openingProfiles.get(profileId);
     if (pending) {
-      if (caller.role !== 'manager-admin' && pending.ownerClientId !== caller.clientId) {
+      if (caller.role !== 'manager-admin' && !isSamePrincipal(pending, caller)) {
         throw new TaskServiceError('PROFILE_IN_USE', 'Profile is opening for another client', 409);
       }
       return pending.promise;
     }
-    const operation = openProfileSingle(profileId, caller.clientId);
-    openingProfiles.set(profileId, { promise: operation, ownerClientId: caller.clientId });
+    const operation = openProfileSingle(profileId, caller);
+    openingProfiles.set(profileId, {
+      promise: operation,
+      ownerRole: caller.role,
+      ownerClientId: caller.clientId
+    });
     try {
       return await operation;
     } finally {
@@ -1904,7 +3132,10 @@ export function createTaskService({
     }
   }
 
-  async function openProfileSingle(profileId, ownerClientId) {
+  async function openProfileSingle(profileId, caller) {
+    const ownerRole = caller.role;
+    const ownerClientId = caller.clientId;
+    const leaseAccess = caller.role === 'agent' ? { authorizedClientId: caller.clientId } : {};
     const ownerId = `profile-open:${ownerClientId}:${profileId}:${randomUUID().replaceAll('-', '')}`;
     const profile = await profileStore.get(profileId);
     if ((profile.kind || 'persistent') === 'ephemeral') {
@@ -1914,138 +3145,379 @@ export function createTaskService({
         409
       );
     }
-    await profileStore.acquireLease(profileId, ownerId, { pid: process.pid, ttlMs: 5 * 60_000 });
-    const child = workerFactory(PROFILE_WORKER, 'profile-open');
+    const cleanupReceiptPath = profileCleanupReceiptPath(ownerId);
+    let child;
+    try {
+      await rm(cleanupReceiptPath, { force: true });
+      child = workerFactory(PROFILE_WORKER, 'profile-open');
+      if (
+        !child ||
+        typeof child.once !== 'function' ||
+        typeof child.on !== 'function' ||
+        typeof child.send !== 'function' ||
+        typeof child.kill !== 'function'
+      ) {
+        throw new TaskServiceError('PROFILE_WORKER_INVALID', 'Profile worker could not be initialized', 500);
+      }
+    } catch (error) {
+      child?.kill?.('SIGKILL');
+      throw error;
+    }
+    let resolveExit;
+    let resolveCleanupReport;
     const entry = {
       child,
       ownerId,
+      ownerRole,
       ownerClientId,
       released: false,
+      exited: false,
+      cleanupReported: false,
+      cleanupConfirmed: false,
+      browserStartSent: false,
+      spawnFailed: false,
       renewal: null,
-      lastHeartbeatAt: Date.now()
+      renewalTail: Promise.resolve(),
+      closing: false,
+      lastHeartbeatAt: Date.now(),
+      cleanupReceiptPath,
+      exitPromise: new Promise((resolve) => { resolveExit = resolve; }),
+      cleanupReportPromise: new Promise((resolve) => { resolveCleanupReport = resolve; }),
+      releasePromise: null
     };
     openProfiles.set(profileId, entry);
 
     const release = async () => {
-      if (entry.released) return;
-      entry.released = true;
-      clearInterval(entry.renewal);
-      openProfiles.delete(profileId);
-      await profileStore.releaseLease(profileId, ownerId).catch(() => {});
+      if (entry.released) return true;
+      if (!entry.exited || !entry.cleanupConfirmed) return false;
+      if (entry.releasePromise) return entry.releasePromise;
+      entry.releasePromise = (async () => {
+        entry.closing = true;
+        clearInterval(entry.renewal);
+        await entry.renewalTail.catch(() => {});
+        let released = await profileStore.releaseLease(profileId, ownerId, { cleanupConfirmed: true });
+        if (released !== true) {
+          const current = await profileStore.get(profileId);
+          released = current?.lease?.ownerId !== ownerId;
+        }
+        if (!released) return false;
+        await removeCleanupReceipt(cleanupReceiptPath).catch(() => {});
+        entry.released = true;
+        if (openProfiles.get(profileId) === entry) openProfiles.delete(profileId);
+        void scheduleQueuedTasks().catch(() => {});
+        return true;
+      })().catch(() => false);
+      const released = await entry.releasePromise;
+      if (!released) entry.releasePromise = null;
+      return released;
     };
-    child.once('exit', () => void release());
-    child.once('error', () => void release());
-    child.on('message', (message) => {
-      if (message?.type === 'heartbeat') entry.lastHeartbeatAt = Date.now();
-    });
+    entry.release = release;
+    const confirmCleanup = async (browserClosed) => {
+      if (entry.cleanupReported) return entry.cleanupReportPromise;
+      entry.cleanupReported = true;
+      entry.cleanupConfirmed = browserClosed === true &&
+        await verifyCleanupReceipt(cleanupReceiptPath, {
+          kind: 'profile',
+          profileId,
+          ownerId,
+          workerPid: child.pid
+        });
+      resolveCleanupReport();
+      await release();
+      return entry.cleanupConfirmed;
+    };
+    try {
+      child.once('exit', (code, signal) => {
+        entry.exited = true;
+        entry.exitCode = code;
+        entry.exitSignal = signal || null;
+        resolveExit();
+        // A private, identity-bound receipt remains authoritative when the
+        // child exits after closing Chromium but its final IPC message is lost.
+        // `closed` normally arrives before `exit`. In that ordering the first
+        // cleanup confirmation cannot release the lease yet, so the exit edge
+        // must always retry the idempotent release after confirmation settles.
+        void confirmCleanup(true).then(() => release());
+      });
+      child.once('error', () => {
+        if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+          entry.spawnFailed = true;
+          entry.exited = true;
+          entry.cleanupReported = true;
+          entry.cleanupConfirmed = true;
+          resolveCleanupReport();
+          resolveExit();
+          void release();
+        }
+      });
+      child.on('message', (message) => {
+        if (message?.type === 'heartbeat') entry.lastHeartbeatAt = Date.now();
+        if (message?.type === 'closed' && !entry.cleanupReported) {
+          void confirmCleanup(message.browserClosed === true);
+        }
+      });
+    } catch (error) {
+      if (openProfiles.get(profileId) === entry) openProfiles.delete(profileId);
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // The worker never received a browser-start command and owns no Profile lease.
+      }
+      throw error;
+    }
 
     try {
-      const result = await new Promise((resolve, reject) => {
-        const timer = setTimeout(
+      await profileStore.acquireLease(profileId, ownerId, {
+        pid: child.pid,
+        ttlMs: 5 * 60_000,
+        cleanupRequired: true,
+        ...leaseAccess
+      });
+      if (entry.exited) {
+        throw new TaskServiceError('PROFILE_OPEN_FAILED', 'Profile worker exited before browser startup', 500);
+      }
+      let openTimer;
+      const openResult = new Promise((resolve, reject) => {
+        openTimer = setTimeout(
           () => reject(new TaskServiceError('PROFILE_OPEN_TIMEOUT', 'Profile did not open in time', 504)),
           TASK_SERVICE_DEADLINES.profileOpenMs
         );
         child.on('message', (message) => {
           if (message?.type === 'ready') {
-            clearTimeout(timer);
+            clearTimeout(openTimer);
             resolve(message);
           }
           if (message?.type === 'error') {
-            clearTimeout(timer);
+            clearTimeout(openTimer);
             reject(Object.assign(new Error(message.error?.message), message.error));
           }
         });
-        send(child, { type: 'open', profile });
       });
+      openResult.catch(() => {});
+      entry.browserStartSent = await sendChildMessageConfirmed(child, {
+        type: 'open',
+        profile,
+        cleanupReceiptPath,
+        cleanupReceipt: { kind: 'profile', profileId, ownerId }
+      });
+      if (!entry.browserStartSent) {
+        clearTimeout(openTimer);
+        throw new TaskServiceError('PROFILE_OPEN_SEND_FAILED', 'Profile worker is unavailable', 500);
+      }
+      const result = await openResult;
       void result;
-      await profileStore.acquireLease(profileId, ownerId, { pid: child.pid, ttlMs: 5 * 60_000 });
+      if (entry.exited) throw new TaskServiceError('PROFILE_OPEN_FAILED', 'Profile worker exited while opening', 500);
       entry.renewal = setInterval(() => {
+        if (entry.closing || entry.released) return;
         if (Date.now() - entry.lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
-          send(child, { type: 'close' });
-          child.kill?.('SIGTERM');
+          void closeProfile(profileId, { role: 'manager-admin', clientId: 'manager-admin' }).catch(() => {});
           return;
         }
-        void profileStore.acquireLease(profileId, ownerId, { pid: child.pid, ttlMs: 5 * 60_000 })
-          .catch(() => send(child, { type: 'close' }));
-      }, 20_000);
+        const renewal = entry.renewalTail.then(async () => {
+          if (entry.closing || entry.released) return;
+          await profileStore.acquireLease(profileId, ownerId, {
+            pid: child.pid,
+            ttlMs: 5 * 60_000,
+            cleanupRequired: true,
+            ...leaseAccess
+          });
+        });
+        entry.renewalTail = renewal.catch(() => {
+          if (!entry.closing && !entry.released) send(child, { type: 'close' });
+        });
+      }, profileLeaseRenewalMs);
       entry.renewal.unref?.();
       return { status: 'open', profileId, pid: child.pid };
     } catch (error) {
-      send(child, { type: 'close' });
-      child.kill?.('SIGTERM');
-      await release();
+      if (!entry.browserStartSent) {
+        if (!entry.exited) {
+          child.kill?.('SIGKILL');
+          await waitForEntry(entry.exitPromise, TASK_SERVICE_DEADLINES.profileKillGraceMs);
+        }
+        entry.cleanupReported = true;
+        entry.cleanupConfirmed = entry.exited;
+        resolveCleanupReport();
+        if (!(await entry.release())) await markCleanupUnknown(profileId, ownerId);
+      } else {
+        send(child, { type: 'close' });
+        await shutdownProfileEntry(profileId, entry);
+      }
       throw error;
     }
+  }
+
+  async function waitForEntry(promise, timeoutMs) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function shutdownProfileEntry(profileId, entry) {
+    send(entry.child, { type: 'close' });
+    await waitForEntry(
+      Promise.allSettled([entry.cleanupReportPromise, entry.exitPromise]),
+      TASK_SERVICE_DEADLINES.profileCloseMs
+    );
+    if (!entry.exited) {
+      entry.child.kill?.('SIGTERM');
+      await waitForEntry(entry.exitPromise, TASK_SERVICE_DEADLINES.profileKillGraceMs);
+    }
+    if (!entry.exited) {
+      entry.child.kill?.('SIGKILL');
+      await waitForEntry(entry.exitPromise, TASK_SERVICE_DEADLINES.profileKillGraceMs);
+    }
+    if (await entry.release()) return true;
+    await markCleanupUnknown(profileId, entry.ownerId);
+    return false;
   }
 
   async function closeProfile(
     profileId,
     suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
   ) {
+    await ready;
     const caller = profileCallerIdentity(suppliedCaller);
+    requireProfileUse(await profileStore.get(profileId), caller);
     const pending = openingProfiles.get(profileId);
     if (pending) {
-      if (caller.role !== 'manager-admin' && pending.ownerClientId !== caller.clientId) {
+      if (caller.role !== 'manager-admin' && !isSamePrincipal(pending, caller)) {
         throw new TaskServiceError('PROFILE_IN_USE', 'Profile is opening for another client', 409);
       }
       await pending.promise.catch(() => {});
     }
     const entry = openProfiles.get(profileId);
     if (!entry) {
+      let profile = await profileStore.get(profileId);
+      profile = await reconcileAnyCleanup(profile);
+      if (profile.lease || profile.state !== 'idle') {
+        throw new TaskServiceError(
+          'PROFILE_CLEANUP_UNCONFIRMED',
+          'Profile browser cleanup could not be confirmed; the Profile remains blocked',
+          409
+        );
+      }
       void scheduleQueuedTasks().catch(() => {});
       return { status: 'closed', profileId };
     }
-    if (caller.role !== 'manager-admin' && entry.ownerClientId !== caller.clientId) {
+    if (caller.role !== 'manager-admin' && !isSamePrincipal(entry, caller)) {
       throw new TaskServiceError('PROFILE_IN_USE', 'Profile is open for another client', 409);
     }
-    send(entry.child, { type: 'close' });
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        entry.child.kill('SIGTERM');
-        resolve();
-      }, TASK_SERVICE_DEADLINES.profileCloseMs);
-      entry.child.once('exit', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
-    if (!entry.released) {
-      entry.released = true;
-      clearInterval(entry.renewal);
-      openProfiles.delete(profileId);
-      await profileStore.releaseLease(profileId, entry.ownerId).catch(() => {});
+    if (!(await shutdownProfileEntry(profileId, entry))) {
+      throw new TaskServiceError(
+        'PROFILE_CLEANUP_UNCONFIRMED',
+        'Profile browser cleanup could not be confirmed; the Profile remains blocked',
+        409
+      );
     }
     void scheduleQueuedTasks().catch(() => {});
     return { status: 'closed', profileId };
   }
 
+  async function interruptTaskForShutdown(task) {
+    if (task.state === 'queued' || TERMINAL_TASK_STATES.has(task.state)) return;
+    await update(task, {
+      state: 'failed',
+      error: {
+        code: 'TASK_INTERRUPTED_BY_MANAGER_SHUTDOWN',
+        message: 'Manager shutdown interrupted this attempt; inspect its checkpoint before explicit resume.'
+      },
+      progress: terminalProgress(task, 'failed'),
+      finishedAt: nowIso(),
+      health: { status: 'failed', checkedAt: nowIso() }
+    });
+    const entry = children.get(task.id);
+    if (entry) {
+      send(entry.child, { type: 'cancel' });
+      scheduleForcedStop(task, entry);
+    }
+  }
+
   async function close() {
-    await ready;
+    if (closePromise) return closePromise;
     closing = true;
-    const exitingWorkers = [...children.values()].map((entry) => entry.exitPromise);
-    await Promise.allSettled([
-      ...[...tasks.values()]
-        .filter((task) => !TERMINAL_TASK_STATES.has(task.state))
-        .map((task) => cancel(task.id, { role: 'manager-admin', clientId: 'manager-admin' })),
-      ...[...openProfiles.keys()].map((profileId) => closeProfile(
-        profileId,
-        { role: 'manager-admin', clientId: 'manager-admin' }
-      ))
-    ]);
-    if (exitingWorkers.length > 0) {
-      await Promise.race([
-        Promise.allSettled(exitingWorkers),
-        new Promise((resolve) => {
-          const timer = setTimeout(resolve, diagnosticGraceMs + 5_000);
-          timer.unref?.();
-        })
+    clearTimeout(cleanupReconcileTimer);
+    cleanupReconcileTimer = null;
+    closePromise = (async () => {
+      await ready;
+      // Let an already-running queue drain reach a stable claim boundary.
+      // `closing` prevents any subsequent drain from launching more work.
+      await queueTail.catch(() => {});
+      const exitingWorkers = [...children.values()].map((entry) => entry.exitPromise);
+      const shutdownResults = await Promise.allSettled([
+        ...[...tasks.values()]
+          .filter((task) => task.state !== 'queued' && !TERMINAL_TASK_STATES.has(task.state))
+          .map((task) => interruptTaskForShutdown(task)),
+        ...[...openProfiles.keys()].map((profileId) => closeProfile(
+          profileId,
+          { role: 'manager-admin', clientId: 'manager-admin' }
+        ))
       ]);
-    }
-    while (true) {
-      const pending = [...persistChains.entries()];
-      await Promise.allSettled(pending.map(([, promise]) => promise));
-      if (pending.every(([id, promise]) => persistChains.get(id) === promise)) break;
-    }
+      if (exitingWorkers.length > 0) {
+        await Promise.race([
+          Promise.allSettled(exitingWorkers),
+          new Promise((resolve) => {
+            const timer = setTimeout(resolve, workerCleanupGraceMs + workerHardKillGraceMs + 1_000);
+            timer.unref?.();
+          })
+        ]);
+      }
+      while (true) {
+        const pending = [...persistChains.entries()];
+        await Promise.allSettled(pending.map(([, promise]) => promise));
+        if (pending.every(([id, promise]) => persistChains.get(id) === promise)) break;
+      }
+
+      const forcedExits = [];
+      for (const [taskId, entry] of children) {
+        const task = tasks.get(taskId);
+        if (task) await markCleanupUnknown(task.profileId, task.leaseOwner);
+        forcedExits.push(entry.exitPromise);
+        entry.child.kill?.('SIGKILL');
+      }
+      if (forcedExits.length > 0) {
+        await Promise.race([
+          Promise.allSettled(forcedExits),
+          new Promise((resolve) => setTimeout(resolve, workerHardKillGraceMs))
+        ]);
+        while (true) {
+          const pending = [...persistChains.entries()];
+          await Promise.allSettled(pending.map(([, promise]) => promise));
+          if (pending.every(([id, promise]) => persistChains.get(id) === promise)) break;
+        }
+      }
+      const profiles = typeof profileStore.list === 'function' ? await profileStore.list() : [];
+      const cleanupUnconfirmed = profiles.some((profile) => (
+        profile.state === 'error' || profile.lease?.cleanupRequired === true
+      ));
+      const taskCleanupUnconfirmed = [...tasks.values()].some((task) => (
+        task.leaseHeld === true ||
+        (TERMINAL_TASK_STATES.has(task.state) && task.startedAt && task.cleanup?.settled !== true)
+      ));
+      if (
+        shutdownResults.some((result) => result.status === 'rejected') ||
+        children.size > 0 ||
+        openProfiles.size > 0 ||
+        cleanupUnconfirmed ||
+        taskCleanupUnconfirmed ||
+        finalizationFailures.size > 0
+      ) {
+        throw new TaskServiceError(
+          'SERVICE_SHUTDOWN_UNCONFIRMED',
+          'Task service stopped accepting work, but browser cleanup could not be fully confirmed',
+          500
+        );
+      }
+      return { clean: true };
+    })();
+    return closePromise;
   }
 
   async function schedulerStatus() {

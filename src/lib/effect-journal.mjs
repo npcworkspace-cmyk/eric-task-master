@@ -43,6 +43,53 @@ function validateJournalStats(details) {
   }
 }
 
+function invalidJournal(cause) {
+  return new EffectJournalError(
+    'TASK_EFFECT_JOURNAL_INVALID',
+    'Task effect journal contains an invalid record; no new browser action is allowed',
+    cause
+  );
+}
+
+function parseJournal(source, { includeMetadata = false } = {}) {
+  let lastSequence = 0;
+  let records = 0;
+  const pending = new Map();
+  for (const line of source.split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    let value;
+    try {
+      value = JSON.parse(line);
+    } catch (cause) {
+      throw invalidJournal(cause);
+    }
+    const validRecord = value && typeof value === 'object' && !Array.isArray(value) &&
+      Number.isSafeInteger(value.sequence) && value.sequence >= 1 &&
+      STATES.has(value.state) && SAFE_OPERATIONS.has(value.operation) && safeTimestamp(value.at);
+    if (!validRecord) throw invalidJournal();
+
+    if (value.state === 'started') {
+      if (pending.size > 0 || value.sequence !== lastSequence + 1) throw invalidJournal();
+      lastSequence = value.sequence;
+      pending.set(value.sequence, includeMetadata
+        ? {
+            sequence: value.sequence,
+            operation: value.operation,
+            state: 'started',
+            at: value.at
+          }
+        : value.operation);
+    } else {
+      const active = pending.get(value.sequence);
+      const activeOperation = includeMetadata ? active?.operation : active;
+      if (activeOperation !== value.operation) throw invalidJournal();
+      pending.delete(value.sequence);
+    }
+    records += 1;
+  }
+  return { lastSequence, records, pending };
+}
+
 async function replayJournal(handle, details) {
   const size = typeof details.size === 'bigint' ? Number(details.size) : details.size;
   if (size === 0) return { lastSequence: 0, pending: new Map() };
@@ -53,24 +100,7 @@ async function replayJournal(handle, details) {
     if (bytesRead === 0) break;
     offset += bytesRead;
   }
-  let lastSequence = 0;
-  const pending = new Map();
-  for (const line of buffer.subarray(0, offset).toString('utf8').split(/\r?\n/u)) {
-    if (!line.trim()) continue;
-    try {
-      const value = JSON.parse(line);
-      if (!Number.isSafeInteger(value.sequence) || value.sequence < 1 || !STATES.has(value.state)) continue;
-      lastSequence = Math.max(lastSequence, value.sequence);
-      if (value.state === 'started') {
-        pending.set(value.sequence, safeOperation(value.operation));
-      } else {
-        pending.delete(value.sequence);
-      }
-    } catch {
-      // A torn final append is ignored; earlier durable records remain authoritative.
-    }
-  }
-  return { lastSequence, pending };
+  return parseJournal(buffer.subarray(0, offset).toString('utf8'));
 }
 
 export async function createEffectJournal({ filePath, now = () => new Date().toISOString() } = {}) {
@@ -106,7 +136,13 @@ export async function createEffectJournal({ filePath, now = () => new Date().toI
     await handle.close().catch(() => {});
     throw error;
   }
-  const replayed = await replayJournal(handle, opened);
+  let replayed;
+  try {
+    replayed = await replayJournal(handle, opened);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
   let sequence = replayed.lastSequence;
   let writeTail = Promise.resolve();
   const operations = replayed.pending;
@@ -237,9 +273,6 @@ export async function inspectEffectJournal(filePath, { maxBytes = MAX_INSPECTION
       'Task effect journal is too large for bounded inspection'
     );
   }
-  const pending = new Map();
-  let lastSequence = 0;
-  let records = 0;
   const handle = await open(filePath, 'r');
   let source;
   try {
@@ -268,28 +301,7 @@ export async function inspectEffectJournal(filePath, { maxBytes = MAX_INSPECTION
   } finally {
     await handle.close();
   }
-  for (const line of source.split(/\r?\n/u)) {
-    if (!line.trim()) continue;
-    let value;
-    try {
-      value = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!Number.isSafeInteger(value.sequence) || value.sequence < 1 || !STATES.has(value.state)) continue;
-    records += 1;
-    lastSequence = Math.max(lastSequence, value.sequence);
-    if (value.state === 'started') {
-      pending.set(value.sequence, {
-        sequence: value.sequence,
-        operation: safeOperation(value.operation),
-        state: 'started',
-        at: safeTimestamp(value.at)
-      });
-    } else {
-      pending.delete(value.sequence);
-    }
-  }
+  const { records, lastSequence, pending } = parseJournal(source, { includeMetadata: true });
   return Object.freeze({
     records,
     lastSequence,

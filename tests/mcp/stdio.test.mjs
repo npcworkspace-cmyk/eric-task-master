@@ -38,7 +38,7 @@ for (const [label, mode] of [
 
     if (label === 'legacy') await connection.client.ping();
     const listed = await connection.client.listTools();
-    assert.equal(listed.tools.length, 16);
+    assert.equal(listed.tools.length, 17);
     const start = listed.tools.find((tool) => tool.name === 'taskmaster_tasks_start');
     assert.deepEqual(start.annotations, {
       readOnlyHint: false,
@@ -48,6 +48,13 @@ for (const [label, mode] of [
     });
     const createProfile = listed.tools.find((tool) => tool.name === 'taskmaster_profiles_create');
     assert.deepEqual(createProfile.annotations, {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    });
+    const updateProfile = listed.tools.find((tool) => tool.name === 'taskmaster_profiles_update');
+    assert.deepEqual(updateProfile.annotations, {
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
@@ -71,6 +78,19 @@ for (const [label, mode] of [
     assert.equal(connection.stderr.length, 0);
   });
 }
+
+test('MCP Profile owner can explicitly share a private Profile', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const result = await connection.client.callTool({
+    name: 'taskmaster_profiles_update',
+    arguments: { profileId: 'profile_fixture', access: 'shared' }
+  });
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.data.profile.access, 'shared');
+  assert.equal(result.structuredContent.data.profile.lastUsedAt, '2026-08-24T00:00:00.000Z');
+});
 
 test('stdio wire contains JSON-RPC frames only', async (t) => {
   const child = spawn(process.execPath, [FIXTURE], { stdio: ['pipe', 'pipe', 'pipe'] });

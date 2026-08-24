@@ -136,6 +136,114 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
 });
 
+test('Profile open and close keep operation deadlines beyond the generic MCP request timeout', async (t) => {
+  const profile = { id: 'profile_slow', name: 'Slow Profile', state: 'idle', kind: 'persistent' };
+  const connection = await fixture(t, async (request, response) => {
+    const body = await readJson(request);
+    if (request.url === '/v1/agents/issue') {
+      reply(response, 200, {
+        agentToken: AGENT_TOKEN,
+        agent: { clientId: 'slow-profile-fixture', name: 'MCP Agent' }
+      });
+      return;
+    }
+    if (
+      request.method === 'POST' &&
+      ['/v1/profiles/profile_slow/open', '/v1/profiles/profile_slow/close'].includes(request.url)
+    ) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
+      reply(response, 200, { profile });
+      return;
+    }
+    if (request.method === 'PATCH' && request.url === '/v1/profiles/profile_slow') {
+      reply(response, 200, { profile: { ...profile, ...body } });
+      return;
+    }
+    reply(response, 404, { error: { code: 'NOT_FOUND' } });
+  });
+  const client = new HttpTaskMasterClient({
+    ...connection,
+    clientId: 'slow-profile-fixture',
+    requestTimeoutMs: 100
+  });
+
+  assert.equal((await client.openProfile(profile.id)).id, profile.id);
+  assert.equal((await client.closeProfile(profile.id)).id, profile.id);
+  assert.equal((await client.updateProfile(profile.id, { access: 'shared' })).access, 'shared');
+});
+
+test('HTTP client treats authorization denial as a Profile choice error, not a credential retry', async (t) => {
+  const connection = await fixture(t, async (request, response) => {
+    if (request.url === '/v1/agents/issue') {
+      await readJson(request);
+      reply(response, 200, {
+        agentToken: AGENT_TOKEN,
+        agent: { clientId: 'forbidden-profile-fixture', name: 'MCP Agent' }
+      });
+      return;
+    }
+    reply(response, 403, {
+      error: { code: 'PROFILE_ACCESS_DENIED', message: 'private profile' }
+    });
+  });
+  const client = new HttpTaskMasterClient({ ...connection, clientId: 'forbidden-profile-fixture' });
+  await assert.rejects(client.listProfiles(), (error) => {
+    assert.equal(error.code, 'PROFILE_ACCESS_DENIED');
+    assert.equal(error.statusCode, 403);
+    assert.equal(error.retryable, false);
+    assert.match(error.nextAction, /Profile owned|share/u);
+    return true;
+  });
+});
+
+test('waitTask does not treat a Manager-restart observation as settled cleanup', async (t) => {
+  let taskReads = 0;
+  const observedProgress = [];
+  const connection = await fixture(t, async (request, response) => {
+    if (request.url === '/v1/agents/issue') {
+      await readJson(request);
+      reply(response, 200, {
+        agentToken: AGENT_TOKEN,
+        agent: { clientId: 'wait-cleanup-fixture', name: 'MCP Agent' }
+      });
+      return;
+    }
+    if (request.method === 'GET' && request.url === '/v1/tasks/task_restart') {
+      taskReads += 1;
+      reply(response, 200, {
+        task: {
+          id: 'task_restart',
+          state: 'failed',
+          progress: { completed: taskReads, total: 2 },
+          cleanup: {
+            managerRestartObserved: true,
+            settled: taskReads >= 2
+          }
+        }
+      });
+      return;
+    }
+    reply(response, 404, { error: { code: 'NOT_FOUND' } });
+  });
+  const client = new HttpTaskMasterClient({
+    ...connection,
+    clientId: 'wait-cleanup-fixture'
+  });
+
+  const result = await client.waitTask('task_restart', {
+    waitMs: 1_500,
+    onProgress(progress) {
+      observedProgress.push(progress?.completed);
+    }
+  });
+
+  assert.equal(result.timedOut, false);
+  assert.equal(result.task.cleanup.managerRestartObserved, true);
+  assert.equal(result.task.cleanup.settled, true);
+  assert.equal(taskReads, 2);
+  assert.deepEqual(observedProgress, [1, 2]);
+});
+
 test('HTTP client rejects module, evaluation, session, and credential inputs before network access', async (t) => {
   let requestCount = 0;
   const connection = await fixture(t, (_request, response) => {

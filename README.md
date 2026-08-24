@@ -2,16 +2,17 @@
 
 Eric Task Master is a Playwright browser task runtime for AI Agents. It turns browser work into durable, isolated jobs instead of asking an Agent to repeatedly inspect pages and improvise a new controller.
 
-Version: **1.0.0**
+Version: **1.0.1**
 
 ## What it does
 
 - Runs clicks, input, navigation, uploads, downloads, reading, screenshots, and data extraction through pure Playwright.
-- Keeps logged-in work in isolated persistent Profiles; runs no-login work in disposable **ephemeral (隐身临时)** Profiles that retain no browser state after a task.
-- Lets multiple Agents use different Profiles concurrently. Work aimed at the same Profile enters a bounded FIFO queue instead of stealing tabs or failing randomly.
-- Gives every task a durable ID, live progress, heartbeat, checkpoint, evidence, artifacts, cancellation, recovery, completion verification, and automatic browser cleanup.
+- Keeps logged-in work in isolated persistent Profiles; runs no-login work in disposable **ephemeral (隐身临时)** Profiles that retain no browser state after confirmed cleanup.
+- Lets multiple Agents use different Profiles concurrently. Agent-created Profiles are private by default; the owner can explicitly share one. Work aimed at the same shared Profile enters a bounded FIFO queue instead of stealing tabs or failing randomly, while task status and results remain owner-isolated.
+- Gives every task a durable ID, live progress, heartbeat, checkpoint, evidence, artifacts, cancellation, recovery, completion verification, and verified browser cleanup. If cleanup cannot be proved, the Profile is blocked instead of being reported reusable.
+- Publishes business results only after evidence files are hashed, cleanup is settled, and the completion gate passes. Replayed commands re-check the same integrity boundary instead of returning stale success.
 - Uses `adaptive` behavior to stay fast during deterministic work, add light settling on dynamic pages, and temporarily switch to guarded human pacing after occlusion, timeout, uncertain navigation, or rate limiting. It never blindly retries an action with an unknown outcome.
-- Captures both a screenshot and a bounded semantic page observation when an action fails, a task times out, progress stalls, or a workflow asks the user/Agent for a new instruction.
+- Requests both a screenshot and a bounded semantic page observation when an action fails, a task times out, progress stalls, or a workflow asks for a new instruction. Diagnostics are produced when the Worker and page are still responsive.
 - Discovers task capabilities progressively: Agents first receive compact summaries, then read only the selected task's input contract.
 - Installs reusable **Task Packs** transactionally, so specialized Skills can add site or workflow knowledge without modifying the browser runtime.
 
@@ -51,6 +52,10 @@ After MCP discovery, an Agent follows one loop:
 - **persistent** — for login state and recurring account work. One live task uses the Profile at a time.
 - **ephemeral / 隐身临时** — for no-login tasks. Every task receives a fresh non-persistent context and the browser is destroyed at cleanup. “隐身” means disposable local state; it is not an anti-fingerprinting or restriction-bypass claim.
 
+Profiles created by an Agent start `private`. Switching a Profile to `shared` is an explicit local authorization for other registered Agents to use its browser state; it never shares task records, artifacts, or completion evidence.
+
+The isolation boundary is the registered MCP client identity. Different registered Agent hosts/client IDs are isolated. Parallel conversations that deliberately share one host registration are one local principal and can manage that principal's tasks; strict tenants must use distinct registrations/client IDs.
+
 ## Build specialized capability
 
 Create a reusable Task Pack without editing core:
@@ -78,3 +83,5 @@ Stop the local Manager safely with:
 ```bash
 node scripts/taskmaster.mjs manager stop --json
 ```
+
+Authenticated shutdown drains or interrupts managed work and verifies cleanup. A power loss, operating-system kill, native browser crash, or trusted task that blocks the Node event loop can prevent cleanup proof; in that case Task Master quarantines the affected Profile rather than guessing it is safe, and never kills a process solely from a stale persisted PID.

@@ -37,9 +37,11 @@ const ProfileSchema = z.strictObject({
   defaultBehavior: z.string().optional(),
   headless: z.boolean().optional(),
   browserChannel: z.string().optional(),
+  access: z.enum(['private', 'shared']).optional(),
+  createdBy: z.string().optional(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
-  lastOpenedAt: z.string().optional()
+  lastUsedAt: z.string().optional()
 });
 
 const ProgressSchema = z.strictObject({
@@ -93,6 +95,7 @@ const TaskSchema = z.strictObject({
   id: z.string(),
   profileId: z.string().optional(),
   taskType: z.string().optional(),
+  createdBy: z.string().optional(),
   behavior: z.string().optional(),
   attempt: z.number().int().optional(),
   history: z.array(AttemptHistorySchema).optional(),
@@ -270,6 +273,21 @@ async function sendProgress(ctx, progress) {
   }).catch(() => {});
 }
 
+export function completeImageContent(data) {
+  const mimeType = data?.artifact?.mimeType;
+  if (
+    data?.encoding !== 'base64'
+    || data?.offset !== 0
+    || data?.eof !== true
+    || typeof data?.chunk !== 'string'
+    || typeof mimeType !== 'string'
+    || !mimeType.startsWith('image/')
+  ) {
+    return null;
+  }
+  return { type: 'image', data: data.chunk, mimeType };
+}
+
 function register(server, client, definition) {
   server.registerTool(
     definition.name,
@@ -335,11 +353,34 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       kind: z.enum(PROFILE_KINDS).default('persistent'),
       defaultBehavior: z.enum(BEHAVIOR_MODES).optional(),
       headless: z.boolean().optional(),
-      browserChannel: z.string().trim().min(1).max(64).optional()
+      browserChannel: z.string().trim().min(1).max(64).optional(),
+      access: z.enum(['private', 'shared']).optional()
     }),
     outputSchema: z.strictObject({ profile: ProfileSchema }),
     annotations: LOCAL_WRITE,
     handler: async (args, _ctx, api) => success({ profile: requireId(publicProfile(await api.createProfile(args)), 'profile') })
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_profiles_update',
+    title: 'Update browser profile',
+    description: 'Update a Profile owned by this Agent, including explicitly sharing or privatizing it.',
+    inputSchema: z.strictObject({
+      profileId: IdentifierSchema,
+      name: z.string().trim().min(1).max(80).optional(),
+      defaultBehavior: z.enum(BEHAVIOR_MODES).optional(),
+      headless: z.boolean().optional(),
+      browserChannel: z.string().trim().min(1).max(64).nullable().optional(),
+      access: z.enum(['private', 'shared']).optional()
+    }).refine(
+      ({ profileId: _profileId, ...patch }) => Object.keys(patch).length > 0,
+      { message: 'At least one Profile field must be supplied' }
+    ),
+    outputSchema: z.strictObject({ profile: ProfileSchema }),
+    annotations: LOCAL_WRITE,
+    handler: async ({ profileId, ...patch }, _ctx, api) => success({
+      profile: requireId(publicProfile(await api.updateProfile(profileId, patch)), 'profile')
+    })
   });
 
   for (const action of ['open', 'close']) {
@@ -546,9 +587,8 @@ export function createMcpServer({ client, version = VERSION } = {}) {
           ? data.chunk
           : `Artifact ${data.artifact.id} returned a bounded base64 chunk in structuredContent.`
       }];
-      if (data.encoding === 'base64' && data.artifact.mimeType?.startsWith('image/')) {
-        content.push({ type: 'image', data: data.chunk, mimeType: data.artifact.mimeType });
-      }
+      const imageContent = completeImageContent(data);
+      if (imageContent) content.push(imageContent);
       const envelope = assertResultBound({ ok: true, data });
       return { content, structuredContent: envelope };
     }

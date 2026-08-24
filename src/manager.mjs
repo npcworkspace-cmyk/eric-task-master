@@ -3,7 +3,7 @@ import os from 'node:os';
 import { mkdir } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { JsonStore } from './lib/json-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import {
@@ -18,6 +18,7 @@ import {
 } from './lib/manager-identity.mjs';
 import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
+import { isReservedAgentClientId } from './lib/principal.mjs';
 import {
   HttpError,
   corsHeaders,
@@ -45,6 +46,7 @@ const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60_000;
 const MANAGER_NAME = MANAGER_SERVICE;
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const RESUME_NOTICE = 'Resume is explicit: the task module must inspect its checkpoint and current site state before repeating any action whose external outcome is unknown.';
+const AGENT_TOKEN_VERSION = 'ETMA1';
 
 function defaultDataDirectory() {
   if (process.env.ERIC_TASK_MASTER_HOME) return resolve(process.env.ERIC_TASK_MASTER_HOME);
@@ -63,6 +65,29 @@ function token() {
 
 function tokenHash(value) {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function agentToken(managerToken, clientId) {
+  const encodedClientId = Buffer.from(clientId, 'utf8').toString('base64url');
+  const signature = createHmac('sha256', managerToken)
+    .update(`${AGENT_TOKEN_VERSION}\0${clientId}`, 'utf8')
+    .digest('base64url');
+  return `${AGENT_TOKEN_VERSION}.${encodedClientId}.${signature}`;
+}
+
+function authenticateAgentToken(value, managerToken) {
+  if (typeof value !== 'string') return null;
+  const parts = value.split('.');
+  if (parts.length !== 3 || parts[0] !== AGENT_TOKEN_VERSION) return null;
+  let clientId;
+  try {
+    clientId = Buffer.from(parts[1], 'base64url').toString('utf8');
+    if (Buffer.from(clientId, 'utf8').toString('base64url') !== parts[1]) return null;
+    validateClientId(clientId);
+  } catch {
+    return null;
+  }
+  return secureEqual(value, agentToken(managerToken, clientId)) ? clientId : null;
 }
 
 function secureEqual(left, right) {
@@ -109,6 +134,13 @@ function validateClientId(value) {
       'clientId must contain 1-128 letters, numbers, dots, underscores, colons, or hyphens'
     );
   }
+  if (isReservedAgentClientId(value)) {
+    throw new HttpError(
+      400,
+      'RESERVED_CLIENT_ID',
+      'clientId uses a reserved internal principal name'
+    );
+  }
   return value;
 }
 
@@ -125,8 +157,28 @@ function serviceCaller(auth) {
     : auth;
 }
 
+function canUseProfile(profile, auth) {
+  if (['manager-admin', 'dashboard', 'extension'].includes(auth?.role)) return true;
+  return auth?.role === 'agent' && (
+    profile?.ownerClientId === auth.clientId || profile?.access === 'shared'
+  );
+}
+
+function canManageProfile(profile, auth) {
+  if (['manager-admin', 'dashboard', 'extension'].includes(auth?.role)) return true;
+  return auth?.role === 'agent' && profile?.ownerClientId === auth.clientId;
+}
+
+function requireProfileAccess(profile, auth, { manage = false } = {}) {
+  const allowed = manage ? canManageProfile(profile, auth) : canUseProfile(profile, auth);
+  if (!allowed) {
+    throw new HttpError(403, 'PROFILE_ACCESS_DENIED', 'This Agent is not authorized to use this Profile');
+  }
+  return profile;
+}
+
 function validateProfilePatch(body) {
-  const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel']);
+  const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel', 'access']);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_PROFILE_PATCH', `Unsupported fields: ${unknown.join(', ')}`);
@@ -135,7 +187,7 @@ function validateProfilePatch(body) {
 }
 
 function validateProfileCreate(body) {
-  const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel']);
+  const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel', 'access']);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_PROFILE_CREATE', `Unsupported fields: ${unknown.join(', ')}`);
@@ -330,9 +382,13 @@ export async function createManager({
       draft.extensions = [];
     });
   }
-  if (!Array.isArray(config.agents)) {
+  // Scoped Agent bearers are stateless and stable per registered host. Clear
+  // the legacy registry so concurrent MCP processes cannot evict one another
+  // or grow config.json until bootstrap fails.
+  if (!Array.isArray(config.agents) || config.agents.length !== 0 || config.agentCredentialVersion !== 1) {
     config = await configStore.update((draft) => {
       draft.agents = [];
+      draft.agentCredentialVersion = 1;
     });
   }
 
@@ -365,6 +421,22 @@ export async function createManager({
   let startedAt;
   let listeningAddress;
   let stopped = false;
+  let stopping = false;
+  let stopPromise;
+  let activeOperations = 0;
+  const drainWaiters = new Set();
+  let acceptedShutdownRequest;
+  let shutdownRequestPublished = false;
+  let resolveShutdownRequested;
+  const shutdownRequested = new Promise((resolveShutdown) => {
+    resolveShutdownRequested = resolveShutdown;
+  });
+
+  function publishShutdownRequest(request) {
+    if (shutdownRequestPublished) return;
+    shutdownRequestPublished = true;
+    resolveShutdownRequested(request);
+  }
 
   function currentCors(request) {
     const origin = requestOrigin(request);
@@ -405,11 +477,11 @@ export async function createManager({
     if (secureEqual(bearer, config.managerToken)) {
       return { role: 'manager-admin', clientId: 'manager-admin' };
     }
-    const hashed = tokenHash(bearer);
-    const agent = config.agents.find((item) => secureEqual(item.tokenHash, hashed));
-    if (agent) {
-      return { role: 'agent', clientId: agent.clientId, agent };
+    const agentClientId = authenticateAgentToken(bearer, config.managerToken);
+    if (agentClientId) {
+      return { role: 'agent', clientId: agentClientId };
     }
+    const hashed = tokenHash(bearer);
     const dashboard = dashboardSessions.get(hashed);
     if (dashboard) {
       if (dashboard.expiresAt <= now()) {
@@ -501,6 +573,7 @@ export async function createManager({
         port: listeningAddress?.port ?? port,
         pid: process.pid,
         startedAt,
+        state: stopping ? 'stopping' : 'ready',
         identityFingerprint: managerIdentity.fingerprint,
         ...(counts ? { counts } : {})
       }, cors);
@@ -526,6 +599,26 @@ export async function createManager({
       return;
     }
 
+    if (request.method === 'POST' && url.pathname === '/v1/manager/shutdown') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin');
+      await readJson(request, { maxBytes: 4 * 1024 });
+      acceptedShutdownRequest ??= {
+        requestedAt: new Date(now()).toISOString(),
+        requestedBy: auth.clientId
+      };
+      stopping = true;
+      sendJson(response, 202, {
+        ok: true,
+        accepted: true,
+        state: 'stopping',
+        pid: process.pid,
+        identityFingerprint: managerIdentity.fingerprint,
+        requestedAt: acceptedShutdownRequest.requestedAt
+      }, cors);
+      return { shutdownRequest: acceptedShutdownRequest };
+    }
+
     if (request.method === 'POST' && url.pathname === '/v1/agents/issue') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin');
@@ -534,23 +627,12 @@ export async function createManager({
       const name = typeof body.name === 'string' && body.name.trim()
         ? body.name.trim().slice(0, 80)
         : clientId;
-      const agentToken = token();
+      const scopedToken = agentToken(config.managerToken, clientId);
       const agent = {
-        credentialId: randomBytes(12).toString('hex'),
         clientId,
-        name,
-        tokenHash: tokenHash(agentToken),
-        createdAt: new Date(now()).toISOString()
+        name
       };
-      config = await configStore.update((draft) => {
-        draft.agents = Array.isArray(draft.agents) ? draft.agents : [];
-        draft.agents.push(agent);
-        let remainingForClient = 8;
-        draft.agents = draft.agents.reverse().filter((item) => (
-          item.clientId !== clientId || remainingForClient-- > 0
-        )).reverse();
-      });
-      sendJson(response, 201, { agentToken, agent: publicAgent(agent) }, cors);
+      sendJson(response, 201, { agentToken: scopedToken, agent: publicAgent(agent) }, cors);
       return;
     }
 
@@ -670,14 +752,21 @@ export async function createManager({
     if (request.method === 'GET' && url.pathname === '/v1/profiles') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
-      const profiles = (await profileStore.list()).map(publicProfile);
+      const profiles = (await profileStore.list())
+        .filter((profile) => canUseProfile(profile, auth))
+        .map(publicProfile);
       sendJson(response, 200, { profiles }, cors);
       return;
     }
     if (request.method === 'POST' && url.pathname === '/v1/profiles') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
-      const profile = await profileStore.create(validateProfileCreate(await readJson(request)));
+      const requested = validateProfileCreate(await readJson(request));
+      const { access, ...profileInput } = requested;
+      const profile = await profileStore.create(profileInput, {
+        ownerClientId: auth.role === 'agent' ? auth.clientId : null,
+        access: access ?? (auth.role === 'agent' ? 'private' : 'shared')
+      });
       sendJson(response, 201, { profile: publicProfile(profile) }, cors);
       return;
     }
@@ -685,6 +774,7 @@ export async function createManager({
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
       const profileId = decodeURIComponent(profileMatch[1]);
+      requireProfileAccess(await profileStore.get(profileId), auth, { manage: true });
       const profile = await profileStore.update(
         profileId,
         validateProfilePatch(await readJson(request, { maxBytes: 32 * 1024 }))
@@ -708,7 +798,7 @@ export async function createManager({
         requireRole(auth, 'extension');
         const bundle = validatedSessionBundle(await readJson(request), auth.extension);
         const importSession = requireTaskMethod(taskService, 'importSession');
-        await profileStore.get(profileId);
+        requireProfileAccess(await profileStore.get(profileId), auth);
         let result;
         try {
           result = await importSession(profileId, bundle);
@@ -724,17 +814,16 @@ export async function createManager({
       }
 
       requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
+      requireProfileAccess(await profileStore.get(profileId), auth);
 
       if (actionName === 'open') {
         await profileStore.recoverExpiredLeases();
-        await profileStore.get(profileId);
         const openProfile = requireTaskMethod(taskService, 'openProfile');
         await openProfile(profileId, serviceCaller(auth));
         sendJson(response, 200, { profile: publicProfile(await profileStore.get(profileId)) }, cors);
         return;
       }
 
-      await profileStore.get(profileId);
       const closeProfile = requireTaskMethod(taskService, 'closeProfile');
       await closeProfile(profileId, serviceCaller(auth));
       sendJson(response, 200, { profile: publicProfile(await profileStore.get(profileId)) }, cors);
@@ -871,8 +960,25 @@ export async function createManager({
   }
 
   async function handle(request, response) {
+    let healthRequest = false;
+    let identityRequest = false;
+    let shutdownRequest = false;
+    let acceptedShutdown;
     try {
-      await route(request, response);
+      const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+      healthRequest = request.method === 'GET' && requestUrl.pathname === '/v1/health';
+      identityRequest = request.method === 'POST' && requestUrl.pathname === '/v1/identity/challenge';
+      shutdownRequest = request.method === 'POST' && requestUrl.pathname === '/v1/manager/shutdown';
+    } catch {
+      // Normal routing returns the bounded invalid-host/request error.
+    }
+    if (!healthRequest) activeOperations += 1;
+    try {
+      if (stopping && !healthRequest && !identityRequest && !shutdownRequest) {
+        throw new HttpError(503, 'SERVICE_CLOSING', 'Manager is stopping and accepts no new operations');
+      }
+      const outcome = await route(request, response);
+      acceptedShutdown = outcome?.shutdownRequest;
     } catch (error) {
       if (response.headersSent) {
         response.destroy();
@@ -886,7 +992,28 @@ export async function createManager({
       }
       const normalized = errorResponse(error);
       sendJson(response, normalized.statusCode, normalized.body, cors);
+    } finally {
+      if (!healthRequest) {
+        activeOperations -= 1;
+        if (activeOperations === 0) {
+          for (const resolveDrain of drainWaiters) resolveDrain();
+          drainWaiters.clear();
+        }
+      }
+      if (acceptedShutdown) {
+        const publish = () => setImmediate(() => publishShutdownRequest(acceptedShutdown));
+        if (response.writableFinished) publish();
+        else {
+          response.once('finish', publish);
+          response.once('close', publish);
+        }
+      }
     }
+  }
+
+  async function waitForActiveOperations() {
+    if (activeOperations === 0) return;
+    await new Promise((resolveDrain) => drainWaiters.add(resolveDrain));
   }
 
   async function start() {
@@ -919,23 +1046,36 @@ export async function createManager({
 
   async function stop() {
     if (stopped) return;
-    let serviceError;
-    try {
-      await taskService.close?.();
-    } catch (error) {
-      serviceError = error;
-    } finally {
-      if (server?.listening) {
-        await new Promise((resolveStop, rejectStop) => {
-          server.close((error) => error ? rejectStop(error) : resolveStop());
-          server.closeAllConnections?.();
-        });
+    if (stopPromise) return stopPromise;
+    stopping = true;
+    stopPromise = (async () => {
+      let serviceError;
+      let serverError;
+      try {
+        await waitForActiveOperations();
+        await taskService.close?.();
+      } catch (error) {
+        serviceError = error;
+      } finally {
+        try {
+          if (server?.listening) {
+            await new Promise((resolveStop, rejectStop) => {
+              server.close((error) => error ? rejectStop(error) : resolveStop());
+              server.closeAllConnections?.();
+            });
+          }
+        } catch (error) {
+          serverError = error;
+        } finally {
+          listeningAddress = undefined;
+          stopped = true;
+          await managerLock.release().catch(() => {});
+        }
       }
-      listeningAddress = undefined;
-      stopped = true;
-      await managerLock.release().catch(() => {});
-    }
-    if (serviceError) throw serviceError;
+      if (serviceError) throw serviceError;
+      if (serverError) throw serverError;
+    })();
+    return stopPromise;
   }
 
   const api = {
@@ -950,6 +1090,7 @@ export async function createManager({
     stateDir,
     start,
     stop,
+    shutdownRequested,
     address() {
       return listeningAddress;
     },

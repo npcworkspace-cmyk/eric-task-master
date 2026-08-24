@@ -5,6 +5,8 @@ import { isBehaviorMode, isProfileKind } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
 
 const DEFAULT_LEASE_TTL_MS = 60_000;
+const PROFILE_ACCESS = new Set(['private', 'shared']);
+const CLIENT_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/u;
 
 export class ProfileStoreError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -79,6 +81,35 @@ function ensureBrowserChannel(value) {
   return value;
 }
 
+function ensureProfileAccess(value) {
+  if (!PROFILE_ACCESS.has(value)) {
+    throw new ProfileStoreError('INVALID_PROFILE_ACCESS', 'Profile access must be private or shared');
+  }
+  return value;
+}
+
+function ensureOwnerClientId(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || !CLIENT_ID_PATTERN.test(value)) {
+    throw new ProfileStoreError('INVALID_PROFILE_OWNER', 'Profile ownerClientId is invalid');
+  }
+  return value;
+}
+
+function requireLeaseAccess(profile, authorizedClientId) {
+  if (
+    authorizedClientId &&
+    profile.ownerClientId !== authorizedClientId &&
+    (profile.access || 'shared') !== 'shared'
+  ) {
+    throw new ProfileStoreError(
+      'PROFILE_ACCESS_DENIED',
+      'This Agent is not authorized to use this Profile',
+      403
+    );
+  }
+}
+
 function findProfile(data, profileId) {
   const profile = data.profiles.find((item) => item.id === profileId);
   if (!profile) {
@@ -118,7 +149,18 @@ export class ProfileStore {
     // v0.x Profile records predate explicit persistence semantics. Preserve
     // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
-      for (const profile of data.profiles) profile.kind ||= 'persistent';
+      for (const profile of data.profiles) {
+        profile.kind ||= 'persistent';
+        profile.ownerClientId ??= null;
+        profile.access ||= 'shared';
+        if (
+          profile.lease &&
+          /^(?:task:|profile-open:|session-import:)/u.test(profile.lease.ownerId || '') &&
+          profile.lease.cleanupRequired === undefined
+        ) {
+          profile.lease.cleanupRequired = true;
+        }
+      }
     });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
@@ -134,7 +176,7 @@ export class ProfileStore {
     return structuredClone(findProfile(data, profileId));
   }
 
-  async create(input = {}) {
+  async create(input = {}, ownership = {}) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new ProfileStoreError('INVALID_PROFILE', 'Profile input must be an object');
     }
@@ -158,6 +200,8 @@ export class ProfileStore {
     ensureBehaviorMode(defaultBehavior);
     ensureHeadless(headless);
     const browserChannel = ensureBrowserChannel(requestedBrowserChannel);
+    const ownerClientId = ensureOwnerClientId(ownership.ownerClientId);
+    const access = ensureProfileAccess(ownership.access ?? (ownerClientId ? 'private' : 'shared'));
     const now = new Date(this.#now()).toISOString();
     const profileId = `profile_${randomUUID().replaceAll('-', '')}`;
     const userDataDir = join(this.#profilesRoot, profileId);
@@ -181,6 +225,8 @@ export class ProfileStore {
           defaultBehavior,
           headless,
           browserChannel,
+          ownerClientId,
+          access,
           state: 'idle',
           lease: null,
           createdAt: now,
@@ -197,7 +243,7 @@ export class ProfileStore {
   }
 
   async update(profileId, patch = {}) {
-    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel']);
+    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel', 'access']);
     const unknown = Object.keys(patch).filter((key) => !allowed.has(key));
     if (unknown.length) {
       throw new ProfileStoreError(
@@ -213,9 +259,21 @@ export class ProfileStore {
     if ('browserChannel' in patch) {
       patch = { ...patch, browserChannel: ensureBrowserChannel(patch.browserChannel) };
     }
+    if ('access' in patch) patch = { ...patch, access: ensureProfileAccess(patch.access) };
     let updated;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
+      if (
+        patch.access === 'private' &&
+        (profile.access || 'shared') !== 'private' &&
+        (profile.lease || profile.state !== 'idle')
+      ) {
+        throw new ProfileStoreError(
+          'PROFILE_IN_USE',
+          `Profile ${profileId} must be idle before shared access can be revoked`,
+          409
+        );
+      }
       if (
         patch.name &&
         data.profiles.some(
@@ -516,18 +574,36 @@ export class ProfileStore {
     if (!Number.isSafeInteger(ttlMs) || ttlMs < 1_000) {
       throw new ProfileStoreError('INVALID_LEASE_TTL', 'Lease ttlMs must be at least 1000');
     }
+    if (options.cleanupRequired !== undefined && typeof options.cleanupRequired !== 'boolean') {
+      throw new ProfileStoreError('INVALID_LEASE_CLEANUP', 'Lease cleanupRequired must be a boolean');
+    }
+    const authorizedClientId = options.authorizedClientId === undefined
+      ? null
+      : ensureOwnerClientId(options.authorizedClientId);
 
     const existing = await this.get(profileId);
+    requireLeaseAccess(existing, authorizedClientId);
     if (existing.state === 'deleting' || existing.deletion) {
       throw new ProfileStoreError('PROFILE_IN_USE', `Profile ${profileId} is being deleted`, 409);
+    }
+    if (existing.state === 'error') {
+      throw new ProfileStoreError(
+        'PROFILE_CLEANUP_UNCONFIRMED',
+        `Profile ${profileId} is blocked because browser cleanup was not confirmed`,
+        409
+      );
     }
     if (existing.lease && existing.lease.ownerId !== ownerId) {
       const expired = Date.parse(existing.lease.expiresAt) <= this.#now();
       const alive = await this.#processAlive(existing.lease.pid);
-      if (!expired || alive) {
+      if (!expired || alive || existing.lease.cleanupRequired === true) {
         throw new ProfileStoreError(
-          'PROFILE_LEASED',
-          `Profile ${profileId} is leased by ${existing.lease.ownerId}`,
+          existing.lease.cleanupRequired === true && expired && !alive
+            ? 'PROFILE_CLEANUP_UNCONFIRMED'
+            : 'PROFILE_LEASED',
+          existing.lease.cleanupRequired === true && expired && !alive
+            ? `Profile ${profileId} cleanup is not confirmed`
+            : `Profile ${profileId} is leased by ${existing.lease.ownerId}`,
           409
         );
       }
@@ -536,6 +612,7 @@ export class ProfileStore {
     let leased;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
+      requireLeaseAccess(profile, authorizedClientId);
       if (profile.lease && profile.lease.ownerId !== ownerId) {
         // A competing acquisition may have won after the liveness check.
         if (profile.lease.ownerId !== existing.lease?.ownerId) {
@@ -554,7 +631,8 @@ export class ProfileStore {
           ? profile.lease.acquiredAt
           : new Date(nowMs).toISOString(),
         heartbeatAt: new Date(nowMs).toISOString(),
-        expiresAt: new Date(nowMs + ttlMs).toISOString()
+        expiresAt: new Date(nowMs + ttlMs).toISOString(),
+        cleanupRequired: options.cleanupRequired === true || profile.lease?.cleanupRequired === true
       };
       profile.state = ownerId.startsWith('profile-open:') ? 'open' : 'leased';
       profile.updatedAt = new Date(nowMs).toISOString();
@@ -564,7 +642,10 @@ export class ProfileStore {
     return structuredClone(leased);
   }
 
-  async releaseLease(profileId, ownerId) {
+  async releaseLease(profileId, ownerId, options = {}) {
+    if (options.cleanupConfirmed !== undefined && typeof options.cleanupConfirmed !== 'boolean') {
+      throw new ProfileStoreError('INVALID_CLEANUP_PROOF', 'cleanupConfirmed must be a boolean');
+    }
     let released = false;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
@@ -576,12 +657,34 @@ export class ProfileStore {
           409
         );
       }
+      if (profile.lease.cleanupRequired === true && options.cleanupConfirmed !== true) {
+        throw new ProfileStoreError(
+          'CLEANUP_PROOF_REQUIRED',
+          `Profile ${profileId} requires confirmed browser cleanup before lease release`,
+          409
+        );
+      }
       profile.state = 'idle';
       profile.lease = null;
+      delete profile.cleanupUnknownAt;
       profile.updatedAt = new Date(this.#now()).toISOString();
       released = true;
     });
     return released;
+  }
+
+  async markCleanupUnknown(profileId, ownerId) {
+    let marked = false;
+    await this.#store.update((data) => {
+      const profile = findProfile(data, profileId);
+      if (!profile.lease || profile.lease.ownerId !== ownerId) return;
+      profile.state = 'error';
+      profile.lease.cleanupRequired = true;
+      profile.cleanupUnknownAt = new Date(this.#now()).toISOString();
+      profile.updatedAt = profile.cleanupUnknownAt;
+      marked = true;
+    });
+    return marked;
   }
 
   async recoverExpiredLeases() {
@@ -589,6 +692,7 @@ export class ProfileStore {
     const recoverable = [];
     for (const profile of snapshot.profiles) {
       if (!profile.lease || Date.parse(profile.lease.expiresAt) > this.#now()) continue;
+      if (profile.lease.cleanupRequired === true) continue;
       if (!(await this.#processAlive(profile.lease.pid))) {
         recoverable.push({
           id: profile.id,
@@ -611,6 +715,7 @@ export class ProfileStore {
         ) continue;
         profile.state = 'idle';
         profile.lease = null;
+        delete profile.cleanupUnknownAt;
         profile.updatedAt = new Date(this.#now()).toISOString();
       }
     });

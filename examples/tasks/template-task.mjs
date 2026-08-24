@@ -43,7 +43,7 @@ export async function run({ page, input, outputDir, action, progress, checkpoint
     evidence: [
       { kind: 'url', value: result.url },
       { kind: 'artifact', file: artifactName },
-      { kind: 'behavior-mode', value: action.mode }
+      { kind: 'message', label: 'behavior mode', value: action.mode }
     ]
   };
 }

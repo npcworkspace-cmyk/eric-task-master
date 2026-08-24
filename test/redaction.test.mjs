@@ -6,7 +6,12 @@ import path from 'node:path';
 import { publicTask as publicManagerTask } from '../src/contracts.mjs';
 import { publicProfile as publicManagerProfile } from '../src/contracts.mjs';
 import { isSensitiveKey, redactSensitiveText, redactSensitiveValue } from '../src/lib/redaction.mjs';
-import { publicArtifactRead, publicTask as publicMcpTask, redactText } from '../src/mcp/public-view.mjs';
+import {
+  publicArtifactRead,
+  publicProfile as publicMcpProfile,
+  publicTask as publicMcpTask,
+  redactText
+} from '../src/mcp/public-view.mjs';
 import { closeTaskBrowserContext, runTaskWorker } from '../src/runtime/task-worker.mjs';
 
 const MARKER = 'redteam-marker-7Vv9pQ';
@@ -76,6 +81,27 @@ test('Manager Profile view is an allowlist that ignores future private runtime f
   assert.equal(JSON.stringify(safe).includes(MARKER), false);
 });
 
+test('Manager and MCP Profile views share the same nullable public contract', () => {
+  const profile = {
+    id: 'profile_contract',
+    name: 'Contract',
+    kind: 'persistent',
+    state: 'idle',
+    defaultBehavior: 'adaptive',
+    headless: false,
+    browserChannel: null,
+    access: 'private',
+    ownerClientId: 'agent-owner',
+    createdAt: '2026-08-24T00:00:00.000Z',
+    updatedAt: '2026-08-24T00:01:00.000Z',
+    lastUsedAt: null,
+    lastOpenedAt: null,
+    userDataDir: 'C:/private/profile'
+  };
+  const managerView = publicManagerProfile(profile);
+  assert.deepEqual(publicMcpProfile(managerView), managerView);
+});
+
 test('Manager and MCP public task views never return credential markers in summary or evidence', () => {
   const task = {
     id: 'task_redaction',
@@ -101,6 +127,26 @@ test('Manager and MCP public task views never return credential markers in summa
   assert.equal('futureInternalState' in managerView, false);
   assert.equal(JSON.stringify(publicMcpTask(task)).includes(MARKER), false);
   assert.equal(redactText(variants.join('\n')).includes(MARKER), false);
+});
+
+test('Manager public task projection is idempotent for verified resume state', () => {
+  const task = {
+    id: 'task_resume_contract',
+    supportsResume: true,
+    state: 'failed',
+    checkpoint: {
+      path: 'C:/private/checkpoint.json',
+      attempt: 1,
+      savedAt: '2026-08-24T00:00:00.000Z',
+      sha256: 'a'.repeat(64),
+      sizeBytes: 128
+    },
+    resumeCheckpointValid: true,
+    cleanup: { browserClosed: true, leaseReleased: true, workerExited: true, settled: true }
+  };
+  const once = publicManagerTask(task);
+  assert.equal(once.resumeAvailable, true);
+  assert.deepEqual(publicManagerTask(once), once);
 });
 
 test('declared Agent-visible artifact bytes are preserved exactly', () => {

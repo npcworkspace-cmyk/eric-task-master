@@ -69,7 +69,7 @@ export async function run({ page, input, outputDir, action, progress, checkpoint
     summary: `Read ${snapshot.text.length} characters from ${snapshot.title || snapshot.url}`,
     evidence: [
       { kind: 'url', value: snapshot.url },
-      { kind: 'http-status', value: response?.status() ?? null },
+      { kind: 'count', label: 'HTTP status', value: response?.status() ?? 0 },
       { kind: 'artifact', file: artifactName }
     ]
   };

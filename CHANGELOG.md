@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1 - 2026-08-24
+
+- Hardened Manager shutdown, cleanup receipts, terminal-state handling, diagnostic screenshot delivery, session-import deadlines, public output budgets, and principal isolation after adversarial review.
+- Expanded MCP image delivery, task durability, profile-worker, shutdown-proof, and real-browser acceptance coverage.
+- Corrected the release version without rewriting the existing `1.0.0` release history.
+
 ## 1.0.0 - 2026-08-24
 
 - Added task-scoped ephemeral Profiles for login-free work. Each run starts from a fresh isolated browser context, blocks service workers, persists no cookies or site storage, and closes automatically.

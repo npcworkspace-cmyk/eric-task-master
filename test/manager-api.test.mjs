@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHmac } from 'node:crypto';
 import { createManager } from '../src/manager.mjs';
 import { VERSION } from '../src/contracts.mjs';
 
@@ -143,6 +144,16 @@ async function pair(baseUrl, managerToken) {
   return pairResult.body.token;
 }
 
+async function issueAgent(baseUrl, managerToken, clientId) {
+  const result = await json(await fetch(`${baseUrl}/v1/agents/issue`, {
+    method: 'POST',
+    headers: headers(managerToken),
+    body: JSON.stringify({ clientId, name: clientId })
+  }));
+  assert.equal(result.response.status, 201);
+  return result.body.agentToken;
+}
+
 test('manager serves loopback health/dashboard and persists its token', async (t) => {
   const { manager, baseUrl } = await managerFixture(t);
   const health = await json(await fetch(`${baseUrl}/v1/health`));
@@ -166,6 +177,68 @@ test('manager serves loopback health/dashboard and persists its token', async (t
     createManager({ host: '0.0.0.0', dataDir: join(manager.dataDir, 'invalid') }),
     /must bind to 127\.0\.0\.1/
   );
+});
+
+test('same-host MCP processes share one stable scoped credential without registry growth', async (t) => {
+  const { manager, baseUrl } = await managerFixture(t);
+  const clientId = 'codex.shared-host';
+  const tokens = await Promise.all(
+    Array.from({ length: 24 }, () => issueAgent(baseUrl, manager.token, clientId))
+  );
+  assert.equal(new Set(tokens).size, 1);
+  const reads = await Promise.all(tokens.map((agentToken) => fetch(`${baseUrl}/v1/profiles`, {
+    headers: headers(agentToken)
+  })));
+  assert.equal(reads.every((response) => response.status === 200), true);
+
+  // Exercise substantial credential churn without turning this unit test into
+  // a TCP backlog stress test for the single in-process HTTP server.
+  for (let offset = 0; offset < 280; offset += 40) {
+    await Promise.all(Array.from({ length: Math.min(40, 280 - offset) }, (_, index) => (
+      issueAgent(baseUrl, manager.token, `historical-client-${offset + index}`)
+    )));
+  }
+  const source = await readFile(join(manager.dataDir, 'config.json'));
+  const config = JSON.parse(source.toString('utf8'));
+  assert.equal(source.byteLength < 64 * 1024, true);
+  assert.deepEqual(config.agents, []);
+  assert.equal(config.agentCredentialVersion, 1);
+});
+
+test('Agent credentials cannot occupy an internal principal namespace', async (t) => {
+  const { manager, baseUrl } = await managerFixture(t);
+  for (const clientId of [
+    'manager-admin',
+    'dashboard',
+    'extension',
+    'dashboard:forged',
+    'extension:forged',
+    'internal:forged',
+    'profile-open:forged',
+    'session-import:forged',
+    'task:forged',
+    'taskmaster:forged'
+  ]) {
+    const rejected = await json(await fetch(`${baseUrl}/v1/agents/issue`, {
+      method: 'POST',
+      headers: headers(manager.token),
+      body: JSON.stringify({ clientId, name: clientId })
+    }));
+    assert.equal(rejected.response.status, 400, clientId);
+    assert.equal(rejected.body.error.code, 'RESERVED_CLIENT_ID', clientId);
+  }
+
+  const clientId = 'manager-admin';
+  const encoded = Buffer.from(clientId, 'utf8').toString('base64url');
+  const signature = createHmac('sha256', manager.token)
+    .update(`ETMA1\0${clientId}`, 'utf8')
+    .digest('base64url');
+  const forgedLegacyToken = `ETMA1.${encoded}.${signature}`;
+  const rejectedLegacy = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    headers: headers(forgedLegacyToken)
+  }));
+  assert.equal(rejectedLegacy.response.status, 401);
+  assert.equal(rejectedLegacy.body.error.code, 'INVALID_TOKEN');
 });
 
 test('manager requires auth and pairs only a Chrome extension origin', async (t) => {
@@ -251,6 +324,80 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   }));
   assert.equal(removed.response.status, 200);
   assert.equal(removed.body.removed.id, profileId);
+});
+
+test('Agent-created Profiles are private until their owner explicitly shares them', async (t) => {
+  const { manager, baseUrl } = await managerFixture(t);
+  const tokenA = await issueAgent(baseUrl, manager.token, 'agent-profile-a');
+  const tokenB = await issueAgent(baseUrl, manager.token, 'agent-profile-b');
+
+  const created = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    method: 'POST',
+    headers: headers(tokenA),
+    body: JSON.stringify({ name: 'Agent A private', kind: 'persistent' })
+  }));
+  assert.equal(created.response.status, 201);
+  assert.equal(created.body.profile.access, 'private');
+  assert.equal(created.body.profile.createdBy, 'agent-profile-a');
+  const profileId = created.body.profile.id;
+
+  const hidden = await json(await fetch(`${baseUrl}/v1/profiles`, { headers: headers(tokenB) }));
+  assert.equal(hidden.response.status, 200);
+  assert.equal(hidden.body.profiles.some((profile) => profile.id === profileId), false);
+
+  for (const [method, suffix, body] of [
+    ['PATCH', '', { name: 'stolen' }],
+    ['POST', '/open', undefined]
+  ]) {
+    const denied = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}${suffix}`, {
+      method,
+      headers: headers(tokenB),
+      ...(body ? { body: JSON.stringify(body) } : {})
+    }));
+    assert.equal(denied.response.status, 403);
+    assert.equal(denied.body.error.code, 'PROFILE_ACCESS_DENIED');
+  }
+
+  const shared = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+    method: 'PATCH',
+    headers: headers(tokenA),
+    body: JSON.stringify({ access: 'shared' })
+  }));
+  assert.equal(shared.response.status, 200);
+  assert.equal(shared.body.profile.access, 'shared');
+  const visible = await json(await fetch(`${baseUrl}/v1/profiles`, { headers: headers(tokenB) }));
+  assert.equal(visible.body.profiles.some((profile) => profile.id === profileId), true);
+
+  const stillCannotManage = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+    method: 'PATCH',
+    headers: headers(tokenB),
+    body: JSON.stringify({ defaultBehavior: 'human' })
+  }));
+  assert.equal(stillCannotManage.response.status, 403);
+  assert.equal(stillCannotManage.body.error.code, 'PROFILE_ACCESS_DENIED');
+
+  const openedByB = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/open`, {
+    method: 'POST', headers: headers(tokenB), body: '{}'
+  }));
+  assert.equal(openedByB.response.status, 200);
+  const revokeWhileOpen = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+    method: 'PATCH',
+    headers: headers(tokenA),
+    body: JSON.stringify({ access: 'private' })
+  }));
+  assert.equal(revokeWhileOpen.response.status, 409);
+  assert.equal(revokeWhileOpen.body.error.code, 'PROFILE_IN_USE');
+  const closedByB = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/close`, {
+    method: 'POST', headers: headers(tokenB), body: '{}'
+  }));
+  assert.equal(closedByB.response.status, 200);
+  const privateAgain = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+    method: 'PATCH',
+    headers: headers(tokenA),
+    body: JSON.stringify({ access: 'private' })
+  }));
+  assert.equal(privateAgain.response.status, 200);
+  assert.equal(privateAgain.body.profile.access, 'private');
 });
 
 test('session import is extension-only, origin scoped, and never echoes authentication data', async (t) => {
@@ -367,4 +514,104 @@ test('taskServiceFactory receives the initialized ProfileStore and task state di
   assert.equal(received.profileStore, manager.profileStore);
   assert.equal(received.stateDir, join(root, 'data', 'tasks'));
   assert.equal(manager.taskService, service);
+});
+
+test('Manager enters a visible stopping state and rejects new operations before service cleanup', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'eric-task-master-stopping-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let releaseCleanup;
+  const cleanupBarrier = new Promise((resolveCleanup) => { releaseCleanup = resolveCleanup; });
+  let closeStarted = false;
+  const manager = await createManager({
+    port: 0,
+    dataDir: join(root, 'data'),
+    taskService: {
+      async list() { return []; },
+      async close() {
+        closeStarted = true;
+        await cleanupBarrier;
+      }
+    }
+  });
+  await manager.start();
+  const baseUrl = manager.baseUrl;
+  const stopping = manager.stop();
+  while (!closeStarted) await new Promise((resolveWait) => setTimeout(resolveWait, 1));
+
+  const health = await json(await fetch(`${baseUrl}/v1/health`));
+  assert.equal(health.response.status, 200);
+  assert.equal(health.body.state, 'stopping');
+  const rejected = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify({ name: 'Must not be created' })
+  }));
+  assert.equal(rejected.response.status, 503);
+  assert.equal(rejected.body.error.code, 'SERVICE_CLOSING');
+  assert.deepEqual(await manager.profileStore.list(), []);
+
+  releaseCleanup();
+  await stopping;
+});
+
+test('authenticated graceful shutdown acknowledges before cleanup and cannot self-deadlock', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'eric-task-master-api-shutdown-'));
+  let releaseCleanup;
+  const cleanupBarrier = new Promise((resolveCleanup) => { releaseCleanup = resolveCleanup; });
+  let closeStarted = false;
+  const manager = await createManager({
+    port: 0,
+    dataDir: join(root, 'data'),
+    taskService: {
+      async list() { return []; },
+      async close() {
+        closeStarted = true;
+        await cleanupBarrier;
+      }
+    }
+  });
+  await manager.start();
+  const baseUrl = manager.baseUrl;
+  t.after(async () => {
+    releaseCleanup();
+    await manager.stop().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const unauthorized = await json(await fetch(`${baseUrl}/v1/manager/shutdown`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}'
+  }));
+  assert.equal(unauthorized.response.status, 401);
+  assert.equal(unauthorized.body.error.code, 'AUTH_REQUIRED');
+
+  const agentToken = await issueAgent(baseUrl, manager.token, 'shutdown-denied-agent');
+  const forbidden = await json(await fetch(`${baseUrl}/v1/manager/shutdown`, {
+    method: 'POST',
+    headers: headers(agentToken),
+    body: '{}'
+  }));
+  assert.equal(forbidden.response.status, 403);
+  assert.equal(forbidden.body.error.code, 'ROLE_FORBIDDEN');
+
+  const gracefulStop = manager.shutdownRequested.then(() => manager.stop());
+  const accepted = await json(await fetch(`${baseUrl}/v1/manager/shutdown`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: '{}'
+  }));
+  assert.equal(accepted.response.status, 202);
+  assert.equal(accepted.body.accepted, true);
+  assert.equal(accepted.body.state, 'stopping');
+  assert.equal(accepted.body.pid, process.pid);
+  assert.match(accepted.body.identityFingerprint, /^[A-Za-z0-9_-]{43}$/);
+  assert.match(accepted.body.requestedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  while (!closeStarted) await new Promise((resolveWait) => setTimeout(resolveWait, 1));
+  const health = await json(await fetch(`${baseUrl}/v1/health`));
+  assert.equal(health.response.status, 200);
+  assert.equal(health.body.state, 'stopping');
+  releaseCleanup();
+  await gracefulStop;
 });

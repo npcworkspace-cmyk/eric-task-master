@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { startManager } from './manager.mjs';
 import { createTaskService } from './runtime/task-service.mjs';
 import { createRegistrar } from './registration/index.mjs';
-import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
+import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, isSettledTerminalTask, VERSION } from './contracts.mjs';
 import {
   createIdentityNonce,
   MANAGER_SERVICE,
@@ -17,6 +17,8 @@ import {
   verifyManagerIdentityProof
 } from './lib/manager-identity.mjs';
 import { redactSensitiveText } from './lib/redaction.mjs';
+import { waitForManagerShutdownProof } from './lib/manager-shutdown-proof.mjs';
+import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
 import { readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -28,8 +30,8 @@ Usage:
   taskmaster status [--json]
   taskmaster manager stop [--json]
   taskmaster profiles list [--json]
-  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--behavior MODE] [--headless]
-  taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE]
+  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--behavior MODE] [--access private|shared] [--headless]
+  taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE] [--access private|shared]
   taskmaster profiles open|close|delete PROFILE_ID
   taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
   taskmaster task-types describe TASK_TYPE [--json]
@@ -280,18 +282,43 @@ async function serve(config, json) {
   });
   await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
   const pidFile = join(config.stateDir, 'manager.json');
-  await writeFile(pidFile, `${JSON.stringify({ pid: process.pid, version: VERSION, baseUrl: manager.baseUrl })}\n`, { mode: 0o600 });
+  const shutdownFailureFile = join(config.stateDir, 'manager-shutdown-failure.json');
+  const pidRecord = { pid: process.pid, version: VERSION, baseUrl: manager.baseUrl };
+  await rm(shutdownFailureFile, { force: true }).catch(() => {});
+  await writeFile(pidFile, `${JSON.stringify(pidRecord)}\n`, { mode: 0o600 });
   emit({ ok: true, event: 'manager-ready', version: VERSION, pid: process.pid, baseUrl: manager.baseUrl }, json);
 
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
-    await manager.stop();
-    await rm(pidFile, { force: true }).catch(() => {});
+  let stopPromise;
+  const stop = (trigger) => {
+    if (stopPromise) return stopPromise;
+    stopPromise = shutdownManagerProcess({
+      manager,
+      pidFile,
+      failureFile: shutdownFailureFile,
+      pidRecord,
+      trigger
+    });
+    return stopPromise;
   };
-  process.once('SIGINT', () => void stop().finally(() => process.exit(0)));
-  process.once('SIGTERM', () => void stop().finally(() => process.exit(0)));
+  const stopAndExit = (trigger) => {
+    void stop(trigger).then(
+      () => process.exit(0),
+      (error) => {
+        process.stderr.write(`${JSON.stringify({
+          ok: false,
+          error: {
+            code: error?.code || 'MANAGER_STOP_FAILED',
+            message: redactSensitiveText(error?.message || 'Manager shutdown failed').slice(0, 2_000)
+          }
+        })}\n`);
+        process.exit(1);
+      }
+    );
+  };
+  process.once('SIGINT', () => stopAndExit('SIGINT'));
+  process.once('SIGTERM', () => stopAndExit('SIGTERM'));
+  await manager.shutdownRequested;
+  stopAndExit('api');
   await new Promise(() => {});
 }
 
@@ -349,10 +376,7 @@ async function followTask(context, taskId, json, options = {}) {
       emit({ event: 'task-progress', task }, json);
       previous = signature;
     }
-    if (
-      TERMINAL_TASK_STATES.has(task.state) &&
-      (task.cleanup?.settled || task.cleanup?.managerRestartObserved)
-    ) return task;
+    if (isSettledTerminalTask(task)) return task;
     await new Promise((resolveWait) => setTimeout(resolveWait, pollMs));
   }
   throw cliError(
@@ -444,8 +468,22 @@ async function stopManager(options, json) {
     running = await health(config);
   } catch (error) {
     if (error.code === 'MANAGER_UNREACHABLE') {
-      emit({ ok: true, stopped: false, message: 'Manager is not running' }, json);
-      return;
+      const pidFile = join(config.stateDir, 'manager.json');
+      let recorded;
+      try {
+        recorded = JSON.parse(await readFile(pidFile, 'utf8'));
+      } catch (readError) {
+        if (readError?.code === 'ENOENT') {
+          emit({ ok: true, stopped: false, message: 'Manager is not running' }, json);
+          return;
+        }
+        throw cliError('MANAGER_PID_UNAVAILABLE', 'Manager PID record is unreadable; shutdown status is unconfirmed.');
+      }
+      throw cliError(
+        'MANAGER_SHUTDOWN_UNCONFIRMED',
+        `Recorded Manager process ${recorded.pid || 'unknown'} is unreachable without a clean shutdown proof.`,
+        `Keep ${pidFile} intact, inspect manager-shutdown-failure.json, and recover explicitly; Task Master will never signal a persisted PID.`
+      );
     }
     throw error;
   }
@@ -464,15 +502,48 @@ async function stopManager(options, json) {
   ) {
     throw cliError('MANAGER_PID_MISMATCH', 'Manager PID record does not match the live service; refusing to stop it.');
   }
-  process.kill(recorded.pid, 'SIGTERM');
-  const deadline = Date.now() + 10_000;
+  const pidFile = join(config.stateDir, 'manager.json');
+  let gracefulRequested = false;
+  try {
+    const accepted = await requestJson(config.baseUrl, '/v1/manager/shutdown', {
+      method: 'POST',
+      body: {},
+      token: credentials.token,
+      timeoutMs: 10_000
+    });
+    if (
+      accepted?.accepted !== true ||
+      accepted?.state !== 'stopping' ||
+      accepted?.pid !== recorded.pid ||
+      accepted?.identityFingerprint !== credentials.identity.fingerprint
+    ) {
+      throw cliError(
+        'INVALID_MANAGER_SHUTDOWN_RESPONSE',
+        'Manager returned an invalid graceful-shutdown acknowledgement.'
+      );
+    }
+    gracefulRequested = true;
+  } catch (error) {
+    // A persisted PID is not a process identity: it may have been reused after
+    // the authenticated endpoint disappeared. Fail closed instead of ever
+    // signaling an unrelated process on macOS/Linux.
+    throw error;
+  }
+  const deadline = Date.now() + 270_000;
   while (Date.now() < deadline) {
     try {
       await health(config, 500);
     } catch (error) {
       if (error.code === 'MANAGER_UNREACHABLE') {
-        await rm(join(config.stateDir, 'manager.json'), { force: true }).catch(() => {});
-        emit({ ok: true, stopped: true, pid: recorded.pid }, json);
+        const cleanShutdown = await waitForManagerShutdownProof(pidFile, recorded);
+        if (!cleanShutdown) {
+          throw cliError(
+            'MANAGER_SHUTDOWN_UNCONFIRMED',
+            `Manager process ${recorded.pid} became unreachable without publishing a clean shutdown proof`,
+            `Keep the Manager state directory intact and inspect ${join(config.stateDir, 'manager-shutdown-failure.json')} before restarting.`
+          );
+        }
+        emit({ ok: true, stopped: true, graceful: gracefulRequested, pid: recorded.pid }, json);
         return;
       }
       throw error;
@@ -496,6 +567,7 @@ async function profileCommand(action, args, options, json) {
       kind: options.kind || 'persistent',
       defaultBehavior: options.behavior || 'fast',
       headless: options.headless === true || options.headless === 'true',
+      ...(options.access ? { access: options.access } : {}),
       ...(options.channel ? { browserChannel: options.channel } : {})
     };
     const result = await requestJson(context.config.baseUrl, '/v1/profiles', { method: 'POST', body, token: context.token });
@@ -510,6 +582,7 @@ async function profileCommand(action, args, options, json) {
     if (options.behavior !== undefined) body.defaultBehavior = options.behavior;
     if (options.headless !== undefined) body.headless = options.headless === true || options.headless === 'true';
     if (options.channel !== undefined) body.browserChannel = options.channel === 'none' ? null : options.channel;
+    if (options.access !== undefined) body.access = options.access;
     const result = await requestJson(context.config.baseUrl, `/v1/profiles/${encodeURIComponent(profileId)}`, {
       method: 'PATCH', body, token: context.token
     });
@@ -520,7 +593,12 @@ async function profileCommand(action, args, options, json) {
     ? `/v1/profiles/${encodeURIComponent(profileId)}`
     : `/v1/profiles/${encodeURIComponent(profileId)}/${action}`;
   const method = action === 'delete' ? 'DELETE' : 'POST';
-  const result = await requestJson(context.config.baseUrl, route, { method, token: context.token });
+  const result = await requestJson(context.config.baseUrl, route, {
+    method,
+    token: context.token,
+    ...(action === 'open' ? { timeoutMs: 75_000 } : {}),
+    ...(action === 'close' ? { timeoutMs: 45_000 } : {})
+  });
   emit({ ok: true, ...result }, json);
 }
 

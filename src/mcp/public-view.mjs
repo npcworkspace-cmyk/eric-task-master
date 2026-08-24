@@ -1,4 +1,5 @@
 import { basename } from 'node:path';
+import { publicProfile as publicManagerProfile } from '../contracts.mjs';
 import { redactSensitiveText } from '../lib/redaction.mjs';
 import { TaskMasterClientError } from './errors.mjs';
 
@@ -90,18 +91,7 @@ export function publicStatus(status) {
 }
 
 export function publicProfile(profile) {
-  return definedEntries([
-    ['id', stringValue(profile?.id, 128)],
-    ['name', stringValue(profile?.name, 80)],
-    ['kind', stringValue(profile?.kind, 32)],
-    ['state', stringValue(profile?.state, 64)],
-    ['defaultBehavior', stringValue(profile?.defaultBehavior, 32)],
-    ['headless', booleanValue(profile?.headless)],
-    ['browserChannel', stringValue(profile?.browserChannel, 64)],
-    ['createdAt', stringValue(profile?.createdAt, 64)],
-    ['updatedAt', stringValue(profile?.updatedAt, 64)],
-    ['lastOpenedAt', stringValue(profile?.lastOpenedAt, 64)]
-  ]);
+  return safeJson(publicManagerProfile(profile)) || {};
 }
 
 function publicProgress(progress) {
@@ -238,6 +228,7 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['id', stringValue(task?.id, 128)],
     ['profileId', stringValue(task?.profileId, 128)],
     ['taskType', stringValue(task?.taskType, 128)],
+    ['createdBy', stringValue(task?.createdBy, 128)],
     ['behavior', stringValue(task?.behavior, 32)],
     ['attempt', Number.isSafeInteger(task?.attempt) ? task.attempt : undefined],
     ['history', publicAttemptHistory(task?.history)],

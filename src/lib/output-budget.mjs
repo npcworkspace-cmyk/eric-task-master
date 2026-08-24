@@ -68,10 +68,14 @@ function outsideRoot(root, candidate) {
   return relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
 }
 
+function sameFile(left, right) {
+  return String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino);
+}
+
 function isDiagnosticFile(root, candidate) {
   const parts = path.relative(root, candidate).split(path.sep);
   return parts.length === 2 && parts[0] === 'screenshots' &&
-    /^\d{13,16}-[a-z0-9_-]{1,48}\.png$/iu.test(parts[1]);
+    /^\d{13,16}-[a-z0-9_-]{1,48}\.(?:png|jpe?g)$/iu.test(parts[1]);
 }
 
 function budgetExceeded(snapshot, limits) {
@@ -113,7 +117,8 @@ export async function createOutputBudget({ root, limits: suppliedLimits } = {}) 
   async function verifyRoot() {
     const currentStats = await lstat(resolvedRoot);
     const currentCanonical = await realpath(resolvedRoot);
-    if (!currentStats.isDirectory() || currentStats.isSymbolicLink() || currentCanonical !== canonicalRoot) {
+    if (!currentStats.isDirectory() || currentStats.isSymbolicLink() ||
+        currentCanonical !== canonicalRoot || !sameFile(rootStats, currentStats)) {
       throw new OutputBudgetError('TASK_OUTPUT_ROOT_CHANGED', 'Task output root changed during execution');
     }
   }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -105,7 +106,7 @@ async function installTaskType({ root, stateDir, profiles, moduleSource }) {
   };
 }
 
-test('Manager restart recovery resumes the same task ID once per stable resume key', async (t) => {
+test('Manager restart recovers a durable checkpoint without its lost IPC pointer', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-resume-restart-'));
   const stateDir = path.join(root, 'state', 'tasks');
   const profiles = fakeProfiles(root);
@@ -113,7 +114,7 @@ test('Manager restart recovery resumes the same task ID once per stable resume k
     root,
     stateDir,
     profiles,
-    moduleSource: 'export async function run() { return { summary: "unused", evidence: [] }; }\n'
+    moduleSource: 'export const meta = { supportsResume: true }; export async function run() { return { summary: "unused", evidence: [{ kind: "message", value: "unused" }] }; }\n'
   });
   const id = `task_${'a'.repeat(32)}`;
   const taskRoot = path.join(stateDir, id);
@@ -121,12 +122,13 @@ test('Manager restart recovery resumes the same task ID once per stable resume k
   const checkpointPath = path.join(taskRoot, 'checkpoint.json');
   const savedAt = '2026-08-24T01:02:03.000Z';
   await mkdir(outputDir, { recursive: true });
-  await writeFile(checkpointPath, `${JSON.stringify({ savedAt, data: { next: 2 } })}\n`);
+  await writeFile(checkpointPath, `${JSON.stringify({ taskId: id, attempt: 1, savedAt, data: { next: 2 } })}\n`);
   await writeFile(path.join(taskRoot, 'task.json'), `${JSON.stringify({
     id,
     profileId: profiles.profile.id,
     taskType: 'durability',
     taskTypeSha256: installed.sha256,
+    supportsResume: true,
     modulePath: installed.snapshotPath,
     ownerClientId: AGENT_A.clientId,
     idempotencyKey: 'restart-original-0001',
@@ -140,7 +142,9 @@ test('Manager restart recovery resumes the same task ID once per stable resume k
     progress: { current: 1, total: 3, message: 'Before restart' },
     heartbeatAt: '2026-08-24T01:00:01.000Z',
     outputDir,
-    checkpoint: { path: checkpointPath, savedAt },
+    // checkpoint.json was committed, but Manager crashed before its IPC pointer
+    // could be persisted into task.json.
+    checkpoint: null,
     result: null,
     error: null,
     cleanup: { browserClosed: false, leaseReleased: false, workerExited: false, settled: false },
@@ -209,6 +213,19 @@ test('Manager restart recovery resumes the same task ID once per stable resume k
   await assert.rejects(service.resume(id, { resumeKey: 'resume-restart-0001' }, AGENT_B), { code: 'TASK_NOT_FOUND' });
 
   interruptedWorkerAlive = false;
+  await assert.rejects(
+    service.resume(id, { resumeKey: 'resume-unconfirmed-0001' }, AGENT_A),
+    { code: 'TASK_CLEANUP_NOT_SETTLED' }
+  );
+  assert.equal(profiles.profile.lease.ownerId, `task:${id}`);
+  await writeFile(path.join(taskRoot, 'cleanup-attempt-1.json'), `${JSON.stringify({
+    version: 1,
+    kind: 'task',
+    taskId: id,
+    attempt: 1,
+    workerPid: 999_999,
+    closedAt: new Date().toISOString()
+  })}\n`);
 
   const [first, replay] = await Promise.all([
     service.resume(id, { resumeKey: 'resume-restart-0001' }, AGENT_A),
@@ -234,12 +251,201 @@ test('Manager restart recovery resumes the same task ID once per stable resume k
   assert.equal(completed.cleanup.browserClosed, true);
   assert.equal(completed.cleanup.leaseReleased, true);
   assert.equal(profiles.profile.lease, null);
+  assert.deepEqual((await service.getInternal(id)).checkpoint, {
+    path: checkpointPath,
+    attempt: 1,
+    savedAt,
+    sha256: createHash('sha256').update(await readFile(checkpointPath)).digest('hex'),
+    sizeBytes: (await readFile(checkpointPath)).byteLength
+  });
   const artifacts = await service.listArtifacts(id, AGENT_A);
   assert.deepEqual(artifacts.map((item) => item.name), ['resumed.json']);
   await assert.rejects(
     service.resume(id, { resumeKey: 'resume-restart-0002' }, AGENT_A),
     { code: 'TASK_NOT_RESUMABLE' }
   );
+  await writeFile(path.join(outputDir, 'resumed.json'), '{"changed":true}\n');
+  const duplicateResume = await service.resume(id, { resumeKey: 'resume-restart-0001' }, AGENT_A);
+  assert.equal(duplicateResume.state, 'failed');
+  assert.equal(duplicateResume.error.code, 'TASK_COMPLETION_INTEGRITY_FAILED');
+  assert.equal('result' in duplicateResume, false);
+});
+
+test('Manager restart launches a queued resume with the same frozen checkpoint snapshot', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-queued-resume-restart-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'state', 'tasks');
+  const profiles = fakeProfiles(root);
+  const installed = await installTaskType({
+    root,
+    stateDir,
+    profiles,
+    moduleSource: 'export const meta = { supportsResume: true }; export async function run() { return { summary: "unused", evidence: [{ kind: "message", value: "unused" }] }; }\n'
+  });
+  const id = `task_${'c'.repeat(32)}`;
+  const taskRoot = path.join(stateDir, id);
+  const outputDir = path.join(taskRoot, 'output');
+  const checkpointPath = path.join(taskRoot, 'checkpoint.json');
+  const frozenPath = path.join(taskRoot, 'resume-input-attempt-2-fixed.json');
+  const savedAt = '2026-08-24T02:03:04.000Z';
+  const source = Buffer.from(`${JSON.stringify({ taskId: id, attempt: 1, savedAt, data: { next: 9 } })}\n`);
+  const resumeInput = {
+    path: frozenPath,
+    sourceAttempt: 1,
+    targetAttempt: 2,
+    savedAt,
+    sha256: createHash('sha256').update(source).digest('hex'),
+    sizeBytes: source.byteLength
+  };
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(checkpointPath, source);
+  await writeFile(frozenPath, source);
+  await writeFile(path.join(taskRoot, 'task.json'), `${JSON.stringify({
+    id,
+    profileId: profiles.profile.id,
+    taskType: 'durability',
+    taskTypeSha256: installed.sha256,
+    supportsResume: true,
+    modulePath: installed.snapshotPath,
+    ownerClientId: AGENT_A.clientId,
+    idempotencyKey: 'queued-resume-restart-0001',
+    requestHash: 'd'.repeat(64),
+    behavior: 'fast',
+    input: { marker: 'queued-resume' },
+    timeoutMs: 30_000,
+    attempt: 2,
+    history: [
+      { attempt: 1, resumed: false, state: 'failed', startedAt: '2026-08-24T02:00:00.000Z', finishedAt: '2026-08-24T02:01:00.000Z' },
+      { attempt: 2, resumed: true, startedAt: '2026-08-24T02:02:00.000Z', checkpointSavedAt: savedAt }
+    ],
+    state: 'queued',
+    progress: { current: 0, total: null, message: 'Resume attempt 2 queued from checkpoint' },
+    heartbeatAt: '2026-08-24T02:02:00.000Z',
+    outputDir,
+    checkpoint: { path: checkpointPath, attempt: 1, savedAt, sha256: resumeInput.sha256, sizeBytes: source.byteLength },
+    resumeInput,
+    resumeCheckpointValid: true,
+    result: null,
+    error: null,
+    completion: null,
+    completionClaimed: false,
+    cleanup: { browserClosed: false, leaseReleased: false, workerExited: false, settled: false },
+    createdAt: '2026-08-24T02:00:00.000Z',
+    updatedAt: '2026-08-24T02:02:00.000Z',
+    startedAt: null,
+    finishedAt: null,
+    workerPid: null,
+    leaseOwner: `task:${id}`,
+    leaseHeld: false
+  }, null, 2)}\n`);
+  let observedResumeInput;
+  const service = createTaskService({
+    stateDir,
+    profileStore: profiles,
+    allowedTaskRoots: [installed.allowed],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        observedResumeInput = structuredClone(message.config.resumeCheckpoint);
+        setImmediate(() => {
+          child.emit('message', {
+            type: 'result',
+            result: { summary: 'Queued resume survived restart', evidence: [{ kind: 'message', value: 'same snapshot' }] }
+          });
+          child.emit('message', { type: 'state', state: 'completed' });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish();
+        });
+      });
+    }
+  });
+  t.after(() => service.close().catch(() => {}));
+  const completed = await waitFor(async () => {
+    const current = await service.get(id, AGENT_A);
+    return current.state === 'completed' && current.cleanup.settled ? current : null;
+  });
+  assert.equal(completed.attempt, 2);
+  assert.deepEqual(observedResumeInput, resumeInput);
+  assert.deepEqual(JSON.parse(await readFile(observedResumeInput.path, 'utf8')).data, { next: 9 });
+  assert.equal(profiles.profile.lease, null);
+});
+
+test('a resumed attempt recovers its newer checkpoint when the checkpoint IPC is lost', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-resume-ipc-loss-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'state', 'tasks');
+  const allowed = path.join(root, 'allowed');
+  await mkdir(allowed);
+  const modulePath = path.join(allowed, 'resume-ipc-loss.mjs');
+  await writeFile(modulePath, 'export const meta = { supportsResume: true }; export async function run() {}\n');
+  const profiles = fakeProfiles(root);
+  const service = createTaskService({
+    stateDir,
+    profileStore: profiles,
+    allowedTaskRoots: [allowed],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => void (async () => {
+          if (message.config.attempt <= 2) {
+            const savedAt = new Date().toISOString();
+            const encoded = `${JSON.stringify({
+              taskId: message.config.taskId,
+              attempt: message.config.attempt,
+              savedAt,
+              data: { cursor: message.config.attempt * 10 }
+            })}\n`;
+            await writeFile(message.config.checkpointPath, encoded);
+            if (message.config.attempt === 1) {
+              child.emit('message', {
+                type: 'checkpoint',
+                path: message.config.checkpointPath,
+                attempt: 1,
+                savedAt,
+                sha256: createHash('sha256').update(encoded).digest('hex'),
+                sizeBytes: Buffer.byteLength(encoded)
+              });
+            }
+            child.emit('message', { type: 'error', error: { code: 'RETRY', message: 'retry from checkpoint' } });
+          } else {
+            assert.equal(message.config.resumeCheckpoint.sourceAttempt, 2);
+            assert.deepEqual(JSON.parse(await readFile(message.config.resumeCheckpoint.path, 'utf8')).data, { cursor: 20 });
+            child.emit('message', {
+              type: 'result',
+              result: { summary: 'Recovered newest checkpoint', evidence: [{ kind: 'message', value: 'attempt 3' }] }
+            });
+            child.emit('message', { type: 'state', state: 'completed' });
+          }
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish();
+        })());
+      });
+    }
+  });
+  t.after(() => service.close().catch(() => {}));
+  await service.installTaskType({ name: 'resume-ipc-loss', modulePath }, ADMIN);
+  const task = await service.create({
+    profileId: profiles.profile.id,
+    taskType: 'resume-ipc-loss',
+    idempotencyKey: 'resume-ipc-loss-attempt-1'
+  }, AGENT_A);
+  await waitFor(async () => (await service.get(task.id, AGENT_A)).resumeAvailable === true);
+  await service.resume(task.id, { resumeKey: 'resume-ipc-loss-attempt-2' }, AGENT_A);
+  const second = await waitFor(async () => {
+    const current = await service.get(task.id, AGENT_A);
+    return current.state === 'failed' && current.attempt === 2 && current.cleanup.settled ? current : null;
+  });
+  assert.equal(second.resumeAvailable, true);
+  assert.equal((await service.getInternal(task.id)).checkpoint.attempt, 2);
+  await service.resume(task.id, { resumeKey: 'resume-ipc-loss-attempt-3' }, AGENT_A);
+  const completed = await waitFor(async () => {
+    const current = await service.get(task.id, AGENT_A);
+    return current.state === 'completed' && current.cleanup.settled ? current : null;
+  });
+  assert.equal(completed.attempt, 3);
+  assert.equal(profiles.profile.lease, null);
 });
 
 test('resume fails closed without checkpoint, settled cleanup, or an unchanged module snapshot', async (t) => {
@@ -247,7 +453,7 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
   const allowed = path.join(root, 'allowed');
   await mkdir(allowed);
   const modulePath = path.join(allowed, 'guards.mjs');
-  await writeFile(modulePath, 'export async function run() { return { summary: "ok", evidence: [] }; }\n');
+  await writeFile(modulePath, 'export const meta = { supportsResume: true }; export async function run() { return { summary: "ok", evidence: [{ kind: "message", value: "ok" }] }; }\n');
   const profiles = fakeProfiles(root);
   const workers = [];
   const service = createTaskService({
@@ -261,10 +467,24 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
         if (message.type !== 'start') return;
         const mode = message.config.input.mode;
         setImmediate(() => void (async () => {
-          if (mode !== 'no-checkpoint') {
+          if (mode === 'invalid-orphan-checkpoint') {
+            await writeFile(message.config.checkpointPath, '{"savedAt":"not-a-date","data":{}}\n');
+          } else if (mode !== 'no-checkpoint') {
             const savedAt = new Date().toISOString();
-            await writeFile(message.config.checkpointPath, `${JSON.stringify({ savedAt, data: { mode } })}\n`);
-            child.emit('message', { type: 'checkpoint', path: message.config.checkpointPath, savedAt });
+            const checkpointTarget = mode === 'foreign-pointer'
+              ? path.join(root, 'outside-checkpoint.json')
+              : message.config.checkpointPath;
+            await writeFile(checkpointTarget, `${JSON.stringify({
+              taskId: message.config.taskId,
+              attempt: message.config.attempt,
+              savedAt,
+              data: { mode }
+            })}\n`);
+            child.emit('message', {
+              type: 'checkpoint',
+              path: checkpointTarget,
+              savedAt
+            });
           }
           child.emit('message', { type: 'error', error: { code: 'FIXTURE_FAILED', message: 'fixture failure' } });
           if (mode !== 'cleanup-open') {
@@ -295,6 +515,50 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
     { code: 'TASK_CHECKPOINT_REQUIRED' }
   );
 
+  const invalidOrphan = await service.create({
+    profileId: profiles.profile.id,
+    taskType: 'guards',
+    idempotencyKey: 'guard-invalid-orphan-checkpoint',
+    input: { mode: 'invalid-orphan-checkpoint' }
+  }, AGENT_A);
+  await waitFor(async () => (await service.get(invalidOrphan.id, AGENT_A)).cleanup.settled);
+  await assert.rejects(
+    service.resume(invalidOrphan.id, { resumeKey: 'resume-invalid-orphan' }, AGENT_A),
+    { code: 'TASK_CHECKPOINT_REQUIRED' }
+  );
+  assert.equal((await service.getInternal(invalidOrphan.id)).checkpoint, null);
+
+  const foreignPointer = await service.create({
+    profileId: profiles.profile.id,
+    taskType: 'guards',
+    idempotencyKey: 'guard-foreign-checkpoint-pointer',
+    input: { mode: 'foreign-pointer' }
+  }, AGENT_A);
+  await waitFor(async () => (await service.get(foreignPointer.id, AGENT_A)).cleanup.settled);
+  await assert.rejects(
+    service.resume(foreignPointer.id, { resumeKey: 'resume-foreign-pointer' }, AGENT_A),
+    { code: 'TASK_CHECKPOINT_INVALID' }
+  );
+
+  const replacedCheckpoint = await service.create({
+    profileId: profiles.profile.id,
+    taskType: 'guards',
+    idempotencyKey: 'guard-replaced-checkpoint',
+    input: { mode: 'replace-checkpoint' }
+  }, AGENT_A);
+  await waitFor(async () => (await service.get(replacedCheckpoint.id, AGENT_A)).resumeAvailable === true);
+  const replacedInternal = await service.getInternal(replacedCheckpoint.id);
+  await writeFile(replacedInternal.checkpoint.path, `${JSON.stringify({
+    taskId: replacedCheckpoint.id,
+    attempt: replacedInternal.attempt,
+    savedAt: new Date().toISOString(),
+    data: { mode: 'replacement' }
+  })}\n`);
+  await assert.rejects(
+    service.resume(replacedCheckpoint.id, { resumeKey: 'resume-replaced-checkpoint' }, AGENT_A),
+    { code: 'TASK_CHECKPOINT_INVALID' }
+  );
+
   const cleanupOpen = await service.create({
     profileId: profiles.profile.id,
     taskType: 'guards',
@@ -306,6 +570,7 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
     service.resume(cleanupOpen.id, { resumeKey: 'resume-cleanup-open' }, AGENT_A),
     { code: 'TASK_CLEANUP_NOT_SETTLED' }
   );
+  workers.at(-1).emit('message', { type: 'cleanup', browserClosed: true });
   workers.at(-1).finish();
   await waitFor(async () => (await service.get(cleanupOpen.id, AGENT_A)).cleanup.settled);
 
@@ -382,7 +647,7 @@ test('completion gate rejects malformed success and accepts a stable declared ar
     });
   }
 
-  for (const mode of ['missing-result', 'missing-artifact', 'browser-open']) {
+  for (const mode of ['missing-result', 'missing-artifact']) {
     const rejected = await run(mode);
     assert.equal(rejected.state, 'failed');
     assert.equal(rejected.error.code, 'TASK_COMPLETION_GATE_FAILED');
@@ -396,13 +661,79 @@ test('completion gate rejects malformed success and accepts a stable declared ar
   assert.equal(valid.cleanup.settled, true);
   assert.equal(profiles.profile.lease, null);
   assert.equal('input' in valid, false);
+
+  async function createValid(key) {
+    const body = {
+      profileId: profiles.profile.id,
+      taskType: 'gate',
+      idempotencyKey: key,
+      input: { mode: 'valid' }
+    };
+    const created = await service.create(body, AGENT_A);
+    const completed = await waitFor(async () => {
+      const current = await service.get(created.id, AGENT_A);
+      return current.state === 'completed' && current.cleanup.settled ? current : null;
+    });
+    return { body, completed };
+  }
+
+  const duplicateGate = await createValid('completion-gate-duplicate-replay');
+  await writeFile(
+    path.join(root, 'state', 'tasks', duplicateGate.completed.id, 'output', 'valid.json'),
+    '{"changed":true}\n'
+  );
+  const duplicateCreate = await service.create(duplicateGate.body, AGENT_A);
+  assert.equal(duplicateCreate.state, 'failed');
+  assert.equal(duplicateCreate.error.code, 'TASK_COMPLETION_INTEGRITY_FAILED');
+  assert.equal('result' in duplicateCreate, false);
+
+  const cancelGate = await createValid('completion-gate-terminal-cancel');
+  await writeFile(
+    path.join(root, 'state', 'tasks', cancelGate.completed.id, 'output', 'valid.json'),
+    '{"changed":true}\n'
+  );
+  const terminalCancel = await service.cancel(cancelGate.completed.id, AGENT_A);
+  assert.equal(terminalCancel.state, 'failed');
+  assert.equal(terminalCancel.error.code, 'TASK_COMPLETION_INTEGRITY_FAILED');
+  assert.equal('result' in terminalCancel, false);
+
+  const browserOpen = await service.create({
+    profileId: profiles.profile.id,
+    taskType: 'gate',
+    idempotencyKey: 'completion-gate-browser-open',
+    input: { mode: 'browser-open' }
+  }, AGENT_A);
+  const rejectedOpen = await waitFor(async () => {
+    const current = await service.get(browserOpen.id, AGENT_A);
+    return current.state === 'failed' && current.cleanup.workerExited ? current : null;
+  });
+  assert.equal(rejectedOpen.state, 'failed');
+  assert.equal(rejectedOpen.error.code, 'TASK_COMPLETION_GATE_FAILED');
+  assert.equal(rejectedOpen.cleanup.browserClosed, false);
+  assert.equal(rejectedOpen.cleanup.leaseReleased, false);
+  assert.equal(rejectedOpen.cleanup.settled, false);
+  assert.equal(profiles.profile.lease.ownerId, `task:${browserOpen.id}`);
   const internal = await service.getInternal(valid.id);
   assert.deepEqual(internal.input, { mode: 'valid' });
   assert.equal(internal.timeoutMs, null);
   const persisted = JSON.parse(await readFile(path.join(root, 'state', 'tasks', valid.id, 'task.json'), 'utf8'));
   assert.deepEqual(persisted.input, { mode: 'valid' });
   assert.equal(persisted.timeoutMs, null);
-  assert.deepEqual((await service.listArtifacts(valid.id, AGENT_A)).map((item) => item.name), ['valid.json']);
+  const [verifiedArtifact] = await service.listArtifacts(valid.id, AGENT_A);
+  assert.equal(verifiedArtifact.name, 'valid.json');
+  await writeFile(path.join(root, 'state', 'tasks', valid.id, 'output', 'valid.json'), '{"changed":true}\n');
+  const invalidated = await service.get(valid.id, AGENT_A);
+  assert.equal(invalidated.state, 'failed');
+  assert.equal(invalidated.error.code, 'TASK_COMPLETION_INTEGRITY_FAILED');
+  assert.equal(invalidated.completion.integrity, 'invalid');
+  await assert.rejects(
+    service.listArtifacts(valid.id, AGENT_A),
+    { code: 'ARTIFACT_INTEGRITY_FAILED' }
+  );
+  await assert.rejects(
+    service.readArtifact(valid.id, verifiedArtifact.id, {}, AGENT_A),
+    { code: 'ARTIFACT_INTEGRITY_FAILED' }
+  );
 });
 
 test('real Playwright task resumes from checkpoint and closes both attempt windows', {
@@ -416,6 +747,7 @@ test('real Playwright task resumes from checkpoint and closes both attempt windo
   await writeFile(modulePath, [
     "import { writeFile } from 'node:fs/promises';",
     "import path from 'node:path';",
+    'export const meta = { supportsResume: true };',
     'export async function run({ page, input, outputDir, action, checkpoint, progress }) {',
     '  const previous = await checkpoint.read();',
     "  await action.goto(input.url, { waitUntil: 'domcontentloaded' });",
@@ -477,7 +809,9 @@ test('real Playwright task resumes from checkpoint and closes both attempt windo
   assert.equal(completed.cleanup.browserClosed, true);
   assert.equal(completed.cleanup.leaseReleased, true);
   assert.equal(profiles.profile.lease, null);
-  const artifact = (await service.listArtifacts(completed.id, AGENT_A))[0];
+  const artifact = (await service.listArtifacts(completed.id, AGENT_A))
+    .find((item) => item.name === 'real-resume.json');
+  assert.ok(artifact);
   const content = await service.readArtifact(completed.id, artifact.id, {}, AGENT_A);
   assert.equal(JSON.parse(content.chunk).resumed, true);
 });

@@ -1,6 +1,6 @@
 import { isSensitiveKey, redactSensitiveText } from './lib/redaction.mjs';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.0.1';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -22,6 +22,10 @@ export const TASK_STATES = Object.freeze([
 ]);
 export const TERMINAL_TASK_STATES = new Set(['completed', 'failed', 'cancelled']);
 
+export function isSettledTerminalTask(task) {
+  return TERMINAL_TASK_STATES.has(task?.state) && task?.cleanup?.settled === true;
+}
+
 export function isBehaviorMode(value) {
   return BEHAVIOR_MODES.includes(value);
 }
@@ -40,6 +44,7 @@ export function publicProfile(profile) {
     'defaultBehavior',
     'headless',
     'browserChannel',
+    'access',
     'createdAt',
     'updatedAt',
     'lastUsedAt',
@@ -47,6 +52,8 @@ export function publicProfile(profile) {
   ]) {
     if (profile?.[key] !== undefined) safe[key] = profile[key];
   }
+  if (profile?.createdBy) safe.createdBy = profile.createdBy;
+  else if (profile?.ownerClientId) safe.createdBy = profile.ownerClientId;
   return safe;
 }
 
@@ -74,6 +81,7 @@ export function publicTask(task) {
     'id',
     'profileId',
     'taskType',
+    'supportsResume',
     'behavior',
     'attempt',
     'history',
@@ -94,8 +102,13 @@ export function publicTask(task) {
     'startedAt',
     'finishedAt',
     'completion',
-    'userRequest'
+    'userRequest',
+    'createdBy'
   ]) {
+    if (
+      key === 'result' &&
+      !(task.state === 'completed' && task.completion?.integrity !== 'invalid' && task.completion?.verifiedAt)
+    ) continue;
     if (task?.[key] !== undefined) safe[key] = redactLocalPaths(task[key]);
   }
   if (task.id) safe.outputRef = `taskmaster://tasks/${encodeURIComponent(task.id)}/artifacts/`;
@@ -120,8 +133,16 @@ export function publicTask(task) {
     };
   }
   if (task.ownerClientId) safe.createdBy = task.ownerClientId;
-  safe.resumeAvailable = Boolean(
-    task.state === 'failed' && task.checkpoint && task.cleanup?.settled === true
-  );
+  const hasInternalResumeState = Object.hasOwn(task || {}, 'resumeCheckpointValid');
+  safe.resumeAvailable = hasInternalResumeState
+    ? Boolean(
+        task.supportsResume === true && task.state === 'failed' && task.checkpoint &&
+        task.resumeCheckpointValid === true && task.cleanup?.settled === true
+      )
+    : task.resumeAvailable === true;
+  const resumeBlocked = task.resumeCheckpointError || task.resumeBlocked;
+  if (!safe.resumeAvailable && resumeBlocked) {
+    safe.resumeBlocked = redactLocalPaths(resumeBlocked);
+  }
   return safe;
 }

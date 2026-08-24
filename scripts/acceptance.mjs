@@ -109,10 +109,10 @@ async function readArtifactText(baseUrl, token, taskId, artifactId) {
   return payload.chunk;
 }
 
-function evidenceMap(tasks) {
+function evidenceMap(reports) {
   const map = new Map();
-  for (const task of tasks) {
-    for (const item of task.result?.evidence || []) {
+  for (const report of reports) {
+    for (const item of report.evidence || []) {
       if (!map.has(item.kind)) map.set(item.kind, []);
       map.get(item.kind).push(item);
     }
@@ -127,7 +127,8 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
   const fixture = await fixtureServer();
   let profile;
   let ephemeralProfile;
-  const tasks = [];
+    const tasks = [];
+    const acceptanceReports = [];
   try {
     const health = await api(baseUrl, '/v1/health');
     add('manager health', health.ok && health.service === 'eric-task-master');
@@ -259,29 +260,6 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       );
     }
 
-    const evidence = evidenceMap(tasks);
-    const allTrue = (kind) => evidence.get(kind)?.length === 3 && evidence.get(kind).every((item) => item.ok);
-    add('navigation', allTrue('navigation'));
-    add('text input', allTrue('input'));
-    add('human behavior mechanics', allTrue('behavior'));
-    add('click and select', allTrue('checkbox') && allTrue('select'));
-    add('file upload', allTrue('upload'));
-    add('cookie and local storage', allTrue('cookie') && allTrue('localStorage'));
-    add(
-      'imported session persisted',
-      allTrue('session-import-cookie') && allTrue('session-import-storage')
-    );
-    add('file download', allTrue('download'));
-    add('screenshot fallback primitive', allTrue('screenshot'));
-    add(
-      'progress and heartbeat',
-      tasks.every((task) => task.progress?.current === 9 && task.progress?.total === 9 && task.heartbeatAt)
-    );
-    add(
-      'checkpoint and compact evidence',
-      tasks.every((task) => task.checkpoint?.ref && task.result?.evidence?.length >= 10)
-    );
-
     for (const task of tasks) {
       const { artifacts } = await api(baseUrl, `/v1/tasks/${encodeURIComponent(task.id)}/artifacts`, { token });
       const expected = new Set(['acceptance.json', 'acceptance.png', 'taskmaster-fixture.txt']);
@@ -302,8 +280,33 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
           code: 'ACCEPTANCE_ARTIFACT_MISMATCH'
         });
       }
+      acceptanceReports.push(report);
     }
     add('bounded artifact API', true);
+
+    const evidence = evidenceMap(acceptanceReports);
+    const allTrue = (kind) => evidence.get(kind)?.length === 3 && evidence.get(kind).every((item) => item.ok);
+    add('navigation', allTrue('navigation'));
+    add('text input', allTrue('input'));
+    add('human behavior mechanics', allTrue('behavior'));
+    add('click and select', allTrue('checkbox') && allTrue('select'));
+    add('file upload', allTrue('upload'));
+    add('cookie and local storage', allTrue('cookie') && allTrue('localStorage'));
+    add(
+      'imported session persisted',
+      allTrue('session-import-cookie') && allTrue('session-import-storage')
+    );
+    add('file download', allTrue('download'));
+    add('screenshot fallback primitive', allTrue('screenshot'));
+    add(
+      'progress and heartbeat',
+      tasks.every((task) => task.progress?.current === 9 && task.progress?.total === 9 && task.heartbeatAt)
+    );
+    add(
+      'checkpoint and compact evidence',
+      tasks.every((task) => task.checkpoint?.ref && task.result?.evidence?.length === 4) &&
+      acceptanceReports.every((report) => Array.isArray(report.evidence) && report.evidence.length >= 10)
+    );
 
     ({ profile: ephemeralProfile } = await api(baseUrl, '/v1/profiles', {
       method: 'POST',
@@ -347,6 +350,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     }
 
     const ephemeralTasks = [];
+    const ephemeralReports = [];
     for (let index = 0; index < 2; index += 1) {
       const created = await api(baseUrl, '/v1/tasks', {
         method: 'POST',
@@ -360,13 +364,29 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
           input: { url: fixture.url, uploadPath, expectCleanStart: true }
         }
       });
-      ephemeralTasks.push(await waitForTask(baseUrl, token, created.task.id));
+      const task = await waitForTask(baseUrl, token, created.task.id);
+      ephemeralTasks.push(task);
+      const { artifacts } = await api(baseUrl, `/v1/tasks/${encodeURIComponent(task.id)}/artifacts`, { token });
+      const reportArtifact = artifacts.find((artifact) => artifact.name === 'acceptance.json');
+      if (!reportArtifact) {
+        throw Object.assign(new Error(`Ephemeral acceptance report is missing for ${task.id}`), {
+          code: 'ACCEPTANCE_ARTIFACT_MISSING'
+        });
+      }
+      ephemeralReports.push(JSON.parse(await readArtifactText(
+        baseUrl,
+        token,
+        task.id,
+        reportArtifact.id
+      )));
     }
     add(
       'ephemeral task isolation',
-      ephemeralTasks.every((task) => (
-        task.state === 'completed' &&
-        task.result?.evidence?.some((item) => item.kind === 'ephemeral-clean-start' && item.ok)
+      ephemeralTasks.every((task) => task.state === 'completed') &&
+      ephemeralReports.length === ephemeralTasks.length &&
+      ephemeralReports.every((report) => (
+        report.passed === true &&
+        report.evidence?.some((item) => item.kind === 'ephemeral-clean-start' && item.ok)
       ))
     );
 

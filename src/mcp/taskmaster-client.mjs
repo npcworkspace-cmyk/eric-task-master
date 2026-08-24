@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { API_VERSION, VERSION } from '../contracts.mjs';
+import { API_VERSION, isSettledTerminalTask, VERSION } from '../contracts.mjs';
 import {
   createIdentityNonce,
   MANAGER_SERVICE,
@@ -14,12 +14,14 @@ import { TaskMasterClientError } from './errors.mjs';
 
 const DEFAULT_PORT = 19_946;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const PROFILE_OPEN_REQUEST_TIMEOUT_MS = 75_000;
+const PROFILE_CLOSE_REQUEST_TIMEOUT_MS = 45_000;
+const MAX_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TOKEN = /^\S{32,512}$/;
-const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
 const FORBIDDEN_INPUT_KEY = /^(?:module_?path|evaluate|authorization|auth_?header|cookies?|password|passwd|secrets?|credentials?|api_?key|token|(?:access|refresh|api|auth|bearer|session)_?token|session(?:_?id|_?token)?)$/i;
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -27,6 +29,7 @@ export const TASKMASTER_CLIENT_METHODS = Object.freeze([
   'getStatus',
   'listProfiles',
   'createProfile',
+  'updateProfile',
   'openProfile',
   'closeProfile',
   'listTaskTypes',
@@ -183,11 +186,18 @@ function remoteError(status, payload) {
   const code = typeof candidate === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(candidate)
     ? candidate
     : `HTTP_${status}`;
-  if (status === 401 || status === 403) {
+  if (status === 401) {
     return clientError(code, 'Task Master rejected the scoped agent credential.', {
       retryable: true,
       statusCode: status,
       nextAction: 'Reconnect the MCP server so Task Master can issue a fresh agent credential.'
+    });
+  }
+  if (status === 403) {
+    return clientError(code, 'This Agent is not authorized for the requested Task Master resource.', {
+      retryable: false,
+      statusCode: status,
+      nextAction: 'Use a Profile owned by this Agent, or explicitly share the intended Profile.'
     });
   }
   if (status === 404) {
@@ -261,8 +271,11 @@ export class HttpTaskMasterClient {
     this.#stateDir = resolve(stateDir ?? join(homedir(), '.eric-task-master'));
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
     this.#fetch = fetchImpl;
-    if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 100 || requestTimeoutMs > 60_000) {
-      throw clientError('INVALID_TIMEOUT', 'requestTimeoutMs must be an integer from 100 to 60000.');
+    if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 100 || requestTimeoutMs > MAX_REQUEST_TIMEOUT_MS) {
+      throw clientError(
+        'INVALID_TIMEOUT',
+        `requestTimeoutMs must be an integer from 100 to ${MAX_REQUEST_TIMEOUT_MS}.`
+      );
     }
     this.#requestTimeoutMs = requestTimeoutMs;
     if (ensureManager !== undefined && typeof ensureManager !== 'function') {
@@ -282,18 +295,39 @@ export class HttpTaskMasterClient {
   }
 
   async createProfile(input) {
-    assertAllowedKeys(input, new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel']), 'Profile request');
+    assertAllowedKeys(input, new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel', 'access']), 'Profile request');
     return (await this.#request('/v1/profiles', { method: 'POST', body: input })).profile;
+  }
+
+  async updateProfile(profileId, patch) {
+    assertIdentifier(profileId, 'profileId');
+    assertAllowedKeys(
+      patch,
+      new Set(['name', 'defaultBehavior', 'headless', 'browserChannel', 'access']),
+      'Profile patch'
+    );
+    return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}`, {
+      method: 'PATCH',
+      body: patch
+    })).profile;
   }
 
   async openProfile(profileId) {
     assertIdentifier(profileId, 'profileId');
-    return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}/open`, { method: 'POST', body: {} })).profile;
+    return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}/open`, {
+      method: 'POST',
+      body: {},
+      timeoutMs: Math.max(this.#requestTimeoutMs, PROFILE_OPEN_REQUEST_TIMEOUT_MS)
+    })).profile;
   }
 
   async closeProfile(profileId) {
     assertIdentifier(profileId, 'profileId');
-    return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}/close`, { method: 'POST', body: {} })).profile;
+    return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}/close`, {
+      method: 'POST',
+      body: {},
+      timeoutMs: Math.max(this.#requestTimeoutMs, PROFILE_CLOSE_REQUEST_TIMEOUT_MS)
+    })).profile;
   }
 
   async listTaskTypes(input = {}) {
@@ -343,10 +377,7 @@ export class HttpTaskMasterClient {
     do {
       task = (await this.#request(`/v1/tasks/${encodeURIComponent(taskId)}`, { signal })).task;
       if (typeof onProgress === 'function') await onProgress(task?.progress, task);
-      if (
-        TERMINAL_STATES.has(task?.state) &&
-        (task?.cleanup?.settled === true || task?.cleanup?.managerRestartObserved === true)
-      ) return { task, timedOut: false };
+      if (isSettledTerminalTask(task)) return { task, timedOut: false };
       if (task?.state === 'waiting_user' || task?.health?.status === 'stalled') {
         return { task, timedOut: false };
       }
@@ -554,7 +585,13 @@ export class HttpTaskMasterClient {
     }
   }
 
-  async #requestJson(pathname, { method = 'GET', body, token, signal: parentSignal } = {}) {
+  async #requestJson(pathname, {
+    method = 'GET',
+    body,
+    token,
+    signal: parentSignal,
+    timeoutMs = this.#requestTimeoutMs
+  } = {}) {
     const url = new URL(pathname, this.#baseUrl);
     if (url.origin !== this.#baseUrl.origin) {
       throw clientError('LOOPBACK_REQUIRED', 'Task Master request escaped the configured manager origin.');
@@ -566,7 +603,7 @@ export class HttpTaskMasterClient {
         throw clientError('REQUEST_TOO_LARGE', `Task Master request exceeds ${MAX_REQUEST_BYTES} bytes.`);
       }
     }
-    const requestSignal = createRequestSignal(parentSignal, this.#requestTimeoutMs);
+    const requestSignal = createRequestSignal(parentSignal, timeoutMs);
     let response;
     try {
       response = await this.#fetch(url, {

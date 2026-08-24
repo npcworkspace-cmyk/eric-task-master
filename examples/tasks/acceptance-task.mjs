@@ -130,7 +130,7 @@ export async function run({ page, context, input, outputDir, action, progress, c
   return {
     summary: `Playwright acceptance passed (${evidence.length}/${evidence.length})`,
     evidence: [
-      ...evidence,
+      { kind: 'count', label: 'acceptance checks passed', value: evidence.length },
       { kind: 'artifact', file: path.basename(reportPath), agentVisible: true },
       { kind: 'artifact', file: path.basename(screenshotPath), agentVisible: true },
       { kind: 'artifact', file: path.basename(downloadPath), agentVisible: true }
