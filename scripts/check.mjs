@@ -34,9 +34,12 @@ async function staticChecks() {
   invariant(!(manifest.permissions || []).includes('debugger'), 'extension must not request debugger');
   invariant(manifest.action?.default_icon?.['128'] === 'icons/icon-128.png', 'extension icon contract drift');
   await access(resolve(ROOT, 'scripts', 'taskmaster.mjs'));
-  const [launcher, bootstrapPolicy] = await Promise.all([
+  const [launcher, bootstrapPolicy, taskWorker, taskService, workflow] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8')
+    readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'runtime', 'task-service.mjs'), 'utf8'),
+    readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8')
   ]);
   invariant(launcher.includes("['ci', '--ignore-scripts', '--no-audit', '--no-fund']"), 'fixed launcher lacks dependency bootstrap');
   invariant(
@@ -44,6 +47,26 @@ async function staticChecks() {
       bootstrapPolicy.includes("'install'") && bootstrapPolicy.includes("'chromium'"),
     'fixed launcher lacks Chromium bootstrap'
   );
+  invariant(
+    taskWorker.includes('browser.newContext(') && taskWorker.includes('launchPersistentContext('),
+    'persistent/ephemeral browser boundary drift'
+  );
+  invariant(
+    taskService.includes('scheduleQueuedTasks') && taskService.includes('TASK_PROGRESS_STALLED'),
+    'task scheduler or progress-health boundary drift'
+  );
+  invariant(
+    workflow.includes('windows-latest') && workflow.includes('macos-latest') &&
+      workflow.includes('ubuntu-24.04') && workflow.includes('node: [20, 22]'),
+    'cross-platform release matrix drift'
+  );
+  await Promise.all([
+    access(resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')),
+    access(resolve(ROOT, 'src', 'lib', 'semantic-observer.mjs')),
+    access(resolve(ROOT, 'src', 'lib', 'task-pack.mjs')),
+    access(resolve(ROOT, 'src', 'lib', 'user-handoff.mjs')),
+    access(resolve(ROOT, 'docs', 'RELEASE-GATE.md'))
+  ]);
   await Promise.all([16, 32, 48, 128].map((size) => (
     access(resolve(ROOT, 'extension', 'icons', `icon-${size}.png`))
   )));
@@ -66,9 +89,13 @@ async function staticChecks() {
   const skill = await readFile(resolve(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8');
   invariant(skill.startsWith('---\nname: eric-task-master\n'), 'Skill frontmatter is invalid');
   invariant(skill.includes('node scripts/taskmaster.mjs connect --json'), 'Skill lacks the fixed startup command');
+  invariant(
+    skill.includes('taskmaster_task_types_describe') && skill.includes('taskmaster_tasks_continue'),
+    'Skill lacks progressive discovery or same-task handoff'
+  );
   const popup = await readFile(resolve(ROOT, 'extension', 'popup.js'), 'utf8');
   invariant(popup.includes('http://127.0.0.1:19946'), 'extension and manager port contract drift');
-  return { passed: 15, total: 15 };
+  return { passed: 21, total: 21 };
 }
 
 function run(command, args, env = {}) {
@@ -92,7 +119,12 @@ try {
   process.stdout.write(`${JSON.stringify({ stage: 'static', ok: true, ...staticResult })}\n`);
   await run(process.execPath, ['--test', '--test-concurrency=1'], { TASKMASTER_REAL_BROWSER: '1' });
   await run(process.execPath, [resolve(ROOT, 'scripts', 'acceptance.mjs')]);
-  process.stdout.write(`${JSON.stringify({ ok: true, version: VERSION, stages: ['static', 'tests', 'acceptance'] })}\n`);
+  await run(process.execPath, [resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')]);
+  process.stdout.write(`${JSON.stringify({
+    ok: true,
+    version: VERSION,
+    stages: ['static', 'tests', 'acceptance', 'commercial-acceptance']
+  })}\n`);
 } catch (error) {
   process.stderr.write(`${JSON.stringify({
     ok: false,

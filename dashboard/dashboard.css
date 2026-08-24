@@ -113,7 +113,12 @@ table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 11px 9px; border-top: 1px solid #e4e1d9; text-align: left; vertical-align: middle; }
 th { border-top: 0; color: #777c78; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
 .task-name { max-width: 240px; overflow: hidden; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.task-status { font-size: 10px; font-weight: 800; text-transform: uppercase; }
+.task-status { font-size: 10px; text-transform: uppercase; }
+.task-status strong, .task-status small, td.muted span { display: block; }
+.task-status strong { font-weight: 800; }
+.task-status small { margin-top: 3px; color: #777c78; font-size: 8px; text-transform: none; }
+.task-status small.warning, .task-status.stalled strong { color: #b54a25; }
+td.muted span + span { margin-top: 3px; }
 .progress { width: 180px; }
 .progress-track { height: 5px; overflow: hidden; border-radius: 9px; background: #e7e4dc; }
 .progress-fill { height: 100%; border-radius: inherit; background: #e46b31; }

@@ -1,23 +1,29 @@
 # Eric Task Master
 
-Eric Task Master is a Playwright-first browser task system for AI Agents. It gives Agents durable browser Profiles, isolated task windows, progress and recovery, optional human-paced behavior, and reusable task Skills without making the everyday browser the automation engine.
+Eric Task Master is a Playwright browser task runtime for AI Agents. It turns browser work into durable, isolated jobs instead of asking an Agent to repeatedly inspect pages and improvise a new controller.
 
-Version: **0.0.3**
+Version: **1.0.0**
 
-## What it enables
+## What it does
 
-- Multiple Agents can work in separate persistent browser Profiles without stealing each other's tabs, focus, or login state.
-- Short and long browser tasks keep a durable task ID, progress, heartbeat, checkpoint, artifacts, cancellation, and automatic window cleanup.
-- `fast`, `human`, and `adaptive` behavior can be selected per Profile or per task. Human mode adds bounded pointer paths, in-target clicks, varied typing, eased scrolling, and explicit reading dwell; deterministic data work stays fast by default.
-- A lightweight Chromium extension manages Playwright Profiles and lets the user explicitly copy the current site's session into a chosen Profile.
-- Standard MCP tools let supported Agent hosts discover and use the same Task Master after one registration flow.
-- Specialized Skills can add site or workflow logic as verified task types while reusing the same Profile, task, progress, evidence, and cleanup foundation.
+- Runs clicks, input, navigation, uploads, downloads, reading, screenshots, and data extraction through pure Playwright.
+- Keeps logged-in work in isolated persistent Profiles; runs no-login work in disposable **ephemeral (隐身临时)** Profiles that retain no browser state after a task.
+- Lets multiple Agents use different Profiles concurrently. Work aimed at the same Profile enters a bounded FIFO queue instead of stealing tabs or failing randomly.
+- Gives every task a durable ID, live progress, heartbeat, checkpoint, evidence, artifacts, cancellation, recovery, completion verification, and automatic browser cleanup.
+- Uses `adaptive` behavior to stay fast during deterministic work, add light settling on dynamic pages, and temporarily switch to guarded human pacing after occlusion, timeout, uncertain navigation, or rate limiting. It never blindly retries an action with an unknown outcome.
+- Captures both a screenshot and a bounded semantic page observation when an action fails, a task times out, progress stalls, or a workflow asks the user/Agent for a new instruction.
+- Discovers task capabilities progressively: Agents first receive compact summaries, then read only the selected task's input contract.
+- Installs reusable **Task Packs** transactionally, so specialized Skills can add site or workflow knowledge without modifying the browser runtime.
 
-The three layers are deliberately separate:
+This enables unattended daily work, batch research and collection, repeated operations, long-running browser jobs, and multi-Agent browser execution while reducing repeated page-reading and controller-generation tokens. The exact savings depend on the workflow; this project does not claim a universal percentage.
 
-1. **Playwright + Manager** — reliable browser execution, isolation, lifecycle, and outputs.
-2. **Real-browser panel** — Profile settings and user-approved current-site session transfer only.
-3. **MCP + Skills** — simple Agent tools and reusable workflow-specific task modules.
+## Three layers
+
+1. **Task Master runtime** — Profiles, Playwright execution, queues, health, checkpoints, evidence, recovery, and cleanup.
+2. **Real-browser control panel** — Profile settings and an explicit current-site session transfer. The extension never becomes the automation engine.
+3. **MCP + Skills + Task Packs** — small Agent tools and reusable workflow-specific behavior.
+
+Core stays site-agnostic. Reddit, ecommerce, creator discovery, form workflows, pagination, parsing, and platform-specific rate-limit rules belong in specialized Skills or Task Packs.
 
 ## One fixed start
 
@@ -27,39 +33,45 @@ Requires Node.js 20 or newer. From the project root run:
 node scripts/taskmaster.mjs connect --json
 ```
 
-This fixed command installs lockfile-pinned dependencies and Playwright Chromium when missing, starts the local Manager at `http://127.0.0.1:19946`, runs the real-browser acceptance suite, and transactionally registers the STDIO MCP server in detected supported Agent hosts. If a host reports `registered_pending_restart`, reload that host once.
+That command installs lockfile-pinned dependencies and Playwright Chromium when missing, starts the loopback Manager, runs the real-browser acceptance suite, and registers the same STDIO MCP server in detected supported Agent hosts. If a host reports `registered_pending_restart`, reload that host once.
 
-Load [`extension/`](./extension/) as an unpacked extension in a Chromium browser. Enter the single `ETM1...` pairing code returned by `connect`; it includes a SHA-256 Manager identity fingerprint. The extension verifies a fresh signed local challenge before it sends that code or any extension/session credential, and keeps the public identity pin in trusted extension storage. The extension does not click, type, navigate, or scrape web pages for tasks.
+Load [`extension/`](./extension/) as an unpacked Chromium extension and enter the returned `ETM1...` pairing code. The extension verifies the Manager's pinned Ed25519 identity before sending any local credential or session data.
 
-After MCP discovery, an Agent follows one small loop:
+After MCP discovery, an Agent follows one loop:
 
-1. Check `taskmaster_status` and list Profiles.
-2. List installed task types.
-3. Start a task with an idempotency key and keep its task ID.
-4. Wait or reconnect to that same task ID.
-5. If it failed with a checkpoint, explicitly resume that same ID with a stable resume key; never submit a duplicate.
-6. Read its compact evidence and declared artifacts.
+1. Check status and list Profiles.
+2. Search compact task-type summaries and describe only the selected type.
+3. Start once with an idempotency key and retain the task ID.
+4. Wait on that ID. Never create a duplicate because an Agent disconnected.
+5. If the task reports `waiting_user` or `stalled`, read its diagnostic artifacts before continuing or resuming.
+6. Accept completion only after cleanup is settled and evidence/artifacts prove the result.
 
-MCP starts Manager automatically on the first tool call if it is not already running. A disconnected wait does not destroy the browser task, and task windows close when cleanup settles.
+## Profile choice
 
-Worker code cannot declare success by itself. Manager first verifies the result contract, every declared Agent-visible artifact, browser closure, Worker exit, and Profile lease release. Failed checkpointed work keeps its original task ID, input, module snapshot, output, attempt history, and can be resumed explicitly after a Manager restart without blindly replaying an unknown website action.
+- **persistent** — for login state and recurring account work. One live task uses the Profile at a time.
+- **ephemeral / 隐身临时** — for no-login tasks. Every task receives a fresh non-persistent context and the browser is destroyed at cleanup. “隐身” means disposable local state; it is not an anti-fingerprinting or restriction-bypass claim.
 
-## Product boundary
+## Build specialized capability
 
-- Browser execution is pure Playwright; the extension is a control and consent surface.
-- Account state stays in local persistent Profiles. Session transfer is limited to the active site and requires an explicit user click.
-- Session transfer verifies the pinned Manager before reading cookies or LocalStorage, rejects tab/origin drift, replaces rather than merges the destination origin, rolls back on failure, and revokes its temporary site permission.
-- Core Task Master stays site-agnostic. Selectors, pagination, parsing, rate-limit policy, and business rules belong in specialized Skills or single-file task modules.
-- Human pacing makes interactions less mechanically abrupt; it is not a promise to bypass site controls or prevent account restrictions.
-- Agent-visible APIs do not return Manager credentials, cookies, Profile directories, module paths, or local output paths.
+Create a reusable Task Pack without editing core:
 
-Agents should start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Developers can read [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md).
+```bash
+node scripts/taskmaster.mjs task-packs scaffold ./my-pack --name my-pack --json
+node scripts/taskmaster.mjs task-packs validate ./my-pack --json
+node scripts/taskmaster.mjs task-packs install ./my-pack --json
+```
 
-Run the complete local delivery gate with:
+A specialized Skill should teach discovery, platform logic, checkpoints, outputs, and completion evidence, then call the registered Task Master task types. It should not recreate Manager, browser launch, Profile, progress, diagnostics, or cleanup code.
+
+## Verification
 
 ```bash
 npm run check
 ```
+
+The delivery gate runs static boundaries, unit/integration/security tests, real Chromium feature acceptance, and a concurrent/fault/restart commercial acceptance workload. Cross-platform CI is defined for Windows, macOS, and Linux; a platform is considered verified only when its own CI run passes.
+
+Start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Runtime details are in [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md).
 
 Stop the local Manager safely with:
 

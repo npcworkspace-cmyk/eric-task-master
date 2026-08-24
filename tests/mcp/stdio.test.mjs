@@ -38,12 +38,26 @@ for (const [label, mode] of [
 
     if (label === 'legacy') await connection.client.ping();
     const listed = await connection.client.listTools();
-    assert.equal(listed.tools.length, 14);
+    assert.equal(listed.tools.length, 16);
     const start = listed.tools.find((tool) => tool.name === 'taskmaster_tasks_start');
     assert.deepEqual(start.annotations, {
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: true,
+      openWorldHint: true
+    });
+    const createProfile = listed.tools.find((tool) => tool.name === 'taskmaster_profiles_create');
+    assert.deepEqual(createProfile.annotations, {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    });
+    const continueTask = listed.tools.find((tool) => tool.name === 'taskmaster_tasks_continue');
+    assert.deepEqual(continueTask.annotations, {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
       openWorldHint: true
     });
     assert.ok(start.inputSchema);

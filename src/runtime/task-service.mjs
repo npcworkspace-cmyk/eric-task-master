@@ -13,16 +13,21 @@ const IMPORT_WORKER = fileURLToPath(new URL('./import-session-worker.mjs', impor
 const PROJECT_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const ACCEPTANCE_TASK = fileURLToPath(new URL('../../examples/tasks/acceptance-task.mjs', import.meta.url));
 const READ_PAGE_TASK = fileURLToPath(new URL('../../examples/tasks/read-page-task.mjs', import.meta.url));
+const OBSERVE_PAGE_TASK = fileURLToPath(new URL('../../examples/tasks/observe-page-task.mjs', import.meta.url));
 const DURABLE_DELAY_TASK = fileURLToPath(new URL('../../examples/tasks/durable-delay-task.mjs', import.meta.url));
+const HANDOFF_ACCEPTANCE_TASK = fileURLToPath(new URL('../../examples/tasks/handoff-acceptance-task.mjs', import.meta.url));
 const LEASE_TTL_MS = 60_000;
 const HEARTBEAT_TIMEOUT_MS = 65_000;
 const DIAGNOSTIC_GRACE_MS = 15_000;
+const PROGRESS_STALL_MS = 2 * 60_000;
+const PROGRESS_FAILURE_MS = 10 * 60_000;
 const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MAX_ARTIFACTS = 100;
 const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const MAX_ATTEMPTS = 100;
 const RESUME_KEY_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
+const HANDOFF_ID_PATTERN = /^handoff_[a-f0-9]{32}$/;
 
 export const TASK_SERVICE_DEADLINES = Object.freeze({
   profileOpenMs: 30_000,
@@ -87,6 +92,37 @@ function profileCallerIdentity(caller = {}) {
 
 function canAccess(task, caller) {
   return caller.role === 'manager-admin' || task.ownerClientId === caller.clientId;
+}
+
+function taskTypeMatchesDomain(taskType, domain) {
+  if (!domain) return true;
+  const candidate = domain.trim().toLowerCase();
+  return (taskType.domains || []).some((registered) => (
+    registered === candidate ||
+    (registered.startsWith('*.') && candidate.endsWith(registered.slice(1)))
+  ));
+}
+
+function filterTaskTypes(taskTypes, filters = {}) {
+  const query = typeof filters.query === 'string' ? filters.query.trim().toLowerCase() : '';
+  const domain = typeof filters.domain === 'string' ? filters.domain.trim().toLowerCase() : '';
+  const intent = typeof filters.intent === 'string' ? filters.intent.trim().toLowerCase() : '';
+  if (query.length > 120 || domain.length > 253 || intent.length > 80) {
+    throw new TaskServiceError('INVALID_TASK_TYPE_FILTER', 'Task type filters exceed their bounded length');
+  }
+  return taskTypes.filter((taskType) => {
+    const searchable = [
+      taskType.id,
+      taskType.name,
+      taskType.title,
+      taskType.description,
+      ...(taskType.tags || []),
+      ...(taskType.intents || [])
+    ].filter(Boolean).join(' ').toLowerCase();
+    return (!query || searchable.includes(query)) &&
+      (!intent || (taskType.intents || []).includes(intent)) &&
+      taskTypeMatchesDomain(taskType, domain);
+  });
 }
 
 function stableValue(value) {
@@ -292,6 +328,10 @@ export function createTaskService({
   workerFactory = defaultWorkerFactory,
   heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
   diagnosticGraceMs = DIAGNOSTIC_GRACE_MS,
+  progressStallMs = PROGRESS_STALL_MS,
+  progressFailureMs = PROGRESS_FAILURE_MS,
+  maxConcurrentTasks = 4,
+  maxQueuedTasks = 100,
   sessionImportTimeoutMs = TASK_SERVICE_DEADLINES.sessionImportMs,
   sessionImportRollbackGraceMs = TASK_SERVICE_DEADLINES.sessionImportRollbackGraceMs,
   taskTypeRegistry,
@@ -303,6 +343,8 @@ export function createTaskService({
   seedTaskTypes = [
     { name: 'acceptance', modulePath: ACCEPTANCE_TASK },
     { name: 'read-page', modulePath: READ_PAGE_TASK },
+    { name: 'observe-page', modulePath: OBSERVE_PAGE_TASK },
+    { name: 'handoff-acceptance', modulePath: HANDOFF_ACCEPTANCE_TASK },
     { name: 'durable-delay', modulePath: DURABLE_DELAY_TASK }
   ]
 } = {}) {
@@ -314,6 +356,18 @@ export function createTaskService({
     throw new TypeError('artifactValidationHook must be a function when provided');
   }
   if (typeof processAlive !== 'function') throw new TypeError('processAlive must be a function');
+  if (!Number.isFinite(progressStallMs) || progressStallMs < 1_000) {
+    throw new TypeError('progressStallMs must be at least 1000');
+  }
+  if (!Number.isFinite(progressFailureMs) || progressFailureMs <= progressStallMs) {
+    throw new TypeError('progressFailureMs must be greater than progressStallMs');
+  }
+  if (!Number.isSafeInteger(maxConcurrentTasks) || maxConcurrentTasks < 1 || maxConcurrentTasks > 32) {
+    throw new TypeError('maxConcurrentTasks must be an integer from 1 to 32');
+  }
+  if (!Number.isSafeInteger(maxQueuedTasks) || maxQueuedTasks < 1 || maxQueuedTasks > 10_000) {
+    throw new TypeError('maxQueuedTasks must be an integer from 1 to 10000');
+  }
   if (!Number.isFinite(sessionImportTimeoutMs) || sessionImportTimeoutMs <= 0) {
     throw new TypeError('sessionImportTimeoutMs must be positive');
   }
@@ -334,7 +388,10 @@ export function createTaskService({
     seedTypes: seedTaskTypes
   });
   let createTail = Promise.resolve();
+  let queueTail = Promise.resolve();
+  let closing = false;
   const ready = initialize();
+  void ready.then(() => scheduleQueuedTasks()).catch(() => {});
 
   function normalizeAttemptHistory(task) {
     task.attempt = Number.isSafeInteger(task.attempt) && task.attempt >= 1
@@ -423,7 +480,8 @@ export function createTaskService({
       if (!task || task.id !== entry.name || typeof task.profileId !== 'string') continue;
       normalizeAttemptHistory(task);
       const cleanupComplete = Boolean(task.cleanup?.workerExited && task.cleanup?.leaseReleased);
-      if (!TERMINAL_TASK_STATES.has(task.state) || !cleanupComplete) {
+      const safelyQueued = task.state === 'queued' && !task.startedAt && !task.workerPid && task.leaseHeld !== true;
+      if ((!TERMINAL_TASK_STATES.has(task.state) && !safelyQueued) || (!safelyQueued && !cleanupComplete)) {
         task.state = 'failed';
         task.error = {
           code: 'TASK_INTERRUPTED_BY_MANAGER_RESTART',
@@ -443,6 +501,81 @@ export function createTaskService({
       }
       tasks.set(task.id, task);
     }
+  }
+
+  function queuedTasks() {
+    return [...tasks.values()]
+      .filter((task) => task.state === 'queued')
+      .sort((left, right) => (
+        left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
+      ));
+  }
+
+  async function updateQueueMetadata() {
+    const queued = queuedTasks();
+    const activeProfiles = new Set(
+      [...children.keys()].map((id) => tasks.get(id)?.profileId).filter(Boolean)
+    );
+    const writes = [];
+    queued.forEach((task, index) => {
+      const reason = activeProfiles.has(task.profileId)
+        ? 'Waiting for the Profile lease'
+        : children.size >= maxConcurrentTasks
+          ? 'Waiting for an execution slot'
+          : 'Ready to start';
+      if (task.queuePosition !== index + 1 || task.queueReason !== reason) {
+        task.queuePosition = index + 1;
+        task.queueReason = reason;
+        task.updatedAt = nowIso();
+        writes.push(persist(task));
+      }
+    });
+    await Promise.all(writes);
+  }
+
+  async function drainQueue() {
+    let capacity = Math.max(0, maxConcurrentTasks - children.size);
+    if (capacity === 0) {
+      await updateQueueMetadata();
+      return;
+    }
+    const activeProfiles = new Set(
+      [...children.keys()].map((id) => tasks.get(id)?.profileId).filter(Boolean)
+    );
+    for (const task of queuedTasks()) {
+      if (capacity <= 0) break;
+      if (activeProfiles.has(task.profileId)) continue;
+      let profile;
+      try {
+        profile = await profileStore.get(task.profileId);
+      } catch (error) {
+        task.state = 'failed';
+        task.health = { status: 'failed', checkedAt: nowIso() };
+        task.error = sanitizeError(error, 'PROFILE_NOT_FOUND');
+        task.finishedAt = nowIso();
+        task.cleanup = { browserClosed: true, leaseReleased: true, workerExited: true, settled: true };
+        finishAttemptHistory(task);
+        await persist(task);
+        continue;
+      }
+      if (profile.state !== 'idle' && profile.lease?.ownerId !== task.leaseOwner) continue;
+      task.queuePosition = null;
+      task.queueReason = null;
+      await persist(task);
+      await launchTaskAttempt(task, profile);
+      if (children.has(task.id)) {
+        activeProfiles.add(task.profileId);
+        capacity -= 1;
+      }
+    }
+    await updateQueueMetadata();
+  }
+
+  function scheduleQueuedTasks() {
+    if (closing) return Promise.resolve();
+    const operation = queueTail.then(drainQueue);
+    queueTail = operation.catch(() => {});
+    return operation;
   }
 
   function persist(task) {
@@ -593,16 +726,19 @@ export function createTaskService({
     }
     task.cleanup.settled = true;
     task.finishedAt ||= nowIso();
+    task.health = { status: task.state, checkedAt: nowIso() };
     finishAttemptHistory(task);
     await update(task, {
       state: task.state,
       error: task.error,
       finishedAt: task.finishedAt,
       cleanup: task.cleanup,
+      health: task.health,
       history: task.history,
       ...(task.completion ? { completion: task.completion } : {})
     });
     entry?.resolveExit?.();
+    void scheduleQueuedTasks().catch(() => {});
   }
 
   function scheduleForcedStop(task, entry) {
@@ -640,6 +776,7 @@ export function createTaskService({
       child,
       finalized: false,
       diagnoseAt: 0,
+      stallDiagnoseAt: 0,
       forceKillTimer: null,
       hardKillTimer: null,
       watchdog: null,
@@ -674,7 +811,46 @@ export function createTaskService({
         return;
       }
       if (message.type === 'progress' && message.progress) {
-        void update(task, { progress: clone(message.progress), heartbeatAt: message.at || nowIso() }).catch(() => {});
+        entry.stallDiagnoseAt = 0;
+        const at = message.at || nowIso();
+        const healthStatus = task.state === 'waiting_user'
+          ? 'waiting_user'
+          : task.state === 'cooling_down'
+            ? 'cooling_down'
+            : 'healthy';
+        void update(task, {
+          progress: clone(message.progress),
+          progressAt: at,
+          heartbeatAt: at,
+          health: { status: healthStatus, checkedAt: at }
+        }).catch(() => {});
+        return;
+      }
+      if (message.type === 'waiting_user' && message.request) {
+        const request = message.request;
+        if (
+          typeof request.id !== 'string' || !HANDOFF_ID_PATTERN.test(request.id) ||
+          typeof request.reason !== 'string' || !request.reason.trim()
+        ) return;
+        void update(task, {
+          state: 'waiting_user',
+          userRequest: {
+            id: request.id,
+            reason: redactSensitiveText(request.reason).slice(0, 500),
+            ...(typeof request.instructions === 'string'
+              ? { instructions: redactSensitiveText(request.instructions).slice(0, 2_000) }
+              : {}),
+            requestedAt: request.requestedAt || nowIso(),
+            expiresAt: request.expiresAt || null,
+            screenshotAvailable: request.screenshotAvailable === true,
+            status: 'pending'
+          },
+          progress: {
+            ...task.progress,
+            message: `Waiting for a new instruction: ${redactSensitiveText(request.reason).slice(0, 300)}`
+          },
+          health: { status: 'waiting_user', checkedAt: nowIso() }
+        }).catch(() => {});
         return;
       }
       if (message.type === 'state' && typeof message.state === 'string') {
@@ -693,6 +869,11 @@ export function createTaskService({
         if (!TERMINAL_TASK_STATES.has(task.state)) {
           void update(task, {
             state: message.state,
+            ...(message.state === 'cooling_down'
+              ? { health: { status: 'cooling_down', checkedAt: nowIso() } }
+              : message.state === 'running' || message.state === 'recovering'
+                ? { health: { status: 'healthy', checkedAt: nowIso() } }
+                : {}),
             ...(terminal ? { finishedAt: nowIso() } : {})
           }).catch(() => {});
         }
@@ -705,6 +886,33 @@ export function createTaskService({
       }
       if (message.type === 'screenshot') {
         void update(task, { lastScreenshot: { path: message.path, reason: message.reason, at: nowIso() } }).catch(() => {});
+        return;
+      }
+      if (message.type === 'observation') {
+        void update(task, { lastObservation: { path: message.path, reason: message.reason, at: nowIso() } }).catch(() => {});
+        return;
+      }
+      if (message.type === 'behavior' && message.behavior) {
+        void update(task, { behaviorState: clone(message.behavior) }).catch(() => {});
+        return;
+      }
+      if (message.type === 'cooldown' && message.cooldown) {
+        const record = message.cooldown;
+        if (
+          ['active', 'completed'].includes(record.status) &&
+          typeof record.resumeAt === 'string' &&
+          typeof record.reason === 'string'
+        ) {
+          void update(task, {
+            cooldown: {
+              status: record.status,
+              durationMs: Number(record.durationMs) || 0,
+              resumeAt: record.resumeAt,
+              reason: redactSensitiveText(record.reason).slice(0, 160),
+              updatedAt: nowIso()
+            }
+          }).catch(() => {});
+        }
         return;
       }
       if (message.type === 'result') {
@@ -748,32 +956,77 @@ export function createTaskService({
         return;
       }
       const heartbeatAge = Date.now() - Date.parse(task.heartbeatAt);
-      if (heartbeatAge <= heartbeatTimeoutMs) return;
-      if (!entry.diagnoseAt) {
-        entry.diagnoseAt = Date.now();
+      if (heartbeatAge > heartbeatTimeoutMs) {
+        if (!entry.diagnoseAt) {
+          entry.diagnoseAt = Date.now();
+          void update(task, {
+            progress: {
+              ...task.progress,
+              message: 'Worker heartbeat delayed; capturing diagnostics'
+            }
+          }).catch(() => {});
+          send(child, {
+            type: 'diagnose',
+            reason: 'heartbeat-timeout',
+            outputDir: task.outputDir
+          });
+          return;
+        }
+        if (Date.now() - entry.diagnoseAt >= diagnosticGraceMs) {
+          void update(task, {
+            state: 'failed',
+            health: { status: 'failed', checkedAt: nowIso() },
+            error: { code: 'TASK_HEARTBEAT_TIMEOUT', message: 'Task worker stopped reporting heartbeats' },
+            finishedAt: nowIso()
+          }).catch(() => {});
+          send(child, { type: 'cancel' });
+          scheduleForcedStop(task, entry);
+        }
+        return;
+      }
+
+      const progressSensitive = ['starting_browser', 'running', 'recovering'].includes(task.state);
+      if (!progressSensitive) return;
+      const progressAge = Date.now() - Date.parse(task.progressAt || task.startedAt || task.createdAt);
+      if (progressAge <= progressStallMs) return;
+      if (!entry.stallDiagnoseAt) {
+        entry.stallDiagnoseAt = Date.now();
         void update(task, {
+          health: {
+            status: 'stalled',
+            since: task.progressAt || task.startedAt || task.createdAt,
+            checkedAt: nowIso(),
+            diagnosticRequested: true
+          },
           progress: {
             ...task.progress,
-            message: 'Worker heartbeat delayed; capturing diagnostics'
+            message: 'No task progress reported; capturing diagnostics'
           }
         }).catch(() => {});
         send(child, {
           type: 'diagnose',
-          reason: 'heartbeat-timeout',
+          reason: 'progress-stalled',
           outputDir: task.outputDir
         });
         return;
       }
-      if (Date.now() - entry.diagnoseAt >= diagnosticGraceMs) {
+      if (progressAge >= progressFailureMs) {
         void update(task, {
           state: 'failed',
-          error: { code: 'TASK_HEARTBEAT_TIMEOUT', message: 'Task worker stopped reporting heartbeats' },
+          health: { status: 'failed', checkedAt: nowIso() },
+          error: {
+            code: 'TASK_PROGRESS_STALLED',
+            message: 'Task remained live but did not report meaningful progress before the stall deadline'
+          },
           finishedAt: nowIso()
         }).catch(() => {});
         send(child, { type: 'cancel' });
         scheduleForcedStop(task, entry);
       }
-    }, Math.min(5_000, Math.max(100, Math.floor(heartbeatTimeoutMs / 3))));
+    }, Math.min(
+      5_000,
+      Math.max(100, Math.floor(Math.min(heartbeatTimeoutMs, progressStallMs) / 3))
+    ));
     entry.watchdog.unref?.();
   }
 
@@ -917,6 +1170,9 @@ export function createTaskService({
       }
       return publicRecord(existing);
     }
+    if (queuedTasks().length >= maxQueuedTasks) {
+      throw new TaskServiceError('TASK_QUEUE_FULL', 'Task queue reached its configured capacity', 429);
+    }
 
     const id = taskId();
     const taskRoot = path.join(root, id);
@@ -939,7 +1195,15 @@ export function createTaskService({
       resumeKeys: [],
       state: 'queued',
       progress: { current: 0, total: null, message: 'Queued' },
+      progressAt: nowIso(),
       heartbeatAt: nowIso(),
+      health: { status: 'healthy', checkedAt: nowIso() },
+      behaviorState: {
+        configured: behavior,
+        effective: behavior === 'adaptive' ? 'fast' : behavior,
+        at: nowIso()
+      },
+      cooldown: null,
       outputDir,
       checkpoint: null,
       result: null,
@@ -955,7 +1219,7 @@ export function createTaskService({
     beginAttemptHistory(task);
     tasks.set(id, task);
     await persist(task);
-    await launchTaskAttempt(task, profile);
+    await scheduleQueuedTasks();
     await awaitTaskPersistence(id);
     return publicRecord(task);
   }
@@ -1102,9 +1366,18 @@ export function createTaskService({
     task.workerPid = null;
     task.leaseHeld = false;
     task.lastScreenshot = null;
+    task.lastObservation = null;
+    task.progressAt = nowIso();
+    task.health = { status: 'healthy', checkedAt: nowIso() };
+    task.behaviorState = {
+      configured: task.behavior,
+      effective: task.behavior === 'adaptive' ? 'fast' : task.behavior,
+      at: nowIso()
+    };
+    task.cooldown = null;
     beginAttemptHistory(task, { resumed: true, checkpointSavedAt: checkpoint.savedAt });
     await persist(task);
-    await launchTaskAttempt(task, profile);
+    await scheduleQueuedTasks();
     await awaitTaskPersistence(task.id);
     return publicRecord(task);
   }
@@ -1171,6 +1444,18 @@ export function createTaskService({
         // A diagnostic screenshot is the last-resort evidence for an Agent. Reserve
         // capacity for it even when a task declares the maximum number of outputs.
         declarations.unshift({ relativePath, kind: 'diagnostic-screenshot' });
+      }
+    }
+    if (typeof task.lastObservation?.path === 'string') {
+      const relativePath = path.relative(task.outputDir, task.lastObservation.path);
+      if (
+        relativePath &&
+        !path.isAbsolute(relativePath) &&
+        relativePath !== '..' &&
+        !relativePath.startsWith(`..${path.sep}`) &&
+        !declarations.some((item) => item.relativePath === relativePath)
+      ) {
+        declarations.unshift({ relativePath, kind: 'diagnostic-observation' });
       }
     }
     return declarations.slice(0, MAX_ARTIFACTS).map(({ relativePath, kind }) => ({
@@ -1381,6 +1666,7 @@ export function createTaskService({
     if (TERMINAL_TASK_STATES.has(task.state)) return publicRecord(task);
     await update(task, {
       state: 'cancelled',
+      health: { status: 'cancelled', checkedAt: nowIso() },
       progress: { ...task.progress, message: 'Cancellation requested' },
       finishedAt: nowIso()
     });
@@ -1396,6 +1682,49 @@ export function createTaskService({
       finishAttemptHistory(task);
       await update(task, { cleanup: task.cleanup, history: task.history });
     }
+    void scheduleQueuedTasks().catch(() => {});
+    return publicRecord(task);
+  }
+
+  async function continueTask(id, body = {}, suppliedCaller = {}) {
+    await ready;
+    const caller = callerIdentity(suppliedCaller);
+    const task = tasks.get(id);
+    if (!task || !canAccess(task, caller)) {
+      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    }
+    const allowed = new Set(['requestId', 'note']);
+    const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+    if (unknown.length) {
+      throw new TaskServiceError('INVALID_TASK_CONTINUE', `Unsupported continue fields: ${unknown.join(', ')}`);
+    }
+    if (task.state !== 'waiting_user' || task.userRequest?.status !== 'pending') {
+      throw new TaskServiceError('TASK_NOT_WAITING_USER', 'Task is not waiting for a new instruction', 409);
+    }
+    const requestId = body.requestId || task.userRequest.id;
+    if (!HANDOFF_ID_PATTERN.test(requestId) || requestId !== task.userRequest.id) {
+      throw new TaskServiceError('USER_HANDOFF_MISMATCH', 'Handoff request ID does not match the live task', 409);
+    }
+    if (body.note !== undefined && (typeof body.note !== 'string' || body.note.length > 2_000)) {
+      throw new TaskServiceError('INVALID_TASK_CONTINUE', 'note must contain at most 2000 characters');
+    }
+    const entry = children.get(id);
+    if (!entry || !send(entry.child, { type: 'continue', requestId, note: body.note || '' })) {
+      throw new TaskServiceError('TASK_WORKER_UNAVAILABLE', 'Task worker is unavailable for continuation', 409);
+    }
+    task.userRequest = {
+      ...task.userRequest,
+      status: 'continued',
+      continuedAt: nowIso(),
+      ...(body.note?.trim() ? { note: redactSensitiveText(body.note).slice(0, 2_000) } : {})
+    };
+    await update(task, {
+      state: 'recovering',
+      userRequest: task.userRequest,
+      progress: { ...task.progress, message: 'New instruction received; verifying live page state' },
+      progressAt: nowIso(),
+      health: { status: 'healthy', checkedAt: nowIso() }
+    });
     return publicRecord(task);
   }
 
@@ -1407,14 +1736,74 @@ export function createTaskService({
     return registry.install(input);
   }
 
-  async function listTaskTypes(suppliedCaller = {}) {
+  async function installTaskPack(input = {}, suppliedCaller = {}) {
+    const caller = callerIdentity(suppliedCaller);
+    if (caller.role !== 'manager-admin') {
+      throw new TaskServiceError('TASK_PACK_INSTALL_FORBIDDEN', 'Only Manager admin can install Task Packs', 403);
+    }
+    const allowed = new Set(['name', 'version', 'title', 'description', 'modules']);
+    const unknown = Object.keys(input).filter((key) => !allowed.has(key));
+    if (unknown.length) {
+      throw new TaskServiceError('INVALID_TASK_PACK', `Unsupported Task Pack fields: ${unknown.join(', ')}`);
+    }
+    if (
+      typeof input.name !== 'string' || !/^[a-z][a-z0-9._-]{0,79}$/.test(input.name) ||
+      typeof input.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(input.version)
+    ) {
+      throw new TaskServiceError('INVALID_TASK_PACK', 'Task Pack name or semantic version is invalid');
+    }
+    if (!Array.isArray(input.modules) || input.modules.length < 1 || input.modules.length > 64) {
+      throw new TaskServiceError('INVALID_TASK_PACK', 'Task Pack must contain 1 to 64 modules');
+    }
+    const modules = input.modules.map((item) => {
+      if (
+        !item || typeof item !== 'object' || Array.isArray(item) ||
+        Object.keys(item).some((key) => !['name', 'modulePath'].includes(key)) ||
+        typeof item.name !== 'string' || typeof item.modulePath !== 'string'
+      ) {
+        throw new TaskServiceError('INVALID_TASK_PACK', 'Every Task Pack module must contain name and modulePath');
+      }
+      return { name: item.name, modulePath: item.modulePath };
+    });
+    const taskTypes = await registry.installBatch(modules, {
+      pack: { name: input.name, version: input.version }
+    });
+    return {
+      name: input.name,
+      version: input.version,
+      ...(typeof input.title === 'string' ? { title: input.title.slice(0, 120) } : {}),
+      ...(typeof input.description === 'string' ? { description: input.description.slice(0, 2_000) } : {}),
+      taskTypes
+    };
+  }
+
+  async function listTaskTypes(filters = {}, suppliedCaller = undefined) {
+    const legacyCaller = suppliedCaller === undefined && (filters.role || filters.clientId);
+    const caller = legacyCaller ? filters : suppliedCaller;
+    callerIdentity(caller || {});
+    const requestedFilters = legacyCaller ? {} : filters;
+    const taskTypes = filterTaskTypes(await registry.listSummaries(), requestedFilters);
+    return { taskTypes, total: taskTypes.length };
+  }
+
+  async function describeTaskType(name, suppliedCaller = {}) {
     callerIdentity(suppliedCaller);
-    return { taskTypes: await registry.list() };
+    if (typeof name !== 'string' || !name) {
+      throw new TaskServiceError('TASK_TYPE_REQUIRED', 'Task type is required');
+    }
+    return registry.describe(name);
   }
 
   async function importSession(profileId, bundle) {
     await ready;
     const profile = await profileStore.get(profileId);
+    if ((profile.kind || 'persistent') === 'ephemeral') {
+      throw new TaskServiceError(
+        'EPHEMERAL_PROFILE_SESSION_UNSUPPORTED',
+        'Ephemeral Profiles never accept or retain browser sessions',
+        409
+      );
+    }
     if (profile.state !== 'idle' || profile.lease) {
       throw new TaskServiceError('PROFILE_IN_USE', 'Target profile must be idle before session import', 409);
     }
@@ -1518,6 +1907,13 @@ export function createTaskService({
   async function openProfileSingle(profileId, ownerClientId) {
     const ownerId = `profile-open:${ownerClientId}:${profileId}:${randomUUID().replaceAll('-', '')}`;
     const profile = await profileStore.get(profileId);
+    if ((profile.kind || 'persistent') === 'ephemeral') {
+      throw new TaskServiceError(
+        'EPHEMERAL_PROFILE_OPEN_UNSUPPORTED',
+        'Ephemeral Profiles are created only for task-scoped browser contexts',
+        409
+      );
+    }
     await profileStore.acquireLease(profileId, ownerId, { pid: process.pid, ttlMs: 5 * 60_000 });
     const child = workerFactory(PROFILE_WORKER, 'profile-open');
     const entry = {
@@ -1595,7 +1991,10 @@ export function createTaskService({
       await pending.promise.catch(() => {});
     }
     const entry = openProfiles.get(profileId);
-    if (!entry) return { status: 'closed', profileId };
+    if (!entry) {
+      void scheduleQueuedTasks().catch(() => {});
+      return { status: 'closed', profileId };
+    }
     if (caller.role !== 'manager-admin' && entry.ownerClientId !== caller.clientId) {
       throw new TaskServiceError('PROFILE_IN_USE', 'Profile is open for another client', 409);
     }
@@ -1616,11 +2015,13 @@ export function createTaskService({
       openProfiles.delete(profileId);
       await profileStore.releaseLease(profileId, entry.ownerId).catch(() => {});
     }
+    void scheduleQueuedTasks().catch(() => {});
     return { status: 'closed', profileId };
   }
 
   async function close() {
     await ready;
+    closing = true;
     const exitingWorkers = [...children.values()].map((entry) => entry.exitPromise);
     await Promise.allSettled([
       ...[...tasks.values()]
@@ -1647,7 +2048,20 @@ export function createTaskService({
     }
   }
 
+  async function schedulerStatus() {
+    await ready;
+    return {
+      active: children.size,
+      queued: queuedTasks().length,
+      waitingUser: [...tasks.values()].filter((task) => task.state === 'waiting_user').length,
+      stalled: [...tasks.values()].filter((task) => task.health?.status === 'stalled').length,
+      maxConcurrent: maxConcurrentTasks,
+      maxQueued: maxQueuedTasks
+    };
+  }
+
   return Object.freeze({
+    schedulerStatus,
     list,
     create,
     get,
@@ -1655,9 +2069,12 @@ export function createTaskService({
     listArtifacts,
     readArtifact,
     cancel,
+    continueTask,
     resume,
     installTaskType,
+    installTaskPack,
     listTaskTypes,
+    describeTaskType,
     importSession,
     openProfile,
     closeProfile,

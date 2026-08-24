@@ -69,7 +69,7 @@ test('a real long browser task survives MCP client replacement and exposes bound
   await manager.profileStore.remove(profile.id);
 });
 
-test('different Profiles run concurrently while a same-Profile collision fails closed', {
+test('different Profiles run concurrently while same-Profile work queues safely', {
   skip: process.env.TASKMASTER_REAL_BROWSER !== '1'
 }, async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'taskmaster-mcp-profile-isolation-'));
@@ -126,9 +126,8 @@ test('different Profiles run concurrently while a same-Profile collision fails c
   ]);
   assert.equal(leftDone.task.state, 'completed');
   assert.equal(rightDone.task.state, 'completed');
-  assert.equal(collisionDone.task.state, 'failed');
+  assert.equal(collisionDone.task.state, 'completed');
   assert.equal(collisionDone.task.cleanup.settled, true);
-  assert.match(collisionDone.task.error.code, /PROFILE_(?:LEASED|LEASE_FAILED)/);
 
   await manager.profileStore.remove(leftProfile.id);
   await manager.profileStore.remove(rightProfile.id);
@@ -185,14 +184,18 @@ test('a real Playwright action failure returns its diagnostic screenshot through
   assert.equal(terminal.task.cleanup.settled, true);
   assert.equal(terminal.task.error.code, 'ACTION_FAILED');
   assert.equal(typeof terminal.task.lastScreenshot?.ref, 'string');
+  assert.equal(typeof terminal.task.lastObservation?.ref, 'string');
 
   const artifacts = await client.listArtifacts(task.id);
-  assert.equal(artifacts.length, 1);
-  assert.equal(artifacts[0].kind, 'diagnostic-screenshot');
-  assert.equal(artifacts[0].mimeType, 'image/png');
+  assert.deepEqual(new Set(artifacts.map((artifact) => artifact.kind)), new Set([
+    'diagnostic-screenshot',
+    'diagnostic-observation'
+  ]));
+  const screenshotArtifact = artifacts.find((artifact) => artifact.kind === 'diagnostic-screenshot');
+  assert.equal(screenshotArtifact.mimeType, 'image/png');
   const screenshot = await client.readArtifact({
     taskId: task.id,
-    artifactId: artifacts[0].id,
+    artifactId: screenshotArtifact.id,
     maxBytes: 48 * 1024
   });
   assert.equal(screenshot.encoding, 'base64');

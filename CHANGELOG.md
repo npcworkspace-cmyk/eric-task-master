@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.0 - 2026-08-24
+
+- Added task-scoped ephemeral Profiles for login-free work. Each run starts from a fresh isolated browser context, blocks service workers, persists no cookies or site storage, and closes automatically.
+- Reworked `adaptive` behavior into visible fast, cautious, guarded, and cooldown states so ordinary work stays fast while ambiguity, failure, or rate limits trigger bounded protection without blind action replay.
+- Added progressive task discovery, full contract-on-demand, transactional versioned Task Packs, and a portable scaffold for specialized Skills without adding site logic to the core.
+- Added bounded semantic page observations, stable element references, cross-origin frame discovery, and automatic screenshot plus semantic evidence for timeouts, failures, stalls, and human handoffs.
+- Added same-task `waiting_user` continuation so an Agent or user can inspect the live page and resume the existing Worker without restarting or duplicating uncertain actions.
+- Added bounded FIFO scheduling across Profiles, same-Profile lease serialization, queue visibility, task cancellation, explicit cooldown countdowns, separate heartbeat/progress health, stall diagnosis, and fail-closed recovery.
+- Expanded the extension and Dashboard to manage persistent and ephemeral Profiles, observe effective behavior, queues, cooldowns, stalled tasks, diagnostics, and continuation requests.
+- Added a commercial acceptance gate covering real Chromium actions, session handling, ephemeral-state erasure, semantic observation, handoff, concurrent Profiles, queue pressure, cancellation, failure diagnostics, cleanup, and Manager restart persistence.
+- Added Windows, macOS, and Linux CI across Node.js 20 and 22, plus a concise fixed-path base Skill and machine-safe MCP contracts for new Agents.
+
 ## 0.0.3 - 2026-08-24
 
 - Upgraded `human` behavior with bounded curved pointer paths, safe in-target click positions, realistic press duration, per-character typing rhythm, punctuation pauses, eased scrolling, and explicit bounded reading dwell.

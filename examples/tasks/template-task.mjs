@@ -5,6 +5,13 @@ export const meta = Object.freeze({
   name: 'task-template',
   version: '1.0.0',
   description: 'Copyable single-file Task Master module with durable output and compact evidence.',
+  intents: ['read-page'],
+  tags: ['template'],
+  outputs: ['json'],
+  preferredBehavior: 'fast',
+  risk: 'read',
+  readOnly: true,
+  supportsResume: false,
   inputSchema: {
     type: 'object',
     additionalProperties: false,

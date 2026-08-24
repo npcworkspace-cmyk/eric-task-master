@@ -5,6 +5,13 @@ export const meta = Object.freeze({
   name: 'durable-delay',
   version: '1.0.0',
   description: 'Deterministic long-task fixture for progress, disconnect, and recovery acceptance.',
+  intents: ['test-durability'],
+  tags: ['acceptance', 'builtin'],
+  outputs: ['json'],
+  preferredBehavior: 'fast',
+  risk: 'read',
+  readOnly: true,
+  supportsResume: true,
   inputSchema: {
     type: 'object',
     additionalProperties: false,

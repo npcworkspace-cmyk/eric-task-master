@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { BEHAVIOR_MODES, VERSION } from '../contracts.mjs';
+import { BEHAVIOR_MODES, PROFILE_KINDS, VERSION } from '../contracts.mjs';
 import { TaskMasterClientError, toPublicError } from './errors.mjs';
 import {
   MAX_ARTIFACT_CHUNK_BYTES,
@@ -32,6 +32,7 @@ const PublicErrorSchema = z.strictObject({
 const ProfileSchema = z.strictObject({
   id: z.string(),
   name: z.string().optional(),
+  kind: z.enum(PROFILE_KINDS).optional(),
   state: z.string().optional(),
   defaultBehavior: z.string().optional(),
   headless: z.boolean().optional(),
@@ -60,6 +61,12 @@ const CleanupSchema = z.strictObject({
 
 const DiagnosticSchema = z.strictObject({
   kind: z.literal('screenshot'),
+  reason: z.string().optional(),
+  at: z.string().optional(),
+  artifactsAvailable: z.literal(true)
+});
+const ObservationSchema = z.strictObject({
+  kind: z.literal('semantic-observation'),
   reason: z.string().optional(),
   at: z.string().optional(),
   artifactsAvailable: z.literal(true)
@@ -96,8 +103,45 @@ const TaskSchema = z.strictObject({
   updatedAt: z.string().optional(),
   finishedAt: z.string().optional(),
   heartbeatAt: z.string().optional(),
+  progressAt: z.string().optional(),
+  health: z.strictObject({
+    status: z.string().optional(),
+    since: z.string().optional(),
+    checkedAt: z.string().optional(),
+    diagnosticRequested: z.boolean().optional()
+  }).optional(),
+  behaviorState: z.strictObject({
+    configured: z.string().optional(),
+    effective: z.string().optional(),
+    at: z.string().optional(),
+    adaptive: z.strictObject({
+      level: z.number().optional(),
+      label: z.string().optional(),
+      actionsRemaining: z.number().optional(),
+      signal: z.string().optional()
+    }).optional()
+  }).optional(),
+  cooldown: z.strictObject({
+    status: z.string().optional(),
+    durationMs: z.number().optional(),
+    resumeAt: z.string().optional(),
+    reason: z.string().optional(),
+    updatedAt: z.string().optional()
+  }).optional(),
+  queuePosition: z.number().optional(),
+  queueReason: z.string().optional(),
   cleanup: CleanupSchema.optional(),
   diagnostic: DiagnosticSchema.optional(),
+  observation: ObservationSchema.optional(),
+  userRequest: z.strictObject({
+    id: z.string(),
+    reason: z.string().optional(),
+    instructions: z.string().optional(),
+    requestedAt: z.string().optional(),
+    expiresAt: z.string().optional(),
+    status: z.string().optional(),
+    screenshotAvailable: z.boolean().optional()
+  }).optional(),
   checkpoint: z.strictObject({ available: z.literal(true), savedAt: z.string().optional() }).optional(),
   resumeAvailable: z.boolean().optional(),
   summary: z.string().optional(),
@@ -111,8 +155,17 @@ const TaskTypeSchema = z.strictObject({
   description: z.string().optional(),
   version: z.string().optional(),
   readOnly: z.boolean().optional(),
+  domains: z.array(z.string()).optional(),
+  intents: z.array(z.string()).optional(),
+  tags: z.array(z.string()).optional(),
+  outputs: z.array(z.string()).optional(),
+  preferredBehavior: z.enum(BEHAVIOR_MODES).optional(),
+  risk: z.enum(['read', 'write', 'mixed']).optional(),
+  pack: z.strictObject({ name: z.string(), version: z.string() }).optional(),
+  supportsResume: z.boolean().optional(),
   inputSchema: z.record(z.string(), z.json()).optional()
 });
+const TaskTypeSummarySchema = TaskTypeSchema.omit({ inputSchema: true });
 
 const ArtifactSchema = z.strictObject({
   id: z.string(),
@@ -152,6 +205,12 @@ const OPEN_WORLD_TASK = Object.freeze({
   readOnlyHint: false,
   destructiveHint: true,
   idempotentHint: true,
+  openWorldHint: true
+});
+const OPEN_WORLD_CONTINUE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
   openWorldHint: true
 });
 
@@ -257,7 +316,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   register(server, taskMaster, {
     name: 'taskmaster_profiles_list',
     title: 'List browser profiles',
-    description: 'List agent-visible persistent Playwright profiles without filesystem paths or credentials.',
+    description: 'List persistent and task-scoped ephemeral Playwright Profiles without filesystem paths or credentials.',
     inputSchema: z.strictObject({}),
     outputSchema: z.strictObject({ profiles: z.array(ProfileSchema), truncated: z.boolean() }),
     annotations: READ_ONLY,
@@ -273,6 +332,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
     description: 'Create one managed Playwright profile. This operation is intentionally non-idempotent.',
     inputSchema: z.strictObject({
       name: z.string().trim().min(1).max(80),
+      kind: z.enum(PROFILE_KINDS).default('persistent'),
       defaultBehavior: z.enum(BEHAVIOR_MODES).optional(),
       headless: z.boolean().optional(),
       browserChannel: z.string().trim().min(1).max(64).optional()
@@ -300,14 +360,32 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   register(server, taskMaster, {
     name: 'taskmaster_task_types_list',
     title: 'List registered task types',
-    description: 'List high-level task types registered for scoped agents. No executable module paths are exposed.',
-    inputSchema: z.strictObject({}),
-    outputSchema: z.strictObject({ taskTypes: z.array(TaskTypeSchema), truncated: z.boolean() }),
+    description: 'Search compact task summaries by text, domain, or intent. Call taskmaster_task_types_describe only for the selected task.',
+    inputSchema: z.strictObject({
+      query: z.string().trim().max(120).optional(),
+      domain: z.string().trim().max(253).optional(),
+      intent: z.string().trim().max(80).optional()
+    }),
+    outputSchema: z.strictObject({ taskTypes: z.array(TaskTypeSummarySchema), truncated: z.boolean() }),
     annotations: READ_ONLY,
-    handler: async (_args, _ctx, api) => {
-      const taskTypes = (await api.listTaskTypes()).map(publicTaskType).map((item) => requireId(item, 'task type'));
+    handler: async (args, _ctx, api) => {
+      const taskTypes = (await api.listTaskTypes(args))
+        .map((item) => publicTaskType(item, { includeSchema: false }))
+        .map((item) => requireId(item, 'task type'));
       return success({ taskTypes: taskTypes.slice(0, 100), truncated: taskTypes.length > 100 });
     }
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_task_types_describe',
+    title: 'Describe registered task type',
+    description: 'Read the full input contract only after selecting one compact task summary.',
+    inputSchema: z.strictObject({ taskType: IdentifierSchema }),
+    outputSchema: z.strictObject({ taskType: TaskTypeSchema }),
+    annotations: READ_ONLY,
+    handler: async ({ taskType }, _ctx, api) => success({
+      taskType: requireId(publicTaskType(await api.describeTaskType(taskType)), 'task type')
+    })
   });
 
   register(server, taskMaster, {
@@ -382,6 +460,22 @@ export function createMcpServer({ client, version = VERSION } = {}) {
         timedOut: result.timedOut === true
       });
     }
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_tasks_continue',
+    title: 'Continue a task waiting for instruction',
+    description: 'Continue the same live task after inspecting its request, screenshot, semantic observation, and current page. The task module must verify page state before acting.',
+    inputSchema: z.strictObject({
+      taskId: IdentifierSchema,
+      requestId: IdentifierSchema.optional(),
+      note: z.string().max(2_000).optional()
+    }),
+    outputSchema: z.strictObject({ task: TaskSchema }),
+    annotations: OPEN_WORLD_CONTINUE,
+    handler: async (args, _ctx, api) => success({
+      task: requireId(publicTask(await api.continueTask(args), { includeResult: false }), 'task')
+    })
   });
 
   register(server, taskMaster, {

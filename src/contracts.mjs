@@ -1,10 +1,11 @@
 import { isSensitiveKey, redactSensitiveText } from './lib/redaction.mjs';
 
-export const VERSION = '0.0.3';
+export const VERSION = '1.0.0';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
 export const BEHAVIOR_MODES = Object.freeze(['fast', 'human', 'adaptive']);
+export const PROFILE_KINDS = Object.freeze(['persistent', 'ephemeral']);
 export const PROFILE_STATES = Object.freeze(['idle', 'starting', 'open', 'leased', 'deleting', 'error']);
 export const TASK_STATES = Object.freeze([
   'queued',
@@ -25,11 +26,16 @@ export function isBehaviorMode(value) {
   return BEHAVIOR_MODES.includes(value);
 }
 
+export function isProfileKind(value) {
+  return PROFILE_KINDS.includes(value);
+}
+
 export function publicProfile(profile) {
   const safe = {};
   for (const key of [
     'id',
     'name',
+    'kind',
     'state',
     'defaultBehavior',
     'headless',
@@ -73,7 +79,13 @@ export function publicTask(task) {
     'history',
     'state',
     'progress',
+    'progressAt',
     'heartbeatAt',
+    'health',
+    'behaviorState',
+    'cooldown',
+    'queuePosition',
+    'queueReason',
     'result',
     'error',
     'cleanup',
@@ -81,7 +93,8 @@ export function publicTask(task) {
     'updatedAt',
     'startedAt',
     'finishedAt',
-    'completion'
+    'completion',
+    'userRequest'
   ]) {
     if (task?.[key] !== undefined) safe[key] = redactLocalPaths(task[key]);
   }
@@ -97,6 +110,13 @@ export function publicTask(task) {
       reason: task.lastScreenshot.reason,
       at: task.lastScreenshot.at,
       ref: `taskmaster://tasks/${encodeURIComponent(task.id)}/screenshot`
+    };
+  }
+  if (task.lastObservation) {
+    safe.lastObservation = {
+      reason: task.lastObservation.reason,
+      at: task.lastObservation.at,
+      ref: `taskmaster://tasks/${encodeURIComponent(task.id)}/observation`
     };
   }
   if (task.ownerClientId) safe.createdBy = task.ownerClientId;

@@ -40,7 +40,11 @@ export const meta = {
   }
 };
 
-export async function run({ page, input, outputDir, action, cooldown, effects, progress, checkpoint, signal }) {
+export async function run({
+  page, context, input, outputDir,
+  action, cooldown, effects, semantic, handoff,
+  progress, checkpoint, signal
+}) {
   const target = new URL(input.url);
   if (!['http:', 'https:'].includes(target.protocol)) throw new TypeError('url must use HTTP(S)');
   await mkdir(outputDir, { recursive: true });
@@ -67,18 +71,60 @@ export async function run({ page, input, outputDir, action, cooldown, effects, p
 }
 ```
 
+The module return value is not streamed. Persist large or durable data below `outputDir`, declare each safe relative file as an Agent-visible artifact, and return only a compact summary/evidence object. Unlisted files remain internal.
+
+## Semantic observation and visual fallback
+
+Use ordinary Playwright locators when the workflow already knows the page. Use `semantic` when structure is unfamiliar or a stable ref is cheaper than repeatedly sending page screenshots to an Agent:
+
+```js
+const view = await semantic.snapshot({
+  scope: 'viewport',       // or 'full_page' for document-wide semantic text
+  maxNodes: 180,
+  maxTextChars: 12_000
+});
+
+const submit = view.refs.find((item) => item.role === 'button' && /submit/i.test(item.name));
+if (!submit) {
+  const instruction = await handoff.request({
+    reason: 'Submit control is not semantically identifiable',
+    instructions: 'Inspect the screenshot and semantic observation, then describe the safe next step.',
+    timeoutMs: 10 * 60_000
+  });
+  await progress({ current: 1, total: 2, message: `Instruction received: ${instruction.note || 'continue'}` });
+} else {
+  await semantic.click(submit.ref, {
+    snapshotId: view.id,
+    actionOptions: { timeout: 10_000 }
+  });
+}
+```
+
+Available methods are:
+
+- `semantic.snapshot(options)` → `{ id, url, title, content, refs, truncated, frameErrors }`;
+- `semantic.resolve(ref, { snapshotId })` → one exact Playwright Locator;
+- `semantic.href(ref, { snapshotId })` → an absolute HTTP(S) URL;
+- `semantic.click(ref, { snapshotId, actionOptions })`;
+- `semantic.fill(ref, value, { snapshotId, actionOptions })`;
+- `semantic.navigate(ref, { snapshotId, navigationOptions })`.
+
+Refs are intentionally invalid after navigation or a newer snapshot. Take a fresh snapshot rather than guessing. Cross-origin frames are inspected through Playwright frame APIs with a bounded frame count; failed frames are reported in `frameErrors` and do not silently become successful observations.
+
+`handoff.request()` captures a viewport screenshot and semantic observation before state becomes `waiting_user`. Manager accepts continuation only for the matching live request ID. The module resumes in the same Worker and must verify current page state before acting. If the request times out, the task fails and cleanup closes the browser.
+
 The supported `inputSchema` subset is deliberately small and enforced at registration and task creation: `type`, `enum`, object `properties`/`required`/`additionalProperties`, array `items` and item limits, string length/pattern limits, and numeric minimum/maximum. Unsupported schema keywords fail registration instead of being silently ignored.
 
 ## Runtime rules
 
 - Use `action.goto/click/fill/type/hover/scroll/read/run` so the selected `fast`, `human`, or `adaptive` policy applies. Direct Playwright locators remain available for deterministic reads and assertions.
 - After observing content that a human-paced workflow actually reads, call `await action.read({ words: observedWordCount })`. The delay is bounded to eight seconds, returns its duration, and is zero in effective fast mode. Do not use it for deterministic bulk extraction.
-- Report progress after each meaningful, externally verifiable unit. Automatic heartbeat does not replace task progress.
+- Report progress after each meaningful, externally verifiable unit. Automatic heartbeat does not replace task progress. By default, two minutes without meaningful progress marks the task `stalled` and captures diagnostics; ten minutes of continued silence fails and cleans it up. `waiting_user` and an explicit `cooling_down` period are not treated as stalls.
 - Checkpoint after a recoverable unit. `await checkpoint(data)` stores that bounded data; `await checkpoint.read()` returns exactly the previously stored `data` object, or `null` when no checkpoint exists. It does not return an internal `{ savedAt, data }` wrapper.
 - A resume reruns `run(runtime)` in a new isolated Worker and browser context while preserving the same task ID, input, output directory, and checkpoint. Start with `const previous = await checkpoint.read()` and branch from fields such as `previous?.nextIndex`; do not assume in-memory variables from the previous attempt still exist.
 - Make output writes idempotent with the checkpoint. For append-style results, use a deterministic per-unit filename or stable record key and rebuild the final JSONL/CSV in sorted order. A crash can happen between writing output and saving the next checkpoint, so blind `appendFile()` may duplicate the last unit after resume.
 - Inspect current page state and diagnostic evidence before retrying an unknown action outcome. Do not blindly replay writes.
-- On 429 or a site-provided cooldown, checkpoint first, then call `await cooldown({ response, attempt, fallbackMs, reason })`. It honors `Retry-After`, applies bounded exponential fallback with positive jitter, switches task state to `cooling_down`, keeps heartbeats visible, and returns to `running` without replaying an action. Platform-specific retry limits remain in the specialized module.
+- On 429 or a site-provided cooldown, checkpoint first, then call `await cooldown({ response, attempt, fallbackMs, reason })`. It honors `Retry-After`, applies bounded exponential fallback with positive jitter, switches task state to `cooling_down`, exposes `resumeAt` in status, keeps heartbeats visible, and returns to `running` without replaying an action. Platform-specific retry limits remain in the specialized module.
 - Check `signal.aborted` inside long loops and stop cleanly.
 - Persist large results below `outputDir`, but expose only explicit relative files as `{ kind: 'artifact', file, agentVisible: true }`.
 - Agent-visible artifact chunks are returned byte-for-byte so JSON/JSONL/CSV and SHA-256 verification remain valid. Treat `agentVisible: true` as an explicit disclosure decision: never declare a credential-bearing file.

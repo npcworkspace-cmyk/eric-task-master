@@ -1,6 +1,6 @@
 {
   "name": "eric-task-master",
-  "version": "0.0.3",
+  "version": "1.0.0",
   "description": "Playwright-first browser task runtime with a real-browser control panel.",
   "type": "module",
   "private": true,
@@ -14,6 +14,7 @@
     "start": "node src/cli.mjs serve",
     "connect": "node src/cli.mjs connect",
     "acceptance": "node scripts/acceptance.mjs",
+    "acceptance:commercial": "node scripts/commercial-acceptance.mjs",
     "check": "node scripts/check.mjs",
     "generate:icons": "node scripts/generate-icons.mjs",
     "mcp": "node src/mcp/stdio.mjs",

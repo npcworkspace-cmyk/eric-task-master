@@ -30,9 +30,12 @@ function serviceFixture() {
   const tasks = new Map();
   return {
     calls,
-    async listTaskTypes(caller) {
-      calls.push(['list-types', caller]);
+    async listTaskTypes(filters, caller) {
+      calls.push(['list-types', caller, filters]);
       return { taskTypes: [{ name: 'fixture', sha256: 'a'.repeat(64) }] };
+    },
+    async describeTaskType(name) {
+      return { id: name, name, inputSchema: { type: 'object' } };
     },
     async installTaskType(input, caller) {
       calls.push(['install-type', input, caller]);

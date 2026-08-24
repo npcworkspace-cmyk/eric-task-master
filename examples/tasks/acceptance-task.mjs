@@ -5,6 +5,12 @@ export const meta = Object.freeze({
   name: 'full-playwright-acceptance',
   version: '1.0.0',
   description: 'Built-in deterministic browser action acceptance task.',
+  intents: ['accept-browser'],
+  tags: ['acceptance', 'builtin'],
+  outputs: ['json', 'png', 'download'],
+  preferredBehavior: 'fast',
+  risk: 'mixed',
+  supportsResume: false,
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -12,7 +18,8 @@ export const meta = Object.freeze({
     properties: {
       url: { type: 'string', minLength: 8, maxLength: 4096 },
       uploadPath: { type: 'string', minLength: 1, maxLength: 4096 },
-      expectedSession: { type: 'boolean' }
+      expectedSession: { type: 'boolean' },
+      expectCleanStart: { type: 'boolean' }
     }
   }
 });
@@ -26,6 +33,14 @@ export async function run({ page, context, input, outputDir, action, progress, c
 
   await action.goto(input.url, { waitUntil: 'domcontentloaded' });
   evidence.push({ kind: 'navigation', ok: page.url().startsWith(new URL(input.url).origin) });
+  if (input.expectCleanStart) {
+    const initialCookies = await context.cookies(input.url);
+    const initialStorage = await page.evaluate(() => localStorage.getItem('taskmaster_fixture'));
+    evidence.push({
+      kind: 'ephemeral-clean-start',
+      ok: !initialCookies.some((cookie) => cookie.name === 'taskmaster_fixture') && initialStorage === null
+    });
+  }
   if (input.expectedSession) {
     const importedCookies = await context.cookies(input.url);
     const importedStorage = await page.evaluate(() => localStorage.getItem('taskmaster_imported'));

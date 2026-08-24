@@ -16,6 +16,7 @@ const ui = Object.freeze({
   attentionCount: document.querySelector('#attention-count'),
   createProfileForm: document.querySelector('#create-profile-form'),
   profileName: document.querySelector('#profile-name'),
+  profileKind: document.querySelector('#profile-kind'),
   profileMode: document.querySelector('#profile-mode'),
   profileHeadless: document.querySelector('#profile-headless'),
   profiles: document.querySelector('#profiles'),
@@ -130,7 +131,8 @@ function renderProfiles() {
       element('h3', '', profile.name),
       element('span', `state-pill ${profileState(profile)}`, profileState(profile))
     );
-    const meta = element('p', 'profile-meta', `ID ${profile.id} · 最后使用 ${formatTime(profile.lastUsedAt)}`);
+    const kind = profile.kind === 'ephemeral' ? '隐身临时' : '持久登录';
+    const meta = element('p', 'profile-meta', `${kind} · ID ${profile.id} · 最后使用 ${formatTime(profile.lastUsedAt)}`);
     const controls = element('div', 'profile-controls');
     const mode = document.createElement('select');
     mode.title = '默认行为模式';
@@ -152,8 +154,11 @@ function renderProfiles() {
     headless.append(headlessInput, '后台运行');
 
     const isOpen = ['open', 'leased', 'starting'].includes(profileState(profile));
+    const isEphemeral = profile.kind === 'ephemeral';
     const rename = button('改名', 'ghost', () => renameProfile(profile));
     const toggle = button(isOpen ? '关闭' : '打开', '', () => setProfileOpen(profile, !isOpen));
+    toggle.disabled = isEphemeral;
+    toggle.title = isEphemeral ? '隐身 Profile 仅在任务中临时启动，结束后自动销毁' : '';
     const remove = button('删除', 'danger', () => deleteProfile(profile));
     remove.disabled = profileState(profile) !== 'idle';
     controls.append(mode, headless, rename, toggle, remove);
@@ -167,7 +172,15 @@ function taskProgress(task) {
   const current = Number(task.progress?.current ?? 0);
   const total = Number(task.progress?.total ?? 0);
   const percent = total > 0 ? Math.max(0, Math.min(100, Math.round(current / total * 100))) : 0;
-  return { current, total, percent, message: task.progress?.message || '' };
+  let message = task.progress?.message || '';
+  if (task.state === 'queued' && task.queuePosition) {
+    message = `队列 #${task.queuePosition} · ${task.queueReason || '等待调度'}`;
+  }
+  if (task.cooldown?.status === 'active') {
+    const seconds = Math.max(0, Math.ceil((Date.parse(task.cooldown.resumeAt) - Date.now()) / 1000));
+    message = `${task.cooldown.reason || '限流冷却'} · ${seconds}s 后恢复`;
+  }
+  return { current, total, percent, message };
 }
 
 function resultUrl(task) {
@@ -187,7 +200,11 @@ function renderTasks() {
     const row = document.createElement('tr');
     const name = element('td', 'task-name', task.name || task.meta?.name || task.id);
     const profile = element('td', '', task.profileName || task.profileId || '—');
-    const status = element('td', 'task-status', task.state || task.status || 'unknown');
+    const status = element('td', `task-status ${task.health?.status || ''}`);
+    status.append(element('strong', '', task.state || task.status || 'unknown'));
+    const behavior = task.behaviorState?.effective || task.behavior;
+    if (behavior) status.append(element('small', '', `行为 ${behavior}`));
+    if (task.health?.status === 'stalled') status.append(element('small', 'warning', '已截图 · 需关注'));
     const progress = taskProgress(task);
     const progressCell = element('td', 'progress');
     const track = element('div', 'progress-track');
@@ -200,11 +217,18 @@ function renderTasks() {
       element('span', '', `${progress.percent}%`)
     );
     progressCell.append(track, progressCopy);
-    const heartbeat = element('td', 'muted', formatTime(task.lastHeartbeatAt || task.heartbeatAt || task.updatedAt));
+    const heartbeat = element('td', 'muted');
+    heartbeat.append(
+      element('span', '', `心跳 ${formatTime(task.lastHeartbeatAt || task.heartbeatAt || task.updatedAt)}`),
+      element('span', '', `进度 ${formatTime(task.progressAt || task.updatedAt)}`)
+    );
     const actions = element('td', 'row-actions');
     const state = task.state || task.status;
     const cancel = button('取消', 'danger', () => cancelTask(task));
     cancel.disabled = TERMINAL_TASK_STATES.has(state);
+    if (state === 'waiting_user') {
+      actions.append(button('继续', 'primary', () => continueTask(task)));
+    }
     actions.append(cancel);
     if (task.result || task.outputRef) {
       actions.append(button('查看结果', '', () => showTaskResult(task)));
@@ -248,10 +272,34 @@ async function showTaskResult(task) {
   ui.resultDialog.showModal();
 }
 
+async function continueTask(task) {
+  const handoff = task.userRequest || {};
+  const note = prompt(
+    `${handoff.reason || '任务正在等待新指令'}\n\n请先查看诊断截图/语义现场并确认当前页面状态；可补充下一步说明：`,
+    ''
+  );
+  if (note === null) return;
+  try {
+    await request(`/v1/tasks/${encodeURIComponent(task.id)}/continue`, {
+      method: 'POST',
+      body: {
+        ...(handoff.id ? { requestId: handoff.id } : {}),
+        ...(note.trim() ? { note: note.trim() } : {})
+      }
+    });
+    setMessage('已发送新指令，任务正在核验当前页面', 'success');
+    await refresh();
+  } catch (error) {
+    setMessage(error.message, 'error');
+  }
+}
+
 function updateSummary() {
   ui.profileCount.textContent = String(profiles.length);
   ui.runningCount.textContent = String(tasks.filter((task) => ACTIVE_TASK_STATES.has(task.state || task.status)).length);
-  ui.attentionCount.textContent = String(tasks.filter((task) => ATTENTION_TASK_STATES.has(task.state || task.status)).length);
+  ui.attentionCount.textContent = String(tasks.filter((task) => (
+    ATTENTION_TASK_STATES.has(task.state || task.status) || task.health?.status === 'stalled'
+  )).length);
 }
 
 function formatTime(value) {
@@ -294,7 +342,12 @@ async function createProfile(event) {
   try {
     await request('/v1/profiles', {
       method: 'POST',
-      body: { name, defaultBehavior: ui.profileMode.value, headless: ui.profileHeadless.checked }
+      body: {
+        name,
+        kind: ui.profileKind.value,
+        defaultBehavior: ui.profileMode.value,
+        headless: ui.profileHeadless.checked
+      }
     });
     ui.profileName.value = '';
     ui.profileHeadless.checked = false;
@@ -331,7 +384,10 @@ async function setProfileOpen(profile, shouldOpen) {
 }
 
 async function deleteProfile(profile) {
-  if (!confirm(`删除 Profile “${profile.name}”？其持久化浏览器数据将被清理。`)) return;
+  const detail = profile.kind === 'ephemeral'
+    ? '其临时任务设置将被清理。'
+    : '其持久化浏览器数据将被清理。';
+  if (!confirm(`删除 Profile “${profile.name}”？${detail}`)) return;
   try {
     await request(`/v1/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE' });
     setMessage('Profile 已删除', 'success');

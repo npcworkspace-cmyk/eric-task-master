@@ -59,6 +59,14 @@ const client = {
       modulePath: 'C:\\secret\\task.mjs'
     }];
   },
+  async describeTaskType(name) {
+    return {
+      id: name,
+      title: 'Fixture reader',
+      readOnly: true,
+      inputSchema: { type: 'object', properties: { url: { type: 'string' } } }
+    };
+  },
   async startTask(input) { return { ...task, taskType: input.taskType, profileId: input.profileId }; },
   async listTasks() { return { tasks: [task], nextCursor: 'next_fixture' }; },
   async getTask() { return task; },
@@ -66,6 +74,7 @@ const client = {
     await onProgress?.(task.progress, task);
     return { task, timedOut: true };
   },
+  async continueTask() { return { ...task, state: 'recovering' }; },
   async resumeTask() {
     return {
       task: { ...task, attempt: 2, state: 'queued' },

@@ -1,7 +1,7 @@
 import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { isBehaviorMode } from '../contracts.mjs';
+import { isBehaviorMode, isProfileKind } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
 
 const DEFAULT_LEASE_TTL_MS = 60_000;
@@ -58,6 +58,16 @@ function ensureHeadless(value) {
   return value;
 }
 
+function ensureProfileKind(value) {
+  if (!isProfileKind(value)) {
+    throw new ProfileStoreError(
+      'INVALID_PROFILE_KIND',
+      'Profile kind must be persistent or ephemeral'
+    );
+  }
+  return value;
+}
+
 function ensureBrowserChannel(value) {
   if (value === null || value === undefined || value === '') return null;
   if (typeof value !== 'string' || !/^[a-zA-Z0-9._-]{1,40}$/.test(value)) {
@@ -105,6 +115,11 @@ export class ProfileStore {
   async init() {
     await mkdir(this.#profilesRoot, { recursive: true, mode: 0o700 });
     await this.#store.init();
+    // v0.x Profile records predate explicit persistence semantics. Preserve
+    // their existing browser state by migrating them to persistent Profiles.
+    await this.#store.update((data) => {
+      for (const profile of data.profiles) profile.kind ||= 'persistent';
+    });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
   }
@@ -123,7 +138,7 @@ export class ProfileStore {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new ProfileStoreError('INVALID_PROFILE', 'Profile input must be an object');
     }
-    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel']);
+    const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel']);
     const unknown = Object.keys(input).filter((key) => !allowed.has(key));
     if (unknown.length) {
       throw new ProfileStoreError(
@@ -133,11 +148,13 @@ export class ProfileStore {
     }
     const {
       name,
+      kind = 'persistent',
       defaultBehavior = 'fast',
       headless = false,
       browserChannel: requestedBrowserChannel = null
     } = input;
     const normalizedName = normalizeName(name);
+    ensureProfileKind(kind);
     ensureBehaviorMode(defaultBehavior);
     ensureHeadless(headless);
     const browserChannel = ensureBrowserChannel(requestedBrowserChannel);
@@ -159,6 +176,7 @@ export class ProfileStore {
         created = {
           id: profileId,
           name: normalizedName,
+          kind,
           userDataDir,
           defaultBehavior,
           headless,

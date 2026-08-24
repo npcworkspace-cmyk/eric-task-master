@@ -1,7 +1,8 @@
-name: cross-platform-verification
+name: cross-platform-release-gate
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -12,13 +13,12 @@ jobs:
   verify:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-24.04]
         node: [20, 22]
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -26,13 +26,16 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - if: runner.os == 'Linux'
+      - name: Install Chromium on Linux
+        if: runner.os == 'Linux'
         run: npx playwright install --with-deps chromium
-      - if: runner.os != 'Linux'
+      - name: Install Chromium on Windows or macOS
+        if: runner.os != 'Linux'
         run: npx playwright install chromium
       - run: npm run check
         env:
           TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
+          TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:

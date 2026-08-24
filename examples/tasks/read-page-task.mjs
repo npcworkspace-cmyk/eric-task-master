@@ -5,6 +5,13 @@ export const meta = Object.freeze({
   name: 'read-page',
   version: '1.0.0',
   description: 'Open one HTTP(S) page and persist a bounded text-and-link snapshot.',
+  intents: ['extract-text', 'read-page'],
+  tags: ['builtin', 'observation'],
+  outputs: ['json', 'screenshot'],
+  preferredBehavior: 'fast',
+  risk: 'read',
+  readOnly: true,
+  supportsResume: false,
   inputSchema: {
     type: 'object',
     additionalProperties: false,

@@ -1,6 +1,8 @@
 import { isBehaviorMode } from '../contracts.mjs';
 
 const DEFAULT_HUMAN_TIMING = Object.freeze({
+  cautiousBeforeAction: [15, 45],
+  cautiousAfterAction: [25, 75],
   beforeAction: [45, 140],
   afterAction: [55, 180],
   hoverPause: [70, 180],
@@ -14,6 +16,17 @@ const DEFAULT_HUMAN_TIMING = Object.freeze({
   readingPerWord: [90, 160],
   readingMaximum: 8_000
 });
+
+const ADAPTIVE_SIGNALS = Object.freeze({
+  dynamic: Object.freeze({ level: 1, actions: 2 }),
+  action_failure: Object.freeze({ level: 2, actions: 4 }),
+  occluded: Object.freeze({ level: 2, actions: 4 }),
+  timeout: Object.freeze({ level: 2, actions: 4 }),
+  navigation_unknown: Object.freeze({ level: 3, actions: 6 }),
+  rate_limit: Object.freeze({ level: 3, actions: 6 })
+});
+
+const ADAPTIVE_LABELS = Object.freeze(['fast', 'cautious', 'guarded', 'cooldown']);
 
 export class BehaviorActionError extends Error {
   constructor(operation, cause) {
@@ -53,10 +66,21 @@ function easedSegments(total, steps, random) {
   });
 }
 
+function adaptiveFailureSignal(error) {
+  const text = `${error?.name || ''} ${error?.code || ''} ${error?.message || ''}`.toLowerCase();
+  if (text.includes('occlud') || text.includes('intercept')) return 'occluded';
+  if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
+  if (text.includes('navigation') || text.includes('target closed') || text.includes('context destroyed')) {
+    return 'navigation_unknown';
+  }
+  return 'action_failure';
+}
+
 /**
- * Creates the task-scoped action facade used by task modules. Adaptive mode is
- * fast until the caller reports a dynamic-page or rate-limit signal, or an
- * action fails. It never retries an unknown action outcome automatically.
+ * Creates the task-scoped action facade used by task modules. Adaptive mode
+ * keeps deterministic work fast, adds only short settling pauses for ordinary
+ * dynamic-page signals, and uses full human pacing after stronger ambiguity or
+ * rate-limit signals. It never retries an unknown action outcome automatically.
  */
 export function createActionHelper({
   page,
@@ -66,12 +90,16 @@ export function createActionHelper({
   abortSignal,
   onFailure = async () => {},
   onEffect = async () => undefined,
+  onAdaptiveState = () => {},
   timing = DEFAULT_HUMAN_TIMING
 } = {}) {
   if (!page) throw new TypeError('page is required');
   if (!isBehaviorMode(mode)) throw new TypeError(`Unsupported behavior mode: ${mode}`);
 
-  let adaptiveSlowdown = 0;
+  let adaptiveLevel = 0;
+  let adaptiveActionsRemaining = 0;
+  let adaptiveSignal = null;
+  let adaptiveGeneration = 0;
   let cursor = { x: 0, y: 0 };
 
   const throwIfAborted = () => {
@@ -79,10 +107,18 @@ export function createActionHelper({
     throw abortSignal.reason instanceof Error ? abortSignal.reason : new Error('Task execution was aborted');
   };
 
-  const usesHumanTiming = () => mode === 'human' || (mode === 'adaptive' && adaptiveSlowdown > 0);
+  const usesHumanTiming = () => mode === 'human' || (mode === 'adaptive' && adaptiveLevel >= 2);
+  const usesCautiousTiming = () => mode === 'adaptive' && adaptiveLevel === 1;
 
   async function pause(range) {
-    if (usesHumanTiming()) await sleep(numberBetween(range, random));
+    if (usesHumanTiming()) {
+      await sleep(numberBetween(range, random));
+    } else if (usesCautiousTiming()) {
+      const cautiousRange = range === timing.beforeAction
+        ? timing.cautiousBeforeAction
+        : timing.cautiousAfterAction;
+      await sleep(numberBetween(cautiousRange, random));
+    }
   }
 
   async function moveToLocator(locator, requestedPosition) {
@@ -164,14 +200,40 @@ export function createActionHelper({
   }
 
   function signal(kind) {
-    if (mode !== 'adaptive') return;
-    if (['dynamic', 'rate_limit', 'timeout', 'occluded', 'navigation_unknown'].includes(kind)) {
-      adaptiveSlowdown = Math.max(adaptiveSlowdown, kind === 'rate_limit' ? 8 : 3);
+    if (mode !== 'adaptive') return null;
+    const policy = ADAPTIVE_SIGNALS[kind];
+    if (!policy) return adaptiveState();
+    if (policy.level >= adaptiveLevel) adaptiveSignal = kind;
+    adaptiveLevel = Math.max(adaptiveLevel, policy.level);
+    adaptiveActionsRemaining = Math.max(adaptiveActionsRemaining, policy.actions);
+    adaptiveGeneration += 1;
+    const state = adaptiveState();
+    Promise.resolve(onAdaptiveState(state)).catch(() => {});
+    return state;
+  }
+
+  function adaptiveState() {
+    return Object.freeze({
+      level: adaptiveLevel,
+      label: ADAPTIVE_LABELS[adaptiveLevel],
+      actionsRemaining: adaptiveActionsRemaining,
+      signal: adaptiveSignal
+    });
+  }
+
+  function decayAdaptiveState(generationAtStart) {
+    if (mode !== 'adaptive' || generationAtStart !== adaptiveGeneration || adaptiveActionsRemaining <= 0) return;
+    adaptiveActionsRemaining -= 1;
+    if (adaptiveActionsRemaining === 0) {
+      adaptiveLevel = 0;
+      adaptiveSignal = null;
     }
+    Promise.resolve(onAdaptiveState(adaptiveState())).catch(() => {});
   }
 
   async function execute(operation, callback, effectOperation = operation) {
     throwIfAborted();
+    const generationAtStart = adaptiveGeneration;
     const sequence = await onEffect({ state: 'started', operation: effectOperation });
     let result;
     try {
@@ -181,12 +243,14 @@ export function createActionHelper({
       throwIfAborted();
       await pause(timing.afterAction);
       throwIfAborted();
-      if (mode === 'adaptive' && adaptiveSlowdown > 0) adaptiveSlowdown -= 1;
+      decayAdaptiveState(generationAtStart);
     } catch (cause) {
       // Playwright cannot prove that a failed click/navigation did not reach the
       // website. Keep the started record pending; a later attempt must inspect
       // real state and resolve the unknown outcome explicitly.
-      if (mode === 'adaptive') adaptiveSlowdown = Math.max(adaptiveSlowdown, 3);
+      if (mode === 'adaptive') {
+        signal(adaptiveFailureSignal(cause));
+      }
       if (!abortSignal?.aborted) {
         try {
           await onFailure({ operation, error: cause });
@@ -209,7 +273,13 @@ export function createActionHelper({
     },
 
     get effectiveMode() {
-      return usesHumanTiming() ? 'human' : 'fast';
+      if (usesHumanTiming()) return 'human';
+      if (usesCautiousTiming()) return 'cautious';
+      return 'fast';
+    },
+
+    get adaptiveState() {
+      return adaptiveState();
     },
 
     signal,

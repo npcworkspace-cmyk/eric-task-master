@@ -135,7 +135,7 @@ function validateProfilePatch(body) {
 }
 
 function validateProfileCreate(body) {
-  const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel']);
+  const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel']);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_PROFILE_CREATE', `Unsupported fields: ${unknown.join(', ')}`);
@@ -489,6 +489,9 @@ export async function createManager({
     }
 
     if (request.method === 'GET' && url.pathname === '/v1/health') {
+      const counts = typeof taskService.schedulerStatus === 'function'
+        ? await taskService.schedulerStatus()
+        : undefined;
       sendJson(response, 200, {
         ok: true,
         service: MANAGER_NAME,
@@ -498,7 +501,8 @@ export async function createManager({
         port: listeningAddress?.port ?? port,
         pid: process.pid,
         startedAt,
-        identityFingerprint: managerIdentity.fingerprint
+        identityFingerprint: managerIdentity.fingerprint,
+        ...(counts ? { counts } : {})
       }, cors);
       return;
     }
@@ -657,8 +661,9 @@ export async function createManager({
 
     const profileMatch = /^\/v1\/profiles\/([^/]+)$/.exec(url.pathname);
     const profileActionMatch = /^\/v1\/profiles\/([^/]+)\/(open|close|session)$/.exec(url.pathname);
+    const taskTypeMatch = /^\/v1\/task-types\/([^/]+)$/.exec(url.pathname);
     const taskMatch = /^\/v1\/tasks\/([^/]+)$/.exec(url.pathname);
-    const taskActionMatch = /^\/v1\/tasks\/([^/]+)\/(cancel|resume)$/.exec(url.pathname);
+    const taskActionMatch = /^\/v1\/tasks\/([^/]+)\/(cancel|resume|continue)$/.exec(url.pathname);
     const taskArtifactsMatch = /^\/v1\/tasks\/([^/]+)\/artifacts$/.exec(url.pathname);
     const taskArtifactMatch = /^\/v1\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname);
 
@@ -739,8 +744,22 @@ export async function createManager({
     if (request.method === 'GET' && url.pathname === '/v1/task-types') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
-      const result = await requireTaskMethod(taskService, 'listTaskTypes')(serviceCaller(auth));
+      const result = await requireTaskMethod(taskService, 'listTaskTypes')({
+        query: url.searchParams.get('query') || '',
+        domain: url.searchParams.get('domain') || '',
+        intent: url.searchParams.get('intent') || ''
+      }, serviceCaller(auth));
       sendJson(response, 200, result, cors);
+      return;
+    }
+    if (taskTypeMatch && request.method === 'GET') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const taskType = await requireTaskMethod(taskService, 'describeTaskType')(
+        decodeURIComponent(taskTypeMatch[1]),
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, { taskType }, cors);
       return;
     }
     if (request.method === 'POST' && url.pathname === '/v1/task-types/install') {
@@ -751,6 +770,16 @@ export async function createManager({
         auth
       );
       sendJson(response, 201, { taskType: installed }, cors);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/task-packs/install') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin');
+      const installed = await requireTaskMethod(taskService, 'installTaskPack')(
+        await readJson(request, { maxBytes: 256 * 1024 }),
+        auth
+      );
+      sendJson(response, 201, { taskPack: installed }, cors);
       return;
     }
 
@@ -820,6 +849,16 @@ export async function createManager({
           serviceCaller(auth)
         );
         sendJson(response, 202, { task: publicTask(task), notice: RESUME_NOTICE }, cors);
+        return;
+      }
+      if (taskActionMatch[2] === 'continue') {
+        requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+        const task = await requireTaskMethod(taskService, 'continueTask')(
+          taskId,
+          await readJson(request, { maxBytes: 4 * 1024 }),
+          serviceCaller(auth)
+        );
+        sendJson(response, 202, { task: publicTask(task) }, cors);
         return;
       }
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');

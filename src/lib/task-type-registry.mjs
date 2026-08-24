@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isBehaviorMode } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
 
 const MAX_TASK_MODULE_BYTES = 2 * 1024 * 1024;
@@ -11,6 +12,8 @@ const DEFAULT_INSPECTION_TIMEOUT_MS = 5_000;
 const INSPECTOR_PATH = fileURLToPath(new URL('../runtime/task-module-inspector.mjs', import.meta.url));
 const TASK_TYPE_PATTERN = /^[a-z][a-z0-9._-]{0,79}$/;
 const INPUT_SCHEMA_TYPES = new Set(['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']);
+const TASK_RISKS = new Set(['read', 'write', 'mixed']);
+const DISCOVERY_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
 const INPUT_SCHEMA_KEYS = new Set([
   'additionalProperties',
   'default',
@@ -44,19 +47,65 @@ function inside(root, candidate) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function publicType(record) {
+function publicType(record, { includeSchema = true, includeIntegrity = true } = {}) {
   return {
     id: record.name,
     name: record.name,
     title: record.title || record.name,
     ...(record.description ? { description: record.description } : {}),
     ...(record.version ? { version: record.version } : {}),
-    ...(record.inputSchema ? { inputSchema: structuredClone(record.inputSchema) } : {}),
+    ...(includeSchema && record.inputSchema ? { inputSchema: structuredClone(record.inputSchema) } : {}),
     readOnly: record.readOnly === true,
-    sha256: record.sha256,
-    size: record.size,
-    installedAt: record.installedAt
+    ...(record.domains?.length ? { domains: [...record.domains] } : {}),
+    ...(record.intents?.length ? { intents: [...record.intents] } : {}),
+    ...(record.tags?.length ? { tags: [...record.tags] } : {}),
+    ...(record.outputs?.length ? { outputs: [...record.outputs] } : {}),
+    ...(record.preferredBehavior ? { preferredBehavior: record.preferredBehavior } : {}),
+    ...(record.risk ? { risk: record.risk } : {}),
+    ...(record.pack ? { pack: { name: record.pack.name, version: record.pack.version } } : {}),
+    supportsResume: record.supportsResume === true,
+    ...(includeIntegrity ? {
+      sha256: record.sha256,
+      size: record.size,
+      installedAt: record.installedAt
+    } : {})
   };
+}
+
+function boundedTokenList(value, field, maximum = 32) {
+  if (value === undefined) return undefined;
+  if (
+    !Array.isArray(value) || value.length > maximum ||
+    value.some((item) => typeof item !== 'string' || !DISCOVERY_TOKEN.test(item)) ||
+    new Set(value).size !== value.length
+  ) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_METADATA',
+      `meta.${field} must contain at most ${maximum} unique lowercase discovery tokens`
+    );
+  }
+  return value.length ? [...value] : undefined;
+}
+
+function boundedDomains(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 16 || new Set(value).size !== value.length) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_METADATA',
+      'meta.domains must contain at most 16 unique hostnames'
+    );
+  }
+  const normalized = value.map((item) => String(item).trim().toLowerCase());
+  for (const domain of normalized) {
+    const host = domain.startsWith('*.') ? domain.slice(2) : domain;
+    if (!host || host.length > 253 || /[^a-z0-9.-]/u.test(host) || host.startsWith('.') || host.endsWith('.') || host.includes('..')) {
+      throw new TaskTypeRegistryError(
+        'INVALID_TASK_METADATA',
+        'meta.domains must contain simple hostnames or wildcard subdomains'
+      );
+    }
+  }
+  return normalized.length ? normalized : undefined;
 }
 
 function invalidSchema(location, message) {
@@ -148,12 +197,35 @@ function safeMetadata(meta, expectedName) {
     inputSchema = JSON.parse(encoded);
     validateInputSchema(inputSchema);
   }
+  const domains = boundedDomains(source.domains);
+  const intents = boundedTokenList(source.intents, 'intents', 16);
+  const tags = boundedTokenList(source.tags, 'tags');
+  const outputs = boundedTokenList(source.outputs, 'outputs');
+  if (source.preferredBehavior !== undefined && !isBehaviorMode(source.preferredBehavior)) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_METADATA',
+      'meta.preferredBehavior must be fast, human, or adaptive'
+    );
+  }
+  if (source.risk !== undefined && !TASK_RISKS.has(source.risk)) {
+    throw new TaskTypeRegistryError('INVALID_TASK_METADATA', 'meta.risk must be read, write, or mixed');
+  }
+  if (source.supportsResume !== undefined && typeof source.supportsResume !== 'boolean') {
+    throw new TaskTypeRegistryError('INVALID_TASK_METADATA', 'meta.supportsResume must be a boolean');
+  }
   return {
     title,
     ...(description ? { description } : {}),
     ...(version ? { version } : {}),
     ...(inputSchema ? { inputSchema } : {}),
-    readOnly: source.readOnly === true
+    readOnly: source.readOnly === true,
+    ...(domains ? { domains } : {}),
+    ...(intents ? { intents } : {}),
+    ...(tags ? { tags } : {}),
+    ...(outputs ? { outputs } : {}),
+    ...(source.preferredBehavior ? { preferredBehavior: source.preferredBehavior } : {}),
+    ...(source.risk ? { risk: source.risk } : {}),
+    supportsResume: source.supportsResume === true
   };
 }
 
@@ -321,7 +393,52 @@ export class TaskTypeRegistry {
     return this.#install(input);
   }
 
-  async #install({ name, modulePath } = {}, { allowUpdate = false } = {}) {
+  async installBatch(inputs = [], { pack } = {}) {
+    await this.#ready;
+    if (!Array.isArray(inputs) || inputs.length < 1 || inputs.length > 64) {
+      throw new TaskTypeRegistryError('INVALID_TASK_PACK', 'Task Pack must contain 1 to 64 task modules');
+    }
+    const names = inputs.map((input) => input?.name);
+    if (new Set(names).size !== names.length) {
+      throw new TaskTypeRegistryError('INVALID_TASK_PACK', 'Task Pack task names must be unique');
+    }
+    const snapshot = await this.#store.read();
+    const prepared = [];
+    for (const input of inputs) {
+      const candidate = await this.#prepareInstall(input, { currentTypes: snapshot.types });
+      if (candidate.changed && pack) {
+        candidate.record.pack = { name: pack.name, version: pack.version };
+      }
+      prepared.push(candidate);
+    }
+
+    const installed = [];
+    await this.#store.update((data) => {
+      // Validate the entire batch against the latest registry before changing
+      // any record. A conflict therefore cannot leave a partially installed Pack.
+      for (const candidate of prepared) {
+        const current = data.types.find((item) => item.name === candidate.record.name);
+        if (current && current.sha256 !== candidate.record.sha256) {
+          throw new TaskTypeRegistryError(
+            'TASK_TYPE_CONFLICT',
+            `Task type ${candidate.record.name} is already installed with different content`,
+            409
+          );
+        }
+      }
+      for (const candidate of prepared) {
+        const current = data.types.find((item) => item.name === candidate.record.name);
+        if (current) installed.push(current);
+        else {
+          data.types.push(candidate.record);
+          installed.push(candidate.record);
+        }
+      }
+    });
+    return installed.map((record) => publicType(record));
+  }
+
+  async #prepareInstall({ name, modulePath } = {}, { allowUpdate = false, currentTypes = [] } = {}) {
     if (typeof name !== 'string' || !TASK_TYPE_PATTERN.test(name)) {
       throw new TaskTypeRegistryError(
         'INVALID_TASK_TYPE',
@@ -359,13 +476,13 @@ export class TaskTypeRegistry {
     const sha256 = createHash('sha256').update(source).digest('hex');
     const snapshotName = `${name}-${sha256}.mjs`;
     const snapshotPath = path.join(this.#snapshotRoot, snapshotName);
-    const current = (await this.#store.read()).types.find((item) => item.name === name);
+    const current = currentTypes.find((item) => item.name === name);
     if (current?.sha256 === sha256) {
       if (current.snapshotName !== snapshotName) {
         throw new TaskTypeRegistryError('INVALID_TASK_SNAPSHOT', 'Task snapshot path is invalid', 500);
       }
       await verifySnapshot(snapshotPath, sha256);
-      return publicType(current);
+      return { record: current, changed: false };
     }
     if (current && !allowUpdate) {
       throw new TaskTypeRegistryError(
@@ -393,8 +510,17 @@ export class TaskTypeRegistry {
       snapshotName,
       installedAt: new Date().toISOString()
     };
+    return { record, changed: true };
+  }
+
+  async #install(input, { allowUpdate = false } = {}) {
+    const snapshot = await this.#store.read();
+    const prepared = await this.#prepareInstall(input, { allowUpdate, currentTypes: snapshot.types });
+    if (!prepared.changed) return publicType(prepared.record);
     let installed;
     await this.#store.update((data) => {
+      const { record } = prepared;
+      const { name, sha256 } = record;
       const index = data.types.findIndex((item) => item.name === name);
       if (index >= 0 && data.types[index].sha256 === sha256) {
         installed = data.types[index];
@@ -420,6 +546,24 @@ export class TaskTypeRegistry {
     return data.types
       .map(publicType)
       .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async listSummaries() {
+    await this.#ready;
+    const data = await this.#store.read();
+    return data.types
+      .map((record) => publicType(record, { includeSchema: false, includeIntegrity: false }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async describe(name) {
+    await this.#ready;
+    const data = await this.#store.read();
+    const record = data.types.find((item) => item.name === name);
+    if (!record) {
+      throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
+    }
+    return publicType(record, { includeSchema: true, includeIntegrity: false });
   }
 
   async resolve(name) {

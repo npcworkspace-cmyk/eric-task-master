@@ -60,6 +60,7 @@ export function createCooldownHelper({
   onState = async () => {},
   onProgress = async () => {},
   onSignal = () => {},
+  onCooldown = async () => {},
   now = () => Date.now(),
   random = Math.random
 } = {}) {
@@ -81,10 +82,14 @@ export function createCooldownHelper({
     onSignal('rate_limit');
     await onState('cooling_down');
     await onProgress({ durationMs, resumeAt, reason });
+    await onCooldown({ status: 'active', durationMs, resumeAt, reason });
     try {
       await sleep(durationMs, signal);
     } finally {
-      if (!signal?.aborted) await onState('running');
+      if (!signal?.aborted) {
+        await onCooldown({ status: 'completed', durationMs, resumeAt, reason });
+        await onState('running');
+      }
     }
     return { durationMs, resumeAt };
   };

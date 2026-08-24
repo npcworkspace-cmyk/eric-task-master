@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
@@ -28,6 +28,7 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   });
 
   assert.equal(created.name, 'Research');
+  assert.equal(created.kind, 'persistent');
   assert.equal(created.state, 'idle');
   assert.equal(created.headless, true);
   assert.equal(created.browserChannel, 'chrome');
@@ -59,6 +60,28 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   const removed = await reopened.remove(created.id);
   assert.equal(removed.id, created.id);
   await assert.rejects(reopened.get(created.id), { code: 'PROFILE_NOT_FOUND' });
+});
+
+test('ProfileStore creates ephemeral templates and migrates pre-kind records to persistent', async (t) => {
+  const { config, store } = await fixture(t);
+  const temporary = await store.create({ name: 'Anonymous work', kind: 'ephemeral' });
+  assert.equal(temporary.kind, 'ephemeral');
+
+  const data = JSON.parse(await readFile(config.filePath, 'utf8'));
+  delete data.profiles[0].kind;
+  await writeFile(config.filePath, `${JSON.stringify(data)}\n`);
+  const reopened = new ProfileStore(config);
+  await reopened.init();
+  assert.equal((await reopened.get(temporary.id)).kind, 'persistent');
+
+  await assert.rejects(
+    reopened.create({ name: 'Invalid kind', kind: 'private' }),
+    { code: 'INVALID_PROFILE_KIND' }
+  );
+  await assert.rejects(
+    reopened.update(temporary.id, { kind: 'ephemeral' }),
+    { code: 'INVALID_PROFILE_PATCH' }
+  );
 });
 
 test('ProfileStore enforces exclusive leases and recovers only expired dead owners', async (t) => {

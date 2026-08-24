@@ -1,13 +1,13 @@
 ---
 name: eric-task-master
-description: Install, connect, and use Eric Task Master for durable Playwright browser work with isolated persistent profiles, MCP task control, progress, recovery, artifacts, optional human behavior, and specialized task modules.
+description: Install, connect, and use Eric Task Master for durable Playwright browser jobs with persistent or ephemeral Profiles, adaptive behavior, task queues, progress health, semantic diagnostics, recovery, artifacts, and composable Task Packs.
 ---
 
 # Eric Task Master
 
-Task Master is the browser execution layer. Playwright performs browser work in isolated persistent Profiles. The everyday-browser extension only manages Profiles and performs a user-approved, current-site session transfer.
+Task Master is the browser execution layer. Use its registered high-level task types; do not invent another daemon, port, controller, browser launcher, or task-follow loop.
 
-## One fixed startup
+## Fixed startup and acceptance
 
 From the cloned project root or this Skill directory, run exactly:
 
@@ -15,39 +15,44 @@ From the cloned project root or this Skill directory, run exactly:
 node scripts/taskmaster.mjs connect --json
 ```
 
-First use is incomplete until `connect` returns `ok: true`. It installs lockfile-pinned dependencies and Chromium when missing, starts Manager, runs the real-browser acceptance suite, and safely registers the same STDIO MCP server in every detected supported Agent host.
+Installation is incomplete until this command returns `ok: true` and its real-browser acceptance checks pass. It installs lockfile-pinned dependencies and Chromium when missing, starts Manager, and safely registers STDIO MCP in detected supported Agent hosts. If it reports `registered_pending_restart`, ask the user to reload that Agent host once. If startup fails, retry this same command once, then report the exact `error.code` and `nextAction`; do not branch into speculative controllers.
 
-If registration reports `registered_pending_restart`, ask the user to restart or reload that Agent host once. Do not invent ports, daemons, browser flags, config formats, or alternate controllers. If startup fails, retry this same command once, then report its exact `error.code` and `nextAction`.
+After reload, call `taskmaster_status`, then `taskmaster_profiles_list`. Create a Profile only when no suitable one exists because creation is non-idempotent:
 
-After the host reload, call `taskmaster_status`. MCP starts Manager automatically when it is not running. Then call `taskmaster_profiles_list`. Create a Profile only if no suitable one exists because profile creation is non-idempotent.
+- choose `persistent` for login state or recurring account work;
+- choose `ephemeral` for no-login temporary work. It starts clean for every task and retains no browser state after cleanup. It cannot receive session transfer or be opened manually.
 
-## Run tasks through MCP
+## Fixed task loop
 
-Use these high-level tools instead of reconstructing HTTP or Playwright control:
+1. Call `taskmaster_task_types_list` with a narrow `query`, `domain`, or `intent`. This returns compact summaries only.
+2. Call `taskmaster_task_types_describe` for the one selected type and construct input from that schema.
+3. Call `taskmaster_tasks_start` once with a stable unique `idempotencyKey`; keep the returned task ID.
+4. Call `taskmaster_tasks_wait` repeatedly, or `taskmaster_tasks_get` for a snapshot. A cancelled wait does not cancel the durable task.
+5. If state is `waiting_user`, list/read the diagnostic screenshot and semantic-observation artifacts, inspect current state, then call `taskmaster_tasks_continue` with the matching request ID. This continues the same live task.
+6. If health is `stalled`, read diagnostics. Do not submit a duplicate. The controller will fail and clean up the task if meaningful progress remains silent past its hard deadline.
+7. If a failed task exposes a checkpoint and settled cleanup, inspect its error, checkpoint timestamp, diagnostics, and current site state; then call `taskmaster_tasks_resume` on the same ID with one stable `resumeKey`.
+8. Claim completion only when the task is terminal, cleanup is settled, and its compact evidence plus declared artifacts prove the requested outcome.
 
-1. `taskmaster_task_types_list` to discover installed task contracts.
-2. `taskmaster_tasks_start` with a stable, unique `idempotencyKey`.
-3. Keep the returned `taskId`.
-4. Use `taskmaster_tasks_wait` for bounded waits or `taskmaster_tasks_get` for a snapshot.
-5. If a failed task has a checkpoint and settled cleanup, inspect its progress and diagnostics, then call `taskmaster_tasks_resume` on the same task ID with one stable `resumeKey`.
-6. Use `taskmaster_artifacts_list` and bounded `taskmaster_artifacts_read` for declared results.
+Same-Profile tasks queue in FIFO order; different Profiles may run concurrently within the Manager resource budget. Queueing is normal, not a reason to retry.
 
-A cancelled MCP wait does not cancel the durable task. Only `taskmaster_tasks_cancel` cancels it. Never submit a replacement merely because an Agent disconnected; retrieve the original task by ID first.
+## Behavior choice
 
-Resume is always explicit and idempotent. Reuse the same `resumeKey` when retrying the same resume request; use a new key only for a deliberately new attempt. Before resume, inspect the checkpoint, progress, error, and current site state. Never assume an external click, submission, message, or purchase failed merely because its response was lost.
+- `fast`: deterministic Playwright with minimum necessary waiting. Default for stable, data-heavy work.
+- `human`: bounded pointer curves, in-target clicks, typing rhythm, eased scrolling, and explicit reading dwell.
+- `adaptive`: starts fast, uses a brief cautious tier for ordinary dynamic content, and temporarily uses guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. It returns to fast after successful actions and never auto-replays an unknown effect.
 
-Default to `fast` for deterministic and data-heavy work. Use `human` only when the user or workflow requests paced pointer, typing, hover, scrolling, and reading. Use `adaptive` when a dynamic site may require the task module to signal timeouts, occlusion, navigation uncertainty, or rate limiting. In a custom task, call `action.read({ words })` only after observing content the workflow actually intends to read; do not add invented dwell to bulk collection.
+The task status exposes configured/effective behavior and active cooldown timing. Human-like pacing is a reliability option, not a promise to evade website controls or protect an account from platform enforcement.
 
-The worker emits heartbeats automatically and task modules report meaningful progress. A delayed heartbeat triggers a diagnostic screenshot before failure. Every action failure and task timeout also attempts a screenshot. Treat the screenshot reference as diagnostic evidence, not proof that an external action succeeded.
+## Diagnostics and handoff
 
-## Specialized Skills and disposable modules
+Action failure, task timeout, delayed heartbeat, stalled progress, and explicit `handoff.request()` all trigger a bounded viewport screenshot plus a bounded semantic observation when the page is available. Prefer the semantic artifact first because it is smaller and gives stable refs, roles, names, text, and frame context; use the screenshot for visual ambiguity.
 
-If a specialized Skill matches the site or workflow, follow that Skill for discovery, pagination, parsing, rate-limit policy, checkpoints, and completion evidence. It must use Task Master as its execution layer; it must not duplicate Manager, Profile, MCP, progress, or cleanup logic.
+The Worker emits liveness heartbeats automatically. Task modules must still report meaningful progress after each externally verifiable unit. Manager distinguishes “process alive” from “work advancing,” wakes bounded waits with attention states, captures diagnostics on silence, and closes every task window during terminal cleanup.
 
-When no task type exists, create one bounded, single-file `.mjs` module using [references/task-runtime.md](references/task-runtime.md). Register it with the fixed launcher; Task Master copies it into a Manager-owned inbox, verifies it, and snapshots it before execution. Site selectors and business logic belong there, never in this base Skill.
+## Specialized Skills and Task Packs
 
-For authenticated work, follow [references/profiles-and-sessions.md](references/profiles-and-sessions.md). Never request, print, persist, or return cookies, tokens, authorization headers, Manager credentials, or browser-profile files.
+If a specialized Skill matches, follow it for site discovery, selectors, pagination, parsing, rate-limit policy, checkpoints, outputs, and evidence. It should call Task Master task types rather than duplicate the base runtime.
 
-## Completion gate
+When no task type exists, read [references/task-runtime.md](references/task-runtime.md). For one disposable job, register one bounded `.mjs` task. For reusable capability, read [references/task-packs.md](references/task-packs.md) and ship a versioned Task Pack. Task Pack installation is transactional: a conflict rejects the whole Pack without partial registration.
 
-Claim completion only when the original task is terminal, cleanup has settled, and its compact evidence plus declared artifacts prove the requested outcome. Manager independently rejects a Worker completion claim when the result is malformed, a declared Agent-visible artifact is missing or unstable, the browser did not close, the Worker did not exit, or the Profile lease was not released. A module return value is not a data stream; large JSONL, CSV, screenshots, and downloads must be declared artifacts.
+For account work, read [references/profiles-and-sessions.md](references/profiles-and-sessions.md). Never request, print, persist, or return cookies, tokens, authorization headers, Manager credentials, or browser-profile files.

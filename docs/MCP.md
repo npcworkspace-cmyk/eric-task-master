@@ -48,10 +48,12 @@ The admin credential is used only for that exchange. Profiles, task types, tasks
 - `taskmaster_profiles_open`
 - `taskmaster_profiles_close`
 - `taskmaster_task_types_list`
+- `taskmaster_task_types_describe`
 - `taskmaster_tasks_start`
 - `taskmaster_tasks_list`
 - `taskmaster_tasks_get`
 - `taskmaster_tasks_wait`
+- `taskmaster_tasks_continue`
 - `taskmaster_tasks_resume`
 - `taskmaster_tasks_cancel`
 - `taskmaster_artifacts_list`
@@ -63,13 +65,28 @@ The MCP surface never accepts arbitrary module paths, JavaScript evaluation, coo
 
 ## Long tasks, progress, and cancellation
 
-`taskmaster_tasks_start` returns immediately with a durable task ID. Use `taskmaster_tasks_get` for a snapshot or `taskmaster_tasks_wait` for a bounded wait of at most 30 seconds. When the MCP request contains a progress token, the wait tool forwards bounded progress notifications.
+`taskmaster_tasks_start` returns immediately with a durable task ID. Use `taskmaster_tasks_get` for a snapshot or `taskmaster_tasks_wait` for a bounded wait of at most 30 seconds. When the MCP request contains a progress token, the wait tool forwards bounded progress notifications. A wait also returns early when a task enters `waiting_user` or its health becomes `stalled`, so the Agent can inspect diagnostics rather than sleeping through an attention state.
+
+Task status separates liveness from advancement:
+
+- `heartbeatAt` proves the Worker is still reporting;
+- `progressAt` records the last meaningful module progress;
+- `health.status` reports `healthy`, `stalled`, `waiting_user`, `cooling_down`, or a terminal state;
+- `behaviorState` exposes configured and currently effective behavior;
+- `cooldown.resumeAt` exposes an active rate-limit deadline;
+- `queuePosition` and `queueReason` explain bounded scheduler waiting.
+
+Same-Profile work is FIFO queued. Different Profiles run concurrently up to the Manager budget. Queueing never requires a duplicate task submission.
+
+When state is `waiting_user`, list/read the task's `diagnostic-observation` and `diagnostic-screenshot` artifacts, then call `taskmaster_tasks_continue` with the live request ID and an optional bounded note. This keeps the same task ID, Worker, browser, output, checkpoint, and effect journal. It is intentionally non-idempotent and open-world because a new instruction may lead to an external browser action.
 
 Cancelling or disconnecting a wait request stops only that wait. The browser task continues under Task Master. Only `taskmaster_tasks_cancel` requests task cancellation. This prevents a transient MCP host disconnect from destroying a long task.
 
 If a failed task exposes a preserved checkpoint and settled cleanup, `taskmaster_tasks_resume` starts a new attempt on the same task ID. It requires a stable `resumeKey`; retrying the same key is idempotent, while a new key is a new explicit resume decision. Resume fails closed for the wrong owner, a non-failed task, missing checkpoint, unsettled cleanup, missing persisted context, or a changed module snapshot. The caller must inspect the checkpoint and current site state before repeating any action whose external outcome is unknown.
 
 A Worker completion claim is provisional. Manager publishes `completed` only after validating the bounded result shape, all declared Agent-visible artifacts, browser closure, Worker exit, and Profile lease release. Otherwise the task is `failed` with `TASK_COMPLETION_GATE_FAILED`.
+
+Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow.
 
 ## Output and artifact bounds
 

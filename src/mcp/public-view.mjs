@@ -93,6 +93,7 @@ export function publicProfile(profile) {
   return definedEntries([
     ['id', stringValue(profile?.id, 128)],
     ['name', stringValue(profile?.name, 80)],
+    ['kind', stringValue(profile?.kind, 32)],
     ['state', stringValue(profile?.state, 64)],
     ['defaultBehavior', stringValue(profile?.defaultBehavior, 32)],
     ['headless', booleanValue(profile?.headless)],
@@ -182,6 +183,57 @@ export function publicTask(task, { includeResult = true } = {}) {
       ['artifactsAvailable', true]
     ])
     : undefined;
+  const observation = task?.lastObservation && typeof task.lastObservation === 'object'
+    ? definedEntries([
+      ['kind', 'semantic-observation'],
+      ['reason', stringValue(task.lastObservation.reason, 128)],
+      ['at', stringValue(task.lastObservation.at, 64)],
+      ['artifactsAvailable', true]
+    ])
+    : undefined;
+  const userRequest = task?.userRequest && typeof task.userRequest === 'object'
+    ? definedEntries([
+      ['id', stringValue(task.userRequest.id, 128)],
+      ['reason', stringValue(task.userRequest.reason, 500)],
+      ['instructions', stringValue(task.userRequest.instructions, 2_000)],
+      ['requestedAt', stringValue(task.userRequest.requestedAt, 64)],
+      ['expiresAt', stringValue(task.userRequest.expiresAt, 64)],
+      ['status', stringValue(task.userRequest.status, 32)],
+      ['screenshotAvailable', booleanValue(task.userRequest.screenshotAvailable)]
+    ])
+    : undefined;
+  const health = task?.health && typeof task.health === 'object'
+    ? definedEntries([
+      ['status', stringValue(task.health.status, 32)],
+      ['since', stringValue(task.health.since, 64)],
+      ['checkedAt', stringValue(task.health.checkedAt, 64)],
+      ['diagnosticRequested', booleanValue(task.health.diagnosticRequested)]
+    ])
+    : undefined;
+  const behaviorState = task?.behaviorState && typeof task.behaviorState === 'object'
+    ? definedEntries([
+      ['configured', stringValue(task.behaviorState.configured, 32)],
+      ['effective', stringValue(task.behaviorState.effective, 32)],
+      ['at', stringValue(task.behaviorState.at, 64)],
+      ['adaptive', task.behaviorState.adaptive && typeof task.behaviorState.adaptive === 'object'
+        ? definedEntries([
+          ['level', numberValue(task.behaviorState.adaptive.level)],
+          ['label', stringValue(task.behaviorState.adaptive.label, 32)],
+          ['actionsRemaining', numberValue(task.behaviorState.adaptive.actionsRemaining)],
+          ['signal', stringValue(task.behaviorState.adaptive.signal, 64)]
+        ])
+        : undefined]
+    ])
+    : undefined;
+  const cooldown = task?.cooldown && typeof task.cooldown === 'object'
+    ? definedEntries([
+      ['status', stringValue(task.cooldown.status, 32)],
+      ['durationMs', numberValue(task.cooldown.durationMs)],
+      ['resumeAt', stringValue(task.cooldown.resumeAt, 64)],
+      ['reason', stringValue(task.cooldown.reason, 160)],
+      ['updatedAt', stringValue(task.cooldown.updatedAt, 64)]
+    ])
+    : undefined;
   return definedEntries([
     ['id', stringValue(task?.id, 128)],
     ['profileId', stringValue(task?.profileId, 128)],
@@ -191,13 +243,21 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['history', publicAttemptHistory(task?.history)],
     ['state', stringValue(task?.state, 64)],
     ['progress', publicProgress(task?.progress)],
+    ['progressAt', stringValue(task?.progressAt, 64)],
     ['createdAt', stringValue(task?.createdAt, 64)],
     ['startedAt', stringValue(task?.startedAt, 64)],
     ['updatedAt', stringValue(task?.updatedAt, 64)],
     ['finishedAt', stringValue(task?.finishedAt, 64)],
     ['heartbeatAt', stringValue(task?.heartbeatAt, 64)],
+    ['health', health],
+    ['behaviorState', behaviorState],
+    ['cooldown', cooldown],
+    ['queuePosition', numberValue(task?.queuePosition)],
+    ['queueReason', stringValue(task?.queueReason, 160)],
     ['cleanup', cleanup && Object.keys(cleanup).length ? cleanup : undefined],
     ['diagnostic', diagnostic],
+    ['observation', observation],
+    ['userRequest', userRequest],
     ['checkpoint', task?.checkpoint ? definedEntries([
       ['available', true],
       ['savedAt', stringValue(task.checkpoint.savedAt, 64)]
@@ -209,14 +269,28 @@ export function publicTask(task, { includeResult = true } = {}) {
   ]);
 }
 
-export function publicTaskType(taskType) {
-  const schema = safeJson(taskType?.inputSchema);
+export function publicTaskType(taskType, { includeSchema = true } = {}) {
+  const schema = includeSchema ? safeJson(taskType?.inputSchema) : undefined;
+  const stringList = (value, maximum) => Array.isArray(value)
+    ? value.slice(0, maximum).map((item) => stringValue(item, 253)).filter(Boolean)
+    : undefined;
   return definedEntries([
     ['id', stringValue(taskType?.id ?? taskType?.name, 128)],
     ['title', stringValue(taskType?.title ?? taskType?.name, 120)],
     ['description', stringValue(taskType?.description, 1024)],
     ['version', stringValue(taskType?.version, 32)],
     ['readOnly', booleanValue(taskType?.readOnly)],
+    ['domains', stringList(taskType?.domains, 16)],
+    ['intents', stringList(taskType?.intents, 16)],
+    ['tags', stringList(taskType?.tags, 32)],
+    ['outputs', stringList(taskType?.outputs, 32)],
+    ['preferredBehavior', stringValue(taskType?.preferredBehavior, 32)],
+    ['risk', stringValue(taskType?.risk, 16)],
+    ['pack', taskType?.pack && typeof taskType.pack === 'object' ? definedEntries([
+      ['name', stringValue(taskType.pack.name, 80)],
+      ['version', stringValue(taskType.pack.version, 64)]
+    ]) : undefined],
+    ['supportsResume', booleanValue(taskType?.supportsResume)],
     ['inputSchema', schema && typeof schema === 'object' && !Array.isArray(schema) ? schema : undefined]
   ]);
 }

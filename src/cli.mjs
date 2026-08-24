@@ -17,6 +17,7 @@ import {
   verifyManagerIdentityProof
 } from './lib/manager-identity.mjs';
 import { redactSensitiveText } from './lib/redaction.mjs';
+import { readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -27,14 +28,19 @@ Usage:
   taskmaster status [--json]
   taskmaster manager stop [--json]
   taskmaster profiles list [--json]
-  taskmaster profiles create --name NAME [--behavior MODE] [--headless]
+  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--behavior MODE] [--headless]
   taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE]
   taskmaster profiles open|close|delete PROFILE_ID
-  taskmaster task-types list [--json]
+  taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
+  taskmaster task-types describe TASK_TYPE [--json]
   taskmaster task-types install --type NAME --module PATH [--json]
+  taskmaster task-packs validate PATH [--json]
+  taskmaster task-packs scaffold PATH --name PACK_NAME [--json]
+  taskmaster task-packs install PATH [--json]
   taskmaster task list [--json]
   taskmaster task run --profile ID --type TYPE [--module PATH] [--input JSON] [--request-key KEY]
   taskmaster task status|follow|cancel TASK_ID [--json]
+  taskmaster task continue TASK_ID [--request-id ID] [--note TEXT] [--json]
   taskmaster task resume TASK_ID --resume-key KEY [--detach] [--json]
   taskmaster artifacts list TASK_ID [--json]
   taskmaster artifacts read TASK_ID --artifact ARTIFACT_ID [--offset N] [--max-bytes N]
@@ -487,6 +493,7 @@ async function profileCommand(action, args, options, json) {
     if (!options.name) throw cliError('PROFILE_NAME_REQUIRED', '--name is required');
     const body = {
       name: options.name,
+      kind: options.kind || 'persistent',
       defaultBehavior: options.behavior || 'fast',
       headless: options.headless === true || options.headless === 'true',
       ...(options.channel ? { browserChannel: options.channel } : {})
@@ -589,13 +596,41 @@ async function taskCommand(action, args, options, json) {
     emit({ ok: true, ...result }, json);
     return;
   }
+  if (action === 'continue') {
+    const result = await requestJson(context.config.baseUrl, `/v1/tasks/${encodeURIComponent(taskId)}/continue`, {
+      method: 'POST',
+      token: context.token,
+      body: {
+        ...(options['request-id'] ? { requestId: options['request-id'] } : {}),
+        ...(options.note ? { note: options.note } : {})
+      }
+    });
+    emit({ ok: true, ...result }, json);
+    return;
+  }
   throw cliError('UNKNOWN_COMMAND', `Unknown task command: ${action}`);
 }
 
-async function taskTypeCommand(action, options, json) {
+async function taskTypeCommand(action, args, options, json) {
   const context = await apiContext(options);
   if (action === 'list') {
-    const result = await requestJson(context.config.baseUrl, '/v1/task-types', { token: context.token });
+    const query = new URLSearchParams();
+    if (options.query) query.set('query', options.query);
+    if (options.domain) query.set('domain', options.domain);
+    if (options.intent) query.set('intent', options.intent);
+    const suffix = query.size ? `?${query}` : '';
+    const result = await requestJson(context.config.baseUrl, `/v1/task-types${suffix}`, { token: context.token });
+    emit({ ok: true, ...result }, json);
+    return;
+  }
+  if (action === 'describe') {
+    const taskType = args[0];
+    if (!taskType) throw cliError('TASK_TYPE_REQUIRED', 'task-types describe requires a task type');
+    const result = await requestJson(
+      context.config.baseUrl,
+      `/v1/task-types/${encodeURIComponent(taskType)}`,
+      { token: context.token }
+    );
     emit({ ok: true, ...result }, json);
     return;
   }
@@ -612,6 +647,54 @@ async function taskTypeCommand(action, options, json) {
     return;
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown task-types command: ${action}`);
+}
+
+function publicPack(pack) {
+  return {
+    name: pack.name,
+    version: pack.version,
+    ...(pack.title ? { title: pack.title } : {}),
+    ...(pack.description ? { description: pack.description } : {}),
+    tasks: pack.tasks
+  };
+}
+
+async function taskPackCommand(action, args, options, json) {
+  const location = args[0];
+  if (!location) throw cliError('TASK_PACK_PATH_REQUIRED', `task-packs ${action} requires a path`);
+  if (action === 'validate') {
+    const loaded = await readTaskPack(location);
+    emit({ ok: true, taskPack: publicPack(loaded.pack) }, json);
+    return;
+  }
+  if (action === 'scaffold') {
+    if (!options.name) throw cliError('TASK_PACK_NAME_REQUIRED', '--name is required');
+    const created = await scaffoldTaskPack(location, { name: options.name });
+    emit({ ok: true, taskPack: publicPack(created.pack) }, json);
+    return;
+  }
+  if (action === 'install') {
+    const loaded = await readTaskPack(location);
+    const context = await apiContext(options);
+    const modules = [];
+    for (const module of loaded.modules) {
+      modules.push({ name: module.name, modulePath: await stageTaskModule(context.config, module.modulePath) });
+    }
+    const result = await requestJson(context.config.baseUrl, '/v1/task-packs/install', {
+      method: 'POST',
+      token: context.token,
+      body: {
+        name: loaded.pack.name,
+        version: loaded.pack.version,
+        ...(loaded.pack.title ? { title: loaded.pack.title } : {}),
+        ...(loaded.pack.description ? { description: loaded.pack.description } : {}),
+        modules
+      }
+    });
+    emit({ ok: true, ...result }, json);
+    return;
+  }
+  throw cliError('UNKNOWN_COMMAND', `Unknown task-packs command: ${action}`);
 }
 
 async function artifactCommand(action, args, options, json) {
@@ -692,7 +775,8 @@ async function main() {
     throw cliError('UNKNOWN_COMMAND', `Unknown manager command: ${action}`);
   }
   if (command === 'profiles') return profileCommand(positionals.shift() || 'list', positionals, options, json);
-  if (command === 'task-types') return taskTypeCommand(positionals.shift() || 'list', options, json);
+  if (command === 'task-types') return taskTypeCommand(positionals.shift() || 'list', positionals, options, json);
+  if (command === 'task-packs') return taskPackCommand(positionals.shift() || 'validate', positionals, options, json);
   if (command === 'task') return taskCommand(positionals.shift() || 'list', positionals, options, json);
   if (command === 'artifacts') return artifactCommand(positionals.shift() || 'list', positionals, options, json);
   if (command === 'mcp') return mcpCommand(positionals.shift() || 'status', options, json);

@@ -49,6 +49,10 @@
           <div><p class="eyebrow">PROFILES</p><h2>Playwright Profiles</h2></div>
           <form id="create-profile-form" class="inline-form">
             <input id="profile-name" maxlength="60" placeholder="Profile 名称" required>
+            <select id="profile-kind" aria-label="Profile 类型">
+              <option value="persistent">持久登录</option>
+              <option value="ephemeral">隐身临时</option>
+            </select>
             <select id="profile-mode" aria-label="默认行为模式">
               <option value="fast">快速</option>
               <option value="human">拟人</option>

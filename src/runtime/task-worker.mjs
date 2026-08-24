@@ -7,6 +7,8 @@ import { createCooldownHelper } from '../lib/cooldown.mjs';
 import { createEffectJournal } from '../lib/effect-journal.mjs';
 import { createOutputBudget } from '../lib/output-budget.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
+import { createSemanticObserver } from '../lib/semantic-observer.mjs';
+import { createUserHandoff } from '../lib/user-handoff.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 20_000;
 const DEFAULT_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
@@ -74,17 +76,39 @@ export async function closeTaskBrowserContext(context, timeoutMs = 10_000) {
   }
 }
 
+export async function closeTaskBrowserSession(context, browser, timeoutMs = 10_000) {
+  const contextClosed = await closeTaskBrowserContext(context, timeoutMs);
+  let browserClosed = true;
+  if (browser) {
+    try {
+      await withDeadline(browser.close?.() || Promise.resolve(), timeoutMs);
+    } catch {
+      browserClosed = false;
+    }
+  }
+  return contextClosed && browserClosed;
+}
+
 let activePage = null;
 let activeProgress = { current: 0, total: null, message: 'Starting browser' };
 let activeOutputBudget = null;
+let activeSemantic = null;
+let activeHandoff = null;
 
-async function captureFailure(page, outputDir, reason, outputBudget = activeOutputBudget) {
+async function captureFailure(
+  page,
+  outputDir,
+  reason,
+  outputBudget = activeOutputBudget,
+  semantic = activeSemantic
+) {
   if (!page || page.isClosed?.()) return null;
   const screenshotsDir = path.join(outputDir, 'screenshots');
   const safeReason = String(reason || 'failure').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 48);
   const screenshotPath = path.join(screenshotsDir, `${Date.now()}-${safeReason}.png`);
   let releaseReservation = () => {};
   let captured = false;
+  let result = null;
   try {
     await outputBudget?.assertSafeRoot?.();
     await mkdir(screenshotsDir, { recursive: true });
@@ -92,12 +116,40 @@ async function captureFailure(page, outputDir, reason, outputBudget = activeOutp
     await withDeadline(page.screenshot({ path: screenshotPath, fullPage: false }), 8_000);
     captured = true;
     safeSend({ type: 'screenshot', path: screenshotPath, reason: safeReason });
-    return screenshotPath;
+    result = screenshotPath;
   } catch {
-    return null;
+    result = null;
   } finally {
     if (!captured) releaseReservation();
   }
+  if (semantic) {
+    const observationsDir = path.join(outputDir, 'observations');
+    const observationPath = path.join(observationsDir, `${Date.now()}-${safeReason}.json`);
+    let releaseObservation = () => {};
+    let observationCaptured = false;
+    try {
+      await outputBudget?.assertSafeRoot?.();
+      await mkdir(observationsDir, { recursive: true });
+      releaseObservation = await outputBudget?.reserveDiagnostic?.(observationPath) || releaseObservation;
+      const snapshot = await withDeadline(semantic.snapshot({
+        scope: 'viewport',
+        maxNodes: 120,
+        maxTextChars: 8_000
+      }), 8_000);
+      await writeJsonAtomic(observationPath, {
+        reason: safeReason,
+        capturedAt: new Date().toISOString(),
+        snapshot
+      });
+      observationCaptured = true;
+      safeSend({ type: 'observation', path: observationPath, reason: safeReason });
+    } catch {
+      // A semantic diagnostic is best-effort and never hides the browser error.
+    } finally {
+      if (!observationCaptured) releaseObservation();
+    }
+  }
+  return result;
 }
 
 function normalizeResult(result) {
@@ -127,6 +179,7 @@ export async function runTaskWorker(config, {
   const heartbeatMs = Number(config.heartbeatMs) || DEFAULT_HEARTBEAT_MS;
   const timeoutMs = Number(config.timeoutMs) || DEFAULT_TASK_TIMEOUT_MS;
   let context = null;
+  let browser = null;
   let heartbeatTimer = null;
   let timeoutTimer = null;
   let lastScreenshot = null;
@@ -189,7 +242,11 @@ export async function runTaskWorker(config, {
     const playwright = await loadPlaywright();
     const browserName = config.profile.browser || 'chromium';
     const browserType = playwright[browserName];
-    if (!browserType?.launchPersistentContext) {
+    const profileKind = config.profile.kind || 'persistent';
+    if (
+      (profileKind === 'persistent' && !browserType?.launchPersistentContext) ||
+      (profileKind === 'ephemeral' && !browserType?.launch)
+    ) {
       const error = new Error(`Unsupported Playwright browser: ${browserName}`);
       error.code = 'BROWSER_UNSUPPORTED';
       throw error;
@@ -200,7 +257,15 @@ export async function runTaskWorker(config, {
       ...(config.profile.browserChannel ? { channel: config.profile.browserChannel } : {}),
       ...(config.profile.launchOptions || {})
     };
-    context = await browserType.launchPersistentContext(config.profile.userDataDir, launchOptions);
+    if (profileKind === 'ephemeral') {
+      browser = await browserType.launch(launchOptions);
+      context = await browser.newContext({
+        serviceWorkers: 'block',
+        ...(config.profile.contextOptions || {})
+      });
+    } else {
+      context = await browserType.launchPersistentContext(config.profile.userDataDir, launchOptions);
+    }
     const pages = context.pages();
     const page = pages[0] || await context.newPage();
     activePage = page;
@@ -249,18 +314,43 @@ export async function runTaskWorker(config, {
       }
     };
 
+    let semantic;
     const action = createActionHelper({
       page,
       mode: config.behavior,
       abortSignal: executionSignal,
       onEffect: (event) => effectJournal.record(event),
+      onAdaptiveState: (state) => safeSend({
+        type: 'behavior',
+        behavior: {
+          configured: config.behavior,
+          effective: state.level >= 2 ? 'human' : state.level === 1 ? 'cautious' : 'fast',
+          adaptive: state,
+          at: new Date().toISOString()
+        }
+      }),
       onFailure: async ({ operation }) => {
         lastScreenshot = await captureFailure(page, config.outputDir, `action-${operation}`, outputBudget);
       }
     });
+    semantic = createSemanticObserver({ page, action });
+    activeSemantic = semantic;
+    const handoff = createUserHandoff({
+      signal: executionSignal,
+      capture: (reason) => captureFailure(page, config.outputDir, reason, outputBudget, semantic),
+      onRequest: async (request) => safeSend({ type: 'waiting_user', request }),
+      onState: async (state) => safeSend({ type: 'state', state }),
+      onProgress: async (message) => progress({
+        current: activeProgress.current,
+        total: activeProgress.total,
+        message
+      })
+    });
+    activeHandoff = handoff;
     const cooldown = createCooldownHelper({
       signal: executionSignal,
       onSignal: (kind) => action.signal(kind),
+      onCooldown: async (record) => safeSend({ type: 'cooldown', cooldown: record }),
       onState: async (state) => safeSend({ type: 'state', state }),
       onProgress: async ({ durationMs, resumeAt, reason }) => progress({
         current: activeProgress.current,
@@ -288,6 +378,8 @@ export async function runTaskWorker(config, {
       action,
       cooldown,
       effects,
+      semantic,
+      handoff,
       progress,
       checkpoint,
       signal: executionSignal
@@ -345,9 +437,12 @@ export async function runTaskWorker(config, {
     // unknown outcome with a misleading terminal record.
     await effectJournal?.close?.().catch(() => {});
     if (!executionSignal.aborted) executionController.abort(new TaskCancelledError());
-    browserClosed = await closeTaskBrowserContext(context);
+    browserClosed = await closeTaskBrowserSession(context, browser);
     activePage = null;
     activeOutputBudget = null;
+    activeSemantic = null;
+    activeHandoff?.cancel();
+    activeHandoff = null;
     safeSend({ type: 'cleanup', browserClosed, at: new Date().toISOString() });
   }
 }
@@ -369,6 +464,9 @@ if (typeof process.send === 'function') {
       return;
     }
     if (message?.type === 'cancel') controller.abort();
+    if (message?.type === 'continue') {
+      void activeHandoff?.continue({ requestId: message.requestId, note: message.note });
+    }
     if (message?.type === 'diagnose') {
       void captureFailure(activePage, message.outputDir, message.reason || 'diagnostic').finally(() => {
         safeSend({ type: 'heartbeat', at: new Date().toISOString(), progress: activeProgress });

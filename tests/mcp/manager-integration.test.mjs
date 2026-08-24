@@ -13,9 +13,12 @@ test('HTTP client matches the scoped Manager task and artifact APIs', async (t) 
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>fixture</title>');
   const calls = [];
   const taskService = {
-    async listTaskTypes(caller) {
-      calls.push(['types', caller]);
+    async listTaskTypes(filters, caller) {
+      calls.push(['types', caller, filters]);
       return { taskTypes: [{ name: 'fixture.read', sha256: 'a'.repeat(64), size: 100 }] };
+    },
+    async describeTaskType(name) {
+      return { id: name, name, inputSchema: { type: 'object' } };
     },
     async list(options) {
       calls.push(['list', options]);

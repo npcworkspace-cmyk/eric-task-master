@@ -24,6 +24,7 @@ const ui = Object.freeze({
   pairExtension: document.querySelector('#pair-extension'),
   workspace: document.querySelector('#workspace'),
   newProfileName: document.querySelector('#new-profile-name'),
+  newProfileKind: document.querySelector('#new-profile-kind'),
   newProfileMode: document.querySelector('#new-profile-mode'),
   newProfileHeadless: document.querySelector('#new-profile-headless'),
   createProfile: document.querySelector('#create-profile'),
@@ -226,10 +227,12 @@ function renderProfiles() {
   ui.profileList.replaceChildren();
   ui.sessionProfile.replaceChildren();
   for (const profile of profiles) {
-    const option = document.createElement('option');
-    option.value = profile.id;
-    option.textContent = profile.name;
-    ui.sessionProfile.append(option);
+    if (profile.kind !== 'ephemeral') {
+      const option = document.createElement('option');
+      option.value = profile.id;
+      option.textContent = profile.name;
+      ui.sessionProfile.append(option);
+    }
 
     const row = document.createElement('div');
     row.className = 'profile-row';
@@ -241,7 +244,8 @@ function renderProfiles() {
     name.textContent = profile.name;
     const state = document.createElement('div');
     state.className = 'profile-state';
-    state.textContent = profile.status || profile.state || 'idle';
+    const kind = profile.kind === 'ephemeral' ? '隐身临时' : '持久登录';
+    state.textContent = `${kind} · ${profile.status || profile.state || 'idle'}`;
     copy.append(name, state);
 
     const mode = document.createElement('select');
@@ -267,10 +271,13 @@ function renderProfiles() {
     const actions = document.createElement('div');
     actions.className = 'profile-actions';
     const isOpen = ['open', 'leased', 'starting'].includes(profile.status || profile.state);
-    actions.append(
-      makeButton('改名', `重命名 ${profile.name}`, () => renameProfile(profile)),
-      makeButton(isOpen ? '关闭' : '打开', `${isOpen ? '关闭' : '打开'} ${profile.name}`, () => setProfileOpen(profile, !isOpen))
-    );
+    const rename = makeButton('改名', `重命名 ${profile.name}`, () => renameProfile(profile));
+    const toggle = makeButton(isOpen ? '关闭' : '打开', `${isOpen ? '关闭' : '打开'} ${profile.name}`, () => setProfileOpen(profile, !isOpen));
+    if (profile.kind === 'ephemeral') {
+      toggle.disabled = true;
+      toggle.title = '隐身 Profile 仅在任务中临时启动，结束后自动销毁';
+    }
+    actions.append(rename, toggle);
     row.append(copy, mode, headless, actions);
     ui.profileList.append(row);
   }
@@ -281,7 +288,7 @@ function renderProfiles() {
     empty.textContent = '还没有 Profile';
     ui.profileList.append(empty);
   }
-  ui.syncSession.disabled = !profiles.length || !activeSite;
+  ui.syncSession.disabled = ui.sessionProfile.options.length === 0 || !activeSite;
 }
 
 async function refreshProfiles() {
@@ -307,7 +314,12 @@ async function createProfile() {
   try {
     await request('/v1/profiles', {
       method: 'POST',
-      body: { name, defaultBehavior: ui.newProfileMode.value, headless: ui.newProfileHeadless.checked }
+      body: {
+        name,
+        kind: ui.newProfileKind.value,
+        defaultBehavior: ui.newProfileMode.value,
+        headless: ui.newProfileHeadless.checked
+      }
     });
     ui.newProfileName.value = '';
     ui.newProfileHeadless.checked = false;
@@ -424,7 +436,7 @@ async function syncCurrentSite() {
   } catch (error) {
     setMessage(error.message, 'error');
   } finally {
-    ui.syncSession.disabled = !profiles.length || !activeSite;
+    ui.syncSession.disabled = ui.sessionProfile.options.length === 0 || !activeSite;
   }
 }
 

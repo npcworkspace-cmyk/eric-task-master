@@ -90,29 +90,65 @@ test('human mode uses bounded pointer motion, typing rhythm, eased scroll, and r
   assert.ok(sleeps.includes(readingDelay));
 });
 
-test('adaptive mode slows after a signal and does not retry failed actions', async () => {
+test('adaptive mode grades ordinary dynamic signals separately from ambiguous failures', async () => {
   const { locator, page } = fixture();
   const sleeps = [];
   const failures = [];
-  let clickCount = 0;
-  locator.click = async () => {
-    clickCount += 1;
-    throw new Error('covered by overlay');
-  };
+  const states = [];
   const action = createActionHelper({
     page,
     mode: 'adaptive',
     random: () => 0,
     sleep: async (ms) => sleeps.push(ms),
-    onFailure: async (failure) => failures.push(failure.operation)
+    onFailure: async (failure) => failures.push(failure.operation),
+    onAdaptiveState: (state) => states.push(state)
   });
 
   action.signal('dynamic');
-  assert.equal(action.effectiveMode, 'human');
+  assert.equal(action.effectiveMode, 'cautious');
+  assert.deepEqual(action.adaptiveState, {
+    level: 1,
+    label: 'cautious',
+    actionsRemaining: 2,
+    signal: 'dynamic'
+  });
+  await action.hover('#submit');
+  assert.equal(action.effectiveMode, 'cautious');
+  assert.equal(sleeps.every((ms) => ms <= 75), true);
+  assert.equal(action.adaptiveState.actionsRemaining, 1);
+  await action.hover('#submit');
+  assert.equal(action.effectiveMode, 'fast');
+
+  let clickCount = 0;
+  locator.click = async () => {
+    clickCount += 1;
+    throw new Error('covered by overlay');
+  };
   await assert.rejects(action.click('#submit'), BehaviorActionError);
   assert.equal(clickCount, 1);
   assert.deepEqual(failures, ['click']);
+  assert.equal(action.effectiveMode, 'human');
+  assert.equal(action.adaptiveState.label, 'guarded');
   assert.ok(sleeps.length > 0);
+  assert.deepEqual(states.map((state) => state.label), ['cautious', 'cautious', 'fast', 'guarded']);
+});
+
+test('adaptive rate-limit signals preserve a full guarded action budget', async () => {
+  const { page } = fixture();
+  page.goto = async () => ({
+    status: () => 429,
+    headers: () => ({ 'retry-after': '10' })
+  });
+  const action = createActionHelper({ page, mode: 'adaptive', sleep: async () => {} });
+
+  await action.goto('https://example.test');
+  assert.deepEqual(action.adaptiveState, {
+    level: 3,
+    label: 'cooldown',
+    actionsRemaining: 6,
+    signal: 'rate_limit'
+  });
+  assert.equal(action.effectiveMode, 'human');
 });
 
 test('an action exception stays pending because the website outcome is unknown', async () => {

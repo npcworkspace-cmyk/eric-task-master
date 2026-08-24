@@ -4,7 +4,7 @@
 
 1. Browser work is executed only through Playwright APIs.
 2. The everyday-browser extension is control-plane only. Its sole page-data capability is a user-clicked, origin-scoped session transfer.
-3. A persistent profile has at most one live lease.
+3. Every Profile has at most one live lease. A persistent Profile owns browser state; an ephemeral Profile is a clean task-scoped context template and retains none.
 4. Every task has a state, heartbeat, progress record, output directory, and deterministic cleanup.
 5. Unknown action outcomes are inspected before retrying.
 6. Authentication material never appears in agent-visible responses or logs.
@@ -52,13 +52,18 @@ The first Manager state initialization persists an Ed25519 key pair beside the p
 - `POST /v1/profiles/:id/close`
 - `POST /v1/profiles/:id/session`
 
+`kind` is immutable. `persistent` Profiles can be opened and receive explicit origin-scoped session transfer. `ephemeral` Profiles reject both operations and launch `browser.newContext()` inside each task; cleanup closes the context and owning browser.
+
 ### Tasks
 
 - `GET /v1/task-types`
+- `GET /v1/task-types/:id`
 - `POST /v1/task-types/install` (Manager admin only)
+- `POST /v1/task-packs/install` (Manager admin only, transactional batch)
 - `GET /v1/tasks`
 - `POST /v1/tasks`
 - `GET /v1/tasks/:id`
+- `POST /v1/tasks/:id/continue`
 - `POST /v1/tasks/:id/resume`
 - `POST /v1/tasks/:id/cancel`
 - `GET /v1/tasks/:id/artifacts`
@@ -83,7 +88,13 @@ An active task changes the state to `leased`. A stale process lock is recovered 
 
 `queued -> acquiring_profile -> starting_browser -> running -> verifying -> completed`
 
+Manager owns a bounded FIFO scheduler. Different Profiles may occupy independent slots; work for the same Profile remains queued until the previous Worker exits and its lease is released. Queue position/reason are public. Manager restart preserves never-started queued tasks and fails interrupted active work closed.
+
 Side states are `waiting_user`, `cooling_down`, `recovering`, `failed`, and `cancelled`. Terminal tasks always pass through cleanup.
+
+Heartbeat and progress are separate clocks. Heartbeat proves Worker liveness. `progressAt` proves application work advanced. The default stall detector requests screenshot plus semantic diagnostics after two minutes without progress and fails/cleans up after ten minutes of continued silence; explicit `waiting_user` and `cooling_down` states are exempt.
+
+`waiting_user` is an in-process handoff, not a new task. The Worker captures diagnostics, publishes one bounded request ID, and waits. Only a matching continuation from the owning Agent/authorized Dashboard resumes the same Worker; timeout or cancellation fails closed and cleanup closes its browser.
 
 `completed` is never accepted directly from a Worker. A Worker completion claim first enters `verifying`; Manager then validates the bounded result shape, every declared agent-visible artifact, confirmed browser closure, Worker exit, and Profile lease release. A failed gate becomes `TASK_COMPLETION_GATE_FAILED`.
 
@@ -93,7 +104,7 @@ A failed task with a stable checkpoint can be resumed only by its original owner
 
 - `fast`: deterministic native Playwright operations with minimum necessary waits.
 - `human`: bounded curved pointer motion, safe in-target click offsets and press duration, per-character typing rhythm, eased scrolling, and explicit reading dwell.
-- `adaptive`: starts fast and slows after dynamic-page failures or rate-limit signals.
+- `adaptive`: starts fast, uses a short cautious tier for ordinary dynamic signals, and uses bounded guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. Stronger signals retain a larger guarded-action budget; successful actions decay back to fast. No tier retries an unknown effect automatically.
 
 Task-level policy overrides the profile default and is discarded during cleanup.
 Only task logic knows when content is actually being read, so it requests bounded dwell with `action.read({ words })`; the runtime does not guess from page size or silently slow deterministic collection.
@@ -111,7 +122,11 @@ Manager never imports a task module while installing it. A short-lived inspector
 ```js
 export const meta = { name: 'example', version: '1.0.0' };
 
-export async function run({ page, context, input, outputDir, action, cooldown, effects, progress, checkpoint, signal }) {
+export async function run({
+  page, context, input, outputDir,
+  action, cooldown, effects, semantic, handoff,
+  progress, checkpoint, signal
+}) {
   await action.goto(input.url, { waitUntil: 'domcontentloaded' });
   await progress({ current: 1, total: 1, message: 'Loaded target' });
   return { summary: 'Done', evidence: [{ kind: 'url', value: page.url() }] };
@@ -119,6 +134,10 @@ export async function run({ page, context, input, outputDir, action, cooldown, e
 ```
 
 Each attempt replays the same internal effect journal. State-changing operations must use `action`; direct `page` access is observational. A `started` record without a durable terminal record is carried into the next attempt and blocks every new action until trusted task logic inspects external state and explicitly resolves that exact sequence as observed succeeded or observed not applied. Resume never clears an unknown outcome implicitly. Timeout, cancellation, and output-budget failure abort the task signal before bounded screenshot diagnostics, so the action facade rejects late operations before cleanup.
+
+`semantic.snapshot()` builds one bounded, redacted ref/text view across up to sixteen Playwright Frames. A ref resolves only while its snapshot and page URL are current; navigation invalidates it. `semantic.click/fill/navigate` route through the same action/effect policy. Diagnostics persist the semantic view beside the viewport screenshot, allowing an Agent to inspect structure first and use pixels only where structure is ambiguous.
+
+Task-type list responses contain compact metadata (`domains`, `intents`, `tags`, outputs, risk, preferred behavior, resume support, and Pack provenance) without the input schema. The full schema is returned only by describe. A Task Pack validates and inspects every candidate before one registry commit; conflicts cannot partially install a Pack.
 
 `checkpoint(data)` persists an internal timestamped envelope, while task code sees only the exact prior `data` from `checkpoint.read()`. Output and checkpoint are not one filesystem transaction; resumable modules therefore use deterministic per-unit outputs or stable-key deduplication instead of blind append-only writes.
 

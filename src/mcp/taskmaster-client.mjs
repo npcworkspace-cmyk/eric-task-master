@@ -30,10 +30,12 @@ export const TASKMASTER_CLIENT_METHODS = Object.freeze([
   'openProfile',
   'closeProfile',
   'listTaskTypes',
+  'describeTaskType',
   'startTask',
   'listTasks',
   'getTask',
   'waitTask',
+  'continueTask',
   'resumeTask',
   'cancelTask',
   'listArtifacts',
@@ -280,7 +282,7 @@ export class HttpTaskMasterClient {
   }
 
   async createProfile(input) {
-    assertAllowedKeys(input, new Set(['name', 'defaultBehavior', 'headless', 'browserChannel']), 'Profile request');
+    assertAllowedKeys(input, new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel']), 'Profile request');
     return (await this.#request('/v1/profiles', { method: 'POST', body: input })).profile;
   }
 
@@ -294,9 +296,15 @@ export class HttpTaskMasterClient {
     return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}/close`, { method: 'POST', body: {} })).profile;
   }
 
-  async listTaskTypes() {
-    const payload = await this.#request('/v1/task-types');
+  async listTaskTypes(input = {}) {
+    assertAllowedKeys(input, new Set(['query', 'domain', 'intent']), 'Task type list request');
+    const payload = await this.#request(buildQuery('/v1/task-types', input));
     return Array.isArray(payload.taskTypes) ? payload.taskTypes : [];
+  }
+
+  async describeTaskType(taskType) {
+    assertIdentifier(taskType, 'taskType');
+    return (await this.#request(`/v1/task-types/${encodeURIComponent(taskType)}`)).taskType;
   }
 
   async startTask(input) {
@@ -339,6 +347,9 @@ export class HttpTaskMasterClient {
         TERMINAL_STATES.has(task?.state) &&
         (task?.cleanup?.settled === true || task?.cleanup?.managerRestartObserved === true)
       ) return { task, timedOut: false };
+      if (task?.state === 'waiting_user' || task?.health?.status === 'stalled') {
+        return { task, timedOut: false };
+      }
       if (Date.now() >= deadline) break;
       await delay(Math.min(500, Math.max(1, deadline - Date.now())), signal);
     } while (Date.now() <= deadline);
@@ -348,6 +359,22 @@ export class HttpTaskMasterClient {
   async cancelTask(taskId) {
     assertIdentifier(taskId, 'taskId');
     return (await this.#request(`/v1/tasks/${encodeURIComponent(taskId)}/cancel`, { method: 'POST', body: {} })).task;
+  }
+
+  async continueTask(input) {
+    assertAllowedKeys(input, new Set(['taskId', 'requestId', 'note']), 'Task continue request');
+    assertIdentifier(input.taskId, 'taskId');
+    if (input.requestId !== undefined) assertIdentifier(input.requestId, 'requestId');
+    if (input.note !== undefined && (typeof input.note !== 'string' || input.note.length > 2_000)) {
+      throw clientError('INVALID_TASK_CONTINUE', 'note must contain at most 2000 characters.');
+    }
+    return (await this.#request(`/v1/tasks/${encodeURIComponent(input.taskId)}/continue`, {
+      method: 'POST',
+      body: {
+        ...(input.requestId ? { requestId: input.requestId } : {}),
+        ...(input.note ? { note: input.note } : {})
+      }
+    })).task;
   }
 
   async resumeTask(input) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -80,6 +80,21 @@ async function waitForTask(baseUrl, token, id, timeoutMs = 120_000) {
   throw Object.assign(new Error(`Task ${id} did not finish cleanup`), { code: 'ACCEPTANCE_TASK_TIMEOUT', task });
 }
 
+async function waitForTaskState(baseUrl, token, id, expectedState, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let task;
+  while (Date.now() < deadline) {
+    ({ task } = await api(baseUrl, `/v1/tasks/${encodeURIComponent(id)}`, { token }));
+    if (task.state === expectedState) return task;
+    if (TERMINAL_TASK_STATES.has(task.state)) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  throw Object.assign(new Error(`Task ${id} did not reach ${expectedState}`), {
+    code: 'ACCEPTANCE_TASK_STATE_TIMEOUT',
+    task
+  });
+}
+
 async function readArtifactText(baseUrl, token, taskId, artifactId) {
   const payload = await api(
     baseUrl,
@@ -111,6 +126,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
   const add = (name, passed, detail) => checks.push({ name, passed: Boolean(passed), ...(detail ? { detail } : {}) });
   const fixture = await fixtureServer();
   let profile;
+  let ephemeralProfile;
   const tasks = [];
   try {
     const health = await api(baseUrl, '/v1/health');
@@ -289,6 +305,117 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     }
     add('bounded artifact API', true);
 
+    ({ profile: ephemeralProfile } = await api(baseUrl, '/v1/profiles', {
+      method: 'POST',
+      token,
+      body: {
+        name: `Ephemeral acceptance ${Date.now()}`,
+        kind: 'ephemeral',
+        defaultBehavior: 'adaptive',
+        headless: true
+      }
+    }));
+    add(
+      'ephemeral Profile creation',
+      ephemeralProfile?.id && ephemeralProfile.kind === 'ephemeral' && ephemeralProfile.state === 'idle'
+    );
+
+    for (const operation of ['open', 'session']) {
+      let rejected = false;
+      try {
+        await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}/${operation}`, {
+          method: 'POST',
+          token: operation === 'session' ? paired.token : token,
+          ...(operation === 'session' ? {
+            headers: { Origin: extensionOrigin },
+            body: {
+              origin: fixtureOrigin,
+              cookies: [],
+              localStorage: [],
+              source: { tabUrl: fixtureOrigin }
+            }
+          } : { body: {} })
+        });
+      } catch (error) {
+        rejected = error.code === (
+          operation === 'open'
+            ? 'EPHEMERAL_PROFILE_OPEN_UNSUPPORTED'
+            : 'EPHEMERAL_PROFILE_SESSION_UNSUPPORTED'
+        );
+      }
+      add(`ephemeral Profile rejects ${operation}`, rejected);
+    }
+
+    const ephemeralTasks = [];
+    for (let index = 0; index < 2; index += 1) {
+      const created = await api(baseUrl, '/v1/tasks', {
+        method: 'POST',
+        token,
+        body: {
+          profileId: ephemeralProfile.id,
+          taskType: 'acceptance',
+          idempotencyKey: `acceptance-${acceptanceRunId}-ephemeral-${index}`,
+          behavior: 'adaptive',
+          timeoutMs: 90_000,
+          input: { url: fixture.url, uploadPath, expectCleanStart: true }
+        }
+      });
+      ephemeralTasks.push(await waitForTask(baseUrl, token, created.task.id));
+    }
+    add(
+      'ephemeral task isolation',
+      ephemeralTasks.every((task) => (
+        task.state === 'completed' &&
+        task.result?.evidence?.some((item) => item.kind === 'ephemeral-clean-start' && item.ok)
+      ))
+    );
+
+    const handoffCreated = await api(baseUrl, '/v1/tasks', {
+      method: 'POST',
+      token,
+      body: {
+        profileId: ephemeralProfile.id,
+        taskType: 'handoff-acceptance',
+        idempotencyKey: `acceptance-${acceptanceRunId}-handoff`,
+        behavior: 'adaptive',
+        timeoutMs: 90_000,
+        input: { url: fixture.url }
+      }
+    });
+    const waiting = await waitForTaskState(baseUrl, token, handoffCreated.task.id, 'waiting_user');
+    const waitingArtifacts = await api(
+      baseUrl,
+      `/v1/tasks/${encodeURIComponent(waiting.id)}/artifacts`,
+      { token }
+    );
+    add(
+      'waiting_user diagnostics',
+      waiting.userRequest?.status === 'pending' &&
+      waiting.lastScreenshot?.ref &&
+      waiting.lastObservation?.ref &&
+      waitingArtifacts.artifacts.some((item) => item.kind === 'diagnostic-screenshot') &&
+      waitingArtifacts.artifacts.some((item) => item.kind === 'diagnostic-observation')
+    );
+    await api(baseUrl, `/v1/tasks/${encodeURIComponent(waiting.id)}/continue`, {
+      method: 'POST',
+      token,
+      body: { requestId: waiting.userRequest.id, note: 'acceptance-continue' }
+    });
+    const handoffTask = await waitForTask(baseUrl, token, waiting.id);
+    add(
+      'waiting_user same-task continuation',
+      handoffTask.state === 'completed' &&
+      handoffTask.id === waiting.id &&
+      handoffTask.userRequest?.status === 'continued'
+    );
+    add(
+      'ephemeral Profile leaves no browser state',
+      (await readdir(resolve(stateDir, 'profiles', ephemeralProfile.id))).length === 0
+    );
+
+    await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}`, { method: 'DELETE', token });
+    ephemeralProfile = null;
+
     await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE', token });
     const remaining = await api(baseUrl, '/v1/profiles', { token });
     add(
@@ -303,6 +430,9 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     if (profile?.id) {
       await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}/close`, { method: 'POST', token }).catch(() => {});
       await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE', token }).catch(() => {});
+    }
+    if (ephemeralProfile?.id) {
+      await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}`, { method: 'DELETE', token }).catch(() => {});
     }
     await fixture.close();
   }

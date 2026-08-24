@@ -185,6 +185,190 @@ test('cancellation is terminal and still releases the profile lease', async (t) 
   await service.close();
 });
 
+test('waiting_user keeps the same live task and continues only through its matching handoff', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  const requestId = `handoff_${'a'.repeat(32)}`;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          setImmediate(() => {
+            child.emit('message', { type: 'heartbeat', at: new Date().toISOString() });
+            child.emit('message', {
+              type: 'waiting_user',
+              request: {
+                id: requestId,
+                reason: 'Confirm the live page',
+                instructions: 'Inspect diagnostics first',
+                requestedAt: new Date().toISOString(),
+                expiresAt: new Date(Date.now() + 60_000).toISOString(),
+                screenshotAvailable: true
+              }
+            });
+            child.emit('message', { type: 'state', state: 'waiting_user' });
+            child.emit('message', {
+              type: 'progress',
+              at: new Date().toISOString(),
+              progress: { current: 1, total: 2, message: 'Waiting for instruction' }
+            });
+          });
+        }
+        if (message.type === 'continue') {
+          setImmediate(() => {
+            child.emit('message', { type: 'state', state: 'running' });
+            child.emit('message', { type: 'result', result: { summary: 'Continued safely', evidence: [] } });
+            child.emit('message', { type: 'state', state: 'completed' });
+            child.emit('message', { type: 'cleanup', browserClosed: true });
+            child.finish(0);
+          });
+        }
+      });
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'task-service-handoff'
+  }, ADMIN);
+  const waiting = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.state === 'waiting_user' ? task : null;
+  });
+  assert.equal(waiting.userRequest.id, requestId);
+  assert.equal(waiting.userRequest.status, 'pending');
+  assert.equal(waiting.health.status, 'waiting_user');
+  await assert.rejects(
+    service.continueTask(created.id, { requestId: `handoff_${'b'.repeat(32)}` }, ADMIN),
+    { code: 'USER_HANDOFF_MISMATCH', statusCode: 409 }
+  );
+  const recovering = await service.continueTask(created.id, { requestId, note: 'Page checked' }, ADMIN);
+  assert.notEqual(recovering.state, 'waiting_user');
+  const completed = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.cleanup.settled ? task : null;
+  });
+  assert.equal(completed.state, 'completed');
+  assert.equal(completed.id, created.id);
+  assert.equal(completed.userRequest.status, 'continued');
+  assert.equal(store.profile.state, 'idle');
+  await service.close();
+});
+
+test('same-Profile tasks queue in FIFO order instead of failing a lease collision', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-queue-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  const workers = [];
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    maxConcurrentTasks: 2,
+    workerFactory() {
+      const worker = new FakeWorker();
+      worker.onSend = (message) => {
+        if (message.type === 'start') workers.push({ worker, taskId: message.config.taskId });
+      };
+      return worker;
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const first = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'queue-first'
+  }, ADMIN);
+  const second = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'queue-second'
+  }, ADMIN);
+  assert.equal(workers.length, 1);
+  assert.equal((await service.get(second.id, ADMIN)).state, 'queued');
+  assert.equal((await service.get(second.id, ADMIN)).queuePosition, 1);
+
+  const complete = (entry, summary) => {
+    entry.worker.emit('message', { type: 'result', result: { summary, evidence: [] } });
+    entry.worker.emit('message', { type: 'state', state: 'completed' });
+    entry.worker.emit('message', { type: 'cleanup', browserClosed: true });
+    entry.worker.finish();
+  };
+  complete(workers[0], 'first complete');
+  await waitFor(() => workers.length === 2);
+  assert.equal(workers[1].taskId, second.id);
+  complete(workers[1], 'second complete');
+  const done = await waitFor(async () => {
+    const task = await service.get(second.id, ADMIN);
+    return task.state === 'completed' && task.cleanup.settled ? task : null;
+  });
+  assert.equal(done.result.summary, 'second complete');
+  assert.equal((await service.schedulerStatus()).queued, 0);
+  await service.close();
+});
+
+test('live-but-stalled tasks trigger diagnostics and fail after the bounded progress deadline', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-stall-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  const messages = [];
+  let heartbeat;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    progressStallMs: 1_000,
+    progressFailureMs: 1_500,
+    diagnosticGraceMs: 100,
+    heartbeatTimeoutMs: 1_000,
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        messages.push(message.type === 'diagnose' ? `${message.type}:${message.reason}` : message.type);
+        if (message.type === 'start') {
+          child.emit('message', { type: 'state', state: 'running' });
+          heartbeat = setInterval(() => child.emit('message', {
+            type: 'heartbeat', at: new Date().toISOString()
+          }), 100);
+        }
+        if (message.type === 'cancel') {
+          clearInterval(heartbeat);
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish();
+        }
+      });
+    }
+  });
+  t.after(() => clearInterval(heartbeat));
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'stalled-task'
+  }, ADMIN);
+  const stalled = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.health?.status === 'stalled' ? task : null;
+  }, 3_000);
+  assert.equal(stalled.health.diagnosticRequested, true);
+  assert.ok(messages.includes('diagnose:progress-stalled'));
+  const failed = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.cleanup.settled ? task : null;
+  }, 4_000);
+  assert.equal(failed.state, 'failed');
+  assert.equal(failed.error.code, 'TASK_PROGRESS_STALLED');
+  assert.equal(failed.cleanup.browserClosed, true);
+  await service.close();
+});
+
 test('session import response never echoes cookie or localStorage values', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-import-'));
   t.after(() => rm(root, { recursive: true, force: true }));
