@@ -132,8 +132,11 @@ export async function runCommercialAcceptance() {
     const timed = await client.startTask({
       profileId: profiles[1].id,
       taskType: 'durable-delay',
+      // Keep the task deadline long enough for a cold Chromium start on every
+      // supported runner, then exceed it inside the running page so screenshot
+      // and semantic timeout diagnostics are meaningfully testable.
       input: { steps: 120, delayMs: 100 },
-      timeoutMs: 1_000,
+      timeoutMs: 10_000,
       idempotencyKey: `commercial-timeout-${Date.now()}`
     });
     taskIds.push(timed.id);
@@ -146,7 +149,13 @@ export async function runCommercialAcceptance() {
         timedDone.error?.code === 'TASK_TIMEOUT' &&
         timedDone.cleanup?.browserClosed === true &&
         diagnostics.some((artifact) => artifact.kind === 'diagnostic-screenshot') &&
-        diagnostics.some((artifact) => artifact.kind === 'diagnostic-observation')
+        diagnostics.some((artifact) => artifact.kind === 'diagnostic-observation'),
+      JSON.stringify({
+        state: timedDone.state,
+        errorCode: timedDone.error?.code,
+        browserClosed: timedDone.cleanup?.browserClosed,
+        artifactKinds: diagnostics.map((artifact) => artifact.kind)
+      })
     );
 
     const profileRootsAreEmpty = (await Promise.all(profiles.map(async (profile) => (

@@ -291,14 +291,34 @@ test('the real MV3 panel pairs, manages a Playwright Profile, and opens a scoped
     return current?.defaultBehavior === 'human' ? current : null;
   });
 
+  const openResponsePromise = popup.waitForResponse((response) => {
+    const request = response.request();
+    return request.method() === 'POST' &&
+      new URL(response.url()).pathname === `/v1/profiles/${profile.id}/open`;
+  }, { timeout: 75_000 });
   await row.getByRole('button', { name: '打开', exact: true }).click();
+  const openResponse = await openResponsePromise;
+  const openPayload = await openResponse.json().catch(() => ({}));
+  assert.equal(openResponse.ok(), true, JSON.stringify(openPayload));
   await poll(async () => {
     const list = await api(manager, '/v1/profiles');
     return list.profiles.find((item) => item.id === profile.id)?.state === 'open';
-  }, 30_000);
+  });
   await popup.locator('#refresh-profiles').click();
+  row = popup.locator('.profile-row').filter({ hasText: profileName });
   const closeButton = row.getByRole('button', { name: '关闭', exact: true });
-  await closeButton.waitFor({ state: 'visible' });
+  try {
+    await closeButton.waitFor({ state: 'visible', timeout: 20_000 });
+  } catch (error) {
+    error.message += ` profileOpen=${JSON.stringify({
+      response: openPayload,
+      profiles: (await api(manager, '/v1/profiles')).profiles,
+      message: await popup.locator('#status-message').textContent(),
+      panel: await popup.locator('#profile-list').innerText(),
+      errors: popupErrors
+    })}`;
+    throw error;
+  }
   await closeButton.click();
   await poll(async () => {
     const list = await api(manager, '/v1/profiles');
@@ -309,6 +329,7 @@ test('the real MV3 panel pairs, manages a Playwright Profile, and opens a scoped
   await popup.getByRole('button', { name: /打开任务 Dashboard/ }).click();
   const dashboard = await dashboardPromise;
   await dashboard.waitForLoadState('domcontentloaded');
+  await dashboard.bringToFront();
   await poll(async () => (await dashboard.locator('#connection-label').textContent()) === '本机 Manager 已连接');
   assert.equal(new URL(dashboard.url()).hash, '');
   assert.equal(await dashboard.locator('#profile-count').textContent(), '1');
