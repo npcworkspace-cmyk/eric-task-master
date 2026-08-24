@@ -71,7 +71,8 @@ The supported `inputSchema` subset is deliberately small and enforced at registr
 
 ## Runtime rules
 
-- Use `action.goto/click/fill/type/hover/scroll/run` so the selected `fast`, `human`, or `adaptive` policy applies. Direct Playwright locators remain available for deterministic reads and assertions.
+- Use `action.goto/click/fill/type/hover/scroll/read/run` so the selected `fast`, `human`, or `adaptive` policy applies. Direct Playwright locators remain available for deterministic reads and assertions.
+- After observing content that a human-paced workflow actually reads, call `await action.read({ words: observedWordCount })`. The delay is bounded to eight seconds, returns its duration, and is zero in effective fast mode. Do not use it for deterministic bulk extraction.
 - Report progress after each meaningful, externally verifiable unit. Automatic heartbeat does not replace task progress.
 - Checkpoint after a recoverable unit. `await checkpoint(data)` stores that bounded data; `await checkpoint.read()` returns exactly the previously stored `data` object, or `null` when no checkpoint exists. It does not return an internal `{ savedAt, data }` wrapper.
 - A resume reruns `run(runtime)` in a new isolated Worker and browser context while preserving the same task ID, input, output directory, and checkpoint. Start with `const previous = await checkpoint.read()` and branch from fields such as `previous?.nextIndex`; do not assume in-memory variables from the previous attempt still exist.

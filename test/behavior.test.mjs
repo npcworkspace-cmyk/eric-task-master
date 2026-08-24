@@ -8,7 +8,9 @@ function fixture() {
     async hover() { calls.push(['hover']); },
     async click(options) { calls.push(['click', options]); },
     async fill(value, options) { calls.push(['fill', value, options]); },
-    async pressSequentially(value, options) { calls.push(['pressSequentially', value, options]); }
+    async pressSequentially(value, options) { calls.push(['pressSequentially', value, options]); },
+    async scrollIntoViewIfNeeded() { calls.push(['scrollIntoViewIfNeeded']); },
+    async boundingBox() { return { x: 100, y: 80, width: 120, height: 40 }; }
   };
   const page = {
     locator(selector) {
@@ -16,6 +18,7 @@ function fixture() {
       return locator;
     },
     mouse: {
+      async move(x, y) { calls.push(['move', x, y]); },
       async wheel(x, y) { calls.push(['wheel', x, y]); }
     },
     async goto(url, options) {
@@ -35,32 +38,56 @@ test('fast mode performs native actions without artificial sleeps', async () => 
   await action.click('#submit');
   await action.fill('#name', 'Eric');
   await action.scroll({ deltaY: 420 });
+  const readingDelay = await action.read({ words: 50 });
 
   assert.deepEqual(sleeps, []);
+  assert.equal(readingDelay, 0);
   assert.ok(calls.some((item) => item[0] === 'click'));
   assert.ok(calls.some((item) => item[0] === 'fill' && item[1] === 'Eric'));
   assert.deepEqual(calls.find((item) => item[0] === 'wheel'), ['wheel', 0, 420]);
+  assert.equal(calls.some((item) => item[0] === 'move'), false);
 });
 
-test('human mode uses bounded pauses, sequential typing, and segmented scroll', async () => {
+test('human mode uses bounded pointer motion, typing rhythm, eased scroll, and reading dwell', async () => {
   const { calls, page } = fixture();
   const sleeps = [];
+  const randomValues = [0.1, 0.9, 0.3, 0.7];
+  let randomIndex = 0;
   const action = createActionHelper({
     page,
     mode: 'human',
-    random: () => 0,
+    random: () => randomValues[randomIndex++ % randomValues.length],
     sleep: async (ms) => sleeps.push(ms)
   });
 
-  await action.type('#name', 'hello');
-  await action.scroll({ deltaY: 300, steps: 3 });
+  await action.click('#submit');
+  const clickMoves = calls.filter((item) => item[0] === 'move');
+  await action.type('#name', 'Hi, x');
+  await action.scroll({ deltaY: 300, steps: 5 });
+  const readingDelay = await action.read({ words: 20 });
 
-  assert.ok(calls.some((item) => item[0] === 'pressSequentially' && item[1] === 'hello'));
+  const moves = calls.filter((item) => item[0] === 'move');
+  assert.ok(moves.length >= 8);
+  const clickTarget = clickMoves.at(-1);
+  assert.ok(clickMoves.slice(0, -1).some((item) =>
+    Math.abs(item[1] * clickTarget[2] - item[2] * clickTarget[1]) > 0.01));
+  const click = calls.find((item) => item[0] === 'click');
+  assert.ok(click[1].position.x > 0 && click[1].position.x < 120);
+  assert.ok(click[1].position.y > 0 && click[1].position.y < 40);
+  assert.ok(click[1].delay >= 35 && click[1].delay <= 95);
+
+  const keystrokes = calls.filter((item) => item[0] === 'pressSequentially');
+  assert.equal(keystrokes.length, 5);
+  assert.deepEqual(keystrokes.map((item) => item[1]), ['H', 'i', ',', ' ', 'x']);
+  assert.ok(keystrokes.every((item) => item[2].delay >= 25 && item[2].delay <= 85));
+  assert.ok(new Set(keystrokes.map((item) => item[2].delay)).size > 1);
   const wheels = calls.filter((item) => item[0] === 'wheel');
-  assert.equal(wheels.length, 3);
+  assert.equal(wheels.length, 5);
   assert.equal(wheels.reduce((total, item) => total + item[2], 0), 300);
-  assert.ok(sleeps.length >= 4);
-  assert.ok(sleeps.every((value) => value >= 25 && value <= 180));
+  assert.ok(new Set(wheels.map((item) => item[2])).size > 1);
+  assert.ok(Math.abs(wheels[2][2]) > Math.abs(wheels[0][2]));
+  assert.ok(readingDelay >= 2_150 && readingDelay <= 3_900);
+  assert.ok(sleeps.includes(readingDelay));
 });
 
 test('adaptive mode slows after a signal and does not retry failed actions', async () => {

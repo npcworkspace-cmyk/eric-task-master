@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.3 - 2026-08-24
+
+- Upgraded `human` behavior with bounded curved pointer paths, safe in-target click positions, realistic press duration, per-character typing rhythm, punctuation pauses, eased scrolling, and explicit bounded reading dwell.
+- Kept `fast` free of artificial delays and `adaptive` fast until a dynamic-page, failure, or rate-limit signal requests temporary human pacing.
+- Added deterministic behavior tests and real Chromium event-trace acceptance for pointer, input, wheel, and reading mechanics.
+
 ## 0.0.2 - 2026-08-24
 
 - Added a standard STDIO MCP server with scoped per-host Agent identities and durable task tools.

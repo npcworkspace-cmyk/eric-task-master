@@ -92,10 +92,11 @@ A failed task with a stable checkpoint can be resumed only by its original owner
 ## Behavior policies
 
 - `fast`: deterministic native Playwright operations with minimum necessary waits.
-- `human`: bounded mouse, typing, hover, scroll, and reading delays.
+- `human`: bounded curved pointer motion, safe in-target click offsets and press duration, per-character typing rhythm, eased scrolling, and explicit reading dwell.
 - `adaptive`: starts fast and slows after dynamic-page failures or rate-limit signals.
 
 Task-level policy overrides the profile default and is discarded during cleanup.
+Only task logic knows when content is actually being read, so it requests bounded dwell with `action.read({ words })`; the runtime does not guess from page size or silently slow deterministic collection.
 
 Each task output is bounded by a worker-enforced default budget of 512 MiB and 10,000 files. The worker checks it periodically and before progress, checkpoint, and completion; exceeding it fails the task without deleting existing output. A separate small reserve remains available for controlled diagnostic screenshots. The scanner never follows links and has independent entry/depth bounds.
 

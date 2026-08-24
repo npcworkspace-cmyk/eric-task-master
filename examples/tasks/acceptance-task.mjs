@@ -41,6 +41,25 @@ export async function run({ page, context, input, outputDir, action, progress, c
   evidence.push({ kind: 'input', ok: await page.locator('#name').inputValue() === 'Eric Task Master' });
   await progress({ current: 2, total: 9, message: 'Text input verified' });
 
+  await action.hover('#submit');
+  await action.scroll({ deltaY: 120, steps: 4 });
+  const readingDelay = await action.read({ words: 20 });
+  const behaviorTrace = await page.evaluate(() => window.__taskmasterTrace);
+  const humanBehavior = action.effectiveMode === 'human';
+  evidence.push({
+    kind: 'behavior',
+    ok: humanBehavior
+      ? behaviorTrace.pointerMoves >= 4 && behaviorTrace.inputEvents >= 16 &&
+        behaviorTrace.wheelEvents >= 2 && readingDelay > 0 && readingDelay <= 8_000
+      : readingDelay === 0,
+    mode: action.mode,
+    effectiveMode: action.effectiveMode,
+    pointerMoves: behaviorTrace.pointerMoves,
+    inputEvents: behaviorTrace.inputEvents,
+    wheelEvents: behaviorTrace.wheelEvents,
+    readingDelay
+  });
+
   await action.click('#agree');
   evidence.push({ kind: 'checkbox', ok: await page.locator('#agree').isChecked() });
   await action.run('select', () => page.locator('#choice').selectOption('beta'));

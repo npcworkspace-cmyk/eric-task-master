@@ -36,7 +36,7 @@ A cancelled MCP wait does not cancel the durable task. Only `taskmaster_tasks_ca
 
 Resume is always explicit and idempotent. Reuse the same `resumeKey` when retrying the same resume request; use a new key only for a deliberately new attempt. Before resume, inspect the checkpoint, progress, error, and current site state. Never assume an external click, submission, message, or purchase failed merely because its response was lost.
 
-Default to `fast` for deterministic and data-heavy work. Use `human` only when the user or workflow requests paced mouse, typing, hover, and scrolling. Use `adaptive` when a dynamic site may require the task module to signal timeouts, occlusion, navigation uncertainty, or rate limiting.
+Default to `fast` for deterministic and data-heavy work. Use `human` only when the user or workflow requests paced pointer, typing, hover, scrolling, and reading. Use `adaptive` when a dynamic site may require the task module to signal timeouts, occlusion, navigation uncertainty, or rate limiting. In a custom task, call `action.read({ words })` only after observing content the workflow actually intends to read; do not add invented dwell to bulk collection.
 
 The worker emits heartbeats automatically and task modules report meaningful progress. A delayed heartbeat triggers a diagnostic screenshot before failure. Every action failure and task timeout also attempts a screenshot. Treat the screenshot reference as diagnostic evidence, not proof that an external action succeeded.
 

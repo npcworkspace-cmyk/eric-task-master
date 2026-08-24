@@ -2,13 +2,13 @@
 
 Eric Task Master is a Playwright-first browser task system for AI Agents. It gives Agents durable browser Profiles, isolated task windows, progress and recovery, optional human-paced behavior, and reusable task Skills without making the everyday browser the automation engine.
 
-Version: **0.0.2**
+Version: **0.0.3**
 
 ## What it enables
 
 - Multiple Agents can work in separate persistent browser Profiles without stealing each other's tabs, focus, or login state.
 - Short and long browser tasks keep a durable task ID, progress, heartbeat, checkpoint, artifacts, cancellation, and automatic window cleanup.
-- `fast`, `human`, and `adaptive` behavior can be selected per Profile or per task; deterministic data work stays fast by default.
+- `fast`, `human`, and `adaptive` behavior can be selected per Profile or per task. Human mode adds bounded pointer paths, in-target clicks, varied typing, eased scrolling, and explicit reading dwell; deterministic data work stays fast by default.
 - A lightweight Chromium extension manages Playwright Profiles and lets the user explicitly copy the current site's session into a chosen Profile.
 - Standard MCP tools let supported Agent hosts discover and use the same Task Master after one registration flow.
 - Specialized Skills can add site or workflow logic as verified task types while reusing the same Profile, task, progress, evidence, and cleanup foundation.
@@ -50,6 +50,7 @@ Worker code cannot declare success by itself. Manager first verifies the result 
 - Account state stays in local persistent Profiles. Session transfer is limited to the active site and requires an explicit user click.
 - Session transfer verifies the pinned Manager before reading cookies or LocalStorage, rejects tab/origin drift, replaces rather than merges the destination origin, rolls back on failure, and revokes its temporary site permission.
 - Core Task Master stays site-agnostic. Selectors, pagination, parsing, rate-limit policy, and business rules belong in specialized Skills or single-file task modules.
+- Human pacing makes interactions less mechanically abrupt; it is not a promise to bypass site controls or prevent account restrictions.
 - Agent-visible APIs do not return Manager credentials, cookies, Profile directories, module paths, or local output paths.
 
 Agents should start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Developers can read [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md).

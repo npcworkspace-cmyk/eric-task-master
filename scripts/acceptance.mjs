@@ -247,6 +247,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     const allTrue = (kind) => evidence.get(kind)?.length === 3 && evidence.get(kind).every((item) => item.ok);
     add('navigation', allTrue('navigation'));
     add('text input', allTrue('input'));
+    add('human behavior mechanics', allTrue('behavior'));
     add('click and select', allTrue('checkbox') && allTrue('select'));
     add('file upload', allTrue('upload'));
     add('cookie and local storage', allTrue('cookie') && allTrue('localStorage'));
