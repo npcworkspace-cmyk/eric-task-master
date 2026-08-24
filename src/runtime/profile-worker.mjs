@@ -55,7 +55,7 @@ export async function runOpenProfile(profile, {
     const browserType = playwright[profile.browser || 'chromium'];
     if (!browserType?.launchPersistentContext) throw new Error('Unsupported Playwright browser');
     context = await browserType.launchPersistentContext(profile.userDataDir, {
-      headless: false,
+      headless: profile.headless ?? false,
       ...(profile.browserChannel ? { channel: profile.browserChannel } : {}),
       ...(profile.launchOptions || {})
     });

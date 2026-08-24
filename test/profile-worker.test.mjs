@@ -1,6 +1,36 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { closeProfileBrowserSession } from '../src/runtime/profile-worker.mjs';
+import { closeProfileBrowserSession, runOpenProfile } from '../src/runtime/profile-worker.mjs';
+
+test('manual Profile launch respects its configured headless mode', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let launch;
+  const context = {
+    pages() { return [{}]; },
+    browser() { return null; },
+    async close() {}
+  };
+  await runOpenProfile({
+    userDataDir: '/isolated/profile',
+    headless: true,
+    browserChannel: 'chromium'
+  }, {
+    signal: controller.signal,
+    loadPlaywright: async () => ({
+      chromium: {
+        async launchPersistentContext(userDataDir, options) {
+          launch = { userDataDir, options };
+          return context;
+        }
+      }
+    })
+  });
+  assert.deepEqual(launch, {
+    userDataDir: '/isolated/profile',
+    options: { headless: true, channel: 'chromium' }
+  });
+});
 
 test('profile cleanup falls back to authoritative browser close', async () => {
   let browserCloseCalls = 0;

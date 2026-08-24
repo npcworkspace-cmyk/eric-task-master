@@ -3,6 +3,7 @@
 ## 1.0.2 - 2026-08-24
 
 - Made the full Windows, macOS, and Linux gate deterministic across Node.js 20 and 22 by removing cleanup-state timing assumptions and using portable extension and registration fixtures.
+- Made manually opened Profile windows honor their configured headless mode, including Linux environments without a display server.
 - Preserved a safe diagnostic-observation artifact when semantic inspection is transiently unavailable, so screenshot fallback never silently loses the reason or observation status.
 - Upgraded CI to the current official Node 24-based GitHub Actions releases.
 - Added gated CD: only a successful same-repository `main` push can publish exact-commit source, extension, and Skill archives with SHA-256 checksums as an immutable GitHub Release.
