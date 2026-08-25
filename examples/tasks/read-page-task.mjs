@@ -69,7 +69,7 @@ export async function run({ page, input, outputDir, action, progress, checkpoint
     evidence: [
       { kind: 'url', value: snapshot.url },
       { kind: 'count', label: 'HTTP status', value: response?.status() ?? 0 },
-      { kind: 'artifact', file: artifactName }
+      { kind: 'artifact', file: artifactName, agentVisible: true }
     ]
   };
 }

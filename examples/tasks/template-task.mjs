@@ -41,7 +41,7 @@ export async function run({ page, input, outputDir, action, progress, checkpoint
     summary: `Captured ${result.text.length} characters from ${result.title || result.url}`,
     evidence: [
       { kind: 'url', value: result.url },
-      { kind: 'artifact', file: artifactName },
+      { kind: 'artifact', file: artifactName, agentVisible: true },
       { kind: 'message', label: 'behavior mode', value: action.mode }
     ]
   };

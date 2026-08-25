@@ -49,6 +49,6 @@ export async function run({ input, outputDir, action, progress, checkpoint }) {
   });
   return {
     summary: `Completed ${steps} durable progress steps`,
-    evidence: [{ kind: 'artifact', file: artifactName, count: events.length }]
+    evidence: [{ kind: 'artifact', file: artifactName, agentVisible: true }]
   };
 }
