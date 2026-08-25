@@ -37,6 +37,8 @@ const profile = {
   lease: { token: 'do-not-return' }
 };
 
+let profileCreateCalls = 0;
+
 const client = {
   async getStatus() {
     return {
@@ -49,7 +51,16 @@ const client = {
     };
   },
   async listProfiles() { return [profile]; },
-  async createProfile(input) { return { ...profile, name: input.name }; },
+  async createProfile(input) {
+    profileCreateCalls += 1;
+    return {
+      ...profile,
+      name: input.name,
+      createdBy: `fixture-call-${profileCreateCalls}`,
+      lastUsedAt: null,
+      lastOpenedAt: null
+    };
+  },
   async updateProfile(_profileId, patch) { return { ...profile, ...patch }; },
   async openProfile() { return profile; },
   async closeProfile() { return { ...profile, state: 'idle' }; },

@@ -1,6 +1,6 @@
 import { basename } from 'node:path';
 import { publicProfile as publicManagerProfile } from '../contracts.mjs';
-import { redactSensitiveText } from '../lib/redaction.mjs';
+import { redactPublicText } from '../lib/redaction.mjs';
 import { TaskMasterClientError } from './errors.mjs';
 
 export const MAX_TOOL_RESULT_BYTES = 256 * 1024;
@@ -27,9 +27,7 @@ function definedEntries(entries) {
 }
 
 export function redactText(value, maxLength = 2048) {
-  const text = redactSensitiveText(value)
-    .replace(/[A-Za-z]:[\\/][^\s"']+/g, '[LOCAL_PATH]')
-    .replace(/\/(?:Users|home|tmp|var\/folders)\/[^\s"']+/g, '[LOCAL_PATH]');
+  const text = redactPublicText(value, { pathReplacement: '[LOCAL_PATH]' });
   return text.length <= maxLength ? text : `${text.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 

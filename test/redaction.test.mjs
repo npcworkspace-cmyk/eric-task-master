@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { publicTask as publicManagerTask } from '../src/contracts.mjs';
 import { publicProfile as publicManagerProfile } from '../src/contracts.mjs';
-import { isSensitiveKey, redactSensitiveText, redactSensitiveValue } from '../src/lib/redaction.mjs';
+import { isSensitiveKey, redactPublicText, redactSensitiveText, redactSensitiveValue } from '../src/lib/redaction.mjs';
 import {
   publicArtifactRead,
   publicProfile as publicMcpProfile,
@@ -57,6 +57,18 @@ test('central object redaction drops sensitive keys and scrubs nested strings', 
   assert.equal(JSON.stringify(safe).includes(MARKER), false);
 });
 
+test('public text redaction preserves ordinary URLs while removing URL credentials and embedded local paths', () => {
+  assert.equal(redactPublicText('https://example.test/path'), 'https://example.test/path');
+  const redacted = redactPublicText(
+    "ENOENT C:\\Users\\eric\\private.txt /home/eric/private.txt https://user:pass@example.test/callback?code=oauth-secret#fragment"
+  );
+  assert.equal(redacted.includes('C:\\Users'), false);
+  assert.equal(redacted.includes('/home/eric'), false);
+  assert.equal(redacted.includes('user:pass'), false);
+  assert.equal(redacted.includes('oauth-secret'), false);
+  assert.equal(redacted.includes('https://example.test/callback'), true);
+});
+
 test('Manager Profile view is an allowlist that ignores future private runtime fields', () => {
   const safe = publicManagerProfile({
     id: 'profile_safe',
@@ -105,11 +117,15 @@ test('Manager and MCP Profile views share the same nullable public contract', ()
 test('Manager and MCP public task views never return credential markers in summary or evidence', () => {
   const task = {
     id: 'task_redaction',
-    state: 'failed',
+    state: 'completed',
+    completion: { verifiedAt: '2026-08-24T00:00:01.000Z', integrity: 'verified' },
     summary: `api_key=${MARKER}`,
     result: {
-      summary: `session_token: ${MARKER}`,
-      evidence: variants.map((value, index) => ({ kind: 'note', label: `case-${index}`, value }))
+      summary: `session_token: ${MARKER}; ENOENT C:\\Users\\eric\\private.txt`,
+      evidence: [
+        ...variants.map((value, index) => ({ kind: 'note', label: `case-${index}`, value })),
+        { kind: 'url', label: 'valid-url', value: `https://user:pass@example.test/callback?code=${MARKER}` }
+      ]
     },
     error: {
       code: 'TASK_FAILED',
@@ -132,6 +148,9 @@ test('Manager and MCP public task views never return credential markers in summa
   };
   const managerView = publicManagerTask(task);
   assert.equal(JSON.stringify(managerView).includes(MARKER), false);
+  assert.equal(JSON.stringify(managerView).includes('C:\\Users\\eric'), false);
+  assert.equal(JSON.stringify(managerView).includes('user:pass'), false);
+  assert.equal(managerView.result.evidence.at(-1).value, 'https://example.test/callback');
   assert.equal('nested' in managerView, false);
   assert.equal('futureInternalState' in managerView, false);
   assert.deepEqual(managerView.currentActivity, {
@@ -139,7 +158,10 @@ test('Manager and MCP public task views never return credential markers in summa
     status: 'unknown',
     updatedAt: '2026-08-24T00:00:00.000Z'
   });
-  assert.equal(JSON.stringify(publicMcpTask(task)).includes(MARKER), false);
+  const mcpView = publicMcpTask(task);
+  assert.equal(JSON.stringify(mcpView).includes(MARKER), false);
+  assert.equal(mcpView.evidence.at(-1).value, 'https://example.test/callback');
+  assert.doesNotThrow(() => new URL(mcpView.evidence.at(-1).value));
   assert.equal(redactText(variants.join('\n')).includes(MARKER), false);
 });
 

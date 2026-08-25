@@ -1,4 +1,4 @@
-import { isSensitiveKey, redactSensitiveText } from './lib/redaction.mjs';
+import { isSensitiveKey, redactPublicText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
 export const VERSION = '2.0.0';
@@ -66,8 +66,7 @@ export function publicProfile(profile) {
 function redactLocalPaths(value, depth = 0) {
   if (depth > 12) return '[truncated]';
   if (typeof value === 'string') {
-    if (/^(?:[a-z]:[\\/]|\\\\|\/)/i.test(value)) return '[local-path-hidden]';
-    return redactSensitiveText(value);
+    return redactPublicText(value);
   }
   if (Array.isArray(value)) return value.slice(0, 1_000).map((item) => redactLocalPaths(item, depth + 1));
   if (!value || typeof value !== 'object') return value;
@@ -139,14 +138,14 @@ export function publicTask(task) {
   }
   if (task.lastScreenshot) {
     safe.lastScreenshot = {
-      reason: task.lastScreenshot.reason,
+      reason: redactPublicText(task.lastScreenshot.reason ?? ''),
       at: task.lastScreenshot.at,
       ref: `taskmaster://tasks/${encodeURIComponent(task.id)}/screenshot`
     };
   }
   if (task.lastObservation) {
     safe.lastObservation = {
-      reason: task.lastObservation.reason,
+      reason: redactPublicText(task.lastObservation.reason ?? ''),
       at: task.lastObservation.at,
       ref: `taskmaster://tasks/${encodeURIComponent(task.id)}/observation`
     };

@@ -434,6 +434,60 @@ test('Profile behavior changes do not break idempotency and queued attempts use 
   await service.close();
 });
 
+test('worker launch uses the atomic Profile snapshot returned by lease acquisition', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-acquire-policy-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  store.profile.kind = 'ephemeral';
+  store.profile.defaultBehavior = 'fast';
+  const acquireLease = store.acquireLease.bind(store);
+  store.acquireLease = async (...args) => {
+    store.profile.defaultBehavior = 'human';
+    return acquireLease(...args);
+  };
+  let launchConfig;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        launchConfig = message.config;
+        setImmediate(() => {
+          child.emit('message', {
+            type: 'result',
+            result: { summary: 'Done', evidence: [{ kind: 'message', value: 'atomic policy verified' }] }
+          });
+          child.emit('message', { type: 'state', state: 'completed' });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish();
+        });
+      });
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const task = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'profile-acquire-policy-atomic',
+    input: {}
+  }, ADMIN);
+  const completed = await waitFor(async () => {
+    const current = await service.get(task.id, ADMIN);
+    return current.cleanup?.settled ? current : null;
+  });
+
+  assert.equal(completed.state, 'completed');
+  assert.equal(launchConfig.behavior, 'human');
+  assert.equal(launchConfig.profile.defaultBehavior, 'human');
+  assert.equal(completed.behavior, 'human');
+  await service.close();
+});
+
 test('task finalization drains an in-flight heartbeat renewal before releasing the Profile', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-task-renewal-race-'));
   t.after(() => rm(root, { recursive: true, force: true }));

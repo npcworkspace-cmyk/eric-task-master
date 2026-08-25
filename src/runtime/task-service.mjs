@@ -1006,7 +1006,7 @@ export function createTaskService({
       task.queueReason = null;
       task.health = { status: 'healthy', checkedAt: nowIso() };
       await persist(task);
-      await launchTaskAttempt(task, profile);
+      await launchTaskAttempt(task);
       if (children.has(task.id)) {
         activeProfiles.add(task.profileId);
         capacity -= 1;
@@ -1760,7 +1760,7 @@ export function createTaskService({
     }
   }
 
-  async function launchTaskAttempt(task, profile) {
+  async function launchTaskAttempt(task) {
     if (task.state !== 'queued') return;
     const acquiringAt = nowIso();
     await update(task, {
@@ -1789,7 +1789,7 @@ export function createTaskService({
         throw new TaskServiceError('TASK_WORKER_SPAWN_FAILED', 'Task worker has no valid process ID', 500);
       }
       failureCode = 'PROFILE_LEASE_FAILED';
-      await profileStore.acquireLease(task.profileId, task.leaseOwner, {
+      const leasedProfile = await profileStore.acquireLease(task.profileId, task.leaseOwner, {
         pid: child.pid,
         ttlMs: LEASE_TTL_MS,
         cleanupRequired: true,
@@ -1801,7 +1801,7 @@ export function createTaskService({
       }
       failureCode = 'TASK_WORKER_START_FAILED';
       const startingAt = nowIso();
-      const behavior = resolveProfileBehavior(profile);
+      const behavior = resolveProfileBehavior(leasedProfile);
       setAttemptHistoryBehavior(task, behavior);
       await update(task, {
         state: 'starting_browser',
@@ -1826,7 +1826,7 @@ export function createTaskService({
         type: 'start',
         config: {
           taskId: task.id,
-          profile,
+          profile: leasedProfile,
           modulePath: task.modulePath,
           input: clone(task.input),
           behavior,

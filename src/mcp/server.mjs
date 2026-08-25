@@ -41,7 +41,8 @@ const ProfileSchema = z.strictObject({
   createdBy: z.string().optional(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
-  lastUsedAt: z.string().optional()
+  lastUsedAt: z.string().nullable().optional(),
+  lastOpenedAt: z.string().nullable().optional()
 });
 
 const ProgressSchema = z.strictObject({

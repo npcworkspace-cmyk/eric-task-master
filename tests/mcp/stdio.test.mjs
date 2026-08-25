@@ -92,6 +92,20 @@ test('MCP Profile owner can explicitly share a private Profile', async (t) => {
   assert.equal(result.structuredContent.data.profile.lastUsedAt, '2026-08-24T00:00:00.000Z');
 });
 
+test('non-idempotent Profile creation accepts nullable timestamps without a false failure or retry', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const result = await connection.client.callTool({
+    name: 'taskmaster_profiles_create',
+    arguments: { name: 'Nullable timestamps', kind: 'persistent', browserEngine: 'chrome' }
+  });
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.data.profile.lastUsedAt, null);
+  assert.equal(result.structuredContent.data.profile.lastOpenedAt, null);
+  assert.equal(result.structuredContent.data.profile.createdBy, 'fixture-call-1');
+});
+
 test('stdio wire contains JSON-RPC frames only', async (t) => {
   const child = spawn(process.execPath, [FIXTURE], { stdio: ['pipe', 'pipe', 'pipe'] });
   t.after(() => child.kill());
