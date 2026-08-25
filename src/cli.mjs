@@ -684,10 +684,10 @@ async function taskCommand(action, args, options, json) {
       idempotencyKey,
       ...(options.timeout ? { timeoutMs: Number(options.timeout) } : {})
     };
-    const { task } = await requestJson(context.config.baseUrl, '/v1/tasks', {
+    const { taskId, dashboardUrl, task } = await requestJson(context.config.baseUrl, '/v1/tasks', {
       method: 'POST', body, token: context.token
     });
-    emit({ event: 'task-started', task }, json);
+    emit({ event: 'task-started', taskId, dashboardUrl, task }, json);
     if (options.detach) return;
     const terminal = await followTask(context, task.id, json, options);
     emit({ ok: terminal.state === 'completed', event: 'task-finished', task: terminal }, json);

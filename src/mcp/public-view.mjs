@@ -224,6 +224,13 @@ export function publicTask(task, { includeResult = true } = {}) {
       ['updatedAt', stringValue(task.cooldown.updatedAt, 64)]
     ])
     : undefined;
+  const currentActivity = task?.currentActivity && typeof task.currentActivity === 'object'
+    ? definedEntries([
+      ['phase', stringValue(task.currentActivity.phase, 32)],
+      ['status', stringValue(task.currentActivity.status, 16)],
+      ['updatedAt', stringValue(task.currentActivity.updatedAt, 64)]
+    ])
+    : undefined;
   return definedEntries([
     ['id', stringValue(task?.id, 128)],
     ['profileId', stringValue(task?.profileId, 128)],
@@ -233,6 +240,7 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['attempt', Number.isSafeInteger(task?.attempt) ? task.attempt : undefined],
     ['history', publicAttemptHistory(task?.history)],
     ['state', stringValue(task?.state, 64)],
+    ['currentActivity', currentActivity],
     ['progress', publicProgress(task?.progress)],
     ['progressAt', stringValue(task?.progressAt, 64)],
     ['createdAt', stringValue(task?.createdAt, 64)],

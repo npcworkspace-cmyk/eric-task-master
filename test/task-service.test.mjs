@@ -208,6 +208,78 @@ test('task service isolates work in a child, tracks progress, and releases its l
   await service.close();
 });
 
+test('task activity is redacted, phase-aware, durable, and independent from progress freshness', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-activity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  let worker;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      worker = new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          setImmediate(() => {
+            child.emit('message', { type: 'state', state: 'running' });
+            child.emit('message', {
+              type: 'progress',
+              at: 'https://example.test/?token=worker-controlled',
+              progress: { current: 0, total: 10, message: 'Extracting records', phase: 'extracting' }
+            });
+          });
+        }
+        if (message.type === 'cancel') {
+          setImmediate(() => {
+            child.emit('message', { type: 'cleanup', browserClosed: true });
+            child.finish(0);
+          });
+        }
+      });
+      return worker;
+    }
+  });
+  await service.installTaskType({ name: 'activity-fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test', taskType: 'activity-fixture', input: {}, idempotencyKey: 'activity-fixture-0001'
+  }, ADMIN);
+  const extracting = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.progress?.phase === 'extracting' ? task : null;
+  });
+  const progressAt = extracting.progressAt;
+  assert.deepEqual(extracting.currentActivity.phase, 'running');
+  assert.equal(extracting.progress.phase, 'extracting');
+  assert.equal(extracting.currentActivity.updatedAt.includes('worker-controlled'), false);
+  assert.equal(extracting.heartbeatAt.includes('worker-controlled'), false);
+
+  worker.emit('message', {
+    type: 'activity',
+    activity: {
+      phase: 'working', status: 'unknown', selector: '#password', value: 'do-not-return',
+      url: 'https://example.test/?token=do-not-return'
+    }
+  });
+  const unknown = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.currentActivity?.status === 'unknown' ? task : null;
+  });
+  assert.deepEqual(Object.keys(unknown.currentActivity).sort(), ['phase', 'status', 'updatedAt']);
+  assert.equal(JSON.stringify(unknown.currentActivity).includes('do-not-return'), false);
+  assert.equal(unknown.progressAt, progressAt);
+
+  await service.cancel(created.id, ADMIN);
+  const cancelled = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.state === 'cancelled' && task.cleanup.settled ? task : null;
+  });
+  assert.equal(cancelled.currentActivity.phase, 'cancelled');
+  await service.close();
+});
+
 test('task finalization drains an in-flight heartbeat renewal before releasing the Profile', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-task-renewal-race-'));
   t.after(() => rm(root, { recursive: true, force: true }));

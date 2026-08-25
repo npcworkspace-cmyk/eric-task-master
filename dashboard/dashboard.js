@@ -3,6 +3,27 @@ const ACTIVE_TASK_STATES = new Set(['queued', 'acquiring_profile', 'starting_bro
 const ATTENTION_TASK_STATES = new Set(['waiting_user', 'failed']);
 const TERMINAL_TASK_STATES = new Set(['completed', 'failed', 'cancelled']);
 const TOKEN_KEY = 'taskmaster.dashboardToken';
+const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const ACTIVITY_LABELS = Object.freeze({
+  queued: '等待调度',
+  acquiring_profile: '准备 Profile',
+  starting_browser: '启动浏览器',
+  running: '执行任务',
+  navigating: '打开页面',
+  clicking: '点击',
+  typing: '输入',
+  hovering: '悬停',
+  scrolling: '滚动',
+  working: '执行动作',
+  waiting_user: '等待新指令',
+  cooling_down: '限流冷却',
+  recovering: '恢复任务',
+  verifying: '验证结果',
+  cleaning_up: '关闭任务窗口',
+  completed: '已完成',
+  failed: '失败',
+  cancelled: '已取消'
+});
 
 const ui = Object.freeze({
   connectionDot: document.querySelector('#connection-dot'),
@@ -36,6 +57,16 @@ let managerToken = '';
 let profiles = [];
 let tasks = [];
 let refreshTimer = null;
+let refreshInFlight = null;
+let focusedTaskApplied = false;
+let pollingStopped = false;
+
+function focusTaskFromLocation() {
+  const value = new URL(location.href).searchParams.get('task');
+  return typeof value === 'string' && TASK_ID_PATTERN.test(value) ? value : '';
+}
+
+const focusedTaskId = focusTaskFromLocation();
 
 function consumeCodeFromLocation() {
   const url = new URL(location.href);
@@ -217,7 +248,17 @@ function taskProgress(task) {
     const seconds = Math.max(0, Math.ceil((Date.parse(task.cooldown.resumeAt) - Date.now()) / 1000));
     message = `${task.cooldown.reason || '限流冷却'} · ${seconds}s 后恢复`;
   }
-  return { current, total, percent, message };
+  return { current, total, percent, message, phase: task.progress?.phase || '' };
+}
+
+function activityCopy(task) {
+  const activity = task.currentActivity || {};
+  const phase = typeof activity.phase === 'string' ? activity.phase : (task.state || 'running');
+  return {
+    label: ACTIVITY_LABELS[phase] || phase.replaceAll('_', ' '),
+    status: activity.status || 'active',
+    updatedAt: activity.updatedAt || task.updatedAt
+  };
 }
 
 function resultUrl(task) {
@@ -235,13 +276,39 @@ function renderTasks() {
   ui.tasks.replaceChildren();
   for (const task of tasks) {
     const row = document.createElement('tr');
-    const name = element('td', 'task-name', task.name || task.meta?.name || task.id);
+    row.dataset.taskId = task.id;
+    if (task.id === focusedTaskId) {
+      row.classList.add('task-focused');
+      if (!focusedTaskApplied) {
+        focusedTaskApplied = true;
+        queueMicrotask(() => row.scrollIntoView({ block: 'center' }));
+      }
+    }
+    const name = element('td', 'task-name');
+    name.append(
+      element('strong', '', task.taskType || '未命名任务'),
+      element('small', '', task.id)
+    );
+    const agent = element('td', 'agent-name');
+    agent.append(
+      element('strong', '', task.agent?.name || task.createdBy || '本机管理员'),
+      ...(task.agent?.name && task.agent?.clientId
+        ? [element('small', '', task.agent.clientId)]
+        : [])
+    );
     const profile = element('td', '', task.profileName || task.profileId || '—');
     const status = element('td', `task-status ${task.health?.status || ''}`);
     status.append(element('strong', '', task.state || task.status || 'unknown'));
     const behavior = task.behaviorState?.effective || task.behavior;
     if (behavior) status.append(element('small', '', `行为 ${behavior}`));
     if (task.health?.status === 'stalled') status.append(element('small', 'warning', '已截图 · 需关注'));
+    const activity = activityCopy(task);
+    const activityCell = element('td', 'activity-cell');
+    activityCell.append(
+      element('strong', '', activity.label),
+      element('small', `activity-status ${activity.status}`, activity.status),
+      element('small', 'muted', formatTime(activity.updatedAt))
+    );
     const progress = taskProgress(task);
     const progressCell = element('td', 'progress');
     const track = element('div', 'progress-track');
@@ -250,12 +317,13 @@ function renderTasks() {
     track.append(fill);
     const progressCopy = element('div', 'progress-copy');
     progressCopy.append(
-      element('span', '', progress.message || `${progress.current}/${progress.total || '?'}`),
+      element('span', '', progress.phase || `${progress.current}/${progress.total || '?'}`),
       element('span', '', `${progress.percent}%`)
     );
     progressCell.append(track, progressCopy);
-    const heartbeat = element('td', 'muted');
-    heartbeat.append(
+    const feedback = element('td', 'latest-feedback');
+    feedback.append(
+      element('strong', '', progress.message || '等待任务反馈'),
       element('span', '', `心跳 ${formatTime(task.lastHeartbeatAt || task.heartbeatAt || task.updatedAt)}`),
       element('span', '', `进度 ${formatTime(task.progressAt || task.updatedAt)}`)
     );
@@ -278,20 +346,20 @@ function renderTasks() {
       link.rel = 'noreferrer';
       actions.append(link);
     }
-    row.append(name, profile, status, progressCell, heartbeat, actions);
+    row.append(name, agent, profile, status, activityCell, progressCell, feedback, actions);
     ui.tasks.append(row);
   }
   if (!tasks.length) {
     const row = document.createElement('tr');
     const cell = element('td', 'empty', '当前没有任务');
-    cell.colSpan = 6;
+    cell.colSpan = 8;
     row.append(cell);
     ui.tasks.append(row);
   }
 }
 
 async function showTaskResult(task) {
-  ui.resultTitle.textContent = task.name || task.meta?.name || task.id;
+  ui.resultTitle.textContent = task.taskType || task.id;
   ui.resultSummary.textContent = task.result?.summary || (task.state === 'completed' ? '任务已完成。' : '任务尚未返回摘要。');
   const evidence = task.result?.evidence ?? task.result ?? [];
   ui.resultEvidence.textContent = JSON.stringify(evidence, null, 2);
@@ -346,30 +414,55 @@ function formatTime(value) {
 }
 
 async function refresh() {
-  if (!managerToken) {
-    setConnected(false);
-    return;
-  }
-  try {
-    const [profilePayload, taskPayload] = await Promise.all([
-      request('/v1/profiles'),
-      request('/v1/tasks')
-    ]);
-    profiles = unpackList(profilePayload, 'profiles');
-    tasks = unpackList(taskPayload, 'tasks');
-    renderProfiles();
-    renderTasks();
-    updateSummary();
-    ui.lastRefresh.textContent = `刷新于 ${formatTime(new Date())}`;
-    setConnected(true);
-  } catch (error) {
-    if (error.status === 401 || error.status === 403) {
-      managerToken = '';
-      sessionStorage.removeItem(TOKEN_KEY);
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    if (!managerToken) {
+      setConnected(false);
+      return;
     }
-    setConnected(false);
-    setMessage(error.message, 'error');
+    try {
+      const [profilePayload, taskPayload] = await Promise.all([
+        request('/v1/profiles'),
+        request('/v1/tasks')
+      ]);
+      profiles = unpackList(profilePayload, 'profiles');
+      tasks = unpackList(taskPayload, 'tasks');
+      renderProfiles();
+      renderTasks();
+      updateSummary();
+      ui.lastRefresh.textContent = `刷新于 ${formatTime(new Date())}`;
+      setConnected(true);
+    } catch (error) {
+      if (error.status === 401 || error.status === 403) {
+        managerToken = '';
+        sessionStorage.removeItem(TOKEN_KEY);
+      }
+      setConnected(false);
+      setMessage(error.message, 'error');
+    }
+  })();
+  try {
+    return await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
   }
+}
+
+function pollingDelay() {
+  if (document.visibilityState === 'hidden') return 10_000;
+  const live = tasks.some((task) => (
+    ACTIVE_TASK_STATES.has(task.state || task.status) || ATTENTION_TASK_STATES.has(task.state || task.status)
+  ));
+  return live ? 1_000 : 5_000;
+}
+
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  if (pollingStopped) return;
+  refreshTimer = setTimeout(async () => {
+    await refresh();
+    if (!pollingStopped) scheduleRefresh();
+  }, pollingDelay());
 }
 
 async function createProfile(event) {
@@ -437,7 +530,7 @@ async function deleteProfile(profile) {
 }
 
 async function cancelTask(task) {
-  if (!confirm(`取消任务 “${task.name || task.id}”？`)) return;
+  if (!confirm(`取消任务 “${task.taskType || task.id}”？`)) return;
   try {
     await request(`/v1/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST' });
     setMessage('取消请求已发送', 'success');
@@ -465,7 +558,7 @@ managerToken = sessionStorage.getItem(TOKEN_KEY) || '';
 ui.tokenForm.addEventListener('submit', saveToken);
 ui.createProfileForm.addEventListener('submit', createProfile);
 ui.profileKind.addEventListener('change', syncCreatePolicy);
-ui.refreshAll.addEventListener('click', refresh);
+ui.refreshAll.addEventListener('click', () => void refresh());
 syncCreatePolicy();
 void (async () => {
   if (initialCode) {
@@ -476,6 +569,15 @@ void (async () => {
     }
   }
   await refresh();
+  scheduleRefresh();
 })();
-refreshTimer = setInterval(() => void refresh(), 5000);
-window.addEventListener('pagehide', () => clearInterval(refreshTimer), { once: true });
+document.addEventListener('visibilitychange', scheduleRefresh);
+window.addEventListener('pagehide', () => {
+  pollingStopped = true;
+  clearTimeout(refreshTimer);
+});
+window.addEventListener('pageshow', () => {
+  if (!pollingStopped) return;
+  pollingStopped = false;
+  scheduleRefresh();
+});

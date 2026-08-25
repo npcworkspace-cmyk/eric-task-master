@@ -112,7 +112,7 @@ export async function runCommercialAcceptance() {
         idempotencyKey: `commercial-${profileIndex}-${taskIndex}-${Date.now()}`
       }))
     )));
-    taskIds.push(...started.map((task) => task.id));
+    taskIds.push(...started.map((item) => item.taskId));
     let maxActive = 0;
     let maxQueued = 0;
     const monitor = setInterval(() => {
@@ -121,7 +121,7 @@ export async function runCommercialAcceptance() {
         maxQueued = Math.max(maxQueued, Number(status.counts?.queued) || 0);
       }).catch(() => {});
     }, 50);
-    const completed = await Promise.all(started.map((task) => waitTerminal(client, task.id)));
+    const completed = await Promise.all(started.map((item) => waitTerminal(client, item.taskId)));
     clearInterval(monitor);
     const finalStatus = await client.getStatus();
     maxActive = Math.max(maxActive, Number(finalStatus.counts?.active) || 0);
@@ -144,16 +144,16 @@ export async function runCommercialAcceptance() {
       timeoutMs: 30_000,
       idempotencyKey: `commercial-cancel-queued-${Date.now()}`
     });
-    taskIds.push(blocker.id, queued.id);
+    taskIds.push(blocker.taskId, queued.taskId);
     await waitFor(
-      () => client.getTask(queued.id),
+      () => client.getTask(queued.taskId),
       (task) => task.state === 'queued',
       COMMERCIAL_QUEUE_WAIT_MS,
-      `task ${queued.id} queue entry`
+      `task ${queued.taskId} queue entry`
     );
-    const cancelled = await client.cancelTask(queued.id);
-    const cancelledDone = await waitTerminal(client, queued.id);
-    const blockerDone = await waitTerminal(client, blocker.id);
+    const cancelled = await client.cancelTask(queued.taskId);
+    const cancelledDone = await waitTerminal(client, queued.taskId);
+    const blockerDone = await waitTerminal(client, blocker.taskId);
     assertCheck(
       checks,
       'queued cancellation is deterministic',
@@ -170,9 +170,9 @@ export async function runCommercialAcceptance() {
       timeoutMs: 10_000,
       idempotencyKey: `commercial-timeout-${Date.now()}`
     });
-    taskIds.push(timed.id);
-    const timedDone = await waitTerminal(client, timed.id);
-    const diagnostics = await client.listArtifacts(timed.id);
+    taskIds.push(timed.taskId);
+    const timedDone = await waitTerminal(client, timed.taskId);
+    const diagnostics = await client.listArtifacts(timed.taskId);
     assertCheck(
       checks,
       'timeout closes browser and publishes diagnostics',

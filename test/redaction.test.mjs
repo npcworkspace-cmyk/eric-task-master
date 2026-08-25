@@ -115,6 +115,15 @@ test('Manager and MCP public task views never return credential markers in summa
       code: 'TASK_FAILED',
       message: `x-api-key=${MARKER}`
     },
+    currentActivity: {
+      phase: 'clicking',
+      status: 'unknown',
+      updatedAt: '2026-08-24T00:00:00.000Z',
+      selector: `#secret-${MARKER}`,
+      input: MARKER,
+      url: `https://example.test/?token=${MARKER}`,
+      customName: MARKER
+    },
     nested: {
       safeMessage: `token=${MARKER}`,
       sessionToken: MARKER
@@ -125,6 +134,11 @@ test('Manager and MCP public task views never return credential markers in summa
   assert.equal(JSON.stringify(managerView).includes(MARKER), false);
   assert.equal('nested' in managerView, false);
   assert.equal('futureInternalState' in managerView, false);
+  assert.deepEqual(managerView.currentActivity, {
+    phase: 'clicking',
+    status: 'unknown',
+    updatedAt: '2026-08-24T00:00:00.000Z'
+  });
   assert.equal(JSON.stringify(publicMcpTask(task)).includes(MARKER), false);
   assert.equal(redactText(variants.join('\n')).includes(MARKER), false);
 });

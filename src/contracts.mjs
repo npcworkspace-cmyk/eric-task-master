@@ -116,6 +116,19 @@ export function publicTask(task) {
     ) continue;
     if (task?.[key] !== undefined) safe[key] = redactLocalPaths(task[key]);
   }
+  if (
+    task?.currentActivity && typeof task.currentActivity === 'object' &&
+    typeof task.currentActivity.phase === 'string' &&
+    /^[a-z][a-z0-9_-]{0,31}$/.test(task.currentActivity.phase) &&
+    ['active', 'succeeded', 'unknown', 'waiting', 'cancelled'].includes(task.currentActivity.status) &&
+    typeof task.currentActivity.updatedAt === 'string' && task.currentActivity.updatedAt.length <= 64
+  ) {
+    safe.currentActivity = {
+      phase: task.currentActivity.phase,
+      status: task.currentActivity.status,
+      updatedAt: task.currentActivity.updatedAt
+    };
+  }
   if (task.id) safe.outputRef = `taskmaster://tasks/${encodeURIComponent(task.id)}/artifacts/`;
   if (task.checkpoint) {
     safe.checkpoint = {

@@ -48,7 +48,7 @@ const ProgressSchema = z.strictObject({
   current: z.number().optional(),
   total: z.number().optional(),
   percent: z.number().optional(),
-  phase: z.string().optional(),
+  phase: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/).optional(),
   message: z.string().optional(),
   updatedAt: z.string().optional()
 });
@@ -100,6 +100,11 @@ const TaskSchema = z.strictObject({
   attempt: z.number().int().optional(),
   history: z.array(AttemptHistorySchema).optional(),
   state: z.string().optional(),
+  currentActivity: z.strictObject({
+    phase: z.string().optional(),
+    status: z.string().optional(),
+    updatedAt: z.string().optional()
+  }).optional(),
   progress: ProgressSchema.optional(),
   createdAt: z.string().optional(),
   startedAt: z.string().optional(),
@@ -307,7 +312,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   const server = new McpServer(
     { name: 'eric-task-master', version },
     {
-      instructions: 'Use registered task types only. Start returns a durable task ID; poll or wait for progress. MCP cancellation stops waiting but does not cancel the browser task.'
+      instructions: 'Use registered task types only. Every task start returns a scoped Dashboard link and durable task ID; poll or wait for progress. MCP cancellation stops waiting but does not cancel the browser task.'
     }
   );
 
@@ -329,6 +334,25 @@ export function createMcpServer({ client, version = VERSION } = {}) {
     }),
     annotations: READ_ONLY,
     handler: async (_args, _ctx, api) => success({ status: publicStatus(await api.getStatus()) })
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_dashboard_open',
+    title: 'Open scoped Task Master Dashboard',
+    description: 'Return a one-time Agent-scoped Dashboard link, optionally focused on one task. Does not open an operating-system browser.',
+    inputSchema: z.strictObject({ taskId: IdentifierSchema.optional() }),
+    outputSchema: z.strictObject({ taskId: IdentifierSchema.optional(), dashboardUrl: z.string().url() }),
+    annotations: LOCAL_WRITE,
+    handler: async ({ taskId }, _ctx, api) => {
+      const result = await api.openDashboard(taskId);
+      if (typeof result?.dashboardUrl !== 'string') {
+        throw new TaskMasterClientError('INVALID_MANAGER_RESPONSE', 'Task Master returned an invalid Dashboard link.');
+      }
+      return success(
+        { ...(taskId ? { taskId } : {}), dashboardUrl: result.dashboardUrl },
+        `[打开 Task Master 任务面板](${result.dashboardUrl})${taskId ? `\n聚焦任务 ${taskId}。` : ''}`
+      );
+    }
   });
 
   register(server, taskMaster, {
@@ -439,12 +463,19 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       timeoutMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).optional(),
       idempotencyKey: IdempotencyKeySchema
     }),
-    outputSchema: z.strictObject({ task: TaskSchema }),
+    outputSchema: z.strictObject({ taskId: IdentifierSchema, dashboardUrl: z.string().url(), task: TaskSchema }),
     annotations: OPEN_WORLD_TASK,
     handler: async (args, _ctx, api) => {
       assertSafeTaskInput(args.input);
-      const task = requireId(publicTask(await api.startTask(args), { includeResult: false }), 'task');
-      return success({ task }, `Started task ${task.id}. Use taskmaster_tasks_wait or taskmaster_tasks_get to follow it.`);
+      const started = await api.startTask(args);
+      const task = requireId(publicTask(started?.task, { includeResult: false }), 'task');
+      if (started?.taskId !== task.id || typeof started?.dashboardUrl !== 'string') {
+        throw new TaskMasterClientError('INVALID_MANAGER_RESPONSE', 'Task Master returned an inconsistent task start envelope.');
+      }
+      return success(
+        { taskId: task.id, dashboardUrl: started.dashboardUrl, task },
+        `[打开任务面板](${started.dashboardUrl})\nStarted task ${task.id}. Use taskmaster_tasks_wait or taskmaster_tasks_get to follow it.`
+      );
     }
   });
 

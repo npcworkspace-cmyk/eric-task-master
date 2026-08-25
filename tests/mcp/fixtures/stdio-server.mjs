@@ -70,7 +70,20 @@ const client = {
       inputSchema: { type: 'object', properties: { url: { type: 'string' } } }
     };
   },
-  async startTask(input) { return { ...task, taskType: input.taskType, profileId: input.profileId }; },
+  async openDashboard(taskId) {
+    return {
+      ...(taskId ? { taskId } : {}),
+      dashboardUrl: `http://127.0.0.1:19946/dashboard${taskId ? `?task=${taskId}` : ''}#code=${'a'.repeat(32)}`
+    };
+  },
+  async startTask(input) {
+    const startedTask = { ...task, taskType: input.taskType, profileId: input.profileId };
+    return {
+      taskId: startedTask.id,
+      dashboardUrl: `http://127.0.0.1:19946/dashboard?task=${startedTask.id}#code=${'b'.repeat(32)}`,
+      task: startedTask
+    };
+  },
   async listTasks() { return { tasks: [task], nextCursor: 'next_fixture' }; },
   async getTask() { return task; },
   async waitTask(_taskId, { onProgress }) {

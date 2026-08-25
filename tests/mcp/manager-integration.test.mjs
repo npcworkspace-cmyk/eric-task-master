@@ -75,20 +75,20 @@ test('HTTP client matches the scoped Manager task and artifact APIs', async (t) 
   assert.equal(taskTypes[0].name, 'fixture.read');
   assert.equal(calls.find((entry) => entry[0] === 'types')[1].clientId, 'mcp.manager.fixture');
 
-  const task = await client.startTask({
+  const started = await client.startTask({
     profileId: 'profile_fixture',
     taskType: 'fixture.read',
     input: { url: 'https://example.com/' },
     idempotencyKey: 'mcp-manager-fixture-1'
   });
-  assert.equal(task.taskType, 'fixture.read');
+  assert.equal(started.task.taskType, 'fixture.read');
   assert.equal(calls.find((entry) => entry[0] === 'create')[2].clientId, 'mcp.manager.fixture');
 
-  const resumed = await client.resumeTask({ taskId: task.id, resumeKey: 'resume-manager-1' });
+  const resumed = await client.resumeTask({ taskId: started.taskId, resumeKey: 'resume-manager-1' });
   assert.equal(resumed.task.attempt, 2);
   assert.equal(calls.find((entry) => entry[0] === 'resume')[3].clientId, 'mcp.manager.fixture');
   assert.match(resumed.notice, /unknown/i);
 
-  assert.deepEqual(await client.listArtifacts(task.id), []);
+  assert.deepEqual(await client.listArtifacts(started.taskId), []);
   assert.equal(calls.find((entry) => entry[0] === 'artifacts')[2].clientId, 'mcp.manager.fixture');
 });

@@ -7,7 +7,25 @@ import test from 'node:test';
 import { createActionHelper } from '../src/lib/behavior.mjs';
 import { createEffectJournal, inspectEffectJournal } from '../src/lib/effect-journal.mjs';
 import { createOutputBudget } from '../src/lib/output-budget.mjs';
-import { runTaskWorker } from '../src/runtime/task-worker.mjs';
+import { browserEffectActivity, runTaskWorker } from '../src/runtime/task-worker.mjs';
+
+test('browser activity exposes only fixed operation phases and outcome status', () => {
+  const at = '2026-08-25T00:00:00.000Z';
+  assert.deepEqual(browserEffectActivity({ state: 'started', operation: 'goto' }, () => at), {
+    phase: 'navigating', status: 'active', updatedAt: at
+  });
+  assert.deepEqual(browserEffectActivity({ state: 'succeeded', operation: 'fill' }, () => at), {
+    phase: 'typing', status: 'succeeded', updatedAt: at
+  });
+  assert.deepEqual(browserEffectActivity({
+    state: 'failed', operation: 'secret-selector?token=do-not-return'
+  }, () => at), {
+    phase: 'working', status: 'unknown', updatedAt: at
+  });
+  assert.equal(JSON.stringify(browserEffectActivity({
+    state: 'failed', operation: 'secret-selector?token=do-not-return'
+  }, () => at)).includes('do-not-return'), false);
+});
 
 async function temporaryRoot(t, prefix) {
   const root = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -541,6 +559,25 @@ test('task progress cannot move backwards within one attempt', async (t) => {
     'export async function run({ progress }) {',
     "  await progress({ current: 2, total: 3, message: 'Advanced' });",
     "  await progress({ current: 1, total: 3, message: 'Moved backwards' });",
+    "  return { summary: 'must not complete', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_PROGRESS_INVALID');
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('task progress phase is a bounded machine identifier', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-progress-phase-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ progress }) {',
+    "  await progress({ current: 0, total: 1, message: 'unsafe', phase: 'Token secret?value' });",
     "  return { summary: 'must not complete', evidence: [] };",
     '}',
     ''

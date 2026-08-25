@@ -36,6 +36,10 @@ async function managerFixture(t) {
       return [...tasks.values()];
     },
     async create(input) {
+      const existing = typeof input.idempotencyKey === 'string'
+        ? [...tasks.values()].find((task) => task.input?.idempotencyKey === input.idempotencyKey)
+        : null;
+      if (existing) return existing;
       const task = {
         id: `task_${tasks.size + 1}`,
         state: 'queued',
@@ -335,16 +339,32 @@ test('Agent-created Profiles are private until their owner explicitly shares the
   const visible = await json(await fetch(`${baseUrl}/v1/profiles`, { headers: headers(tokenB) }));
   assert.equal(visible.body.profiles.some((profile) => profile.id === profileId), true);
 
+  const dashboardAuthorization = await json(await fetch(`${baseUrl}/v1/dashboard/authorize`, {
+    method: 'POST', headers: headers(tokenB), body: '{}'
+  }));
+  assert.equal(dashboardAuthorization.response.status, 201);
+  const dashboardSession = await json(await fetch(`${baseUrl}/v1/dashboard/session`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: dashboardAuthorization.body.code })
+  }));
+  const dashboardB = dashboardSession.body.dashboardToken;
+
   const stillCannotManage = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
     method: 'PATCH',
-    headers: headers(tokenB),
+    headers: headers(dashboardB),
     body: JSON.stringify({ defaultBehavior: 'human' })
   }));
   assert.equal(stillCannotManage.response.status, 403);
   assert.equal(stillCannotManage.body.error.code, 'PROFILE_ACCESS_DENIED');
 
+  const stillCannotDelete = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+    method: 'DELETE', headers: headers(dashboardB)
+  }));
+  assert.equal(stillCannotDelete.response.status, 403);
+  assert.equal(stillCannotDelete.body.error.code, 'PROFILE_ACCESS_DENIED');
+
   const openedByB = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/open`, {
-    method: 'POST', headers: headers(tokenB), body: '{}'
+    method: 'POST', headers: headers(dashboardB), body: '{}'
   }));
   assert.equal(openedByB.response.status, 200);
   const revokeWhileOpen = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
@@ -355,7 +375,7 @@ test('Agent-created Profiles are private until their owner explicitly shares the
   assert.equal(revokeWhileOpen.response.status, 409);
   assert.equal(revokeWhileOpen.body.error.code, 'PROFILE_IN_USE');
   const closedByB = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/close`, {
-    method: 'POST', headers: headers(tokenB), body: '{}'
+    method: 'POST', headers: headers(dashboardB), body: '{}'
   }));
   assert.equal(closedByB.response.status, 200);
   const privateAgain = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
@@ -369,15 +389,28 @@ test('Agent-created Profiles are private until their owner explicitly shares the
 
 test('task routes delegate to taskService and strip private task fields', async (t) => {
   const { manager, baseUrl } = await managerFixture(t);
+  const requestBody = { module: 'example', input: { url: 'https://example.com' }, idempotencyKey: 'manager-task-0001' };
   const created = await json(await fetch(`${baseUrl}/v1/tasks`, {
     method: 'POST',
     headers: headers(manager.token),
-    body: JSON.stringify({ module: 'example', input: { url: 'https://example.com' } })
+    body: JSON.stringify(requestBody)
   }));
   assert.equal(created.response.status, 202);
+  assert.equal(created.body.taskId, created.body.task.id);
+  assert.match(created.body.dashboardUrl, new RegExp(`^${baseUrl.replaceAll('.', '\\.')}/dashboard\\?task=${created.body.task.id}#code=[A-Za-z0-9_-]{32}$`));
+  assert.equal(created.body.dashboardUrl.includes(manager.token), false);
   assert.equal(created.body.task.state, 'queued');
   assert.equal(created.body.task.modulePath, undefined);
   assert.equal(created.body.task.input, undefined);
+
+  const retried = await json(await fetch(`${baseUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify(requestBody)
+  }));
+  assert.equal(retried.response.status, 202);
+  assert.equal(retried.body.taskId, created.body.taskId);
+  assert.notEqual(retried.body.dashboardUrl, created.body.dashboardUrl);
 
   const taskId = created.body.task.id;
   const fetched = await json(await fetch(`${baseUrl}/v1/tasks/${taskId}`, {

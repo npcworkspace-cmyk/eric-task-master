@@ -42,17 +42,35 @@ function serviceFixture() {
     },
     async list(options) {
       calls.push(['list', options]);
-      return { tasks: [...tasks.values()], nextCursor: null };
+      const caller = options.caller;
+      return {
+        tasks: [...tasks.values()].filter((task) => (
+          caller.role === 'manager-admin' ||
+          (task.ownerRole === caller.role && task.ownerClientId === caller.clientId)
+        )),
+        nextCursor: null
+      };
     },
     async create(input, caller) {
       calls.push(['create', input, caller]);
-      const task = { id: `task_${String(tasks.size + 1).padStart(32, '0')}`, state: 'queued' };
+      const task = {
+        id: `task_${String(tasks.size + 1).padStart(32, '0')}`,
+        state: 'queued',
+        ownerRole: caller.role,
+        ownerClientId: caller.clientId
+      };
       tasks.set(task.id, task);
       return task;
     },
     async get(id, caller) {
       calls.push(['get', id, caller]);
-      return tasks.get(id) || { id, state: 'running' };
+      const task = tasks.get(id);
+      if (!task || (caller.role !== 'manager-admin' && (
+        task.ownerRole !== caller.role || task.ownerClientId !== caller.clientId
+      ))) {
+        throw Object.assign(new Error('Task not found'), { statusCode: 404, code: 'TASK_NOT_FOUND' });
+      }
+      return task;
     },
     async cancel(id, caller) {
       calls.push(['cancel', id, caller]);
@@ -134,7 +152,35 @@ test('role matrix scopes MCP Agent identity and keeps removed extension routes c
     }
   });
   assert.equal(agentTask.status, 202);
+  assert.equal(agentTask.payload.taskId, agentTask.payload.task.id);
+  assert.match(agentTask.payload.dashboardUrl, new RegExp(`^${baseUrl.replaceAll('.', '\\.')}/dashboard\\?task=${agentTask.payload.task.id}#code=`));
+  assert.equal(agentTask.payload.dashboardUrl.includes(manager.token), false);
   assert.equal(service.calls.find((entry) => entry[0] === 'create')[2].clientId, 'codex.fixture');
+
+  const dashboardCode = new URLSearchParams(new URL(agentTask.payload.dashboardUrl).hash.slice(1)).get('code');
+  const dashboardSession = await call(baseUrl, '/v1/dashboard/session', {
+    method: 'POST', origin: baseUrl, body: { code: dashboardCode }
+  });
+  assert.equal(dashboardSession.status, 201);
+  const scopedTasks = await call(baseUrl, '/v1/tasks', { token: dashboardSession.payload.dashboardToken });
+  assert.deepEqual(scopedTasks.payload.tasks.map((task) => task.id), [agentTask.payload.task.id]);
+  const delegatedCaller = service.calls.filter((entry) => entry[0] === 'list').at(-1)[1].caller;
+  assert.equal(delegatedCaller.role, 'agent');
+  assert.equal(delegatedCaller.clientId, 'codex.fixture');
+  const dashboardCannotCreateTask = await call(baseUrl, '/v1/tasks', {
+    method: 'POST', token: dashboardSession.payload.dashboardToken, body: {
+      profileId: 'profile_fixture', taskType: 'fixture', idempotencyKey: 'dashboard-forbidden'
+    }
+  });
+  assert.equal(dashboardCannotCreateTask.status, 403);
+
+  const otherAgent = await call(baseUrl, '/v1/agents/issue', {
+    method: 'POST', token: manager.token, body: { clientId: 'other.fixture', name: 'Other fixture' }
+  });
+  const forbiddenFocus = await call(baseUrl, '/v1/dashboard/authorize', {
+    method: 'POST', token: otherAgent.payload.agentToken, body: { focusTaskId: agentTask.payload.task.id }
+  });
+  assert.equal(forbiddenFocus.status, 404);
 
   const listedArtifacts = await call(baseUrl, `/v1/tasks/${agentTask.payload.task.id}/artifacts`, {
     token: issued.payload.agentToken
@@ -148,11 +194,16 @@ test('role matrix scopes MCP Agent identity and keeps removed extension routes c
   assert.equal(readArtifact.status, 200);
   assert.equal(service.calls.find((entry) => entry[0] === 'read-artifact')[4].clientId, 'codex.fixture');
 
-  const agentDelete = await call(baseUrl, '/v1/profiles/profile_fixture', {
-    method: 'DELETE',
-    token: issued.payload.agentToken
+  const ownedProfile = await call(baseUrl, '/v1/profiles', {
+    method: 'POST', token: issued.payload.agentToken, body: {
+      name: 'Owned private Profile', kind: 'ephemeral'
+    }
   });
-  assert.equal(agentDelete.status, 403);
+  assert.equal(ownedProfile.status, 201);
+  const agentDelete = await call(baseUrl, `/v1/profiles/${ownedProfile.payload.profile.id}`, {
+    method: 'DELETE', token: issued.payload.agentToken
+  });
+  assert.equal(agentDelete.status, 200);
 
   for (const pathname of ['/v1/pair/authorize', '/v1/pair/extension']) {
     const removed = await call(baseUrl, pathname, {
@@ -206,6 +257,23 @@ test('Dashboard exchanges a one-time code for a scoped in-memory session', async
     }
   });
   assert.equal(cannotCreate.status, 403);
+
+  // A normal batch may start hundreds of tasks before anyone opens a link.
+  // Keep at least 257 outstanding one-time approvals alive concurrently.
+  const approvalCodes = [];
+  for (let index = 0; index < 257; index += 1) {
+    const pending = await call(baseUrl, '/v1/dashboard/authorize', {
+      method: 'POST', token: manager.token, body: {}
+    });
+    assert.equal(pending.status, 201);
+    approvalCodes.push(pending.payload.code);
+  }
+  for (const code of [approvalCodes[0], approvalCodes.at(-1)]) {
+    const redeemed = await call(baseUrl, '/v1/dashboard/session', {
+      method: 'POST', origin: baseUrl, body: { code }
+    });
+    assert.equal(redeemed.status, 201);
+  }
 });
 
 test('a state directory has exactly one live Manager owner', async (t) => {

@@ -35,6 +35,23 @@ const PROFILE_CLEANUP_QUEUE_REASON = 'Waiting for confirmed Profile cleanup';
 const PROFILE_BUSY_QUEUE_REASON = 'Waiting for Profile to become idle';
 const CLEANUP_RECONCILE_INTERVAL_MS = 2_000;
 const CLEANUP_RECONCILE_GRACE_MS = 60_000;
+const PROGRESS_PHASE_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+const WORKER_ACTIVITY_PHASES = new Set(['navigating', 'clicking', 'typing', 'hovering', 'scrolling', 'working']);
+const WORKER_ACTIVITY_STATUSES = new Set(['active', 'succeeded', 'unknown']);
+const LIFECYCLE_ACTIVITY_STATUS = Object.freeze({
+  queued: 'waiting',
+  acquiring_profile: 'active',
+  starting_browser: 'active',
+  running: 'active',
+  waiting_user: 'waiting',
+  cooling_down: 'waiting',
+  recovering: 'active',
+  verifying: 'active',
+  cleaning_up: 'active',
+  completed: 'succeeded',
+  failed: 'unknown',
+  cancelled: 'cancelled'
+});
 
 function resolveProfileBehavior(profile) {
   const behavior = profile.kind === 'persistent'
@@ -85,6 +102,23 @@ export class TaskServiceError extends Error {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function lifecycleActivity(phase, at = nowIso()) {
+  return {
+    phase,
+    status: LIFECYCLE_ACTIVITY_STATUS[phase] || 'active',
+    updatedAt: at
+  };
+}
+
+function workerActivity(value) {
+  if (
+    !value || typeof value !== 'object' || Array.isArray(value) ||
+    !WORKER_ACTIVITY_PHASES.has(value.phase) ||
+    !WORKER_ACTIVITY_STATUSES.has(value.status)
+  ) return null;
+  return { phase: value.phase, status: value.status, updatedAt: nowIso() };
 }
 
 function clone(value) {
@@ -804,6 +838,7 @@ export function createTaskService({
         }
       }
       await refreshResumeCheckpointState(task);
+      task.currentActivity = lifecycleActivity(task.state);
       task.updatedAt = nowIso();
       await atomicJson(filePath, task);
       if (task.cleanup.settled === true) {
@@ -864,6 +899,7 @@ export function createTaskService({
         profile = await reconcileAnyCleanup(profile);
       } catch (error) {
         task.state = 'failed';
+        task.currentActivity = lifecycleActivity('failed');
         task.health = { status: 'failed', checkedAt: nowIso() };
         task.error = sanitizeError(error, 'PROFILE_NOT_FOUND');
         task.finishedAt = nowIso();
@@ -875,6 +911,7 @@ export function createTaskService({
       const taskCaller = { role: task.ownerRole, clientId: task.ownerClientId };
       if (!canUseProfile(profile, taskCaller)) {
         task.state = 'failed';
+        task.currentActivity = lifecycleActivity('failed');
         task.health = { status: 'failed', checkedAt: nowIso() };
         task.error = {
           code: 'PROFILE_ACCESS_REVOKED',
@@ -914,6 +951,7 @@ export function createTaskService({
           continue;
         }
         task.state = 'failed';
+        task.currentActivity = lifecycleActivity('failed');
         task.health = { status: 'failed', checkedAt: nowIso() };
         task.error = {
           code: 'PROFILE_CLEANUP_UNCONFIRMED',
@@ -982,7 +1020,10 @@ export function createTaskService({
   }
 
   function update(task, patch) {
-    Object.assign(task, patch, { updatedAt: nowIso() });
+    const activity = Object.hasOwn(patch, 'currentActivity') || typeof patch.state !== 'string'
+      ? null
+      : lifecycleActivity(patch.state);
+    Object.assign(task, patch, ...(activity ? [{ currentActivity: activity }] : []), { updatedAt: nowIso() });
     return persist(task).then(() => task);
   }
 
@@ -1263,6 +1304,7 @@ export function createTaskService({
       entry.attached = false;
       children.delete(task.id);
       task.state = 'failed';
+      task.currentActivity = lifecycleActivity('failed');
       task.error = {
         code: 'TASK_FINALIZATION_PERSIST_FAILED',
         message: 'Task worker exited, but its durable terminal state could not be confirmed.'
@@ -1344,9 +1386,7 @@ export function createTaskService({
         entry.diagnoseAt = 0;
         clearTimeout(entry.forceKillTimer);
         entry.forceKillTimer = null;
-        void update(task, {
-          heartbeatAt: message.at || nowIso()
-        }).catch(() => {});
+        void update(task, { heartbeatAt: nowIso() }).catch(() => {});
         const renewal = entry.leaseRenewalTail.then(async () => {
           if (!entry.attached || entry.finalized) return;
           await profileStore.acquireLease(task.profileId, task.leaseOwner, {
@@ -1371,6 +1411,7 @@ export function createTaskService({
         const progressMessage = typeof message.progress.message === 'string'
           ? redactSensitiveText(message.progress.message).slice(0, 500)
           : '';
+        const phase = message.progress.phase;
         const previousCurrent = Number(task.progress?.current) || 0;
         const previousTotal = task.progress?.total === null || task.progress?.total === undefined
           ? null
@@ -1379,7 +1420,8 @@ export function createTaskService({
           !Number.isFinite(current) || current < 0 || current < previousCurrent ||
           (total !== null && (!Number.isFinite(total) || total < current)) ||
           (previousTotal !== null && (total === null || total < previousTotal)) ||
-          !progressMessage.trim()
+          !progressMessage.trim() ||
+          (phase !== undefined && (typeof phase !== 'string' || !PROGRESS_PHASE_PATTERN.test(phase)))
         ) {
           void update(task, {
             state: 'failed',
@@ -1397,20 +1439,29 @@ export function createTaskService({
         }
         const advanced = current > previousCurrent;
         if (advanced) entry.stallDiagnoseAt = 0;
-        const at = message.at || nowIso();
+        // Timestamp worker feedback at receipt. Worker-controlled strings must
+        // never become public activity or freshness fields.
+        const at = nowIso();
         const healthStatus = task.state === 'waiting_user'
           ? 'waiting_user'
           : task.state === 'cooling_down'
             ? 'cooling_down'
             : 'healthy';
         void update(task, {
-          progress: { current, total, message: progressMessage },
+          progress: { current, total, message: progressMessage, ...(phase === undefined ? {} : { phase }) },
           heartbeatAt: at,
           ...(advanced ? {
             progressAt: at,
             health: { status: healthStatus, checkedAt: at }
           } : {})
         }).catch(() => {});
+        return;
+      }
+      if (message.type === 'activity') {
+        const currentActivity = workerActivity(message.activity);
+        if (currentActivity && task.state !== 'verifying' && !TERMINAL_TASK_STATES.has(task.state)) {
+          void update(task, { currentActivity }).catch(() => {});
+        }
         return;
       }
       if (message.type === 'waiting_user' && message.request) {
@@ -1563,7 +1614,10 @@ export function createTaskService({
       }
       if (message.type === 'cleanup') {
         task.cleanup.browserClosed = Boolean(message.browserClosed);
-        void update(task, { cleanup: task.cleanup }).catch(() => {});
+        void update(task, {
+          cleanup: task.cleanup,
+          currentActivity: lifecycleActivity('cleaning_up')
+        }).catch(() => {});
       }
     });
 
@@ -1896,6 +1950,7 @@ export function createTaskService({
       history: [],
       resumeKeys: [],
       state: 'queued',
+      currentActivity: lifecycleActivity('queued'),
       progress: { current: 0, total: null, message: 'Queued' },
       progressAt: nowIso(),
       heartbeatAt: nowIso(),
@@ -2252,6 +2307,7 @@ export function createTaskService({
     task.resumeKeys.push({ keyHash, attempt: task.attempt, requestedAt: nowIso() });
     task.resumeKeys = task.resumeKeys.slice(-MAX_ATTEMPTS);
     task.state = 'queued';
+    task.currentActivity = lifecycleActivity('queued');
     task.progress = {
       current: 0,
       total: null,
@@ -2366,6 +2422,7 @@ export function createTaskService({
       } catch {
         const invalidAt = nowIso();
         task.state = 'failed';
+        task.currentActivity = lifecycleActivity('failed');
         task.error = {
           code: 'TASK_COMPLETION_INTEGRITY_FAILED',
           message: 'Previously verified completion evidence is missing, changed, or unstable.'

@@ -49,16 +49,16 @@ test('a real long browser task survives MCP client replacement and exposes bound
   });
 
   const replacementClient = new HttpTaskMasterClient(options);
-  const waited = await replacementClient.waitTask(started.id, { waitMs: 15_000 });
+  const waited = await replacementClient.waitTask(started.taskId, { waitMs: 15_000 });
   assert.equal(waited.timedOut, false);
   assert.equal(waited.task.state, 'completed');
   assert.equal(waited.task.progress.current, 8);
   assert.equal(waited.task.cleanup.settled, true);
 
-  const artifacts = await replacementClient.listArtifacts(started.id);
+  const artifacts = await replacementClient.listArtifacts(started.taskId);
   assert.deepEqual(artifacts.map((artifact) => artifact.name), ['durable-delay.json']);
   const content = await replacementClient.readArtifact({
-    taskId: started.id,
+    taskId: started.taskId,
     artifactId: artifacts[0].id,
     maxBytes: 48 * 1024
   });
@@ -120,9 +120,9 @@ test('different Profiles run concurrently while same-Profile work queues safely'
   });
 
   const [leftDone, rightDone, collisionDone] = await Promise.all([
-    client.waitTask(left.id, { waitMs: 20_000 }),
-    client.waitTask(right.id, { waitMs: 20_000 }),
-    client.waitTask(collision.id, { waitMs: 20_000 })
+    client.waitTask(left.taskId, { waitMs: 20_000 }),
+    client.waitTask(right.taskId, { waitMs: 20_000 }),
+    client.waitTask(collision.taskId, { waitMs: 20_000 })
   ]);
   assert.equal(leftDone.task.state, 'completed');
   assert.equal(rightDone.task.state, 'completed');
@@ -184,14 +184,14 @@ test('a real Playwright action failure returns its diagnostic screenshot through
     input: {},
     idempotencyKey: 'diagnostic-action-failure-0001'
   });
-  const terminal = await client.waitTask(task.id, { waitMs: 15_000 });
+  const terminal = await client.waitTask(task.taskId, { waitMs: 15_000 });
   assert.equal(terminal.task.state, 'failed');
   assert.equal(terminal.task.cleanup.settled, true);
   assert.equal(terminal.task.error.code, 'ACTION_FAILED');
   assert.equal(typeof terminal.task.lastScreenshot?.ref, 'string');
   assert.equal(typeof terminal.task.lastObservation?.ref, 'string');
 
-  const artifacts = await client.listArtifacts(task.id);
+  const artifacts = await client.listArtifacts(task.taskId);
   assert.deepEqual(new Set(artifacts.map((artifact) => artifact.kind)), new Set([
     'diagnostic-screenshot',
     'diagnostic-observation'
@@ -199,7 +199,7 @@ test('a real Playwright action failure returns its diagnostic screenshot through
   const screenshotArtifact = artifacts.find((artifact) => artifact.kind === 'diagnostic-screenshot');
   assert.equal(screenshotArtifact.mimeType, 'image/jpeg');
   const screenshot = await client.readArtifact({
-    taskId: task.id,
+    taskId: task.taskId,
     artifactId: screenshotArtifact.id,
     maxBytes: 48 * 1024
   });

@@ -37,6 +37,8 @@ import {
 
 const DASHBOARD_APPROVAL_TTL_MS = 2 * 60_000;
 const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60_000;
+const MAX_DASHBOARD_APPROVALS = 512;
+const MAX_DASHBOARD_SESSIONS = 128;
 const MANAGER_NAME = MANAGER_SERVICE;
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const RESUME_NOTICE = 'Resume is explicit: the task module must inspect its checkpoint and current site state before repeating any action whose external outcome is unknown.';
@@ -142,20 +144,22 @@ function requireRole(auth, ...roles) {
 
 function serviceCaller(auth) {
   return auth?.role === 'dashboard'
-    ? { role: 'manager-admin', clientId: 'dashboard' }
+    ? auth.principal
     : auth;
 }
 
 function canUseProfile(profile, auth) {
-  if (['manager-admin', 'dashboard'].includes(auth?.role)) return true;
-  return auth?.role === 'agent' && (
-    profile?.ownerClientId === auth.clientId || profile?.access === 'shared'
+  const caller = serviceCaller(auth);
+  if (caller?.role === 'manager-admin') return true;
+  return caller?.role === 'agent' && (
+    profile?.ownerClientId === caller.clientId || profile?.access === 'shared'
   );
 }
 
 function canManageProfile(profile, auth) {
-  if (['manager-admin', 'dashboard'].includes(auth?.role)) return true;
-  return auth?.role === 'agent' && profile?.ownerClientId === auth.clientId;
+  const caller = serviceCaller(auth);
+  if (caller?.role === 'manager-admin') return true;
+  return caller?.role === 'agent' && profile?.ownerClientId === caller.clientId;
 }
 
 function requireProfileAccess(profile, auth, { manage = false } = {}) {
@@ -334,6 +338,49 @@ export async function createManager({
     resolveShutdownRequested(request);
   }
 
+  function managerOrigin() {
+    if (!listeningAddress) {
+      throw new HttpError(503, 'MANAGER_NOT_LISTENING', 'Manager is not listening yet');
+    }
+    return `http://${host}:${listeningAddress.port}`;
+  }
+
+  function dashboardLink(code, focusTaskId = null) {
+    const dashboard = new URL('/dashboard', managerOrigin());
+    if (focusTaskId) dashboard.searchParams.set('task', focusTaskId);
+    dashboard.hash = new URLSearchParams({ code }).toString();
+    return dashboard.href;
+  }
+
+  async function createDashboardApproval(principal, focusTaskId = null) {
+    if (!['manager-admin', 'agent'].includes(principal?.role)) {
+      throw new HttpError(403, 'ROLE_FORBIDDEN', 'This credential cannot authorize a Dashboard');
+    }
+    if (focusTaskId !== null) {
+      if (typeof focusTaskId !== 'string' || !/^[a-zA-Z0-9._:-]{1,128}$/.test(focusTaskId)) {
+        throw new HttpError(400, 'INVALID_TASK_ID', 'focusTaskId must be a stable task identifier');
+      }
+      await requireTaskMethod(taskService, 'get')(focusTaskId, principal);
+    }
+    for (const [code, approval] of dashboardApprovals) {
+      if (approval.expiresAt <= now()) dashboardApprovals.delete(code);
+    }
+    while (dashboardApprovals.size >= MAX_DASHBOARD_APPROVALS) {
+      dashboardApprovals.delete(dashboardApprovals.keys().next().value);
+    }
+    const code = randomBytes(24).toString('base64url');
+    dashboardApprovals.set(code, {
+      expiresAt: now() + DASHBOARD_APPROVAL_TTL_MS,
+      principal: { ...principal },
+      focusTaskId
+    });
+    return {
+      code,
+      dashboardUrl: dashboardLink(code, focusTaskId),
+      expiresInMs: DASHBOARD_APPROVAL_TTL_MS
+    };
+  }
+
   function currentCors(request) {
     const origin = requestOrigin(request);
     if (!origin) return {};
@@ -366,7 +413,11 @@ export async function createManager({
       if (dashboard.expiresAt <= now()) {
         dashboardSessions.delete(hashed);
       } else {
-        return { role: 'dashboard', clientId: dashboard.clientId };
+        return {
+          role: 'dashboard',
+          principal: { ...dashboard.principal },
+          focusTaskId: dashboard.focusTaskId
+        };
       }
     }
     throw new HttpError(401, 'INVALID_TOKEN', 'Bearer token is invalid');
@@ -464,18 +515,14 @@ export async function createManager({
 
     if (request.method === 'POST' && url.pathname === '/v1/dashboard/authorize') {
       const auth = await authenticate(request);
-      requireRole(auth, 'manager-admin');
-      await readJson(request, { maxBytes: 4 * 1024 });
-      for (const [code, approval] of dashboardApprovals) {
-        if (approval.expiresAt <= now()) dashboardApprovals.delete(code);
+      requireRole(auth, 'manager-admin', 'agent');
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      const unknown = Object.keys(body).filter((key) => key !== 'focusTaskId');
+      if (unknown.length) {
+        throw new HttpError(400, 'INVALID_DASHBOARD_AUTHORIZATION', 'Dashboard authorization accepts only focusTaskId');
       }
-      while (dashboardApprovals.size >= 8) dashboardApprovals.delete(dashboardApprovals.keys().next().value);
-      const code = randomBytes(24).toString('base64url');
-      dashboardApprovals.set(code, {
-        expiresAt: now() + DASHBOARD_APPROVAL_TTL_MS,
-        clientId: `dashboard:${auth.clientId}`
-      });
-      sendJson(response, 201, { code, expiresInMs: DASHBOARD_APPROVAL_TTL_MS }, cors);
+      const approval = await createDashboardApproval(auth, body.focusTaskId ?? null);
+      sendJson(response, 201, approval, cors);
       return;
     }
 
@@ -490,11 +537,14 @@ export async function createManager({
       for (const [hash, session] of dashboardSessions) {
         if (session.expiresAt <= now()) dashboardSessions.delete(hash);
       }
-      while (dashboardSessions.size >= 8) dashboardSessions.delete(dashboardSessions.keys().next().value);
+      while (dashboardSessions.size >= MAX_DASHBOARD_SESSIONS) {
+        dashboardSessions.delete(dashboardSessions.keys().next().value);
+      }
       const dashboardToken = token();
       dashboardSessions.set(tokenHash(dashboardToken), {
         expiresAt: now() + DASHBOARD_SESSION_TTL_MS,
-        clientId: approval.clientId
+        principal: { ...approval.principal },
+        focusTaskId: approval.focusTaskId
       });
       sendJson(response, 201, {
         dashboardToken,
@@ -532,11 +582,12 @@ export async function createManager({
     if (request.method === 'POST' && url.pathname === '/v1/profiles') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const caller = serviceCaller(auth);
       const requested = validateProfileCreate(await readJson(request));
       const { access, ...profileInput } = requested;
       const profile = await profileStore.create(profileInput, {
-        ownerClientId: auth.role === 'agent' ? auth.clientId : null,
-        access: access ?? (auth.role === 'agent' ? 'private' : 'shared')
+        ownerClientId: caller.role === 'agent' ? caller.clientId : null,
+        access: access ?? (caller.role === 'agent' ? 'private' : 'shared')
       });
       sendJson(response, 201, { profile: publicProfile(profile) }, cors);
       return;
@@ -555,8 +606,9 @@ export async function createManager({
     }
     if (profileMatch && request.method === 'DELETE') {
       const auth = await authenticate(request);
-      requireRole(auth, 'manager-admin', 'dashboard');
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const profileId = decodeURIComponent(profileMatch[1]);
+      requireProfileAccess(await profileStore.get(profileId), auth, { manage: true });
       const removed = await profileStore.remove(profileId);
       sendJson(response, 200, { removed: publicProfile(removed) }, cors);
       return;
@@ -642,7 +694,9 @@ export async function createManager({
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent');
       const task = await requireTaskMethod(taskService, 'create')(await readJson(request), auth);
-      sendJson(response, 202, { task: publicTask(task) }, cors);
+      const safeTask = publicTask(task);
+      const { dashboardUrl } = await createDashboardApproval(auth, safeTask.id);
+      sendJson(response, 202, { taskId: safeTask.id, dashboardUrl, task: safeTask }, cors);
       return;
     }
     if (taskArtifactsMatch && request.method === 'GET') {

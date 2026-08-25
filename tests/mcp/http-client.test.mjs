@@ -91,6 +91,8 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
     }
     if (request.url === '/v1/tasks' && request.method === 'POST') {
       reply(response, 202, {
+        taskId: 'task_safe',
+        dashboardUrl: `http://${request.headers.host}/dashboard?task=task_safe#code=${'c'.repeat(32)}`,
         task: {
           id: 'task_safe',
           profileId: body.profileId,
@@ -130,7 +132,9 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
     input: { url: 'https://example.com/' },
     idempotencyKey: 'request-safe-0001'
   });
-  const resumed = await client.resumeTask({ taskId: started.id, resumeKey: 'resume-safe-0001' });
+  assert.equal(started.taskId, started.task.id);
+  assert.match(started.dashboardUrl, /\/dashboard\?task=task_safe#code=/u);
+  const resumed = await client.resumeTask({ taskId: started.taskId, resumeKey: 'resume-safe-0001' });
   assert.equal(resumed.task.attempt, 2);
   assert.match(resumed.notice, /unknown external action/i);
 
@@ -140,6 +144,54 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.deepEqual(requests[0].body, { clientId: 'codex-fixture', name: 'Codex fixture' });
   assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['idempotencyKey', 'input', 'profileId', 'taskType']);
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
+});
+
+test('HTTP client validates scoped Dashboard links and complete task start envelopes', async (t) => {
+  const connection = await fixture(t, async (request, response) => {
+    const body = await readJson(request);
+    if (request.url === '/v1/agents/issue') {
+      reply(response, 200, {
+        agentToken: AGENT_TOKEN,
+        agent: { clientId: body.clientId, name: body.name }
+      });
+      return;
+    }
+    const origin = `http://${request.headers.host}`;
+    if (request.url === '/v1/dashboard/authorize') {
+      const suffix = body.focusTaskId ? `?task=${body.focusTaskId}` : '';
+      reply(response, 201, { dashboardUrl: `${origin}/dashboard${suffix}#code=${'d'.repeat(32)}` });
+      return;
+    }
+    if (request.url === '/v1/tasks') {
+      const task = { id: 'task_safe', state: 'queued' };
+      const links = {
+        'wrong-origin': `http://127.0.0.1:9/dashboard?task=task_safe#code=${'e'.repeat(32)}`,
+        'wrong-path': `${origin}/other?task=task_safe#code=${'e'.repeat(32)}`,
+        'wrong-focus': `${origin}/dashboard?task=task_other#code=${'e'.repeat(32)}`,
+        'missing-code': `${origin}/dashboard?task=task_safe`,
+        valid: `${origin}/dashboard?task=task_safe#code=${'e'.repeat(32)}`
+      };
+      reply(response, 202, {
+        taskId: body.idempotencyKey === 'mismatched-id' ? 'task_other' : task.id,
+        dashboardUrl: links[body.idempotencyKey] || links.valid,
+        task
+      });
+      return;
+    }
+    reply(response, 404, { error: { code: 'NOT_FOUND' } });
+  });
+  const client = new HttpTaskMasterClient({ ...connection, clientId: 'dashboard-validation' });
+
+  assert.match((await client.openDashboard()).dashboardUrl, /\/dashboard#code=/u);
+  assert.match((await client.openDashboard('task_safe')).dashboardUrl, /\/dashboard\?task=task_safe#code=/u);
+  for (const idempotencyKey of ['wrong-origin', 'wrong-path', 'wrong-focus', 'missing-code', 'mismatched-id']) {
+    await assert.rejects(client.startTask({
+      taskType: 'fixture.read',
+      profileId: 'profile_safe',
+      input: {},
+      idempotencyKey
+    }), { code: 'INVALID_MANAGER_RESPONSE' });
+  }
 });
 
 test('Profile open and close keep operation deadlines beyond the generic MCP request timeout', async (t) => {

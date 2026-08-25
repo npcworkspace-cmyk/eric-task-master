@@ -18,6 +18,26 @@ const DEFAULT_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const ATOMIC_RENAME_RETRY_MS = Object.freeze([25, 50, 100, 200, 400]);
 const TRANSIENT_RENAME_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
+const PROGRESS_PHASE_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+const EFFECT_ACTIVITY = Object.freeze({
+  goto: 'navigating',
+  click: 'clicking',
+  fill: 'typing',
+  type: 'typing',
+  hover: 'hovering',
+  scroll: 'scrolling',
+  custom: 'working'
+});
+
+export function browserEffectActivity({ state, operation } = {}, now = () => new Date().toISOString()) {
+  const phase = EFFECT_ACTIVITY[operation] || 'working';
+  const status = state === 'started'
+    ? 'active'
+    : state === 'succeeded'
+      ? 'succeeded'
+      : 'unknown';
+  return Object.freeze({ phase, status, updatedAt: now() });
+}
 
 class TaskCancelledError extends Error {
   constructor() {
@@ -472,7 +492,7 @@ export async function runTaskWorker(config, {
     const page = pages[0] || await awaitExecution(context.newPage());
     activePage = page;
 
-    const progress = async ({ current, total = null, message }) => {
+    const progress = async ({ current, total = null, message, phase }) => {
       await outputBudget.assertWithinBudget();
       const normalizedCurrent = Number(current);
       const normalizedTotal = total === null ? null : Number(total);
@@ -494,10 +514,16 @@ export async function runTaskWorker(config, {
         throw error;
       }
       if (!String(message || '').trim()) throw new TypeError('progress.message is required');
+      if (phase !== undefined && (typeof phase !== 'string' || !PROGRESS_PHASE_PATTERN.test(phase))) {
+        const error = new TypeError('progress.phase must match ^[a-z][a-z0-9_-]{0,31}$');
+        error.code = 'TASK_PROGRESS_INVALID';
+        throw error;
+      }
       activeProgress = {
         current: normalizedCurrent,
         total: normalizedTotal,
-        message: String(message).slice(0, 500)
+        message: String(message).slice(0, 500),
+        ...(phase === undefined ? {} : { phase })
       };
       safeSend({ type: 'progress', progress: activeProgress, at: new Date().toISOString() });
     };
@@ -564,7 +590,11 @@ export async function runTaskWorker(config, {
       page,
       mode: config.behavior,
       abortSignal: executionSignal,
-      onEffect: (event) => effectJournal.record(event),
+      onEffect: async (event) => {
+        const sequence = await effectJournal.record(event);
+        safeSend({ type: 'activity', activity: browserEffectActivity(event) });
+        return sequence;
+      },
       onAdaptiveState: (state) => safeSend({
         type: 'behavior',
         behavior: {
@@ -575,6 +605,10 @@ export async function runTaskWorker(config, {
         }
       }),
       onFailure: async ({ operation }) => {
+        safeSend({
+          type: 'activity',
+          activity: browserEffectActivity({ state: 'failed', operation })
+        });
         const diagnostics = await captureFailure(page, config.outputDir, `action-${operation}`, outputBudget);
         lastScreenshot = diagnostics.screenshotPath;
       }

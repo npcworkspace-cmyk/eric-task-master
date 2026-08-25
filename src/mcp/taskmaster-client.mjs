@@ -22,6 +22,7 @@ const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TOKEN = /^\S{32,512}$/;
+const DASHBOARD_CODE = /^[A-Za-z0-9_-]{32,128}$/;
 const FORBIDDEN_INPUT_KEY = /^(?:module_?path|evaluate|authorization|auth_?header|cookies?|password|passwd|secrets?|credentials?|api_?key|token|(?:access|refresh|api|auth|bearer|session)_?token|session(?:_?id|_?token)?)$/i;
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -34,6 +35,7 @@ export const TASKMASTER_CLIENT_METHODS = Object.freeze([
   'closeProfile',
   'listTaskTypes',
   'describeTaskType',
+  'openDashboard',
   'startTask',
   'listTasks',
   'getTask',
@@ -121,6 +123,33 @@ function normalizeBaseUrl(value) {
     throw clientError('LOOPBACK_REQUIRED', 'MCP may connect only to a plain HTTP manager on 127.0.0.1.');
   }
   return url;
+}
+
+function validateDashboardUrl(value, baseUrl, expectedTaskId = null) {
+  let dashboard;
+  try {
+    dashboard = new URL(value);
+  } catch {
+    throw clientError('INVALID_MANAGER_RESPONSE', 'Task Master returned an invalid Dashboard URL.');
+  }
+  const query = [...dashboard.searchParams.entries()];
+  const fragment = new URLSearchParams(dashboard.hash.replace(/^#/, ''));
+  const fragmentEntries = [...fragment.entries()];
+  const code = fragment.get('code');
+  const expectedQuery = expectedTaskId === null ? [] : [['task', expectedTaskId]];
+  if (
+    dashboard.origin !== baseUrl.origin ||
+    dashboard.protocol !== 'http:' ||
+    dashboard.hostname !== '127.0.0.1' ||
+    dashboard.username || dashboard.password ||
+    dashboard.pathname !== '/dashboard' ||
+    JSON.stringify(query) !== JSON.stringify(expectedQuery) ||
+    fragmentEntries.length !== 1 || fragmentEntries[0][0] !== 'code' ||
+    typeof code !== 'string' || !DASHBOARD_CODE.test(code)
+  ) {
+    throw clientError('INVALID_MANAGER_RESPONSE', 'Task Master returned a Dashboard link outside the scoped Manager contract.');
+  }
+  return dashboard.href;
 }
 
 function delay(ms, signal) {
@@ -341,6 +370,18 @@ export class HttpTaskMasterClient {
     return (await this.#request(`/v1/task-types/${encodeURIComponent(taskType)}`)).taskType;
   }
 
+  async openDashboard(taskId) {
+    if (taskId !== undefined) assertIdentifier(taskId, 'taskId');
+    const payload = await this.#request('/v1/dashboard/authorize', {
+      method: 'POST',
+      body: taskId === undefined ? {} : { focusTaskId: taskId }
+    });
+    return {
+      ...(taskId === undefined ? {} : { taskId }),
+      dashboardUrl: validateDashboardUrl(payload.dashboardUrl, this.#baseUrl, taskId ?? null)
+    };
+  }
+
   async startTask(input) {
     assertAllowedKeys(input, new Set(['taskType', 'profileId', 'input', 'timeoutMs', 'idempotencyKey']), 'Task request');
     assertIdentifier(input.taskType, 'taskType');
@@ -350,7 +391,19 @@ export class HttpTaskMasterClient {
       throw clientError('INVALID_IDEMPOTENCY_KEY', 'idempotencyKey must contain at least 8 characters.');
     }
     assertSafeTaskInput(input.input);
-    return (await this.#request('/v1/tasks', { method: 'POST', body: input })).task;
+    const payload = await this.#request('/v1/tasks', { method: 'POST', body: input });
+    if (
+      typeof payload.taskId !== 'string' || !IDENTIFIER.test(payload.taskId) ||
+      !payload.task || typeof payload.task !== 'object' || Array.isArray(payload.task) ||
+      payload.task.id !== payload.taskId
+    ) {
+      throw clientError('INVALID_MANAGER_RESPONSE', 'Task Master returned an inconsistent task start envelope.');
+    }
+    return {
+      taskId: payload.taskId,
+      dashboardUrl: validateDashboardUrl(payload.dashboardUrl, this.#baseUrl, payload.taskId),
+      task: payload.task
+    };
   }
 
   async listTasks(input = {}) {

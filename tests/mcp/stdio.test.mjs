@@ -38,7 +38,7 @@ for (const [label, mode] of [
 
     if (label === 'legacy') await connection.client.ping();
     const listed = await connection.client.listTools();
-    assert.equal(listed.tools.length, 17);
+    assert.equal(listed.tools.length, 18);
     const start = listed.tools.find((tool) => tool.name === 'taskmaster_tasks_start');
     assert.deepEqual(start.annotations, {
       readOnlyHint: false,
@@ -171,6 +171,31 @@ test('MCP rejects low-level task fields before dispatch and redacts task interna
   assert.equal(serialized.includes('managerToken'), false);
   assert.equal(serialized.includes('do-not-return'), false);
   assert.equal(serialized.includes('?token='), false);
+});
+
+test('MCP task start and explicit Dashboard open return clickable scoped links first', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const started = await connection.client.callTool({
+    name: 'taskmaster_tasks_start',
+    arguments: {
+      taskType: 'fixture.read',
+      profileId: 'profile_fixture',
+      input: {},
+      idempotencyKey: 'dashboard-link-fixture'
+    }
+  });
+  assert.equal(started.structuredContent.data.taskId, 'task_fixture');
+  assert.equal(started.structuredContent.data.task.id, 'task_fixture');
+  assert.match(started.content[0].text, /^\[打开任务面板\]\(http:\/\/127\.0\.0\.1:19946\/dashboard\?task=task_fixture#code=/u);
+
+  const opened = await connection.client.callTool({
+    name: 'taskmaster_dashboard_open',
+    arguments: { taskId: 'task_fixture' }
+  });
+  assert.equal(opened.structuredContent.data.taskId, 'task_fixture');
+  assert.match(opened.content[0].text, /^\[打开 Task Master 任务面板\]\(http:\/\/127\.0\.0\.1:19946\/dashboard\?task=task_fixture#code=/u);
 });
 
 test('artifact tools expose only explicit agent-visible bounded artifacts', async (t) => {

@@ -23,7 +23,7 @@
       <section id="token-panel" class="token-panel hidden">
         <div>
           <h1>连接本机 Manager</h1>
-          <p>请从扩展或 <code>taskmaster connect</code> 打开本页；授权短码只能使用一次。</p>
+          <p>请让 Agent 启动任务面板，或使用 <code>taskmaster connect</code>；授权短码只能使用一次。</p>
         </div>
         <form id="token-form">
           <input id="manager-token" type="password" autocomplete="off" placeholder="一次性 Dashboard 授权短码" required>
@@ -79,7 +79,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>任务</th><th>Profile</th><th>状态</th><th>进度</th><th>最近心跳</th><th>操作</th></tr></thead>
+            <thead><tr><th>任务</th><th>Agent</th><th>Profile</th><th>状态</th><th>当前活动</th><th>业务进度</th><th>最近反馈</th><th>操作</th></tr></thead>
             <tbody id="tasks"></tbody>
           </table>
         </div>
