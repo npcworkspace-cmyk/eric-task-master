@@ -1,4 +1,5 @@
 import { isSensitiveKey, redactSensitiveText } from './lib/redaction.mjs';
+import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
 export const VERSION = '1.0.4';
 export const API_VERSION = 1;
@@ -151,6 +152,22 @@ export function publicTask(task) {
     };
   }
   if (task.ownerClientId) safe.createdBy = task.ownerClientId;
+  const agentSource = task?.agent && typeof task.agent === 'object'
+    ? task.agent
+    : task?.ownerRole === 'agent' && task.ownerClientId
+      ? { clientId: task.ownerClientId, name: task.ownerAgentName ?? task.ownerClientId }
+      : null;
+  if (agentSource) {
+    try {
+      const clientId = validateAgentClientId(agentSource.clientId);
+      safe.agent = {
+        clientId,
+        name: normalizeAgentName(agentSource.name ?? clientId)
+      };
+    } catch {
+      // Invalid persisted display metadata is omitted without affecting task access.
+    }
+  }
   const hasInternalResumeState = Object.hasOwn(task || {}, 'resumeCheckpointValid');
   safe.resumeAvailable = hasInternalResumeState
     ? Boolean(

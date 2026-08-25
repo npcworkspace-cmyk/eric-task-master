@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { API_VERSION, isSettledTerminalTask, VERSION } from '../contracts.mjs';
+import { authenticateAgentToken, normalizeAgentName } from '../lib/agent-token.mjs';
 import {
   createIdentityNonce,
   MANAGER_SERVICE,
@@ -21,7 +22,8 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const TOKEN = /^\S{32,512}$/;
+const MANAGER_TOKEN = /^\S{32,512}$/;
+const AGENT_TOKEN = /^ETMA2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/;
 const DASHBOARD_CODE = /^[A-Za-z0-9_-]{32,128}$/;
 const FORBIDDEN_INPUT_KEY = /^(?:module_?path|evaluate|authorization|auth_?header|cookies?|password|passwd|secrets?|credentials?|api_?key|token|(?:access|refresh|api|auth|bearer|session)_?token|session(?:_?id|_?token)?)$/i;
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -293,10 +295,14 @@ export class HttpTaskMasterClient {
   } = {}) {
     this.#baseUrl = normalizeBaseUrl(baseUrl ?? `http://127.0.0.1:${DEFAULT_PORT}`);
     this.#clientId = assertIdentifier(clientId, 'clientId');
-    if (typeof clientName !== 'string' || !clientName.trim() || clientName.length > 80) {
-      throw clientError('INVALID_CLIENT_NAME', 'clientName must contain 1 to 80 characters.');
+    try {
+      this.#clientName = normalizeAgentName(clientName);
+    } catch {
+      throw clientError(
+        'INVALID_CLIENT_NAME',
+        'clientName must contain 1-80 Unicode characters, at most 160 UTF-8 bytes, and no controls.'
+      );
     }
-    this.#clientName = clientName.trim();
     this.#stateDir = resolve(stateDir ?? join(homedir(), '.eric-task-master'));
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
     this.#fetch = fetchImpl;
@@ -518,7 +524,7 @@ export class HttpTaskMasterClient {
     } catch {
       throw clientError('MANAGER_CONFIG_INVALID', 'Task Master manager configuration is invalid.');
     }
-    if (typeof config.managerToken !== 'string' || !TOKEN.test(config.managerToken)) {
+    if (typeof config.managerToken !== 'string' || !MANAGER_TOKEN.test(config.managerToken)) {
       throw clientError('MANAGER_TOKEN_UNAVAILABLE', 'Task Master admin credential is unavailable.', {
         nextAction: 'Run the fixed Task Master connect command once.'
       });
@@ -616,7 +622,12 @@ export class HttpTaskMasterClient {
       }
       throw error;
     }
-    if (!TOKEN.test(payload?.agentToken ?? '') || payload?.agent?.clientId !== this.#clientId) {
+    const identity = authenticateAgentToken(payload?.agentToken, credentials.token);
+    if (
+      !AGENT_TOKEN.test(payload?.agentToken ?? '') ||
+      identity?.clientId !== this.#clientId || identity?.name !== this.#clientName ||
+      payload?.agent?.clientId !== identity.clientId || payload?.agent?.name !== identity.name
+    ) {
       throw clientError('INVALID_AGENT_CREDENTIAL', 'Task Master returned an invalid scoped agent credential.');
     }
     this.#agentToken = payload.agentToken;

@@ -11,10 +11,14 @@ import {
   generateManagerIdentity,
   MANAGER_SERVICE
 } from '../../src/lib/manager-identity.mjs';
+import { issueAgentToken } from '../../src/lib/agent-token.mjs';
 import { assertSafeTaskInput, HttpTaskMasterClient } from '../../src/mcp/taskmaster-client.mjs';
 
 const ADMIN_TOKEN = 'a'.repeat(40);
-const AGENT_TOKEN = 'b'.repeat(40);
+
+function scopedToken(clientId, name = 'MCP Agent', managerToken = ADMIN_TOKEN) {
+  return issueAgentToken(managerToken, { clientId, name }).token;
+}
 
 async function readJson(request) {
   const chunks = [];
@@ -75,12 +79,13 @@ async function fixture(t, handler, { pinnedIdentity = generateManagerIdentity(),
 
 test('HTTP client exchanges admin credential once and uses scoped agent token afterward', async (t) => {
   const requests = [];
+  const agentToken = scopedToken('codex-fixture', 'Codex fixture');
   const connection = await fixture(t, async (request, response) => {
     const body = await readJson(request);
     requests.push({ method: request.method, url: request.url, authorization: request.headers.authorization, body });
     if (request.url === '/v1/agents/issue') {
       reply(response, 200, {
-        agentToken: AGENT_TOKEN,
+        agentToken,
         agent: { clientId: 'codex-fixture', name: 'Codex fixture' }
       });
       return;
@@ -140,7 +145,7 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
 
   assert.equal(requests.filter((item) => item.url === '/v1/agents/issue').length, 1);
   assert.equal(requests[0].authorization, `Bearer ${ADMIN_TOKEN}`);
-  for (const request of requests.slice(1)) assert.equal(request.authorization, `Bearer ${AGENT_TOKEN}`);
+  for (const request of requests.slice(1)) assert.equal(request.authorization, `Bearer ${agentToken}`);
   assert.deepEqual(requests[0].body, { clientId: 'codex-fixture', name: 'Codex fixture' });
   assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['idempotencyKey', 'input', 'profileId', 'taskType']);
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
@@ -151,7 +156,7 @@ test('HTTP client validates scoped Dashboard links and complete task start envel
     const body = await readJson(request);
     if (request.url === '/v1/agents/issue') {
       reply(response, 200, {
-        agentToken: AGENT_TOKEN,
+        agentToken: scopedToken(body.clientId, body.name),
         agent: { clientId: body.clientId, name: body.name }
       });
       return;
@@ -194,13 +199,58 @@ test('HTTP client validates scoped Dashboard links and complete task start envel
   }
 });
 
+test('HTTP client re-issues ETMA2 once after a 401 and Manager token rotation', async (t) => {
+  const rotatedAdminToken = 'rotated-admin-token'.padEnd(40, 'r');
+  const clientId = 'rotating-agent';
+  const oldScoped = scopedToken(clientId);
+  const newScoped = scopedToken(clientId, 'MCP Agent', rotatedAdminToken);
+  const observed = [];
+  let connection;
+  connection = await fixture(t, async (request, response) => {
+    const body = await readJson(request);
+    observed.push({ url: request.url, authorization: request.headers.authorization, body });
+    if (request.url === '/v1/agents/issue') {
+      const rotated = request.headers.authorization === `Bearer ${rotatedAdminToken}`;
+      reply(response, 201, {
+        agentToken: rotated ? newScoped : oldScoped,
+        agent: { clientId, name: 'MCP Agent' }
+      });
+      return;
+    }
+    if (request.url === '/v1/profiles' && request.headers.authorization === `Bearer ${oldScoped}`) {
+      await writeFile(join(connection.stateDir, 'config.json'), JSON.stringify({
+        managerToken: rotatedAdminToken,
+        managerIdentity: connection.pinnedIdentity
+      }), { mode: 0o600 });
+      reply(response, 401, { error: { code: 'INVALID_TOKEN', message: 'rotated' } });
+      return;
+    }
+    if (request.url === '/v1/profiles' && request.headers.authorization === `Bearer ${newScoped}`) {
+      reply(response, 200, { profiles: [] });
+      return;
+    }
+    reply(response, 401, { error: { code: 'INVALID_TOKEN' } });
+  });
+  const client = new HttpTaskMasterClient({ ...connection, clientId });
+  assert.deepEqual(await client.listProfiles(), []);
+  assert.deepEqual(
+    observed.map((request) => request.authorization),
+    [
+      `Bearer ${ADMIN_TOKEN}`,
+      `Bearer ${oldScoped}`,
+      `Bearer ${rotatedAdminToken}`,
+      `Bearer ${newScoped}`
+    ]
+  );
+});
+
 test('Profile open and close keep operation deadlines beyond the generic MCP request timeout', async (t) => {
   const profile = { id: 'profile_slow', name: 'Slow Profile', state: 'idle', kind: 'persistent' };
   const connection = await fixture(t, async (request, response) => {
     const body = await readJson(request);
     if (request.url === '/v1/agents/issue') {
       reply(response, 200, {
-        agentToken: AGENT_TOKEN,
+        agentToken: scopedToken('slow-profile-fixture'),
         agent: { clientId: 'slow-profile-fixture', name: 'MCP Agent' }
       });
       return;
@@ -235,7 +285,7 @@ test('HTTP client treats authorization denial as a Profile choice error, not a c
     if (request.url === '/v1/agents/issue') {
       await readJson(request);
       reply(response, 200, {
-        agentToken: AGENT_TOKEN,
+        agentToken: scopedToken('forbidden-profile-fixture'),
         agent: { clientId: 'forbidden-profile-fixture', name: 'MCP Agent' }
       });
       return;
@@ -261,7 +311,7 @@ test('waitTask does not treat a Manager-restart observation as settled cleanup',
     if (request.url === '/v1/agents/issue') {
       await readJson(request);
       reply(response, 200, {
-        agentToken: AGENT_TOKEN,
+        agentToken: scopedToken('wait-cleanup-fixture'),
         agent: { clientId: 'wait-cleanup-fixture', name: 'MCP Agent' }
       });
       return;
@@ -352,7 +402,7 @@ test('HTTP client rejects oversized manager responses', async (t) => {
     if (request.url === '/v1/agents/issue') {
       await readJson(request);
       reply(response, 200, {
-        agentToken: AGENT_TOKEN,
+        agentToken: scopedToken('bounds-fixture'),
         agent: { clientId: 'bounds-fixture', name: 'MCP Agent' }
       });
       return;

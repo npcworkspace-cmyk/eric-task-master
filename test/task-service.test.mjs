@@ -280,6 +280,71 @@ test('task activity is redacted, phase-aware, durable, and independent from prog
   await service.close();
 });
 
+test('task identity snapshots the signed Agent name and legacy tasks fall back to client ID', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-agent-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'state');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  const agent = Object.freeze({
+    role: 'agent',
+    clientId: 'codex.identity',
+    agentName: '可信 Agent 🤖'
+  });
+  const createService = () => createTaskService({
+    stateDir,
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => {
+          child.emit('message', { type: 'result', result: { summary: 'Done', evidence: [] } });
+          child.emit('message', { type: 'state', state: 'completed' });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish(0);
+        });
+      });
+    }
+  });
+
+  let service = createService();
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const task = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'agent-identity-snapshot'
+  }, agent);
+  assert.deepEqual(task.agent, { clientId: agent.clientId, name: agent.agentName });
+  const completed = await waitFor(async () => {
+    const current = await service.get(task.id, agent);
+    return current.cleanup?.settled ? current : null;
+  });
+  assert.deepEqual(completed.agent, task.agent);
+  assert.deepEqual(
+    (await service.get(task.id, { ...agent, agentName: 'Renamed Agent' })).agent,
+    task.agent
+  );
+  assert.equal((await service.getInternal(task.id)).ownerAgentName, agent.agentName);
+  await service.close();
+
+  service = createService();
+  assert.deepEqual((await service.get(task.id, agent)).agent, task.agent);
+  await service.close();
+
+  const taskFile = path.join(stateDir, task.id, 'task.json');
+  const legacy = JSON.parse(await readFile(taskFile, 'utf8'));
+  delete legacy.ownerAgentName;
+  await writeFile(taskFile, `${JSON.stringify(legacy, null, 2)}\n`);
+
+  service = createService();
+  const migrated = await service.get(task.id, agent);
+  assert.deepEqual(migrated.agent, { clientId: agent.clientId, name: agent.clientId });
+  await service.close();
+});
+
 test('task finalization drains an in-flight heartbeat renewal before releasing the Profile', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-task-renewal-race-'));
   t.after(() => rm(root, { recursive: true, force: true }));

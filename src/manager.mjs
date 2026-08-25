@@ -3,7 +3,13 @@ import os from 'node:os';
 import { mkdir } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import {
+  AgentTokenError,
+  authenticateAgentToken,
+  issueAgentToken,
+  validateAgentClientId
+} from './lib/agent-token.mjs';
 import { JsonStore } from './lib/json-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import {
@@ -15,7 +21,6 @@ import {
 } from './lib/manager-identity.mjs';
 import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
-import { isReservedAgentClientId } from './lib/principal.mjs';
 import {
   HttpError,
   corsHeaders,
@@ -42,7 +47,6 @@ const MAX_DASHBOARD_SESSIONS = 128;
 const MANAGER_NAME = MANAGER_SERVICE;
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const RESUME_NOTICE = 'Resume is explicit: the task module must inspect its checkpoint and current site state before repeating any action whose external outcome is unknown.';
-const AGENT_TOKEN_VERSION = 'ETMA1';
 
 function defaultDataDirectory() {
   if (process.env.ERIC_TASK_MASTER_HOME) return resolve(process.env.ERIC_TASK_MASTER_HOME);
@@ -61,29 +65,6 @@ function token() {
 
 function tokenHash(value) {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function agentToken(managerToken, clientId) {
-  const encodedClientId = Buffer.from(clientId, 'utf8').toString('base64url');
-  const signature = createHmac('sha256', managerToken)
-    .update(`${AGENT_TOKEN_VERSION}\0${clientId}`, 'utf8')
-    .digest('base64url');
-  return `${AGENT_TOKEN_VERSION}.${encodedClientId}.${signature}`;
-}
-
-function authenticateAgentToken(value, managerToken) {
-  if (typeof value !== 'string') return null;
-  const parts = value.split('.');
-  if (parts.length !== 3 || parts[0] !== AGENT_TOKEN_VERSION) return null;
-  let clientId;
-  try {
-    clientId = Buffer.from(parts[1], 'base64url').toString('utf8');
-    if (Buffer.from(clientId, 'utf8').toString('base64url') !== parts[1]) return null;
-    validateClientId(clientId);
-  } catch {
-    return null;
-  }
-  return secureEqual(value, agentToken(managerToken, clientId)) ? clientId : null;
 }
 
 function secureEqual(left, right) {
@@ -118,21 +99,26 @@ function publicAgent(agent) {
 }
 
 function validateClientId(value) {
-  if (typeof value !== 'string' || !/^[a-zA-Z0-9._:-]{1,128}$/.test(value)) {
-    throw new HttpError(
-      400,
-      'INVALID_CLIENT_ID',
-      'clientId must contain 1-128 letters, numbers, dots, underscores, colons, or hyphens'
-    );
+  try {
+    return validateAgentClientId(value);
+  } catch (error) {
+    if (error instanceof AgentTokenError) {
+      throw new HttpError(400, error.code, error.message);
+    }
+    throw error;
   }
-  if (isReservedAgentClientId(value)) {
-    throw new HttpError(
-      400,
-      'RESERVED_CLIENT_ID',
-      'clientId uses a reserved internal principal name'
-    );
+}
+
+function validateTaskCreate(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new HttpError(400, 'INVALID_TASK_CREATE', 'Task request must be an object');
   }
-  return value;
+  const allowed = new Set(['profileId', 'taskType', 'input', 'timeoutMs', 'idempotencyKey']);
+  const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+  if (unknown.length) {
+    throw new HttpError(400, 'INVALID_TASK_CREATE', `Unsupported task fields: ${unknown.join(', ')}`);
+  }
+  return body;
 }
 
 function requireRole(auth, ...roles) {
@@ -287,10 +273,10 @@ export async function createManager({
   // Scoped Agent bearers are stateless and stable per registered host. Clear
   // the legacy registry so concurrent MCP processes cannot evict one another
   // or grow config.json until bootstrap fails.
-  if (!Array.isArray(config.agents) || config.agents.length !== 0 || config.agentCredentialVersion !== 1) {
+  if (!Array.isArray(config.agents) || config.agents.length !== 0 || config.agentCredentialVersion !== 2) {
     config = await configStore.update((draft) => {
       draft.agents = [];
-      draft.agentCredentialVersion = 1;
+      draft.agentCredentialVersion = 2;
     });
   }
 
@@ -403,9 +389,9 @@ export async function createManager({
     if (secureEqual(bearer, config.managerToken)) {
       return { role: 'manager-admin', clientId: 'manager-admin' };
     }
-    const agentClientId = authenticateAgentToken(bearer, config.managerToken);
-    if (agentClientId) {
-      return { role: 'agent', clientId: agentClientId };
+    const agent = authenticateAgentToken(bearer, config.managerToken);
+    if (agent) {
+      return { role: 'agent', clientId: agent.clientId, agentName: agent.name };
     }
     const hashed = tokenHash(bearer);
     const dashboard = dashboardSessions.get(hashed);
@@ -500,16 +486,17 @@ export async function createManager({
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin');
       const body = await readJson(request, { maxBytes: 16 * 1024 });
-      const clientId = validateClientId(body.clientId);
-      const name = typeof body.name === 'string' && body.name.trim()
-        ? body.name.trim().slice(0, 80)
-        : clientId;
-      const scopedToken = agentToken(config.managerToken, clientId);
-      const agent = {
-        clientId,
-        name
-      };
-      sendJson(response, 201, { agentToken: scopedToken, agent: publicAgent(agent) }, cors);
+      validateClientId(body.clientId);
+      let issued;
+      try {
+        issued = issueAgentToken(config.managerToken, { clientId: body.clientId, name: body.name });
+      } catch (error) {
+        if (error instanceof AgentTokenError) {
+          throw new HttpError(400, error.code, error.message);
+        }
+        throw error;
+      }
+      sendJson(response, 201, { agentToken: issued.token, agent: publicAgent(issued.agent) }, cors);
       return;
     }
 
@@ -693,7 +680,10 @@ export async function createManager({
     if (request.method === 'POST' && url.pathname === '/v1/tasks') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent');
-      const task = await requireTaskMethod(taskService, 'create')(await readJson(request), auth);
+      const task = await requireTaskMethod(taskService, 'create')(
+        validateTaskCreate(await readJson(request)),
+        auth
+      );
       const safeTask = publicTask(task);
       const { dashboardUrl } = await createDashboardApproval(auth, safeTask.id);
       sendJson(response, 202, { taskId: safeTask.id, dashboardUrl, task: safeTask }, cors);

@@ -231,11 +231,18 @@ export function publicTask(task, { includeResult = true } = {}) {
       ['updatedAt', stringValue(task.currentActivity.updatedAt, 64)]
     ])
     : undefined;
+  const agent = task?.agent && typeof task.agent === 'object'
+    ? definedEntries([
+      ['clientId', stringValue(task.agent.clientId, 128)],
+      ['name', stringValue(task.agent.name, 160)]
+    ])
+    : undefined;
   return definedEntries([
     ['id', stringValue(task?.id, 128)],
     ['profileId', stringValue(task?.profileId, 128)],
     ['taskType', stringValue(task?.taskType, 128)],
     ['createdBy', stringValue(task?.createdBy, 128)],
+    ['agent', agent?.clientId && agent?.name ? agent : undefined],
     ['behavior', stringValue(task?.behavior, 32)],
     ['attempt', Number.isSafeInteger(task?.attempt) ? task.attempt : undefined],
     ['history', publicAttemptHistory(task?.history)],

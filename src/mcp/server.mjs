@@ -91,11 +91,17 @@ const EvidenceSchema = z.strictObject({
   artifactId: z.string().optional()
 });
 
+const AgentSchema = z.strictObject({
+  clientId: z.string(),
+  name: z.string()
+});
+
 const TaskSchema = z.strictObject({
   id: z.string(),
   profileId: z.string().optional(),
   taskType: z.string().optional(),
   createdBy: z.string().optional(),
+  agent: AgentSchema.optional(),
   behavior: z.string().optional(),
   attempt: z.number().int().optional(),
   history: z.array(AttemptHistorySchema).optional(),

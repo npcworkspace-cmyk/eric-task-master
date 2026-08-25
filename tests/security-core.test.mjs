@@ -57,7 +57,8 @@ function serviceFixture() {
         id: `task_${String(tasks.size + 1).padStart(32, '0')}`,
         state: 'queued',
         ownerRole: caller.role,
-        ownerClientId: caller.clientId
+        ownerClientId: caller.clientId,
+        ...(caller.agentName ? { ownerAgentName: caller.agentName } : {})
       };
       tasks.set(task.id, task);
       return task;
@@ -156,6 +157,13 @@ test('role matrix scopes MCP Agent identity and keeps removed extension routes c
   assert.match(agentTask.payload.dashboardUrl, new RegExp(`^${baseUrl.replaceAll('.', '\\.')}/dashboard\\?task=${agentTask.payload.task.id}#code=`));
   assert.equal(agentTask.payload.dashboardUrl.includes(manager.token), false);
   assert.equal(service.calls.find((entry) => entry[0] === 'create')[2].clientId, 'codex.fixture');
+  assert.equal(service.calls.find((entry) => entry[0] === 'create')[2].agentName, 'Codex fixture');
+  assert.deepEqual(agentTask.payload.task.agent, {
+    clientId: 'codex.fixture',
+    name: 'Codex fixture'
+  });
+  assert.equal(JSON.stringify(agentTask.payload.task).includes(issued.payload.agentToken), false);
+  assert.equal('agentToken' in agentTask.payload.task, false);
 
   const dashboardCode = new URLSearchParams(new URL(agentTask.payload.dashboardUrl).hash.slice(1)).get('code');
   const dashboardSession = await call(baseUrl, '/v1/dashboard/session', {

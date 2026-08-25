@@ -4,6 +4,7 @@ import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isBehaviorMode, publicTask, TERMINAL_TASK_STATES } from '../contracts.mjs';
+import { normalizeAgentName } from '../lib/agent-token.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
 import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
@@ -133,7 +134,13 @@ function callerIdentity(caller = {}) {
     caller.role === 'agent' && typeof caller.clientId === 'string' && caller.clientId &&
     !isReservedAgentClientId(caller.clientId)
   ) {
-    return { role: 'agent', clientId: caller.clientId };
+    let agentName;
+    try {
+      agentName = normalizeAgentName(caller.agentName ?? caller.clientId);
+    } catch {
+      throw new TaskServiceError('TASK_ACCESS_DENIED', 'Agent display identity is invalid', 403);
+    }
+    return { role: 'agent', clientId: caller.clientId, agentName };
   }
   throw new TaskServiceError('TASK_ACCESS_DENIED', 'Task operation is not allowed for this caller', 403);
 }
@@ -779,6 +786,13 @@ export function createTaskService({
         : typeof task.ownerClientId !== 'string' || ['manager-admin', 'dashboard'].includes(task.ownerClientId)
           ? 'manager-admin'
           : 'agent';
+      if (task.ownerRole === 'agent') {
+        try {
+          task.ownerAgentName = normalizeAgentName(task.ownerAgentName ?? task.ownerClientId);
+        } catch {
+          task.ownerAgentName = task.ownerClientId;
+        }
+      }
       normalizeAttemptHistory(task);
       task.supportsResume = task.supportsResume === true;
       task.cleanup = {
@@ -1941,6 +1955,7 @@ export function createTaskService({
       modulePath: taskType.modulePath,
       ownerRole: caller.role,
       ownerClientId: caller.clientId,
+      ...(caller.role === 'agent' ? { ownerAgentName: caller.agentName } : {}),
       idempotencyKey: body.idempotencyKey,
       requestHash: hash,
       behavior,

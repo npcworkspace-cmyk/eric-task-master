@@ -35,7 +35,7 @@ async function managerFixture(t) {
     async list() {
       return [...tasks.values()];
     },
-    async create(input) {
+    async create(input, caller) {
       const existing = typeof input.idempotencyKey === 'string'
         ? [...tasks.values()].find((task) => task.input?.idempotencyKey === input.idempotencyKey)
         : null;
@@ -44,7 +44,10 @@ async function managerFixture(t) {
         id: `task_${tasks.size + 1}`,
         state: 'queued',
         modulePath: 'C:/secret/task.mjs',
-        input
+        input,
+        ownerRole: caller.role,
+        ownerClientId: caller.clientId,
+        ...(caller.agentName ? { ownerAgentName: caller.agentName } : {})
       };
       tasks.set(task.id, task);
       return task;
@@ -100,11 +103,11 @@ async function managerFixture(t) {
   return { root, manager, taskService, calls, baseUrl: manager.baseUrl };
 }
 
-async function issueAgent(baseUrl, managerToken, clientId) {
+async function issueAgent(baseUrl, managerToken, clientId, name = clientId) {
   const result = await json(await fetch(`${baseUrl}/v1/agents/issue`, {
     method: 'POST',
     headers: headers(managerToken),
-    body: JSON.stringify({ clientId, name: clientId })
+    body: JSON.stringify({ clientId, name })
   }));
   assert.equal(result.response.status, 201);
   return result.body.agentToken;
@@ -158,7 +161,104 @@ test('same-host MCP processes share one stable scoped credential without registr
   const config = JSON.parse(source.toString('utf8'));
   assert.equal(source.byteLength < 64 * 1024, true);
   assert.deepEqual(config.agents, []);
-  assert.equal(config.agentCredentialVersion, 1);
+  assert.equal(config.agentCredentialVersion, 2);
+});
+
+test('ETMA2 snapshots trusted Agent names while authorization remains client-scoped', async (t) => {
+  const { manager, baseUrl } = await managerFixture(t);
+  const clientId = 'codex.shared-owner';
+  const firstToken = await issueAgent(baseUrl, manager.token, clientId, '第一位 Agent 🤖');
+  const secondToken = await issueAgent(baseUrl, manager.token, clientId, 'Second Agent');
+  assert.notEqual(firstToken, secondToken);
+  assert.match(firstToken, /^ETMA2\./);
+
+  const created = await json(await fetch(`${baseUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: headers(firstToken),
+    body: JSON.stringify({
+      profileId: 'profile_fixture',
+      taskType: 'fixture',
+      idempotencyKey: 'trusted-agent-name'
+    })
+  }));
+  assert.equal(created.response.status, 202);
+  assert.deepEqual(created.body.task.agent, {
+    clientId,
+    name: '第一位 Agent 🤖'
+  });
+
+  const readByRenamedAgent = await json(await fetch(`${baseUrl}/v1/tasks/${created.body.task.id}`, {
+    headers: headers(secondToken)
+  }));
+  assert.equal(readByRenamedAgent.response.status, 200);
+  assert.deepEqual(readByRenamedAgent.body.task.agent, created.body.task.agent);
+
+  const forged = await json(await fetch(`${baseUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: headers(secondToken),
+    body: JSON.stringify({
+      profileId: 'profile_fixture',
+      taskType: 'fixture',
+      idempotencyKey: 'forged-agent-name',
+      ownerAgentName: 'Forged owner'
+    })
+  }));
+  assert.equal(forged.response.status, 400);
+  assert.equal(forged.body.error.code, 'INVALID_TASK_CREATE');
+});
+
+test('ETMA2 survives Manager restart and fails closed after admin token rotation', async (t) => {
+  const { root, manager, baseUrl } = await managerFixture(t);
+  const originalAgentToken = await issueAgent(baseUrl, manager.token, 'codex.restart', 'Restart Agent');
+  const dataDir = join(root, 'data');
+  const dashboardDir = join(root, 'dashboard');
+  await manager.stop();
+
+  let replacement = await createManager({ port: 0, dataDir, dashboardDir, taskService: {} });
+  await replacement.start();
+  let read = await json(await fetch(`${replacement.baseUrl}/v1/profiles`, {
+    headers: headers(originalAgentToken)
+  }));
+  assert.equal(read.response.status, 200);
+  await replacement.stop();
+
+  const configPath = join(dataDir, 'config.json');
+  const config = JSON.parse(await readFile(configPath, 'utf8'));
+  const rotatedManagerToken = 'rotated-manager-admin-token'.padEnd(48, 'r');
+  config.managerToken = rotatedManagerToken;
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
+
+  replacement = await createManager({ port: 0, dataDir, dashboardDir, taskService: {} });
+  await replacement.start();
+  t.after(() => replacement.stop().catch(() => {}));
+  read = await json(await fetch(`${replacement.baseUrl}/v1/profiles`, {
+    headers: headers(originalAgentToken)
+  }));
+  assert.equal(read.response.status, 401);
+  assert.equal(read.body.error.code, 'INVALID_TOKEN');
+  const rotatedAgentToken = await issueAgent(
+    replacement.baseUrl,
+    rotatedManagerToken,
+    'codex.restart',
+    'Restart Agent'
+  );
+  read = await json(await fetch(`${replacement.baseUrl}/v1/profiles`, {
+    headers: headers(rotatedAgentToken)
+  }));
+  assert.equal(read.response.status, 200);
+});
+
+test('Agent issuance rejects controls and non-bounded display names without truncation', async (t) => {
+  const { manager, baseUrl } = await managerFixture(t);
+  for (const name of ['Agent\nName', 'a'.repeat(81), `${'é'.repeat(79)}🤖`, '   ']) {
+    const rejected = await json(await fetch(`${baseUrl}/v1/agents/issue`, {
+      method: 'POST',
+      headers: headers(manager.token),
+      body: JSON.stringify({ clientId: 'codex.invalid-name', name })
+    }));
+    assert.equal(rejected.response.status, 400, JSON.stringify(name));
+    assert.equal(rejected.body.error.code, 'INVALID_AGENT_NAME', JSON.stringify(name));
+  }
 });
 
 test('Agent credentials cannot occupy an internal principal namespace', async (t) => {
@@ -389,7 +489,12 @@ test('Agent-created Profiles are private until their owner explicitly shares the
 
 test('task routes delegate to taskService and strip private task fields', async (t) => {
   const { manager, baseUrl } = await managerFixture(t);
-  const requestBody = { module: 'example', input: { url: 'https://example.com' }, idempotencyKey: 'manager-task-0001' };
+  const requestBody = {
+    profileId: 'profile_fixture',
+    taskType: 'example',
+    input: { url: 'https://example.com' },
+    idempotencyKey: 'manager-task-0001'
+  };
   const created = await json(await fetch(`${baseUrl}/v1/tasks`, {
     method: 'POST',
     headers: headers(manager.token),
