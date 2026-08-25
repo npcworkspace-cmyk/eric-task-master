@@ -138,8 +138,9 @@ async function staticChecks() {
   invariant(skill.startsWith('---\nname: eric-task-master\n'), 'Skill frontmatter is invalid');
   invariant(skill.includes('node scripts/taskmaster.mjs connect --json'), 'Skill lacks the fixed startup command');
   invariant(
-    skill.includes('taskmaster_task_types_describe') && skill.includes('taskmaster_tasks_continue'),
-    'Skill lacks progressive discovery or same-task handoff'
+    skill.includes('taskmaster_task_types_describe') && skill.includes('taskmaster_tasks_continue') &&
+      skill.includes('taskmaster_dashboard_open') && skill.includes('clickable Dashboard link'),
+    'Skill lacks progressive discovery, same-task handoff, or the fixed Dashboard link contract'
   );
   invariant(
     readme.includes('[简体中文](./README.zh-CN.md)') && readmeZh.includes('[English](./README.md)'),

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
+import { createHmac, randomBytes } from 'node:crypto';
+import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path, { dirname } from 'node:path';
@@ -30,9 +30,17 @@ function sendJson(response, status, value) {
   response.end(`${JSON.stringify(value)}\n`);
 }
 
+function legacyAgentToken(managerToken, clientId) {
+  const encodedClientId = Buffer.from(clientId, 'utf8').toString('base64url');
+  const signature = createHmac('sha256', managerToken)
+    .update(`ETMA1\0${clientId}`, 'utf8')
+    .digest('base64url');
+  return `ETMA1.${encodedClientId}.${signature}`;
+}
+
 async function startLegacyManager({
   stateDir,
-  version = '1.0.0',
+  version = '1.0.4',
   counts = { active: 0, queued: 0, waitingUser: 0, stalled: 0 },
   profiles = []
 }) {
@@ -78,6 +86,18 @@ async function startLegacyManager({
         sendJson(response, 200, { profiles });
         return;
       }
+      if (request.method === 'POST' && url.pathname === '/v1/agents/issue') {
+        if (request.headers.authorization !== `Bearer ${managerToken}`) {
+          sendJson(response, 401, { error: { code: 'AUTH_REQUIRED', message: 'Authentication required' } });
+          return;
+        }
+        const body = await readJson(request);
+        sendJson(response, 201, {
+          agentToken: legacyAgentToken(managerToken, body.clientId),
+          agent: { clientId: body.clientId, name: body.name || body.clientId }
+        });
+        return;
+      }
       if (request.method === 'POST' && url.pathname === '/v1/manager/shutdown') {
         if (request.headers.authorization !== `Bearer ${managerToken}`) {
           sendJson(response, 401, { error: { code: 'AUTH_REQUIRED', message: 'Authentication required' } });
@@ -117,6 +137,7 @@ async function startLegacyManager({
   return {
     baseUrl,
     port: address.port,
+    managerToken,
     close: () => new Promise((resolveClose) => server.close(resolveClose)),
     wasShutdownAuthorized: () => shutdownAuthorized
   };
@@ -143,6 +164,16 @@ test('connect authenticates and gracefully replaces an idle older Manager', asyn
     checks: []
   })}\n`);
 
+  const oldIssue = await fetch(`${legacy.baseUrl}/v1/agents/issue`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${legacy.managerToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ clientId: 'upgrade.fixture', name: 'Upgrade fixture' })
+  }).then((response) => response.json());
+  assert.match(oldIssue.agentToken, /^ETMA1\./);
+
   const { stdout } = await execFileAsync(process.execPath, [
     CLI, 'connect', '--host', '127.0.0.1', '--port', String(legacy.port),
     '--state-dir', stateDir, '--skip-mcp-registration', '--json'
@@ -153,10 +184,24 @@ test('connect authenticates and gracefully replaces an idle older Manager', asyn
   assert.equal(legacy.wasShutdownAuthorized(), true);
   assert.equal(result.ok, true);
   assert.equal(result.manager.version, VERSION);
-  assert.equal(result.manager.migratedFrom, '1.0.0');
+  assert.equal(result.manager.migratedFrom, '1.0.4');
   assert.equal(result.manager.startedNow, true);
   const health = await fetch(`${legacy.baseUrl}/v1/health`).then((response) => response.json());
   assert.equal(health.version, VERSION);
+  const currentConfig = JSON.parse(await readFile(path.join(stateDir, 'config.json'), 'utf8'));
+  const newIssue = await fetch(`${legacy.baseUrl}/v1/agents/issue`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${currentConfig.managerToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ clientId: 'upgrade.fixture', name: 'Upgrade fixture' })
+  }).then((response) => response.json());
+  assert.match(newIssue.agentToken, /^ETMA2\./);
+  const scopedProfiles = await fetch(`${legacy.baseUrl}/v1/profiles`, {
+    headers: { Authorization: `Bearer ${newIssue.agentToken}` }
+  });
+  assert.equal(scopedProfiles.status, 200);
 });
 
 test('connect leaves a busy older Manager running and fails closed', async (t) => {
@@ -182,5 +227,5 @@ test('connect leaves a busy older Manager running and fails closed', async (t) =
   );
   assert.equal(legacy.wasShutdownAuthorized(), false);
   const health = await fetch(`${legacy.baseUrl}/v1/health`).then((response) => response.json());
-  assert.equal(health.version, '1.0.0');
+  assert.equal(health.version, '1.0.4');
 });

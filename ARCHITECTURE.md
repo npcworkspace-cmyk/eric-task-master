@@ -52,7 +52,7 @@ The first Manager state initialization persists an Ed25519 key pair beside the p
 
 Agent-created Profiles are `private` by default and may be changed to `shared` only by their owner or the local control plane. Private Profiles are hidden from and unusable by other scoped Agents. Shared Profile access never grants access to another Agent's task record or artifacts. Legacy Profiles without an access field migrate as shared for compatibility. A `persistent` Profile can be opened from the Dashboard so the user can sign in directly in its Playwright window; its native `userDataDir` retains that state. An `ephemeral` Profile cannot be opened manually and launches `browser.newContext()` inside each task; cleanup closes the context and owning browser.
 
-Agent authorization is scoped to one stable registered MCP client ID and role tuple. Internal and legacy-reserved Manager, Dashboard, extension, task, Profile, and session principal names/prefixes cannot be issued as Agent IDs. Different host registrations/client IDs are separate principals. Multiple conversations that reuse one host registration intentionally share that principal; deployments needing tenant isolation assign distinct client IDs.
+Agent authorization is scoped to one stable registered MCP client ID and role tuple. Internal and legacy-reserved Manager, Dashboard, extension, task, Profile, and session principal names/prefixes cannot be issued as Agent IDs. Different host registrations/client IDs are separate operational principals, and multiple conversations that reuse one host registration intentionally share that principal. Processes under the same OS user are trusted peers because they can access the protected Manager bootstrap credential; mutually untrusted tenants require separate OS users, sandboxes, or machines. Agent tokens have no independent revocation list, so Manager credential rotation invalidates all of them.
 
 ### Tasks
 
@@ -76,7 +76,7 @@ Agent authorization is scoped to one stable registered MCP client ID and role tu
 - `POST /v1/dashboard/authorize`
 - `POST /v1/dashboard/session`
 
-Dashboard URLs never contain the Manager admin credential. A Manager admin creates a one-use authorization code; the page exchanges it for an in-memory, expiring Dashboard session.
+Dashboard URLs never contain the Manager admin credential. A Manager admin or scoped Agent creates a one-use authorization code; the page exchanges it for an in-memory, expiring Dashboard session that preserves the original principal and never elevates its permissions.
 
 ## Profile states
 

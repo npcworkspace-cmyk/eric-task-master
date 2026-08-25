@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.0 - 2026-08-25
+
+- Replaced the browser extension and cross-browser session-transfer design with a pure Playwright runtime plus a same-origin Web Dashboard; users now sign in directly inside isolated persistent Profiles.
+- Made browser engines immutable and fail-closed: persistent Profiles default to stable local Chrome with fixed human behavior, while ephemeral Profiles use pinned Chromium with Profile-owned fast, adaptive, or human behavior.
+- Added signed ETMA2 Agent identities, Agent-owned Profiles/tasks, scoped one-time task Dashboard links, Agent/activity/progress visibility, and permission-preserving Dashboard sessions.
+- Made task idempotency independent from mutable Profile policy while resolving the effective behavior at launch and recording it per attempt.
+- Added persistent browser-state acceptance across task execution, manual Profile open-close, and Manager restart, alongside concurrency, queue, cancellation, timeout diagnostics, zero-state, and cleanup gates.
+- Defined one simple Dashboard contract for Agents: every task start returns a clickable link, and an explicit “启动任务面板” request returns a fresh link without automatically opening a browser.
+- Documented the trusted-local-Agent security boundary and global token-rotation model without claiming hostile multi-tenant isolation.
+
 ## 1.0.4 - 2026-08-25
 
 - Reframed the English and Simplified Chinese project introductions around durable, unattended browser work for AI agents, with realistic production possibilities and naturally integrated GitHub discovery terms.

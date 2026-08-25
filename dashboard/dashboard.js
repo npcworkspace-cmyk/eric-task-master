@@ -290,10 +290,12 @@ function renderTasks() {
       element('small', '', task.id)
     );
     const agent = element('td', 'agent-name');
+    const agentName = element('strong');
+    agentName.append(element('bdi', '', task.agent?.name || task.createdBy || '本机管理员'));
     agent.append(
-      element('strong', '', task.agent?.name || task.createdBy || '本机管理员'),
+      agentName,
       ...(task.agent?.name && task.agent?.clientId
-        ? [element('small', '', task.agent.clientId)]
+        ? [element('small', '', `Agent · ${task.agent.clientId}`)]
         : [])
     );
     const profile = element('td', '', task.profileName || task.profileId || '—');

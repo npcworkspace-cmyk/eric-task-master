@@ -1,7 +1,7 @@
 import { isSensitiveKey, redactSensitiveText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
-export const VERSION = '1.0.4';
+export const VERSION = '2.0.0';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;

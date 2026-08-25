@@ -15,7 +15,7 @@ npm run check
 1. static version, dependency, pure-Playwright, Web Dashboard, launcher, and Skill-boundary checks;
 2. serial unit, integration, security, registration, protocol, recovery, and real-browser tests;
 3. real Chromium feature acceptance across Profile-owned fast/human/adaptive behavior, immutable engine policy, removed task overrides, persistent Profile open/close, click/input/select, upload/download, storage, screenshot, progress, checkpoint, artifacts, ephemeral isolation, user handoff, and cleanup;
-4. a commercial acceptance workload with persistent Profile cleanup, bounded concurrency, same-Profile FIFO pressure, queued cancellation, browser timeout diagnostics, ephemeral zero-state verification, quiescence, and Manager restart history recovery.
+4. a commercial acceptance workload with persistent Cookie/localStorage retention across task execution, manual Profile open-close, and Manager restart; bounded concurrency; same-Profile FIFO pressure; queued cancellation; browser timeout diagnostics; ephemeral zero-state verification; quiescence; and terminal history recovery.
 
 Any failed assertion blocks release. The commercial workload report can be persisted with:
 

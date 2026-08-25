@@ -39,6 +39,8 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.match(source, /showTaskResult\(task\)/);
   assert.match(source, /task\.taskType \|\| '未命名任务'/);
   assert.match(source, /task\.agent\?\.name \|\| task\.createdBy/);
+  assert.match(source, /element\('bdi'/);
+  assert.match(source, /`Agent · \$\{task\.agent\.clientId\}`/);
   assert.match(source, /task\.currentActivity \|\| \{\}/);
   assert.match(source, /progress\.message \|\| '等待任务反馈'/);
   assert.match(source, /browserEngine: ui\.profileEngine\.value/);

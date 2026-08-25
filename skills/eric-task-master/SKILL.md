@@ -19,7 +19,7 @@ node scripts/taskmaster.mjs connect --json
 
 Installation is incomplete until this command returns `ok: true` and its real-browser acceptance checks pass. It installs lockfile-pinned dependencies and Chromium when missing, safely migrates an idle authenticated older Manager, starts Manager, and registers STDIO MCP in detected supported Agent hosts. A busy older Manager returns `MANAGER_UPGRADE_BUSY` without interrupting its work; wait for it to settle and rerun the same command once. For any other startup failure, follow the exact `error.code` and `nextAction`, retry the same command at most once after fixing that precondition, and do not branch into speculative controllers.
 
-Open the `dashboard` URL returned by `connect` when the user needs to manage Profiles or tasks. It contains a short-lived one-use code, never the Manager credential.
+Open the `dashboard` URL returned by `connect` when the user needs to manage Profiles or tasks. It contains a short-lived one-use code, never the Manager credential. When the user says “启动任务面板”, call `taskmaster_dashboard_open` and return its clickable link. Do not invent a port or automatically launch an operating-system browser.
 
 If registration reports `registered_pending_restart`, ask the user to reload that host once. Then call `taskmaster_status`, followed by `taskmaster_profiles_list`. When both succeed, ask what browser task to run. Create a Profile only when no suitable one exists because creation is non-idempotent:
 
@@ -30,13 +30,13 @@ Persistent Profiles default to stable local Chrome and fixed `human` behavior. E
 
 An Agent-created Profile is private to that stable Agent client ID by default. Set `access: "shared"` only when the user explicitly wants other registered local Agents to use the same browser state. Sharing a Profile never shares task status, results, or artifacts.
 
-Treat one registered MCP client ID as one local Agent principal. Different registered hosts/client IDs are isolated; parallel conversations using the same host registration intentionally share that principal's task ledger. Use a distinct registration/client ID when strict tenant separation is required.
+Treat one registered MCP client ID as one local Agent principal. Different registered hosts/client IDs prevent accidental task crossover; parallel conversations using the same host registration intentionally share that principal's task ledger. This is operational isolation between trusted processes under one OS user, not a hostile tenant boundary. Run mutually untrusted Agents under separate OS users, sandboxes, or machines.
 
 ## Fixed task loop
 
 1. Call `taskmaster_task_types_list` with a narrow `query`, `domain`, or `intent`. This returns compact summaries only.
 2. Call `taskmaster_task_types_describe` for the one selected type and construct input from that schema.
-3. Call `taskmaster_tasks_start` once with a stable unique `idempotencyKey`; keep the returned task ID.
+3. Call `taskmaster_tasks_start` once with a stable unique `idempotencyKey`; keep the returned task ID and immediately show the returned clickable Dashboard link to the user before following the task.
 4. Call `taskmaster_tasks_wait` repeatedly, or `taskmaster_tasks_get` for a snapshot. A cancelled wait does not cancel the durable task.
 5. If state is `waiting_user`, list/read the diagnostic screenshot and semantic-observation artifacts, inspect current state, then call `taskmaster_tasks_continue` with the matching request ID. This continues the same live task.
 6. If health is `stalled`, read diagnostics. Do not submit a duplicate. The controller will fail and clean up the task if meaningful progress remains silent past its hard deadline.

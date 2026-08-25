@@ -38,7 +38,8 @@ await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 
 const replacements = [
   ['src/contracts.mjs', `export const VERSION = '${current}';`, `export const VERSION = '${next}';`],
-  ['README.md', `Version: **${current}**`, `Version: **${next}**`]
+  ['README.md', `Version: **${current}**`, `Version: **${next}**`],
+  ['README.zh-CN.md', `版本：**${current}**`, `版本：**${next}**`]
 ];
 
 for (const [relative, from, to] of replacements) {

@@ -40,9 +40,12 @@ The response contract is:
 
 The admin credential is used only for that exchange. Profiles, task types, tasks, and artifacts use the scoped agent token. A Manager without the identity challenge or scoped-agent endpoints fails closed. Identity failures and diagnostics go to STDERR only, so STDOUT remains exclusively MCP protocol frames.
 
+This is trusted-local-Agent isolation, not hostile multi-tenant security. Agent client IDs prevent accidental task/Profile crossover, but MCP processes running as the same operating-system user can read the same protected Manager bootstrap credential and are therefore trusted peers. Agent tokens have no independent revocation list: rotating the Manager credential invalidates all of them. Run mutually untrusted Agents under separate OS users, sandboxes, or machines.
+
 ## Tool surface
 
 - `taskmaster_status`
+- `taskmaster_dashboard_open`
 - `taskmaster_profiles_list`
 - `taskmaster_profiles_create`
 - `taskmaster_profiles_open`
@@ -89,6 +92,8 @@ If a failed task exposes a preserved checkpoint and settled cleanup, `taskmaster
 A Worker completion claim is provisional. Manager publishes `completed` only after validating the bounded result shape, all declared Agent-visible artifacts, browser closure, Worker exit, and Profile lease release. Otherwise the task is `failed` with `TASK_COMPLETION_GATE_FAILED`.
 
 Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow.
+
+Every successful `taskmaster_tasks_start` result begins with a clickable, one-time, Agent-scoped Dashboard link focused on that task. When the user says “启动任务面板”, call `taskmaster_dashboard_open` and return its clickable link; the tool does not launch an operating-system browser.
 
 ## Output and artifact bounds
 

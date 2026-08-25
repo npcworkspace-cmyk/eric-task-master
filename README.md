@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **1.0.4**
+Version: **2.0.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -77,6 +77,8 @@ After the first bootstrap, the user should be able to ask naturally:
 > Use Eric Task Master with an ephemeral Profile and adaptive behavior to research these sites, report progress, save evidence, and close every task window when finished.
 
 The Agent then uses one durable loop: discover a task type, start once with an idempotency key, retain the task ID, wait or reconnect to that ID, inspect diagnostics when attention is required, and accept completion only after evidence and cleanup are verified.
+
+Every task start returns a clickable Dashboard link focused on that task. If the user says “启动任务面板”, the Agent returns a fresh one-time link; Task Master does not automatically open an operating-system browser.
 
 ### Profiles
 
