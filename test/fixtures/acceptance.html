@@ -32,7 +32,7 @@
         const choice = document.querySelector('#choice').value;
         const upload = document.querySelector('#upload').files[0]?.name ?? 'none';
         document.querySelector('#result').textContent = `${name}|${agreed}|${choice}|${upload}`;
-        document.cookie = 'taskmaster_fixture=accepted; SameSite=Lax';
+        document.cookie = 'taskmaster_fixture=accepted; Max-Age=86400; SameSite=Lax';
         localStorage.setItem('taskmaster_fixture', 'accepted');
       });
     </script>

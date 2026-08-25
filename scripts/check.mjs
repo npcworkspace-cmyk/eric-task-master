@@ -30,9 +30,9 @@ async function staticChecks() {
     'MCP protocol test dependency boundary drift'
   );
   invariant(!packageJson.dependencies?.['@modelcontextprotocol/sdk'], 'Legacy monolithic MCP SDK is forbidden');
-  const extensionRemoved = await access(resolve(ROOT, 'extension', 'manifest.json'))
+  const extensionRemoved = await access(resolve(ROOT, 'extension'))
     .then(() => false, (error) => error?.code === 'ENOENT');
-  invariant(extensionRemoved, 'extension must not be shipped');
+  invariant(extensionRemoved, 'extension directory or payload must not be shipped');
   await access(resolve(ROOT, 'scripts', 'taskmaster.mjs'));
   const [launcher, bootstrapPolicy, manager, taskWorker, taskService, workflow, releaseWorkflow] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),

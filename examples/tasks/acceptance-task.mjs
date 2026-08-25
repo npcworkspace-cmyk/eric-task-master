@@ -17,7 +17,8 @@ export const meta = Object.freeze({
     properties: {
       url: { type: 'string', minLength: 8, maxLength: 4096 },
       uploadPath: { type: 'string', minLength: 1, maxLength: 4096 },
-      expectCleanStart: { type: 'boolean' }
+      expectCleanStart: { type: 'boolean' },
+      expectExistingState: { type: 'boolean' }
     }
   }
 });
@@ -26,18 +27,30 @@ export async function run({ page, context, input, outputDir, action, progress, c
   if (!input?.url || !input?.uploadPath) {
     throw new TypeError('acceptance task requires input.url and input.uploadPath');
   }
+  if (input.expectCleanStart && input.expectExistingState) {
+    throw new TypeError('acceptance task state expectations are mutually exclusive');
+  }
   await mkdir(outputDir, { recursive: true });
   const evidence = [];
 
   await action.goto(input.url, { waitUntil: 'domcontentloaded' });
   evidence.push({ kind: 'navigation', ok: page.url().startsWith(new URL(input.url).origin) });
-  if (input.expectCleanStart) {
+  if (input.expectCleanStart || input.expectExistingState) {
     const initialCookies = await context.cookies(input.url);
     const initialStorage = await page.evaluate(() => localStorage.getItem('taskmaster_fixture'));
-    evidence.push({
-      kind: 'ephemeral-clean-start',
-      ok: !initialCookies.some((cookie) => cookie.name === 'taskmaster_fixture') && initialStorage === null
-    });
+    if (input.expectCleanStart) {
+      evidence.push({
+        kind: 'ephemeral-clean-start',
+        ok: !initialCookies.some((cookie) => cookie.name === 'taskmaster_fixture') && initialStorage === null
+      });
+    } else {
+      evidence.push({
+        kind: 'persistent-state-existing',
+        ok: initialCookies.some((cookie) => (
+          cookie.name === 'taskmaster_fixture' && cookie.value === 'accepted'
+        )) && initialStorage === 'accepted'
+      });
+    }
   }
   await progress({ current: 1, total: 9, message: 'Fixture loaded' });
 

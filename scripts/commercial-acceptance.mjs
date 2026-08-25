@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +12,33 @@ import { TERMINAL_TASK_STATES, VERSION } from '../src/contracts.mjs';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLIENT_ID = 'commercial.acceptance.agent';
 const COMMERCIAL_QUEUE_WAIT_MS = 120_000;
+
+async function fixtureServer() {
+  const html = await readFile(path.join(ROOT, 'test', 'fixtures', 'acceptance.html'));
+  const server = createServer((request, response) => {
+    if (request.url === '/' || request.url?.startsWith('/?')) {
+      response.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store'
+      });
+      response.end(html);
+      return;
+    }
+    response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    response.end('not found');
+  });
+  await new Promise((resolveListen, rejectListen) => {
+    server.once('error', rejectListen);
+    server.listen(0, '127.0.0.1', resolveListen);
+  });
+  const address = server.address();
+  return {
+    url: `http://127.0.0.1:${address.port}/`,
+    close: () => new Promise((resolveClose, rejectClose) => {
+      server.close((error) => error ? rejectClose(error) : resolveClose());
+    })
+  };
+}
 
 async function waitFor(getValue, predicate, timeoutMs = COMMERCIAL_QUEUE_WAIT_MS, label = 'condition') {
   const deadline = Date.now() + timeoutMs;
@@ -37,6 +65,27 @@ async function waitTerminal(client, taskId, timeoutMs = COMMERCIAL_QUEUE_WAIT_MS
     timeoutMs,
     `task ${taskId} terminal cleanup`
   );
+}
+
+async function readAcceptanceReport(client, taskId) {
+  const artifacts = await client.listArtifacts(taskId);
+  const reportArtifact = artifacts.find((artifact) => artifact.name === 'acceptance.json');
+  if (!reportArtifact) {
+    throw Object.assign(new Error(`Acceptance report is missing for ${taskId}`), {
+      code: 'COMMERCIAL_ACCEPTANCE_ARTIFACT_MISSING'
+    });
+  }
+  const content = await client.readArtifact({
+    taskId,
+    artifactId: reportArtifact.id,
+    maxBytes: 48 * 1024
+  });
+  if (content.encoding !== 'utf8' || content.eof !== true || typeof content.chunk !== 'string') {
+    throw Object.assign(new Error(`Acceptance report is not one bounded UTF-8 artifact for ${taskId}`), {
+      code: 'COMMERCIAL_ACCEPTANCE_ARTIFACT_INVALID'
+    });
+  }
+  return JSON.parse(content.chunk);
 }
 
 function assertCheck(checks, name, condition, detail) {
@@ -67,33 +116,62 @@ export async function runCommercialAcceptance() {
   const checks = [];
   const taskIds = [];
   let manager;
+  let client;
+  let fixture;
+  let persistentProfile;
   try {
+    fixture = await fixtureServer();
     manager = await createRuntime(dataDir);
-    let client = new HttpTaskMasterClient({
+    client = new HttpTaskMasterClient({
       baseUrl: manager.baseUrl,
       stateDir: manager.dataDir,
       clientId: CLIENT_ID,
       clientName: 'Commercial acceptance agent'
     });
-    const manualProfile = await client.createProfile({
-      name: 'Commercial persistent manual login',
+    persistentProfile = await client.createProfile({
+      name: 'Commercial persistent lifecycle',
       kind: 'persistent',
       browserEngine: 'chromium',
       headless: true
     });
-    const openedManualProfile = await client.openProfile(manualProfile.id);
+    const uploadPath = path.join(ROOT, 'test', 'fixtures', 'upload.txt');
+    const seeded = await client.startTask({
+      profileId: persistentProfile.id,
+      taskType: 'acceptance',
+      input: { url: fixture.url, uploadPath },
+      timeoutMs: 90_000,
+      idempotencyKey: `commercial-persistent-seed-${Date.now()}`
+    });
+    taskIds.push(seeded.taskId);
+    const seededDone = await waitTerminal(client, seeded.taskId);
+    assertCheck(
+      checks,
+      'persistent Profile seed task completes',
+      seededDone.state === 'completed',
+      JSON.stringify({ state: seededDone.state, error: seededDone.error })
+    );
+    const seededReport = await readAcceptanceReport(client, seeded.taskId);
+    assertCheck(
+      checks,
+      'persistent Profile writes reusable browser state',
+      seededDone.state === 'completed' && seededDone.behavior === 'human' &&
+        seededReport.passed === true &&
+        seededReport.evidence?.some((item) => item.kind === 'cookie' && item.ok) &&
+        seededReport.evidence?.some((item) => item.kind === 'localStorage' && item.ok)
+    );
+
+    const openedManualProfile = await client.openProfile(persistentProfile.id);
     assertCheck(
       checks,
       'persistent Profile opens through Playwright without an extension',
       openedManualProfile.state === 'open'
     );
-    const closedManualProfile = await client.closeProfile(manualProfile.id);
+    const closedManualProfile = await client.closeProfile(persistentProfile.id);
     assertCheck(
       checks,
       'persistent Profile close confirms cleanup and releases its lease',
       closedManualProfile.state === 'idle'
     );
-    await manager.profileStore.remove(manualProfile.id);
 
     const profiles = await Promise.all(Array.from({ length: 3 }, (_, index) => client.createProfile({
       name: `Commercial ephemeral ${index + 1}`,
@@ -211,6 +289,28 @@ export async function runCommercialAcceptance() {
       clientId: CLIENT_ID,
       clientName: 'Commercial acceptance agent after restart'
     });
+    const retained = await client.startTask({
+      profileId: persistentProfile.id,
+      taskType: 'acceptance',
+      input: { url: fixture.url, uploadPath, expectExistingState: true },
+      timeoutMs: 90_000,
+      idempotencyKey: `commercial-persistent-retained-${Date.now()}`
+    });
+    taskIds.push(retained.taskId);
+    const retainedDone = await waitTerminal(client, retained.taskId);
+    assertCheck(
+      checks,
+      'persistent Profile retained-state task completes',
+      retainedDone.state === 'completed',
+      JSON.stringify({ state: retainedDone.state, error: retainedDone.error })
+    );
+    const retainedReport = await readAcceptanceReport(client, retained.taskId);
+    assertCheck(
+      checks,
+      'persistent browser state survives manual open-close and Manager restart',
+      retainedDone.state === 'completed' && retainedDone.behavior === 'human' &&
+        retainedReport.evidence?.some((item) => item.kind === 'persistent-state-existing' && item.ok)
+    );
     const persisted = await client.listTasks({ limit: 100 });
     const persistedIds = new Set(persisted.tasks.map((task) => task.id));
     assertCheck(
@@ -218,6 +318,8 @@ export async function runCommercialAcceptance() {
       'terminal task history survives Manager restart',
       taskIds.every((id) => persistedIds.has(id)) && persisted.tasks.every((task) => task.cleanup?.settled === true)
     );
+    await manager.profileStore.remove(persistentProfile.id);
+    persistentProfile = null;
 
     return {
       ok: true,
@@ -234,7 +336,12 @@ export async function runCommercialAcceptance() {
       checkedAt: new Date().toISOString()
     };
   } finally {
+    if (persistentProfile?.id && manager) {
+      await client?.closeProfile(persistentProfile.id).catch(() => {});
+      await manager.profileStore.remove(persistentProfile.id).catch(() => {});
+    }
     await manager?.stop().catch(() => {});
+    await fixture?.close().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 }

@@ -422,10 +422,12 @@ test('Profile behavior changes do not break idempotency and queued attempts use 
   workers[0].emit('message', { type: 'cleanup', browserClosed: true });
   workers[0].finish();
   await waitFor(async () => (await service.get(blocker.id, ADMIN)).cleanup.settled === true);
+  await waitFor(() => workers.length === 2 && launchBehaviors.length === 2, 3_000);
   const completed = await waitFor(async () => {
     const current = await service.get(queued.id, ADMIN);
-    return current.state === 'completed' && current.cleanup.settled ? current : null;
-  });
+    return current.cleanup.settled ? current : null;
+  }, 3_000);
+  assert.equal(completed.state, 'completed', JSON.stringify(completed.error || {}));
   assert.deepEqual(launchBehaviors, ['fast', 'human']);
   assert.equal(completed.behavior, 'human');
   assert.equal(completed.history[0].behavior, 'human');
