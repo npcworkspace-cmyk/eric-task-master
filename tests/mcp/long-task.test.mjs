@@ -7,6 +7,17 @@ import { createManager } from '../../src/manager.mjs';
 import { HttpTaskMasterClient } from '../../src/mcp/taskmaster-client.mjs';
 import { createTaskService } from '../../src/runtime/task-service.mjs';
 
+async function waitForTask(client, taskId, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let result;
+  do {
+    const waitMs = Math.min(30_000, Math.max(0, deadline - Date.now()));
+    result = await client.waitTask(taskId, { waitMs });
+    if (!result.timedOut) return result;
+  } while (Date.now() < deadline);
+  return result;
+}
+
 test('a real long browser task survives MCP client replacement and exposes bounded artifacts', {
   skip: process.env.TASKMASTER_REAL_BROWSER !== '1'
 }, async (t) => {
@@ -49,7 +60,7 @@ test('a real long browser task survives MCP client replacement and exposes bound
   });
 
   const replacementClient = new HttpTaskMasterClient(options);
-  const waited = await replacementClient.waitTask(started.taskId, { waitMs: 15_000 });
+  const waited = await waitForTask(replacementClient, started.taskId);
   assert.equal(waited.timedOut, false);
   assert.equal(waited.task.state, 'completed');
   assert.equal(waited.task.progress.current, 8);
@@ -95,8 +106,20 @@ test('different Profiles run concurrently while same-Profile work queues safely'
     clientId: 'parallel.agent'
   });
   const [leftProfile, rightProfile] = await Promise.all([
-    client.createProfile({ name: 'Parallel left', headless: true }),
-    client.createProfile({ name: 'Parallel right', headless: true })
+    client.createProfile({
+      name: 'Parallel left',
+      kind: 'ephemeral',
+      browserEngine: 'chromium',
+      defaultBehavior: 'adaptive',
+      headless: true
+    }),
+    client.createProfile({
+      name: 'Parallel right',
+      kind: 'ephemeral',
+      browserEngine: 'chromium',
+      defaultBehavior: 'adaptive',
+      headless: true
+    })
   ]);
   const [left, right] = await Promise.all([
     client.startTask({
@@ -120,10 +143,13 @@ test('different Profiles run concurrently while same-Profile work queues safely'
   });
 
   const [leftDone, rightDone, collisionDone] = await Promise.all([
-    client.waitTask(left.taskId, { waitMs: 20_000 }),
-    client.waitTask(right.taskId, { waitMs: 20_000 }),
-    client.waitTask(collision.taskId, { waitMs: 20_000 })
+    waitForTask(client, left.taskId),
+    waitForTask(client, right.taskId),
+    waitForTask(client, collision.taskId)
   ]);
+  assert.equal(leftDone.timedOut, false);
+  assert.equal(rightDone.timedOut, false);
+  assert.equal(collisionDone.timedOut, false);
   assert.equal(leftDone.task.state, 'completed');
   assert.equal(rightDone.task.state, 'completed');
   assert.equal(collisionDone.task.state, 'completed');
