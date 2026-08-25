@@ -36,6 +36,19 @@ const PROFILE_BUSY_QUEUE_REASON = 'Waiting for Profile to become idle';
 const CLEANUP_RECONCILE_INTERVAL_MS = 2_000;
 const CLEANUP_RECONCILE_GRACE_MS = 60_000;
 
+function resolveProfileBehavior(profile) {
+  const behavior = profile.kind === 'persistent'
+    ? 'human'
+    : (profile.defaultBehavior ?? 'adaptive');
+  if (!isBehaviorMode(behavior)) {
+    throw new TaskServiceError(
+      'INVALID_PROFILE_BEHAVIOR',
+      'Profile behavior must be fast, human, or adaptive'
+    );
+  }
+  return behavior;
+}
+
 export const TASK_SERVICE_DEADLINES = Object.freeze({
   workerCleanupGraceMs: 30_000,
   workerHardKillGraceMs: 5_000,
@@ -1709,10 +1722,17 @@ export function createTaskService({
       }
       failureCode = 'TASK_WORKER_START_FAILED';
       const startingAt = nowIso();
+      const behavior = resolveProfileBehavior(profile);
       await update(task, {
         state: 'starting_browser',
         startedAt: startingAt,
         workerPid: child.pid,
+        behavior,
+        behaviorState: {
+          configured: behavior,
+          effective: behavior === 'adaptive' ? 'fast' : behavior,
+          at: startingAt
+        },
         progress: { current: 0, total: null, message: 'Starting browser' },
         progressAt: startingAt,
         heartbeatAt: startingAt,
@@ -1728,7 +1748,7 @@ export function createTaskService({
           profile,
           modulePath: task.modulePath,
           input: clone(task.input),
-          behavior: task.behavior,
+          behavior,
           outputDir: task.outputDir,
           checkpointPath: path.join(root, task.id, 'checkpoint.json'),
           ...(task.resumeInput ? { resumeCheckpoint: clone(task.resumeInput) } : {}),
@@ -1794,7 +1814,6 @@ export function createTaskService({
       'profileId',
       'taskType',
       'input',
-      'behavior',
       'timeoutMs',
       'idempotencyKey'
     ]);
@@ -1820,10 +1839,7 @@ export function createTaskService({
 
     const profile = requireProfileUse(await profileStore.get(body.profileId), caller);
     const taskType = await registry.resolve(body.taskType);
-    const behavior = body.behavior || profile.defaultBehavior || 'fast';
-    if (!isBehaviorMode(behavior)) {
-      throw new TaskServiceError('INVALID_BEHAVIOR_MODE', 'behavior must be fast, human, or adaptive');
-    }
+    const behavior = resolveProfileBehavior(profile);
     if (
       body.timeoutMs !== undefined &&
       (!Number.isSafeInteger(body.timeoutMs) || body.timeoutMs < 1_000 || body.timeoutMs > MAX_TASK_TIMEOUT_MS)

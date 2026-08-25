@@ -342,7 +342,7 @@ export class HttpTaskMasterClient {
   }
 
   async startTask(input) {
-    assertAllowedKeys(input, new Set(['taskType', 'profileId', 'input', 'behavior', 'timeoutMs', 'idempotencyKey']), 'Task request');
+    assertAllowedKeys(input, new Set(['taskType', 'profileId', 'input', 'timeoutMs', 'idempotencyKey']), 'Task request');
     assertIdentifier(input.taskType, 'taskType');
     assertIdentifier(input.profileId, 'profileId');
     assertIdentifier(input.idempotencyKey, 'idempotencyKey');

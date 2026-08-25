@@ -219,7 +219,7 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   const createResult = await json(await fetch(`${baseUrl}/v1/profiles`, {
     method: 'POST',
     headers: headers(manager.token),
-    body: JSON.stringify({ name: 'Daily work', defaultBehavior: 'fast' })
+    body: JSON.stringify({ name: 'Daily work', kind: 'ephemeral', defaultBehavior: 'fast' })
   }));
   assert.equal(createResult.response.status, 201);
   assert.equal(createResult.body.profile.userDataDir, undefined);
@@ -233,6 +233,25 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   }));
   assert.equal(patchResult.response.status, 200);
   assert.equal(patchResult.body.profile.defaultBehavior, 'adaptive');
+
+  const persistentResult = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify({ name: 'Signed-in Chrome' })
+  }));
+  assert.equal(persistentResult.response.status, 201);
+  assert.equal(persistentResult.body.profile.browserEngine, 'chrome');
+  assert.equal(persistentResult.body.profile.defaultBehavior, 'human');
+  const fixedBehavior = await json(await fetch(
+    `${baseUrl}/v1/profiles/${persistentResult.body.profile.id}`,
+    {
+      method: 'PATCH',
+      headers: headers(manager.token),
+      body: JSON.stringify({ defaultBehavior: 'human' })
+    }
+  ));
+  assert.equal(fixedBehavior.response.status, 400);
+  assert.equal(fixedBehavior.body.error.code, 'PERSISTENT_BEHAVIOR_FIXED');
 
   const invalidPatch = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
     method: 'PATCH',

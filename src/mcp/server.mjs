@@ -436,7 +436,6 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       taskType: IdentifierSchema,
       profileId: IdentifierSchema,
       input: JsonObjectSchema.default({}),
-      behavior: z.enum(BEHAVIOR_MODES).optional(),
       timeoutMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).optional(),
       idempotencyKey: IdempotencyKeySchema
     }),

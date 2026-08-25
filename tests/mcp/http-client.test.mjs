@@ -117,11 +117,17 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
 
   await client.getStatus();
   await client.getStatus();
+  await assert.rejects(client.startTask({
+    taskType: 'fixture.read',
+    profileId: 'profile_safe',
+    input: {},
+    behavior: 'fast',
+    idempotencyKey: 'request-override-0001'
+  }), { code: 'UNKNOWN_ARGUMENT' });
   const started = await client.startTask({
     taskType: 'fixture.read',
     profileId: 'profile_safe',
     input: { url: 'https://example.com/' },
-    behavior: 'fast',
     idempotencyKey: 'request-safe-0001'
   });
   const resumed = await client.resumeTask({ taskId: started.id, resumeKey: 'resume-safe-0001' });
@@ -132,7 +138,7 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.equal(requests[0].authorization, `Bearer ${ADMIN_TOKEN}`);
   for (const request of requests.slice(1)) assert.equal(request.authorization, `Bearer ${AGENT_TOKEN}`);
   assert.deepEqual(requests[0].body, { clientId: 'codex-fixture', name: 'Codex fixture' });
-  assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['behavior', 'idempotencyKey', 'input', 'profileId', 'taskType']);
+  assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['idempotencyKey', 'input', 'profileId', 'taskType']);
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
 });
 

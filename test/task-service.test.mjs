@@ -146,7 +146,9 @@ test('task service isolates work in a child, tracks progress, and releases its l
   const modulePath = path.join(root, 'task.mjs');
   await writeFile(modulePath, 'export const meta = { supportsResume: true }; export async function run() {}\n');
   const store = fakeProfileStore(root);
+  store.profile.kind = 'persistent';
   let workerKind;
+  let workerBehavior;
   const service = createTaskService({
     stateDir: path.join(root, 'state'),
     profileStore: store,
@@ -156,6 +158,7 @@ test('task service isolates work in a child, tracks progress, and releases its l
       workerKind = kind;
       return new FakeWorker((message, child) => {
         if (message.type !== 'start') return;
+        workerBehavior = message.config.behavior;
         setImmediate(() => {
           child.emit('message', { type: 'heartbeat', at: new Date().toISOString() });
           child.emit('message', { type: 'state', state: 'running' });
@@ -170,6 +173,14 @@ test('task service isolates work in a child, tracks progress, and releases its l
   });
   await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
 
+  await assert.rejects(service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'task-service-behavior-override',
+    input: {},
+    behavior: 'fast'
+  }, ADMIN), { code: 'INVALID_TASK_CREATE' });
+
   const created = await service.create({
     profileId: 'profile_test',
     taskType: 'fixture',
@@ -177,6 +188,8 @@ test('task service isolates work in a child, tracks progress, and releases its l
     input: { secretNotReturned: 'value' }
   }, ADMIN);
   assert.equal(workerKind, 'task');
+  assert.equal(workerBehavior, 'human');
+  assert.equal(created.behavior, 'human');
   assert.equal(created.profileId, 'profile_test');
   assert.equal('leaseOwner' in created, false);
   assert.equal('workerPid' in created, false);
@@ -2121,7 +2134,6 @@ test('real Chromium executes the full acceptance task and cleans up', {
       url: `http://127.0.0.1:${address.port}/acceptance`,
       uploadPath: path.resolve('test/fixtures/upload.txt')
     },
-    behavior: 'fast',
     timeoutMs: 60_000
   }, ADMIN);
   const terminal = await waitFor(async () => {

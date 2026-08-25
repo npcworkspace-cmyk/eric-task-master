@@ -30,7 +30,7 @@ Usage:
   taskmaster status [--json]
   taskmaster manager stop [--json]
   taskmaster profiles list [--json]
-  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior MODE] [--access private|shared] [--headless]
+  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior fast|adaptive|human] [--access private|shared] [--headless]
   taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE] [--access private|shared]
   taskmaster profiles open|close|delete PROFILE_ID
   taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
@@ -621,8 +621,8 @@ async function profileCommand(action, args, options, json) {
     const body = {
       name: options.name,
       kind: options.kind || 'persistent',
-      defaultBehavior: options.behavior || 'fast',
       headless: options.headless === true || options.headless === 'true',
+      ...(options.behavior ? { defaultBehavior: options.behavior } : {}),
       ...(options.access ? { access: options.access } : {}),
       ...(options.engine ? { browserEngine: options.engine } : {})
     };
@@ -682,7 +682,6 @@ async function taskCommand(action, args, options, json) {
       taskType: options.type,
       input: await loadInput(options.input),
       idempotencyKey,
-      ...(options.behavior ? { behavior: options.behavior } : {}),
       ...(options.timeout ? { timeoutMs: Number(options.timeout) } : {})
     };
     const { task } = await requestJson(context.config.baseUrl, '/v1/tasks', {

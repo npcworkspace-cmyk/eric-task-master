@@ -109,6 +109,18 @@ function migrateBrowserEngine(profile) {
   delete profile.browserChannel;
 }
 
+function migrateProfileBehavior(profile) {
+  if (profile.kind === 'persistent') {
+    profile.defaultBehavior = 'human';
+    return;
+  }
+  if (profile.defaultBehavior === undefined || profile.defaultBehavior === null || profile.defaultBehavior === '') {
+    profile.defaultBehavior = 'adaptive';
+    return;
+  }
+  profile.defaultBehavior = ensureBehaviorMode(profile.defaultBehavior);
+}
+
 function ensureProfileAccess(value) {
   if (!PROFILE_ACCESS.has(value)) {
     throw new ProfileStoreError('INVALID_PROFILE_ACCESS', 'Profile access must be private or shared');
@@ -163,7 +175,7 @@ export class ProfileStore {
     removePath = rm
   }) {
     if (!profilesRoot) throw new TypeError('profilesRoot is required');
-    this.#store = new JsonStore(filePath, { version: 2, profiles: [] });
+    this.#store = new JsonStore(filePath, { version: 3, profiles: [] });
     this.#profilesRoot = profilesRoot;
     this.#now = now;
     this.#processAlive = processAlive;
@@ -177,7 +189,7 @@ export class ProfileStore {
     // v0.x Profile records predate explicit persistence semantics. Preserve
     // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
-      if (data.version !== undefined && ![1, 2].includes(data.version)) {
+      if (data.version !== undefined && ![1, 2, 3].includes(data.version)) {
         throw new ProfileStoreError(
           'PROFILE_STORE_VERSION_UNSUPPORTED',
           `Profile store version ${String(data.version)} is unsupported`,
@@ -186,7 +198,9 @@ export class ProfileStore {
       }
       for (const profile of data.profiles) {
         profile.kind ||= 'persistent';
+        ensureProfileKind(profile.kind);
         migrateBrowserEngine(profile);
+        migrateProfileBehavior(profile);
         profile.ownerClientId ??= null;
         profile.access ||= 'shared';
         if (
@@ -197,7 +211,7 @@ export class ProfileStore {
           profile.lease.cleanupRequired = true;
         }
       }
-      data.version = 2;
+      data.version = 3;
     });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
@@ -228,13 +242,21 @@ export class ProfileStore {
     const {
       name,
       kind = 'persistent',
-      defaultBehavior = 'fast',
+      defaultBehavior: requestedBehavior,
       headless = false,
       browserEngine: requestedBrowserEngine
     } = input;
     const normalizedName = normalizeName(name);
     ensureProfileKind(kind);
-    ensureBehaviorMode(defaultBehavior);
+    const defaultBehavior = ensureBehaviorMode(
+      requestedBehavior ?? (kind === 'persistent' ? 'human' : 'adaptive')
+    );
+    if (kind === 'persistent' && defaultBehavior !== 'human') {
+      throw new ProfileStoreError(
+        'PERSISTENT_BEHAVIOR_FIXED',
+        'Persistent Profiles always use human behavior'
+      );
+    }
     ensureHeadless(headless);
     const browserEngine = ensureBrowserEngine(
       requestedBrowserEngine ?? (kind === 'persistent' ? 'chrome' : 'chromium')
@@ -299,6 +321,12 @@ export class ProfileStore {
     let updated;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
+      if (profile.kind === 'persistent' && 'defaultBehavior' in patch) {
+        throw new ProfileStoreError(
+          'PERSISTENT_BEHAVIOR_FIXED',
+          'Persistent Profile behavior cannot be changed'
+        );
+      }
       if (
         patch.access === 'private' &&
         (profile.access || 'shared') !== 'private' &&

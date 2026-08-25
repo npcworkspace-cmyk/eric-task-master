@@ -37,6 +37,7 @@ test('a real long browser task survives MCP client replacement and exposes bound
   const firstClient = new HttpTaskMasterClient(options);
   const profile = await firstClient.createProfile({
     name: 'Long task fixture',
+    kind: 'ephemeral',
     defaultBehavior: 'adaptive',
     headless: true
   });
@@ -44,7 +45,6 @@ test('a real long browser task survives MCP client replacement and exposes bound
     profileId: profile.id,
     taskType: 'durable-delay',
     input: { steps: 8, delayMs: 100 },
-    behavior: 'adaptive',
     idempotencyKey: 'long-task-reconnect-0001'
   });
 
