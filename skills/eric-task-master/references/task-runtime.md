@@ -2,18 +2,27 @@
 
 Read this reference only when an installed high-level task type does not cover the requested work.
 
-## Fixed CLI fallback
+## Trusted local task-type authoring path
+
+This is not the ordinary `needs_adapter` Agent loop. Use the registered-only
+`task start` flow in `SKILL.md` whenever an installed task type covers the
+request. Continue here only when trusted local code must be authored and
+registered. Module installation is a local administrator surface, not a
+sandbox for untrusted code.
+
+Choose one stable CLI Agent identity for the task and reuse it on discovery,
+submission, status, recovery, and artifact reads:
 
 ```bash
-node scripts/taskmaster.mjs task-types list --json
+node scripts/taskmaster.mjs task-types list --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task-types install --type TASK_TYPE --module MODULE.mjs --json
-node scripts/taskmaster.mjs task run --profile PROFILE_ID --type TASK_TYPE --module MODULE.mjs --input '{"url":"https://example.com"}' --request-key UNIQUE_KEY --json
-node scripts/taskmaster.mjs task status TASK_ID --json
-node scripts/taskmaster.mjs task follow TASK_ID --json
-node scripts/taskmaster.mjs task resume TASK_ID --resume-key STABLE_KEY --json
-node scripts/taskmaster.mjs artifacts list TASK_ID --json
-node scripts/taskmaster.mjs artifacts read TASK_ID --artifact ARTIFACT_ID --json
-node scripts/taskmaster.mjs task cancel TASK_ID --json
+node scripts/taskmaster.mjs task run --profile PROFILE_ID --type TASK_TYPE --module MODULE.mjs --input '{"url":"https://example.com"}' --request-key UNIQUE_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task status TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task follow TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task resume TASK_ID --resume-key STABLE_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs artifacts list TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs artifacts read TASK_ID --artifact ARTIFACT_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task cancel TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 ```
 
 `task run` follows progress until cleanup settles unless `--detach` is set. The module may live outside the repository: the CLI accepts only a regular single-file `.mjs` of at most 2 MiB, copies it into a Manager-owned inbox, verifies its hash, and snapshots it. Imports of sibling files are therefore not portable; bundle needed logic into the one module.

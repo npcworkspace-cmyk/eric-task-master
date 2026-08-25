@@ -160,6 +160,7 @@ test('CLI exposes no admin token to a same-port fake Manager with the wrong key'
 
   const result = await runCli([
     'profiles', 'list', '--json',
+    '--agent-id', 'identity-wrong-key-agent', '--agent-name', 'Identity wrong key Agent',
     '--port', String(server.address().port),
     '--state-dir', stateDir
   ]);
@@ -174,7 +175,7 @@ test('CLI exposes no admin token to a same-port fake Manager with the wrong key'
   assert.equal(JSON.stringify(captured).includes(ADMIN_TOKEN), false);
 });
 
-test('CLI final JSON redacts credential markers from Manager responses', async (t) => {
+test('CLI final JSON does not expose credential markers from Manager responses', async (t) => {
   const stateDir = await mkdtemp(path.join(tmpdir(), 'taskmaster-cli-redaction-'));
   const identity = generateManagerIdentity();
   const marker = 'identity-redaction-marker-4Qv8';
@@ -219,12 +220,13 @@ test('CLI final JSON redacts credential markers from Manager responses', async (
 
   const result = await runCli([
     'profiles', 'list', '--json',
+    '--agent-id', 'identity-redaction-agent', '--agent-name', 'Identity redaction Agent',
     '--port', String(server.address().port),
     '--state-dir', stateDir
   ]);
   assert.equal(result.code, 1);
   assert.equal(result.stderr.includes(marker), false);
-  assert.match(result.stderr, /\[REDACTED\]/);
+  assert.match(result.stderr, /Task Master manager rejected the request\./);
 });
 
 test('Manager errorResponse redacts message and nested details', async (t) => {

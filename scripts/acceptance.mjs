@@ -474,7 +474,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     checks,
     checkedAt: new Date().toISOString(),
     nextAction: passed === checks.length
-      ? 'List profiles, then ask for the browser task.'
+      ? 'When acceptance is embedded in connect output, follow the enclosing top-level nextAction. When run standalone, use the documented MCP path or scoped CLI path with one stable Agent identity.'
       : 'Read the first failed check, correct that cause, and rerun the same acceptance command.'
   };
   return result;

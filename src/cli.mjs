@@ -20,6 +20,7 @@ import { redactSensitiveText } from './lib/redaction.mjs';
 import { waitForManagerShutdownProof } from './lib/manager-shutdown-proof.mjs';
 import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
 import { readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
+import { assertSafeTaskInput, HttpTaskMasterClient } from './mcp/taskmaster-client.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -28,11 +29,12 @@ const HELP = `eric-task-master ${VERSION}
 Usage:
   taskmaster connect [--force-acceptance] [--json]
   taskmaster status [--json]
+  taskmaster dashboard-open [TASK_ID] [--json]
   taskmaster manager stop [--json]
   taskmaster profiles list [--json]
   taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior fast|adaptive|human] [--access private|shared] [--headless]
   taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE] [--access private|shared]
-  taskmaster profiles open|close|delete PROFILE_ID
+  taskmaster profiles open|close PROFILE_ID
   taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
   taskmaster task-types describe TASK_TYPE [--json]
   taskmaster task-types install --type NAME --module PATH [--json]
@@ -40,14 +42,17 @@ Usage:
   taskmaster task-packs scaffold PATH --name PACK_NAME [--json]
   taskmaster task-packs install PATH [--json]
   taskmaster task list [--json]
+  taskmaster task start --profile ID --type TYPE --request-key KEY [--input JSON] [--json]
   taskmaster task run --profile ID --type TYPE [--module PATH] [--input JSON] [--request-key KEY]
-  taskmaster task status|follow|cancel TASK_ID [--json]
+  taskmaster task status|wait|follow|cancel TASK_ID [--json]
   taskmaster task continue TASK_ID [--request-id ID] [--note TEXT] [--json]
   taskmaster task resume TASK_ID --resume-key KEY [--detach] [--json]
   taskmaster artifacts list TASK_ID [--json]
   taskmaster artifacts read TASK_ID --artifact ARTIFACT_ID [--offset N] [--max-bytes N]
   taskmaster mcp status|register|unregister|rollback [--json]
 
+Task start accepts registered task types only and returns immediately. Task wait is bounded to 30 seconds.
+Agent-scoped commands require --agent-id STABLE_ID (or ERIC_TASK_MASTER_CLIENT_ID). Use a distinct stable ID per independent Agent; the same ID intentionally shares its private Profiles and tasks.
 Task run follows progress until terminal state by default.`;
 
 function parseArgs(argv) {
@@ -122,7 +127,7 @@ async function readManagerCredentials(stateDir) {
     throw cliError(
       'MANAGER_TOKEN_UNAVAILABLE',
       'Manager authentication token is unavailable',
-      'Run the fixed connect command once.'
+      'Restore the state directory that belongs to the running Manager, or stop it from its verified owning installation; then retry the fixed connect command once. Do not invent another controller or production port.'
     );
   }
   let identity;
@@ -371,15 +376,54 @@ async function apiContext(options) {
   return { config, token: credentials.token, identity: credentials.identity };
 }
 
+async function agentContext(options) {
+  const clientId = options['agent-id'] || process.env.ERIC_TASK_MASTER_CLIENT_ID;
+  if (!clientId) {
+    throw cliError(
+      'AGENT_ID_REQUIRED',
+      'Agent-scoped CLI commands require --agent-id STABLE_ID or ERIC_TASK_MASTER_CLIENT_ID.',
+      'Choose one stable ID for this Agent, add --agent-id STABLE_ID, and reuse it on every scoped command.'
+    );
+  }
+  const config = settings(options);
+  await ensureManager(config);
+  const clientName = options['agent-name'] || process.env.ERIC_TASK_MASTER_CLIENT_NAME || 'Task Master CLI';
+  return {
+    config,
+    client: new HttpTaskMasterClient({
+      baseUrl: config.baseUrl,
+      stateDir: config.stateDir,
+      clientId,
+      clientName
+    })
+  };
+}
+
+async function dashboardOpenCommand(args, options, json) {
+  const context = await agentContext(options);
+  const taskId = args[0];
+  const result = await context.client.openDashboard(taskId);
+  emit({ ok: true, ...result }, json);
+}
+
+async function waitTask(context, taskId, options) {
+  const waitMs = Number(options['wait-ms'] ?? 30_000);
+  return context.client.waitTask(taskId, { waitMs });
+}
+
 async function followTask(context, taskId, json, options = {}) {
   const pollMs = Number(options['poll-ms'] ?? 1_000);
   const timeoutMs = Number(options['wait-ms'] ?? 24 * 60 * 60 * 1_000);
+  if (!Number.isInteger(pollMs) || pollMs < 100 || pollMs > 30_000) {
+    throw cliError('INVALID_POLL_INTERVAL', '--poll-ms must be an integer from 100 to 30000');
+  }
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 7 * 24 * 60 * 60 * 1_000) {
+    throw cliError('INVALID_FOLLOW_TIMEOUT', '--wait-ms for task follow must be an integer from 1000 to 604800000');
+  }
   const deadline = Date.now() + timeoutMs;
   let previous;
   while (Date.now() < deadline) {
-    const { task } = await requestJson(context.config.baseUrl, `/v1/tasks/${encodeURIComponent(taskId)}`, {
-      token: context.token
-    });
+    const task = await context.client.getTask(taskId);
     const signature = JSON.stringify([task.state, task.progress, task.heartbeatAt, task.error]);
     if (signature !== previous) {
       emit({ event: 'task-progress', task }, json);
@@ -457,9 +501,7 @@ async function connect(options, json) {
     acceptance,
     mcpRegistration: registration,
     dashboard: `${config.baseUrl}/dashboard#${new URLSearchParams({ code: dashboardAuthorization.code })}`,
-    nextAction: registration.results?.some((item) => item.status === 'registered_pending_restart')
-      ? 'Restart or reload the registered Agent host once, then use Task Master MCP tools.'
-      : 'List profiles, then ask for the browser task.'
+    nextAction: 'Match this Agent host in mcpRegistration.results. For registered_pending_restart, reload it once; for registered, use taskmaster_status then taskmaster_profiles_list. For needs_adapter, run node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json, then profiles list with the same identity. Do not mix MCP and CLI identities. After status and Profile discovery succeed, ask for the browser task.'
   };
   emit(result, json);
   return result;
@@ -610,10 +652,9 @@ async function stopManager(options, json) {
 }
 
 async function profileCommand(action, args, options, json) {
-  const context = await apiContext(options);
+  const context = await agentContext(options);
   if (action === 'list') {
-    const result = await requestJson(context.config.baseUrl, '/v1/profiles', { token: context.token });
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, profiles: await context.client.listProfiles() }, json);
     return;
   }
   if (action === 'create') {
@@ -626,8 +667,7 @@ async function profileCommand(action, args, options, json) {
       ...(options.access ? { access: options.access } : {}),
       ...(options.engine ? { browserEngine: options.engine } : {})
     };
-    const result = await requestJson(context.config.baseUrl, '/v1/profiles', { method: 'POST', body, token: context.token });
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, profile: await context.client.createProfile(body) }, json);
     return;
   }
   const profileId = args[0];
@@ -638,57 +678,60 @@ async function profileCommand(action, args, options, json) {
     if (options.behavior !== undefined) body.defaultBehavior = options.behavior;
     if (options.headless !== undefined) body.headless = options.headless === true || options.headless === 'true';
     if (options.access !== undefined) body.access = options.access;
-    const result = await requestJson(context.config.baseUrl, `/v1/profiles/${encodeURIComponent(profileId)}`, {
-      method: 'PATCH', body, token: context.token
-    });
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, profile: await context.client.updateProfile(profileId, body) }, json);
     return;
   }
-  const route = action === 'delete'
-    ? `/v1/profiles/${encodeURIComponent(profileId)}`
-    : `/v1/profiles/${encodeURIComponent(profileId)}/${action}`;
-  const method = action === 'delete' ? 'DELETE' : 'POST';
-  const result = await requestJson(context.config.baseUrl, route, {
-    method,
-    token: context.token,
-    ...(action === 'open' ? { timeoutMs: 75_000 } : {}),
-    ...(action === 'close' ? { timeoutMs: 45_000 } : {})
-  });
-  emit({ ok: true, ...result }, json);
+  if (action === 'open' || action === 'close') {
+    const profile = action === 'open'
+      ? await context.client.openProfile(profileId)
+      : await context.client.closeProfile(profileId);
+    emit({ ok: true, profile }, json);
+    return;
+  }
+  throw cliError('UNKNOWN_COMMAND', `Unknown profiles command: ${action}`);
 }
 
 async function taskCommand(action, args, options, json) {
-  const context = await apiContext(options);
+  const context = await agentContext(options);
   if (action === 'list') {
-    const result = await requestJson(context.config.baseUrl, '/v1/tasks', { token: context.token });
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, ...await context.client.listTasks() }, json);
     return;
   }
-  if (action === 'run') {
+  if (action === 'run' || action === 'start') {
     if (!options.profile) throw cliError('PROFILE_ID_REQUIRED', '--profile is required');
     if (!options.type) throw cliError('TASK_TYPE_REQUIRED', '--type is required');
+    if (action === 'start' && options.module) {
+      throw cliError(
+        'REGISTERED_TASK_TYPE_REQUIRED',
+        'task start accepts registered task types only; --module is not supported'
+      );
+    }
+    if (action === 'start' && !options['request-key']) {
+      throw cliError('REQUEST_KEY_REQUIRED', 'task start requires a stable --request-key KEY');
+    }
     if (options.module) {
-      const modulePath = await stageTaskModule(context.config, options.module);
-      await requestJson(context.config.baseUrl, '/v1/task-types/install', {
+      const admin = await apiContext(options);
+      const modulePath = await stageTaskModule(admin.config, options.module);
+      await requestJson(admin.config.baseUrl, '/v1/task-types/install', {
         method: 'POST',
         body: { name: options.type, modulePath },
-        token: context.token
+        token: admin.token
       });
     }
     const idempotencyKey = options['request-key'] || `cli-${randomUUID()}`;
-    emit({ event: 'task-submitting', taskType: options.type, idempotencyKey }, json);
+    if (action === 'run') emit({ event: 'task-submitting', taskType: options.type, idempotencyKey }, json);
+    const input = await loadInput(options.input);
+    assertSafeTaskInput(input);
     const body = {
       profileId: options.profile,
       taskType: options.type,
-      input: await loadInput(options.input),
+      input,
       idempotencyKey,
       ...(options.timeout ? { timeoutMs: Number(options.timeout) } : {})
     };
-    const { taskId, dashboardUrl, task } = await requestJson(context.config.baseUrl, '/v1/tasks', {
-      method: 'POST', body, token: context.token
-    });
-    emit({ event: 'task-started', taskId, dashboardUrl, task }, json);
-    if (options.detach) return;
+    const { taskId, dashboardUrl, task } = await context.client.startTask(body);
+    emit({ ok: true, event: 'task-started', taskId, dashboardUrl, task }, json);
+    if (action === 'start' || options.detach) return;
     const terminal = await followTask(context, task.id, json, options);
     emit({ ok: terminal.state === 'completed', event: 'task-finished', task: terminal }, json);
     if (terminal.state !== 'completed') process.exitCode = 1;
@@ -698,11 +741,7 @@ async function taskCommand(action, args, options, json) {
   if (!taskId) throw cliError('TASK_ID_REQUIRED', `task ${action} requires a task ID`);
   if (action === 'resume') {
     if (!options['resume-key']) throw cliError('RESUME_KEY_REQUIRED', 'task resume requires --resume-key KEY');
-    const result = await requestJson(
-      context.config.baseUrl,
-      `/v1/tasks/${encodeURIComponent(taskId)}/resume`,
-      { method: 'POST', body: { resumeKey: options['resume-key'] }, token: context.token }
-    );
+    const result = await context.client.resumeTask({ taskId, resumeKey: options['resume-key'] });
     emit({ ok: true, event: 'task-resumed', ...result }, json);
     if (options.detach) return;
     const terminal = await followTask(context, taskId, json, options);
@@ -711,8 +750,11 @@ async function taskCommand(action, args, options, json) {
     return;
   }
   if (action === 'status') {
-    const result = await requestJson(context.config.baseUrl, `/v1/tasks/${encodeURIComponent(taskId)}`, { token: context.token });
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, task: await context.client.getTask(taskId) }, json);
+    return;
+  }
+  if (action === 'wait') {
+    emit({ ok: true, ...await waitTask(context, taskId, options) }, json);
     return;
   }
   if (action === 'follow') {
@@ -722,58 +764,48 @@ async function taskCommand(action, args, options, json) {
     return;
   }
   if (action === 'cancel') {
-    const result = await requestJson(context.config.baseUrl, `/v1/tasks/${encodeURIComponent(taskId)}/cancel`, {
-      method: 'POST', token: context.token
-    });
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, task: await context.client.cancelTask(taskId) }, json);
     return;
   }
   if (action === 'continue') {
-    const result = await requestJson(context.config.baseUrl, `/v1/tasks/${encodeURIComponent(taskId)}/continue`, {
-      method: 'POST',
-      token: context.token,
-      body: {
-        ...(options['request-id'] ? { requestId: options['request-id'] } : {}),
-        ...(options.note ? { note: options.note } : {})
-      }
+    const task = await context.client.continueTask({
+      taskId,
+      ...(options['request-id'] ? { requestId: options['request-id'] } : {}),
+      ...(options.note ? { note: options.note } : {})
     });
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, task }, json);
     return;
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown task command: ${action}`);
 }
 
 async function taskTypeCommand(action, args, options, json) {
-  const context = await apiContext(options);
   if (action === 'list') {
-    const query = new URLSearchParams();
-    if (options.query) query.set('query', options.query);
-    if (options.domain) query.set('domain', options.domain);
-    if (options.intent) query.set('intent', options.intent);
-    const suffix = query.size ? `?${query}` : '';
-    const result = await requestJson(context.config.baseUrl, `/v1/task-types${suffix}`, { token: context.token });
-    emit({ ok: true, ...result }, json);
+    const context = await agentContext(options);
+    const taskTypes = await context.client.listTaskTypes({
+      ...(options.query ? { query: options.query } : {}),
+      ...(options.domain ? { domain: options.domain } : {}),
+      ...(options.intent ? { intent: options.intent } : {})
+    });
+    emit({ ok: true, taskTypes }, json);
     return;
   }
   if (action === 'describe') {
+    const context = await agentContext(options);
     const taskType = args[0];
     if (!taskType) throw cliError('TASK_TYPE_REQUIRED', 'task-types describe requires a task type');
-    const result = await requestJson(
-      context.config.baseUrl,
-      `/v1/task-types/${encodeURIComponent(taskType)}`,
-      { token: context.token }
-    );
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, taskType: await context.client.describeTaskType(taskType) }, json);
     return;
   }
   if (action === 'install') {
     if (!options.type) throw cliError('TASK_TYPE_REQUIRED', '--type is required');
     if (!options.module) throw cliError('TASK_MODULE_REQUIRED', '--module is required');
-    const modulePath = await stageTaskModule(context.config, options.module);
-    const result = await requestJson(context.config.baseUrl, '/v1/task-types/install', {
+    const admin = await apiContext(options);
+    const modulePath = await stageTaskModule(admin.config, options.module);
+    const result = await requestJson(admin.config.baseUrl, '/v1/task-types/install', {
       method: 'POST',
       body: { name: options.type, modulePath },
-      token: context.token
+      token: admin.token
     });
     emit({ ok: true, ...result }, json);
     return;
@@ -832,28 +864,20 @@ async function taskPackCommand(action, args, options, json) {
 async function artifactCommand(action, args, options, json) {
   const taskId = args[0];
   if (!taskId) throw cliError('TASK_ID_REQUIRED', `artifacts ${action} requires a task ID`);
-  const context = await apiContext(options);
+  const context = await agentContext(options);
   if (action === 'list') {
-    const result = await requestJson(
-      context.config.baseUrl,
-      `/v1/tasks/${encodeURIComponent(taskId)}/artifacts`,
-      { token: context.token }
-    );
-    emit({ ok: true, ...result }, json);
+    emit({ ok: true, artifacts: await context.client.listArtifacts(taskId) }, json);
     return;
   }
   if (action === 'read') {
     const artifactId = options.artifact || args[1];
     if (!artifactId) throw cliError('ARTIFACT_ID_REQUIRED', 'artifacts read requires --artifact ARTIFACT_ID');
-    const query = new URLSearchParams({
-      offset: String(options.offset ?? 0),
-      maxBytes: String(options['max-bytes'] ?? 48 * 1024)
+    const result = await context.client.readArtifact({
+      taskId,
+      artifactId,
+      offset: Number(options.offset ?? 0),
+      maxBytes: Number(options['max-bytes'] ?? 48 * 1024)
     });
-    const result = await requestJson(
-      context.config.baseUrl,
-      `/v1/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}?${query}`,
-      { token: context.token }
-    );
     emit({ ok: true, ...result }, json);
     return;
   }
@@ -896,6 +920,7 @@ async function main() {
   }
   if (command === 'serve') return serve(settings(options), json);
   if (command === 'connect') return connect(options, json);
+  if (command === 'dashboard-open') return dashboardOpenCommand(positionals, options, json);
   if (command === 'manager') {
     const action = positionals.shift() || 'status';
     if (action === 'stop') return stopManager(options, json);
@@ -913,8 +938,8 @@ async function main() {
   if (command === 'artifacts') return artifactCommand(positionals.shift() || 'list', positionals, options, json);
   if (command === 'mcp') return mcpCommand(positionals.shift() || 'status', options, json);
   if (command === 'status') {
-    const config = settings(options);
-    emit({ ok: true, manager: await health(config) }, json);
+    const context = await agentContext(options);
+    emit({ ok: true, status: await context.client.getStatus() }, json);
     return;
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown command: ${command}`);

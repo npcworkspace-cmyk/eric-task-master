@@ -9,6 +9,8 @@ Task Master has two Profile kinds. Profile names are user-facing; immutable IDs 
 
 One live lease is allowed per Profile. Same-Profile tasks wait in FIFO order; different Profiles may run concurrently within the Manager budget. “Ephemeral / 隐身临时” means no local browser state survives the task. It does not claim fingerprint spoofing, anti-detection, CAPTCHA bypass, or immunity from platform controls.
 
+One registered MCP client ID or one required stable CLI `--agent-id` is one trusted-local Agent principal. Private Profiles and task ledgers are scoped to that ID; reusing it intentionally shares them, while independent Agents must use different stable IDs. A missing CLI ID fails closed. A shared Profile permits another principal to use that browser state but never shares the owner's task records or artifacts. This prevents accidental crossover between trusted local processes, not hostile tenants under the same operating-system account. Use separate operating-system users, sandboxes, or machines for mutually untrusted Agents.
+
 ## Login workflow
 
 This workflow applies only to a `persistent` Profile.
@@ -25,7 +27,7 @@ Only one live lease is allowed. The Dashboard cannot open a Profile while a task
 
 ## Behavior defaults
 
-- `fast`: minimum necessary Playwright waits; default for deterministic and data-heavy work.
+- `fast`: optional speed-first policy for an ephemeral Profile and deterministic, data-heavy work.
 - `human`: bounded hover, mouse, typing, reading, and scrolling cadence.
 - `adaptive`: begins fast, briefly becomes `cautious` for ordinary dynamic-page signals, and becomes guarded human-paced after occlusion, timeout, uncertain navigation, action failure, or rate limiting. Its effective mode and remaining guarded-action budget are visible in task status. Successful actions decay the temporary guard back to fast.
 

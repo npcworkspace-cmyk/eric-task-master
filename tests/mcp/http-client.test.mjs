@@ -362,9 +362,18 @@ test('HTTP client rejects module, evaluation, session, and credential inputs bef
 
   for (const input of [
     { modulePath: './attack.mjs' },
+    { module: './attack.mjs' },
     { evaluate: 'document.cookie' },
     { cookie: 'secret' },
-    { nested: { sessionToken: 'secret' } }
+    { nested: { sessionToken: 'secret' } },
+    { privateKey: 'secret' },
+    { clientSecret: 'secret' },
+    { 'x-api-key': 'secret' },
+    { headers: { 'X-API-Key': 'secret' } },
+    { auth: 'Bearer secret' },
+    { storageState: { cookies: [] } },
+    { userDataDir: '/tmp/profile' },
+    { wsEndpoint: 'ws://127.0.0.1:9222/' }
   ]) {
     await assert.rejects(
       client.startTask({

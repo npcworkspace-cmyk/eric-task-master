@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1 - 2026-08-25
+
+- Added one Agent-scoped CLI path for hosts without a native MCP adapter, reusing the signed Manager identity and existing durable task APIs instead of introducing another controller.
+- Added fresh Dashboard-link creation, registered-only idempotent task start, bounded task waiting, and scoped Profile, task, recovery, and artifact commands for the CLI path.
+- Rejected arbitrary module and credential-bearing inputs from the standard CLI task loop while retaining trusted local Task Pack and task-type authoring as explicit administrator surfaces.
+- Completed the English, Chinese, base Skill, MCP-host, Profile, authoring, and Release-archive documentation so new Agents select one fixed MCP or CLI path without mixing identities.
+- Kept task history created by the former v2.0.0 administrator CLI visible in the local Manager Dashboard; new CLI task records are intentionally visible only to their stable scoped Agent identity.
+
 ## 2.0.0 - 2026-08-25
 
 - Replaced the browser extension and cross-browser session-transfer design with a pure Playwright runtime plus a same-origin Web Dashboard; users now sign in directly inside isolated persistent Profiles.

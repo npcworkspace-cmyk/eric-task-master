@@ -4,7 +4,7 @@
 
 **为 AI Agent 打造的持久化浏览器自动化任务系统。**
 
-版本：**2.0.0**
+版本：**2.0.1**
 
 AI Agent 已经能够理解需求、制定计划和编写代码，但浏览器执行往往仍是最薄弱的一环。Agent 内置浏览器适合短时交互，却很难稳定保留登录态、任务上下文和恢复现场；简单的 CDP 控制器虽然能快速操作真实浏览器，却会迫使每个 Agent 为每次任务重新编写控制器、进度跟踪、异常恢复和清理逻辑。
 
@@ -20,7 +20,7 @@ Task Master 是通用执行基座，不是某一个网站的专用机器人。�
 - 跨越数百个页面的长时间批量任务，不必持续占用一个 Agent 回合；
 - 使用独立持久化 Profile 完成需要登录态的后台、门户、CMS、CRM 和账号工作；
 - 使用隐身临时 Profile 完成不需要登录、任务结束即销毁的干净任务；
-- 多个 Agent 同时操作不同 Profile，互不抢标签页、登录态和任务记录；
+- 可信本机内的多个 Agent 使用不同身份和 Profile 并行工作，避免误抢标签页、登录态和任务记录；
 - 由 Agent、定时器或业务系统触发的日常重复工作流；
 - 浏览器 QA、内容核验、表单处理、文件上传下载和证据留存；
 - 进一步封装成销售线索、电商运营、媒体研究、供应商研究、客服、合规检查或内部 RPA 等生产级 Task Pack。
@@ -31,7 +31,7 @@ Task Master 是通用执行基座，不是某一个网站的专用机器人。�
 
 | 方式 | 优势 | 通常欠缺的部分 |
 | --- | --- | --- |
-| Agent 内置浏览器 | 临时浏览和短时交互方便 | 持久任务、登录 Profile、长任务恢复、多 Agent 隔离、清理证明 |
+| Agent 内置浏览器 | 临时浏览和短时交互方便 | 持久任务、登录 Profile、长任务恢复、可信本机 Agent 作用域、清理证明 |
 | 一次性 CDP 控制器 | 原始控制快、灵活 | 稳定生命周期、队列、进度、检查点、证据、恢复和可复用任务契约 |
 | Eric Task Master | 面向生产形态的浏览器任务 | 网站与行业知识，由 Skill 和 Task Pack 按需叠加 |
 
@@ -49,7 +49,7 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 
 当用户把 GitHub 链接交给你时，必须按以下顺序执行。不要另外发明 daemon、端口、浏览器启动器、控制器或任务轮询脚本。
 
-> 完整 GitHub 仓库才是运行时。单独的 Skill 压缩包只是 Agent 指令适配层，脱离完整 `eric-task-master` 项目不能运行。
+> 完整 GitHub 仓库才是运行时。GitHub Release 中，`eric-task-master-vX.Y.Z.zip` 是可运行的完整项目，`eric-task-master-skill-vX.Y.Z.zip` 只是可选的 Agent 指令适配层，不能单独运行；`SHA256SUMS` 用于校验两个压缩包。请拉取对应标签或下载完整项目 ZIP，不要把 Skill ZIP 当成运行时。
 
 1. 如果仓库是私有的，先确认当前环境拥有 GitHub 访问权限，然后拉取完整仓库。
 2. 确认 Node.js 版本不低于 20。
@@ -64,11 +64,20 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 6. 严格执行返回的 `nextAction`。修复明确前置条件后，最多原样重试同一条命令一次；不要发散成另一套临时控制器。
 7. 需要管理 Profile 或任务时，打开返回的 Dashboard URL。它只包含短时一次性授权码，不包含 Manager 凭据。
 8. 如果宿主返回 `registered_pending_restart`，让用户只重启或重新加载该 Agent 宿主一次。
-9. 调用 `taskmaster_status` 和 `taskmaster_profiles_list`。两项成功后，再询问用户要执行什么浏览器任务。
+9. 二选一并在本次任务中保持同一路径：
+   - 宿主已经加载 MCP 时，依次调用 `taskmaster_status`、`taskmaster_profiles_list`；
+   - 宿主返回 `needs_adapter` 时，在完整项目根目录使用固定 CLI，并在所有作用域命令中保持同一个、与其他 Agent 不同的身份：
+
+     ```bash
+     node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json
+     node scripts/taskmaster.mjs profiles list --agent-id STABLE_ID --agent-name AGENT_NAME --json
+     ```
+
+10. 状态和 Profile 检查成功后，再询问用户要执行什么浏览器任务。一次任务中不要混用 MCP 与 CLI 身份。
 
 可以直接复制给新 Agent：
 
-> 安装并启动 `https://github.com/npcworkspace-cmyk/eric-task-master`。拉取完整仓库，阅读或安装 `skills/eric-task-master`，只运行 `node scripts/taskmaster.mjs connect --json`，不要发明其他控制器或端口。返回已授权的 Dashboard URL；状态和 Profile 检查成功后，询问我要执行什么任务。
+> 安装并启动 `https://github.com/npcworkspace-cmyk/eric-task-master`。拉取完整仓库，阅读或安装 `skills/eric-task-master`，只运行 `node scripts/taskmaster.mjs connect --json`，不要发明其他控制器或端口。宿主支持时走已加载的 MCP；返回 `needs_adapter` 时，严格按 Skill 的固定 CLI 路径并保持一个稳定、独立的 Agent ID。返回已授权的 Dashboard URL；状态和 Profile 检查成功后，询问我要执行什么任务。
 
 ## 日常使用
 
@@ -78,7 +87,7 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 
 Agent 随后只走一条持久任务路径：发现任务类型、使用幂等键提交一次、保存任务 ID、持续等待或重新接管同一个 ID、在需要关注时读取诊断信息，并且只在证据和清理全部通过后宣布完成。
 
-每次启动任务都会返回一个聚焦到该任务的可点击 Dashboard 链接。用户只要说“启动任务面板”，Agent 就返回一条新的一次性链接；Task Master 不会擅自拉起系统浏览器。
+每次启动任务都会返回一个聚焦到该任务的可点击 Dashboard 链接。用户说“启动任务面板”时，使用 MCP `taskmaster_dashboard_open`，或者使用 CLI `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json`，再把新的一次性链接返回给用户。Task Master 不会擅自拉起系统浏览器。
 
 ### Profile
 
@@ -89,7 +98,7 @@ Agent 随后只走一条持久任务路径：发现任务类型、使用幂等�
 
 ### 行为模式
 
-- **fast**：确定性操作和批量数据任务优先速度；
+- **fast**：临时 Profile 可选的速度优先策略，适合确定性操作和批量数据任务；
 - **human**：使用有界鼠标、输入、滚动和阅读节奏；
 - **adaptive**：默认快速，遇到动态页面、遮挡、超时、导航不确定、动作失败或限流时暂时转为谨慎或拟人节奏。
 
@@ -115,7 +124,7 @@ Task Pack 提供可复用任务类型；专项 Skill 教 Agent 何时使用、�
 | Codex、Claude Desktop、Claude Code、Hermes | 已支持 |
 | WorkBuddy、DeepSeek Harness、Pi、OpenClaw | 仍需适配器，当前版本不会自动修改其配置 |
 
-没有宿主专用 MCP 适配器时，仍可通过固定 CLI 使用浏览器运行时。
+没有宿主专用 MCP 适配器时，仍可通过固定且带 Agent 作用域的 CLI 使用浏览器运行时。每条作用域 CLI 命令都要求每个独立 Agent 保持一个稳定且不同的 `--agent-id`；复用同一 ID 会有意共享该身份的私有 Profile 和任务记录。完整的非 MCP 命令路径和可信本机边界见 [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md)。
 
 ## 验收与停止
 

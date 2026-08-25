@@ -11,6 +11,7 @@ import {
   validateManagerIdentityPin,
   verifyManagerIdentityProof
 } from '../lib/manager-identity.mjs';
+import { isSensitiveKey } from '../lib/redaction.mjs';
 import { TaskMasterClientError } from './errors.mjs';
 
 const DEFAULT_PORT = 19_946;
@@ -25,7 +26,7 @@ const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MANAGER_TOKEN = /^\S{32,512}$/;
 const AGENT_TOKEN = /^ETMA2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/;
 const DASHBOARD_CODE = /^[A-Za-z0-9_-]{32,128}$/;
-const FORBIDDEN_INPUT_KEY = /^(?:module_?path|evaluate|authorization|auth_?header|cookies?|password|passwd|secrets?|credentials?|api_?key|token|(?:access|refresh|api|auth|bearer|session)_?token|session(?:_?id|_?token)?)$/i;
+const FORBIDDEN_EXECUTION_INPUT_KEY = /^(?:auth|module(?:_?path)?|evaluate|evaluation|eval|storage_?state|local_?storage|session_?storage|user_?data_?dir|profile_?path|output_?dir|executable_?path|browser_?channel|launch_?options|connect_?options|ws_?endpoint|cdp_?endpoint|debugger_?address|playwright|browser_?context|page_?handle|element_?handle|raw_?handle)$/i;
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export const TASKMASTER_CLIENT_METHODS = Object.freeze([
@@ -94,7 +95,7 @@ export function assertSafeTaskInput(value) {
     seen.add(node);
     if (!Array.isArray(node)) {
       for (const key of Object.keys(node)) {
-        if (FORBIDDEN_INPUT_KEY.test(key)) {
+        if (isSensitiveKey(key) || FORBIDDEN_EXECUTION_INPUT_KEY.test(key)) {
           throw clientError('FORBIDDEN_TASK_INPUT', 'Task input contains a credential or low-level execution field.');
         }
       }
@@ -221,7 +222,7 @@ function remoteError(status, payload) {
     return clientError(code, 'Task Master rejected the scoped agent credential.', {
       retryable: true,
       statusCode: status,
-      nextAction: 'Reconnect the MCP server so Task Master can issue a fresh agent credential.'
+      nextAction: 'Reconnect through the same Task Master installation and reuse the same stable Agent ID so it can issue a fresh scoped credential.'
     });
   }
   if (status === 403) {
@@ -512,7 +513,7 @@ export class HttpTaskMasterClient {
       source = await readFile(join(this.#stateDir, 'config.json'));
     } catch {
       throw clientError('MANAGER_TOKEN_UNAVAILABLE', 'Task Master admin credential is unavailable.', {
-        nextAction: 'Run the fixed Task Master connect command once.'
+        nextAction: 'Restore the state directory that belongs to the running Manager, or stop it from its verified owning installation; then retry connect once. Do not invent another controller or production port.'
       });
     }
     if (source.byteLength > MAX_CONFIG_BYTES) {
@@ -526,7 +527,7 @@ export class HttpTaskMasterClient {
     }
     if (typeof config.managerToken !== 'string' || !MANAGER_TOKEN.test(config.managerToken)) {
       throw clientError('MANAGER_TOKEN_UNAVAILABLE', 'Task Master admin credential is unavailable.', {
-        nextAction: 'Run the fixed Task Master connect command once.'
+        nextAction: 'Restore the state directory that belongs to the running Manager, or stop it from its verified owning installation; then retry connect once. Do not invent another controller or production port.'
       });
     }
     let identity;
@@ -534,7 +535,7 @@ export class HttpTaskMasterClient {
       identity = validateManagerIdentityPin(config.managerIdentity);
     } catch {
       throw clientError('MANAGER_IDENTITY_INVALID', 'Task Master Manager identity pin is unavailable.', {
-        nextAction: 'Run the fixed Task Master connect command once.'
+        nextAction: 'Restore the matching Manager state directory or stop that Manager from its verified owning installation, then retry connect once.'
       });
     }
     return { token: config.managerToken, identity };

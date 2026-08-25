@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.0.0**
+Version: **2.0.1**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -20,7 +20,7 @@ Task Master is a general execution base, not a site-specific bot. Combined with 
 - long-running batch work across hundreds of pages without keeping an Agent turn open;
 - authenticated back-office, portal, CMS, CRM, and account workflows through isolated persistent Profiles;
 - clean no-login jobs through disposable ephemeral Profiles;
-- parallel multi-Agent operations without tabs, login state, or task records colliding;
+- parallel trusted-local Agents using distinct client IDs and Profiles, preventing accidental tab, login-state, and task-record crossover;
 - recurring operational workflows invoked by an Agent, scheduler, or business system;
 - browser QA, content verification, form processing, file upload/download, and evidence capture;
 - production Task Packs for lead operations, ecommerce operations, media research, supplier research, customer support, compliance checks, or internal RPA.
@@ -31,7 +31,7 @@ Those are composable possibilities, not bundled permissions or claims that every
 
 | Approach | Good at | What is usually missing |
 | --- | --- | --- |
-| Built-in Agent browser | quick interactive browsing | durable jobs, reusable login Profiles, long-task recovery, multi-Agent isolation, explicit cleanup proof |
+| Built-in Agent browser | quick interactive browsing | durable jobs, reusable login Profiles, long-task recovery, scoped trusted-local Agent operation, explicit cleanup proof |
 | One-off CDP controller | fast raw browser control | a stable lifecycle, queues, progress, checkpoints, evidence, resumability, reusable task contracts |
 | Eric Task Master | production-shaped browser work | site-specific knowledge, intentionally supplied by Skills and Task Packs |
 
@@ -49,7 +49,7 @@ This separation keeps the base universal: improve one execution engine, then def
 
 If a user gives you this GitHub URL, follow the steps below in order. Do not invent another daemon, port, browser launcher, controller, or retry loop.
 
-> The full repository is the runtime source of truth. The Skill-only archive is an instruction adapter and cannot run without a cloned `eric-task-master` repository.
+> The full repository is the runtime source of truth. On a GitHub Release, `eric-task-master-vX.Y.Z.zip` is the complete runnable project; `eric-task-master-skill-vX.Y.Z.zip` is only the optional Agent instruction adapter and cannot run by itself. `SHA256SUMS` verifies both archives. Clone the matching tag or download the complete project archive—do not substitute the Skill-only archive for the runtime.
 
 1. Authenticate to GitHub if the repository is private, then clone the complete repository.
 2. Require Node.js 20 or newer.
@@ -64,11 +64,20 @@ If a user gives you this GitHub URL, follow the steps below in order. Do not inv
 6. Follow the returned `nextAction`. After correcting the named precondition, retry the same command at most once; do not branch into a speculative replacement controller.
 7. Open the returned Dashboard URL when Profile or task management is needed. It contains a short-lived one-use authorization code, never the Manager credential.
 8. If a host reports `registered_pending_restart`, ask the user to reload that Agent host once.
-9. Call `taskmaster_status`, then `taskmaster_profiles_list`. When both succeed, ask the user what browser task to run.
+9. Choose one operation path and keep it for the task:
+   - if the host loaded the registered MCP server, call `taskmaster_status`, then `taskmaster_profiles_list`;
+   - if the host reports `needs_adapter`, use the fixed CLI from the repository root. Keep one stable, distinct Agent ID on every scoped command:
+
+     ```bash
+     node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json
+     node scripts/taskmaster.mjs profiles list --agent-id STABLE_ID --agent-name AGENT_NAME --json
+     ```
+
+10. When status and Profile discovery succeed, ask the user what browser task to run. Do not mix MCP and CLI identities during one task.
 
 Copyable request for a new Agent:
 
-> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Return the authorized Dashboard URL; after status and Profile discovery succeed, ask what task I want to run.
+> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Use the loaded MCP path when supported; on `needs_adapter`, follow the Skill's fixed CLI path with one stable, distinct Agent ID. Return the authorized Dashboard URL; after status and Profile discovery succeed, ask what task I want to run.
 
 ## Everyday use
 
@@ -78,7 +87,7 @@ After the first bootstrap, the user should be able to ask naturally:
 
 The Agent then uses one durable loop: discover a task type, start once with an idempotency key, retain the task ID, wait or reconnect to that ID, inspect diagnostics when attention is required, and accept completion only after evidence and cleanup are verified.
 
-Every task start returns a clickable Dashboard link focused on that task. If the user says “启动任务面板”, the Agent returns a fresh one-time link; Task Master does not automatically open an operating-system browser.
+Every task start returns a clickable Dashboard link focused on that task. If the user says “启动任务面板”, use MCP `taskmaster_dashboard_open` or CLI `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json`, then return the fresh one-time link. Task Master does not automatically open an operating-system browser.
 
 ### Profiles
 
@@ -89,7 +98,7 @@ New persistent Profiles default to the local stable Chrome channel and fixed `hu
 
 ### Behavior
 
-- **fast** — minimum necessary waiting for deterministic, data-heavy work;
+- **fast** — an optional speed-first policy for ephemeral Profiles and deterministic, data-heavy work;
 - **human** — bounded mouse, typing, scrolling, and reading cadence;
 - **adaptive** — starts fast and temporarily becomes cautious or human-paced after dynamic-page signals, occlusion, timeout, uncertain navigation, action failure, or rate limiting.
 
@@ -115,7 +124,7 @@ A Task Pack defines reusable task types. A specialized Skill teaches the Agent w
 | Codex, Claude Desktop, Claude Code, Hermes | supported |
 | WorkBuddy, DeepSeek Harness, Pi, OpenClaw | adapter required; current release does not modify them automatically |
 
-The browser runtime remains usable through its fixed CLI even when a host-specific MCP adapter is not yet available.
+The browser runtime remains usable through its fixed, Agent-scoped CLI when a host-specific MCP adapter is unavailable. Every scoped CLI command requires a stable, distinct `--agent-id` for each independent Agent; reusing an ID intentionally shares that identity's private Profiles and task ledger. See [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md) for the complete non-MCP command path and its trusted-local boundary.
 
 ## Verification and shutdown
 

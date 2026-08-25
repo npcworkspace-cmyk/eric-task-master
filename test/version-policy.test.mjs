@@ -87,6 +87,7 @@ test('standalone Skill wrapper rejects an incompatible runtime before launching 
     path.resolve(import.meta.dirname, '..', 'skills', 'eric-task-master', 'runtime.json'),
     path.join(skillRoot, 'runtime.json')
   );
+  const expectedRuntime = JSON.parse(await readFile(path.join(skillRoot, 'runtime.json'), 'utf8'));
   await writeFile(path.join(fakeRuntime, 'package.json'), JSON.stringify({
     name: 'eric-task-master',
     version: '1.0.4'
@@ -100,6 +101,6 @@ test('standalone Skill wrapper rejects an incompatible runtime before launching 
   assert.equal(result.status, 1);
   const error = JSON.parse(result.stderr);
   assert.equal(error.error, 'TASKMASTER_RUNTIME_VERSION_MISMATCH');
-  assert.equal(error.expected, '2.0.0');
+  assert.equal(error.expected, expectedRuntime.runtimeVersion);
   assert.equal(error.actual, '1.0.4');
 });

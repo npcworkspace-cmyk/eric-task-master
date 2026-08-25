@@ -98,6 +98,11 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
   assert.match(first.dashboard, new RegExp(`^http://127\\.0\\.0\\.1:${port}/dashboard#code=`));
   assert.equal(first.dashboard.toLowerCase().includes('token'), false);
   assert.equal(first.mcpRegistration.results.filter((item) => item.status === 'registered_pending_restart').length, 1);
+  assert.match(first.nextAction, /mcpRegistration\.results/u);
+  assert.match(first.nextAction, /needs_adapter/u);
+  assert.match(first.nextAction, /--agent-id STABLE_ID/u);
+  assert.match(first.acceptance.nextAction, /top-level nextAction/u);
+  assert.match(first.acceptance.nextAction, /stable Agent identity/u);
 
   const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
   assert.match(config, /\[mcp_servers\.eric-task-master\]/);
@@ -112,7 +117,8 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
   assert.equal(second.mcpRegistration.results.filter((item) => item.status === 'registered').length, 1);
 
   const profiles = parseSingleJson(await runCli([
-    'profiles', 'list', '--json', '--port', String(port), '--state-dir', stateDir
+    'profiles', 'list', '--agent-id', 'connect-flow-agent', '--agent-name', 'Connect flow Agent',
+    '--json', '--port', String(port), '--state-dir', stateDir
   ], env));
   assert.deepEqual(profiles.profiles, []);
 

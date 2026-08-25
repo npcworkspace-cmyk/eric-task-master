@@ -36,7 +36,7 @@ test('CLI safely stages and installs a single-file task module from outside the 
     if (managerStarted) {
       await execFileAsync(process.execPath, [
         CLI, 'manager', 'stop', '--state-dir', stateDir, '--port', String(port), '--json'
-      ], { windowsHide: true, timeout: 15_000 }).catch(() => {});
+      ], { windowsHide: true, timeout: 60_000 });
     }
     await rm(root, { recursive: true, force: true });
   });
@@ -98,7 +98,8 @@ test('CLI safely stages and installs a single-file task module from outside the 
   assert.ok(inboxSources.includes(await readFile(sourcePath, 'utf8')));
 
   const listRun = await execFileAsync(process.execPath, [
-    CLI, 'task-types', 'list', '--state-dir', stateDir, '--port', String(port), '--json'
+    CLI, 'task-types', 'list', '--agent-id', 'task-module-author', '--agent-name', 'Task module author',
+    '--state-dir', stateDir, '--port', String(port), '--json'
   ], { windowsHide: true, timeout: 15_000 });
   const listed = parseLastJsonLine(listRun.stdout);
   assert.ok(listed.taskTypes.some((item) => item.name === 'external-fixture'));

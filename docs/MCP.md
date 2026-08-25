@@ -2,6 +2,8 @@
 
 Task Master exposes a local, high-level MCP surface over STDIO. The MCP process does not execute browser code itself. It submits registered task types to the loopback Task Master manager and returns durable task IDs, bounded status, progress, and explicitly agent-visible artifacts.
 
+This document defines the native MCP path. Hosts marked `needs_adapter` must not invent an MCP registration. They use the fixed, Agent-scoped CLI path documented in [`MCP-HOSTS.md`](./MCP-HOSTS.md), which issues the same kind of scoped Manager identity but is not an MCP connection.
+
 ## Stable STDIO entry
 
 Configure each MCP host to spawn:
@@ -48,6 +50,7 @@ This is trusted-local-Agent isolation, not hostile multi-tenant security. Agent 
 - `taskmaster_dashboard_open`
 - `taskmaster_profiles_list`
 - `taskmaster_profiles_create`
+- `taskmaster_profiles_update`
 - `taskmaster_profiles_open`
 - `taskmaster_profiles_close`
 - `taskmaster_task_types_list`
@@ -67,6 +70,8 @@ Every tool publishes an input schema, output schema, and MCP annotations. Generi
 The MCP surface never accepts arbitrary module paths, JavaScript evaluation, cookie/session transfer, authorization headers, filesystem paths, or raw Playwright handles.
 
 Profile creation accepts an immutable `browserEngine` of `chrome` or `chromium`. Persistent Profiles default to `chrome` with fixed `human` behavior; ephemeral Profiles default to `chromium` with Profile-owned `adaptive` behavior. `taskmaster_tasks_start` accepts no task-level behavior override.
+
+`taskmaster_profiles_update` changes only mutable Profile fields allowed to the owning Agent. It cannot change the browser engine, and persistent Profile behavior remains fixed to `human`.
 
 ## Long tasks, progress, and cancellation
 

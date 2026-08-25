@@ -9,7 +9,7 @@ Task Master is the browser execution layer. Use its registered high-level task t
 
 ## Fixed GitHub-to-task bootstrap
 
-This Skill is the instruction adapter, not the browser runtime. It requires the complete `eric-task-master` repository at the exact version declared in `runtime.json`. When the user supplies the GitHub URL, authenticate if needed, clone the full repository at that matching release tag, and read or install this Skill from `skills/eric-task-master`. If this Skill is installed elsewhere, set `ERIC_TASK_MASTER_ROOT` to that clone. The wrapper rejects an older or future incompatible runtime instead of silently driving it.
+This Skill is the instruction adapter, not the browser runtime. It requires the complete `eric-task-master` repository at the exact version declared in `runtime.json`. On a GitHub Release, `eric-task-master-vX.Y.Z.zip` is the complete runnable project, `eric-task-master-skill-vX.Y.Z.zip` is only this optional instruction adapter, and `SHA256SUMS` verifies both. When the user supplies the GitHub URL, authenticate if needed, clone the full repository at that matching release tag or download the complete project archive, and read or install this Skill from `skills/eric-task-master`. Never substitute the Skill-only archive for the runtime. If this Skill is installed elsewhere, set `ERIC_TASK_MASTER_ROOT` to that clone or extracted complete-project root. The wrapper rejects an older or future incompatible runtime instead of silently driving it.
 
 From the cloned project root run exactly:
 
@@ -19,20 +19,25 @@ node scripts/taskmaster.mjs connect --json
 
 Installation is incomplete until this command returns `ok: true` and its real-browser acceptance checks pass. It installs lockfile-pinned dependencies and Chromium when missing, safely migrates an idle authenticated older Manager, starts Manager, and registers STDIO MCP in detected supported Agent hosts. A busy older Manager returns `MANAGER_UPGRADE_BUSY` without interrupting its work; wait for it to settle and rerun the same command once. For any other startup failure, follow the exact `error.code` and `nextAction`, retry the same command at most once after fixing that precondition, and do not branch into speculative controllers.
 
-Open the `dashboard` URL returned by `connect` when the user needs to manage Profiles or tasks. It contains a short-lived one-use code, never the Manager credential. When the user says “启动任务面板”, call `taskmaster_dashboard_open` and return its clickable link. Do not invent a port or automatically launch an operating-system browser.
+Open the `dashboard` URL returned by `connect` when the user needs to manage Profiles or tasks. It contains a short-lived one-use code, never the Manager credential. When the user says “启动任务面板”, call MCP `taskmaster_dashboard_open`, or run `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json` on the CLI path, and return its clickable link. Do not invent a port or automatically launch an operating-system browser.
 
-If registration reports `registered_pending_restart`, ask the user to reload that host once. Then call `taskmaster_status`, followed by `taskmaster_profiles_list`. When both succeed, ask what browser task to run. Create a Profile only when no suitable one exists because creation is non-idempotent:
+If registration reports `registered_pending_restart`, ask the user to reload that host once. Choose exactly one operation path for the task:
+
+- **MCP path:** after the host loads the registered server, call `taskmaster_status`, followed by `taskmaster_profiles_list`.
+- **CLI path for `needs_adapter`:** run `node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json`, then `node scripts/taskmaster.mjs profiles list --agent-id STABLE_ID --agent-name AGENT_NAME --json` from the complete repository root. Every scoped command requires one stable ID that differs from every independent Agent; a missing or misspelled ID fails closed. Keep it on every status, Profile, task, Dashboard, and artifact command. Do not mix an MCP client identity and a CLI identity during one task.
+
+When status and Profile discovery succeed, ask what browser task to run. Create a Profile only when no suitable one exists because creation is non-idempotent:
 
 - choose `persistent` for login state or recurring account work. Open it from the Dashboard and let the user sign in directly in that Playwright window;
 - choose `ephemeral` for no-login temporary work. It starts clean for every task, retains no browser state after cleanup, and cannot be opened manually.
 
 Persistent Profiles default to stable local Chrome and fixed `human` behavior. Ephemeral Profiles default to pinned Chromium and Profile-owned `adaptive` behavior, with all three modes selectable. Choose the engine and behavior when creating the Profile; the engine is immutable, persistent behavior cannot be patched, and task start has no behavior override. A manual persistent-Profile window is always visible even when its task `headless` setting is enabled.
 
-An Agent-created Profile is private to that stable Agent client ID by default. Set `access: "shared"` only when the user explicitly wants other registered local Agents to use the same browser state. Sharing a Profile never shares task status, results, or artifacts.
+An Agent-created Profile is private to that stable Agent principal by default. Set `access: "shared"` only when the user explicitly wants another trusted local Agent to use the same browser state. Sharing a Profile never shares task status, results, or artifacts.
 
-Treat one registered MCP client ID as one local Agent principal. Different registered hosts/client IDs prevent accidental task crossover; parallel conversations using the same host registration intentionally share that principal's task ledger. This is operational isolation between trusted processes under one OS user, not a hostile tenant boundary. Run mutually untrusted Agents under separate OS users, sandboxes, or machines.
+Treat one registered MCP client ID or one stable CLI `--agent-id` as one local Agent principal. Different IDs prevent accidental private-Profile and task crossover; conversations or CLI processes using the same ID intentionally share that principal's private Profiles and task ledger. This is operational isolation between trusted processes under one OS user, not a hostile tenant boundary. Run mutually untrusted Agents under separate OS users, sandboxes, or machines.
 
-## Fixed task loop
+## Fixed MCP task loop
 
 1. Call `taskmaster_task_types_list` with a narrow `query`, `domain`, or `intent`. This returns compact summaries only.
 2. Call `taskmaster_task_types_describe` for the one selected type and construct input from that schema.
@@ -45,9 +50,22 @@ Treat one registered MCP client ID as one local Agent principal. Different regis
 
 Same-Profile tasks queue in FIFO order; different Profiles may run concurrently within the Manager resource budget. Queueing is normal, not a reason to retry.
 
+## Fixed CLI task loop for hosts without an MCP adapter
+
+Run every command below from the complete repository root with the same `STABLE_ID` and `AGENT_NAME`. Replace uppercase placeholders before execution. Do not use the local authoring/install commands as a substitute for this Agent path.
+
+1. Discover one registered task type with `node scripts/taskmaster.mjs task-types list --query QUERY --agent-id STABLE_ID --agent-name AGENT_NAME --json`, then read its input contract with `node scripts/taskmaster.mjs task-types describe TYPE --agent-id STABLE_ID --agent-name AGENT_NAME --json`.
+2. Submit exactly once with `node scripts/taskmaster.mjs task start --profile PROFILE_ID --type TYPE --input INPUT_JSON --request-key STABLE_REQUEST_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json`. This path accepts registered task types only, rejects `--module`, returns immediately, and includes the durable task ID plus clickable Dashboard URL.
+3. Retain that task ID. Repeatedly run `node scripts/taskmaster.mjs task wait TASK_ID --wait-ms 30000 --agent-id STABLE_ID --agent-name AGENT_NAME --json`; each wait is bounded and a timeout does not cancel the browser task. Use `node scripts/taskmaster.mjs task status TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json` for a snapshot or `node scripts/taskmaster.mjs task list --agent-id STABLE_ID --agent-name AGENT_NAME --json` to rediscover owned work. Never submit a duplicate because a wait ended.
+4. On `waiting_user`, run `node scripts/taskmaster.mjs artifacts list TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json`, read a declared diagnostic with `node scripts/taskmaster.mjs artifacts read TASK_ID --artifact ARTIFACT_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json`, inspect it, then run `node scripts/taskmaster.mjs task continue TASK_ID --request-id REQUEST_ID --note NOTE --agent-id STABLE_ID --agent-name AGENT_NAME --json`.
+5. For an eligible failed task with settled cleanup and a checkpoint, inspect state and run `node scripts/taskmaster.mjs task resume TASK_ID --resume-key STABLE_RESUME_KEY --detach --agent-id STABLE_ID --agent-name AGENT_NAME --json`; use `node scripts/taskmaster.mjs task cancel TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json` only to request explicit task cancellation.
+6. Claim completion only under the same completion requirements as the MCP path. Read only declared Agent-visible result artifacts through `artifacts list/read`.
+
+Profile administration on this path uses `profiles create`, `profiles update`, `profiles open`, and `profiles close` with the same stable Agent ID. Do not use `task-types install` or `task-packs install` as ordinary no-adapter Agent operations; they remain local authoring surfaces.
+
 ## Profile behavior choice
 
-- `fast`: deterministic Playwright with minimum necessary waiting. Default for stable, data-heavy work.
+- `fast`: optional speed-first Playwright policy for an ephemeral Profile and deterministic, data-heavy work.
 - `human`: bounded pointer curves, in-target clicks, typing rhythm, eased scrolling, and explicit reading dwell.
 - `adaptive`: starts fast, uses a brief cautious tier for ordinary dynamic content, and temporarily uses guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. It returns to fast after successful actions and never auto-replays an unknown effect.
 
