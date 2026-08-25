@@ -3,7 +3,8 @@ import { stdin } from 'node:process';
 import { compareSemver, parseSemver } from '../src/lib/semver.mjs';
 
 const candidate = process.argv[2];
-parseSemver(candidate);
+const parsedCandidate = parseSemver(candidate);
+if (parsedCandidate.build.length) throw new Error('Release candidates must not use build metadata');
 
 let source = '';
 stdin.setEncoding('utf8');

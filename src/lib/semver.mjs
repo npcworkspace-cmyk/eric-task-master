@@ -1,4 +1,4 @@
-const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$/;
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
 export function parseSemver(value) {
   const match = SEMVER.exec(String(value ?? ''));
@@ -8,7 +8,8 @@ export function parseSemver(value) {
     major: BigInt(match[1]),
     minor: BigInt(match[2]),
     patch: BigInt(match[3]),
-    prerelease: match[4] ? match[4].split('.') : []
+    prerelease: match[4] ? match[4].split('.') : [],
+    build: match[5] ? match[5].split('.') : []
   };
 }
 
@@ -55,7 +56,7 @@ export function assertVersionIncrease(current, next) {
 export function nextVersion(current, instruction) {
   const parsed = parseSemver(current);
   let next;
-  if (SEMVER.test(String(instruction ?? ''))) next = String(instruction);
+  if (SEMVER.test(String(instruction ?? '')) && !parseSemver(instruction).build.length) next = String(instruction);
   else if (instruction === 'patch') next = `${parsed.major}.${parsed.minor}.${parsed.patch + 1n}`;
   else if (instruction === 'minor') next = `${parsed.major}.${parsed.minor + 1n}.0`;
   else if (instruction === 'major') next = `${parsed.major + 1n}.0.0`;

@@ -12,6 +12,8 @@ test('semantic versions compare according to release precedence', () => {
   assert.equal(compareSemver('2.0.0-rc.2', '2.0.0-rc.1'), 1);
   assert.equal(compareSemver('2.0.0', '2.0.0-rc.99'), 1);
   assert.equal(compareSemver('2.0.0-A', '2.0.0-a'), -1);
+  assert.equal(compareSemver('2.0.0+build.1', '2.0.0'), 0);
+  assert.equal(compareSemver('999.0.0+legacy', '2.0.0'), 1);
   assert.equal(compareSemver('2.0.0-alpha-1', '2.0.0-alpha.1'), 1);
   assert.equal(compareSemver(`2.0.0-${'9'.repeat(80)}`, `2.0.0-${'8'.repeat(79)}`), 1);
   assert.equal(compareSemver('9007199254740993.0.0', '9007199254740992.0.0'), 1);
@@ -41,6 +43,19 @@ test('release version assertion rejects any non-increasing published version', (
   });
   assert.notEqual(rejected.status, 0);
   assert.match(rejected.stderr, /must be greater than published version 2\.0\.0/);
+  for (const published of ['v2.0.0+build.1', 'v999.0.0+legacy']) {
+    const metadataRejected = spawnSync(process.execPath, [script, '2.0.0'], {
+      input: `${published}\n`,
+      encoding: 'utf8'
+    });
+    assert.notEqual(metadataRejected.status, 0, `${published} must participate in precedence checks`);
+  }
+  const metadataCandidate = spawnSync(process.execPath, [script, '2.0.1+build.1'], {
+    input: 'v2.0.0\n',
+    encoding: 'utf8'
+  });
+  assert.notEqual(metadataCandidate.status, 0);
+  assert.match(metadataCandidate.stderr, /must not use build metadata/);
 });
 
 test('release workflow revalidates version monotonicity immediately before publication', async () => {

@@ -4,6 +4,7 @@ import { access, readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VERSION } from '../src/contracts.mjs';
+import { assertReleaseWorkflowPolicy } from './release-workflow-policy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -47,6 +48,7 @@ async function staticChecks() {
   const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
   const releaseVersionChecks = [...releaseWorkflow.matchAll(/scripts\/assert-release-version\.mjs/g)]
     .map((match) => match.index);
+  assertReleaseWorkflowPolicy(releaseWorkflow);
   invariant(launcher.includes("['ci', '--ignore-scripts', '--no-audit', '--no-fund']"), 'fixed launcher lacks dependency bootstrap');
   invariant(
     launcher.includes('playwrightInstallArguments(') &&

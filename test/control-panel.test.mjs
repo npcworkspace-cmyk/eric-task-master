@@ -67,6 +67,7 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.match(css, /\.task-focused/);
   assert.match(css, /min-height: 44px/);
   assert.match(css, /min-width: 44px/);
+  assert.match(css, /\.brand \{[^}]*min-height: 44px/);
   assert.match(css, /outline: 2px solid var\(--signal-ink\)/);
   assert.match(css, /prefers-reduced-motion: reduce/);
   assert.match(html, /id="profile-count">—</);

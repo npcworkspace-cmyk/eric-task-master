@@ -35,7 +35,7 @@ button { cursor: pointer; }
 }
 @supports not (backdrop-filter: blur(1px)) { .topbar { background: rgba(255, 254, 249, .97); } }
 
-.brand { display: flex; align-items: center; gap: 10px; color: inherit; text-decoration: none; }
+.brand { display: flex; min-height: 44px; align-items: center; gap: 10px; color: inherit; text-decoration: none; }
 .brand-mark { position: relative; display: grid; width: 38px; height: 38px; place-items: center; border-radius: 9px; color: var(--paper-bright); background: var(--ink); font: 800 10px/1 "Geist Mono", Consolas, monospace; letter-spacing: .04em; }
 .brand-mark::after { position: absolute; right: 4px; bottom: 4px; width: 5px; height: 5px; background: var(--signal); content: ""; }
 .brand strong, .brand small { display: block; }

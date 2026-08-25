@@ -118,6 +118,10 @@ jobs:
           ARCHIVE_MTIME="@$(git show -s --format=%ct "${RELEASE_SHA}")"
           git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-v${VERSION}/" \
             --output="dist/eric-task-master-v${VERSION}.zip" HEAD
+          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-v${VERSION}/" \
+            --output="dist/eric-task-master-v${VERSION}.repro.zip" HEAD
+          cmp "dist/eric-task-master-v${VERSION}.zip" "dist/eric-task-master-v${VERSION}.repro.zip"
+          rm "dist/eric-task-master-v${VERSION}.repro.zip"
           git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-skill-v${VERSION}/" \
             --output="dist/eric-task-master-skill-v${VERSION}.zip" HEAD:skills/eric-task-master
           git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-skill-v${VERSION}/" \
