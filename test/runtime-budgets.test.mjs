@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { access, link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -513,6 +513,24 @@ test('semantic diagnostic failure leaves an explicit safe fallback beside the sc
   assert.deepEqual(observation.error, { code: 'SEMANTIC_DIAGNOSTIC_UNAVAILABLE' });
   assert.deepEqual(observation.snapshot.refs, []);
   assert.equal(JSON.stringify(observation).includes('page.frames'), false);
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('a locked recovery manifest cannot suppress valid screenshot and observation files', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-diagnostic-manifest-locked-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  await mkdir(path.join(root, 'diagnostics.json'));
+  const browser = fakeBrowser();
+  const config = workerConfig(root, modulePath);
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_RESULT_INVALID');
+  await access(outcome.error.screenshot);
+  assert.equal((await readdir(path.join(config.outputDir, 'observations'))).length, 1);
   assert.equal(browser.wasClosed(), true);
 });
 

@@ -8,6 +8,7 @@
 - Added integration coverage for successful idle migration and refusal to interrupt an older Manager with active work.
 - Published the project under the MIT License so independent Skills, Task Packs, and commercial integrations can build on the core runtime.
 - Made human-handoff state and its captured screenshot/semantic pointers one atomic Manager update, eliminating a slow-Windows observation race without weakening task deadlines.
+- Kept valid diagnostics deliverable when Windows temporarily locks the recovery manifest, added bounded atomic-rename retry, and sized the commercial queue gate for four serial cold browser starts while preserving every task deadline.
 
 ## 1.0.3 - 2026-08-25
 

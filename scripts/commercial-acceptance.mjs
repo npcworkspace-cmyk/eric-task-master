@@ -10,8 +10,9 @@ import { TERMINAL_TASK_STATES, VERSION } from '../src/contracts.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLIENT_ID = 'commercial.acceptance.agent';
+const COMMERCIAL_QUEUE_WAIT_MS = 120_000;
 
-async function waitFor(getValue, predicate, timeoutMs = 60_000) {
+async function waitFor(getValue, predicate, timeoutMs = COMMERCIAL_QUEUE_WAIT_MS, label = 'condition') {
   const deadline = Date.now() + timeoutMs;
   let value;
   while (Date.now() < deadline) {
@@ -19,16 +20,22 @@ async function waitFor(getValue, predicate, timeoutMs = 60_000) {
     if (predicate(value)) return value;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw Object.assign(new Error('Commercial acceptance wait timed out'), {
+  const lastState = typeof value?.state === 'string' ? `, lastState=${value.state}` : '';
+  const cleanup = value?.cleanup?.settled === true ? ', cleanup=settled' : ', cleanup=unsettled';
+  const errorCode = value?.error?.code ? `, error=${value.error.code}` : '';
+  throw Object.assign(new Error(
+    `Commercial acceptance ${label} timed out after ${timeoutMs}ms${lastState}${cleanup}${errorCode}`
+  ), {
     code: 'COMMERCIAL_ACCEPTANCE_TIMEOUT', value
   });
 }
 
-async function waitTerminal(client, taskId, timeoutMs = 60_000) {
+async function waitTerminal(client, taskId, timeoutMs = COMMERCIAL_QUEUE_WAIT_MS) {
   return waitFor(
     () => client.getTask(taskId),
     (task) => TERMINAL_TASK_STATES.has(task.state) && task.cleanup?.settled === true,
-    timeoutMs
+    timeoutMs,
+    `task ${taskId} terminal cleanup`
   );
 }
 
@@ -119,7 +126,12 @@ export async function runCommercialAcceptance() {
       idempotencyKey: `commercial-cancel-queued-${Date.now()}`
     });
     taskIds.push(blocker.id, queued.id);
-    await waitFor(() => client.getTask(queued.id), (task) => task.state === 'queued');
+    await waitFor(
+      () => client.getTask(queued.id),
+      (task) => task.state === 'queued',
+      COMMERCIAL_QUEUE_WAIT_MS,
+      `task ${queued.id} queue entry`
+    );
     const cancelled = await client.cancelTask(queued.id);
     const cancelledDone = await waitTerminal(client, queued.id);
     const blockerDone = await waitTerminal(client, blocker.id);

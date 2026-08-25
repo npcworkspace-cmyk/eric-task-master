@@ -1,4 +1,4 @@
-import { lstat, mkdir, open, readFile, rename, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
@@ -15,6 +15,8 @@ import { writeCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 const DEFAULT_HEARTBEAT_MS = 20_000;
 const DEFAULT_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
+const ATOMIC_RENAME_RETRY_MS = Object.freeze([25, 50, 100, 200, 400]);
+const TRANSIENT_RENAME_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 class TaskCancelledError extends Error {
   constructor() {
@@ -54,16 +56,39 @@ async function writeJsonAtomic(filePath, value) {
   return writeTextAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+async function renameAtomic(temporaryPath, filePath) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(temporaryPath, filePath);
+      return;
+    } catch (error) {
+      const delayMs = ATOMIC_RENAME_RETRY_MS[attempt];
+      if (!TRANSIENT_RENAME_CODES.has(error?.code) || delayMs === undefined) throw error;
+      await new Promise((resolveWait) => setTimeout(resolveWait, delayMs));
+    }
+  }
+}
+
 async function writeTextAtomic(filePath, content) {
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporaryPath, content, { mode: 0o600 });
-  await rename(temporaryPath, filePath);
+  try {
+    await writeFile(temporaryPath, content, { mode: 0o600 });
+    await renameAtomic(temporaryPath, filePath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function writeBufferAtomic(filePath, content) {
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporaryPath, content, { mode: 0o600 });
-  await rename(temporaryPath, filePath);
+  try {
+    await writeFile(temporaryPath, content, { mode: 0o600 });
+    await renameAtomic(temporaryPath, filePath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function sameFileIdentity(left, right) {
@@ -218,9 +243,11 @@ async function captureFailure(
     const screenshot = await withDeadline(captureBoundedDiagnosticImage(page), 8_000);
     await writeBufferAtomic(screenshotPath, screenshot);
     captured = true;
-    await recordDiagnostic('screenshot', screenshotPath, outputDir, safeReason);
-    safeSend({ type: 'screenshot', path: screenshotPath, reason: safeReason });
     result = screenshotPath;
+    // The file and direct IPC pointer are authoritative for the live Manager.
+    // A temporarily locked recovery manifest must not hide valid diagnostics.
+    await recordDiagnostic('screenshot', screenshotPath, outputDir, safeReason).catch(() => {});
+    safeSend({ type: 'screenshot', path: screenshotPath, reason: safeReason });
   } catch {
     result = null;
   } finally {
@@ -268,9 +295,9 @@ async function captureFailure(
         } : {})
       });
       observationCaptured = true;
-      await recordDiagnostic('observation', observationPath, outputDir, safeReason);
-      safeSend({ type: 'observation', path: observationPath, reason: safeReason });
       observationResult = observationPath;
+      await recordDiagnostic('observation', observationPath, outputDir, safeReason).catch(() => {});
+      safeSend({ type: 'observation', path: observationPath, reason: safeReason });
     } catch {
       // A semantic diagnostic is best-effort and never hides the browser error.
     } finally {
