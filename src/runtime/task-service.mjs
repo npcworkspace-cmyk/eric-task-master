@@ -695,7 +695,11 @@ export function createTaskService({
       ? task.history.filter((entry) => (
         entry && typeof entry === 'object' &&
         Number.isSafeInteger(entry.attempt) && entry.attempt >= 1 && entry.attempt <= MAX_ATTEMPTS
-      )).slice(-MAX_ATTEMPTS)
+      )).slice(-MAX_ATTEMPTS).map((entry) => {
+        const normalized = { ...entry };
+        if (!isBehaviorMode(normalized.behavior)) delete normalized.behavior;
+        return normalized;
+      })
       : [];
   }
 
@@ -706,10 +710,17 @@ export function createTaskService({
       attempt: task.attempt,
       resumed,
       startedAt,
+      ...(isBehaviorMode(task.behavior) ? { behavior: task.behavior } : {}),
       ...(checkpointSavedAt ? { checkpointSavedAt } : {})
     });
     task.history = task.history.slice(-MAX_ATTEMPTS);
     return startedAt;
+  }
+
+  function setAttemptHistoryBehavior(task, behavior) {
+    normalizeAttemptHistory(task);
+    const record = [...task.history].reverse().find((entry) => entry.attempt === task.attempt);
+    if (record && isBehaviorMode(behavior)) record.behavior = behavior;
   }
 
   function finishAttemptHistory(task) {
@@ -1791,6 +1802,7 @@ export function createTaskService({
       failureCode = 'TASK_WORKER_START_FAILED';
       const startingAt = nowIso();
       const behavior = resolveProfileBehavior(profile);
+      setAttemptHistoryBehavior(task, behavior);
       await update(task, {
         state: 'starting_browser',
         startedAt: startingAt,
@@ -1801,6 +1813,7 @@ export function createTaskService({
           effective: behavior === 'adaptive' ? 'fast' : behavior,
           at: startingAt
         },
+        history: task.history,
         progress: { current: 0, total: null, message: 'Starting browser' },
         progressAt: startingAt,
         heartbeatAt: startingAt,
@@ -1916,20 +1929,23 @@ export function createTaskService({
     }
     const input = body.input ?? {};
     validateTaskInput(input, taskType.inputSchema);
-    const hash = requestHash({
+    const hashInput = {
       profileId: body.profileId,
       taskType: body.taskType,
       taskTypeSha256: taskType.sha256,
       supportsResume: taskType.supportsResume === true,
-      behavior,
       timeoutMs: body.timeoutMs ?? null,
       input
-    });
+    };
+    const hash = requestHash(hashInput);
     const existing = [...tasks.values()].find((task) => (
       isTaskOwner(task, caller) && task.idempotencyKey === body.idempotencyKey
     ));
     if (existing) {
-      if (existing.requestHash !== hash) {
+      const legacyHash = existing.requestHashVersion === undefined
+        ? requestHash({ ...hashInput, behavior: existing.behavior })
+        : null;
+      if (existing.requestHash !== hash && existing.requestHash !== legacyHash) {
         throw new TaskServiceError(
           'IDEMPOTENCY_CONFLICT',
           'The idempotency key is already bound to a different task request',
@@ -1958,6 +1974,7 @@ export function createTaskService({
       ...(caller.role === 'agent' ? { ownerAgentName: caller.agentName } : {}),
       idempotencyKey: body.idempotencyKey,
       requestHash: hash,
+      requestHashVersion: 2,
       behavior,
       input: clone(input),
       timeoutMs: body.timeoutMs ?? null,
@@ -2317,6 +2334,7 @@ export function createTaskService({
     const checkpoint = await verifyResumeCheckpoint(task);
     const resumeInput = await createResumeInput(task, checkpoint);
     const profile = requireProfileUse(await profileStore.get(task.profileId), caller);
+    const behavior = resolveProfileBehavior(profile);
 
     task.attempt += 1;
     task.resumeKeys.push({ keyHash, attempt: task.attempt, requestedAt: nowIso() });
@@ -2345,9 +2363,10 @@ export function createTaskService({
     task.resumeInput = resumeInput;
     task.progressAt = nowIso();
     task.health = { status: 'healthy', checkedAt: nowIso() };
+    task.behavior = behavior;
     task.behaviorState = {
-      configured: task.behavior,
-      effective: task.behavior === 'adaptive' ? 'fast' : task.behavior,
+      configured: behavior,
+      effective: behavior === 'adaptive' ? 'fast' : behavior,
       at: nowIso()
     };
     task.cooldown = null;

@@ -40,7 +40,17 @@ test('ETMA2 rejects tampering, non-canonical base64url, invalid UTF-8, and ETMA1
 });
 
 test('Agent names enforce controls, Unicode code points, and UTF-8 byte bounds', () => {
-  for (const value of ['Agent\nName', '\tAgent', `Agent${String.fromCharCode(0x7f)}`, `Agent${String.fromCharCode(0x85)}`]) {
+  for (const value of [
+    'Agent\nName',
+    '\tAgent',
+    `Agent${String.fromCharCode(0x7f)}`,
+    `Agent${String.fromCharCode(0x85)}`,
+    'Agent\u202eadmin',
+    'Agent\u2066admin\u2069',
+    'A\u2028B',
+    'A\u2029B',
+    'Agent\u200bAdmin'
+  ]) {
     assert.throws(() => normalizeAgentName(value), (error) => (
       error instanceof AgentTokenError && error.code === 'INVALID_AGENT_NAME'
     ));
@@ -51,6 +61,15 @@ test('Agent names enforce controls, Unicode code points, and UTF-8 byte bounds',
   assert.throws(() => normalizeAgentName(`${'é'.repeat(79)}🤖`), { code: 'INVALID_AGENT_NAME' });
   assert.throws(() => normalizeAgentName('\ud800'), { code: 'INVALID_AGENT_NAME' });
   assert.throws(() => normalizeAgentName('   '), { code: 'INVALID_AGENT_NAME' });
+});
+
+test('reserved Agent client IDs are rejected case-insensitively', () => {
+  for (const clientId of ['Manager-Admin', 'DASHBOARD', 'Dashboard:forged', 'TASK:forged']) {
+    assert.throws(
+      () => issueAgentToken(MANAGER_TOKEN, { clientId, name: 'Agent' }),
+      { code: 'RESERVED_CLIENT_ID' }
+    );
+  }
 });
 
 test('ETMA2 is invalid after Manager token rotation', () => {

@@ -17,8 +17,8 @@ const RESERVED_AGENT_CLIENT_PREFIXES = [
 ];
 
 export function isReservedAgentClientId(value) {
-  return typeof value === 'string' && (
-    RESERVED_AGENT_CLIENT_IDS.has(value) ||
-    RESERVED_AGENT_CLIENT_PREFIXES.some((prefix) => value.startsWith(prefix))
-  );
+  if (typeof value !== 'string') return false;
+  const normalized = value.toLowerCase();
+  return RESERVED_AGENT_CLIENT_IDS.has(normalized) ||
+    RESERVED_AGENT_CLIENT_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }

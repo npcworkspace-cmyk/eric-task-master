@@ -111,6 +111,7 @@ function publicAttemptHistory(history) {
   const entries = history.slice(-100).map((entry) => definedEntries([
     ['attempt', Number.isSafeInteger(entry?.attempt) ? entry.attempt : undefined],
     ['resumed', booleanValue(entry?.resumed)],
+    ['behavior', stringValue(entry?.behavior, 32)],
     ['state', stringValue(entry?.state, 64)],
     ['errorCode', stringValue(entry?.errorCode, 64)],
     ['startedAt', stringValue(entry?.startedAt, 64)],

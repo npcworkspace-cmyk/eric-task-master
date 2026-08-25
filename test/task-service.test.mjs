@@ -191,6 +191,7 @@ test('task service isolates work in a child, tracks progress, and releases its l
   assert.equal(workerKind, 'task');
   assert.equal(workerBehavior, 'human');
   assert.equal(created.behavior, 'human');
+  assert.equal(created.history[0].behavior, 'human');
   assert.equal(created.profileId, 'profile_test');
   assert.equal('leaseOwner' in created, false);
   assert.equal('workerPid' in created, false);
@@ -342,6 +343,92 @@ test('task identity snapshots the signed Agent name and legacy tasks fall back t
   service = createService();
   const migrated = await service.get(task.id, agent);
   assert.deepEqual(migrated.agent, { clientId: agent.clientId, name: agent.clientId });
+  await service.close();
+});
+
+test('Profile behavior changes do not break idempotency and queued attempts use launch-time policy', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-policy-idempotency-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  store.profile.kind = 'ephemeral';
+  store.profile.defaultBehavior = 'fast';
+  const workers = [];
+  const launchBehaviors = [];
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      const worker = new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        launchBehaviors.push(message.config.behavior);
+        if (workers.indexOf(child) !== 0) {
+          setImmediate(() => {
+            child.emit('message', {
+              type: 'result',
+              result: {
+                summary: 'Done',
+                evidence: [{ kind: 'message', value: 'launch-time Profile policy verified' }]
+              }
+            });
+            child.emit('message', { type: 'state', state: 'completed' });
+            child.emit('message', { type: 'cleanup', browserClosed: true });
+            child.finish();
+          });
+        }
+      });
+      workers.push(worker);
+      return worker;
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+
+  const blocker = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'profile-policy-blocker',
+    input: {}
+  }, ADMIN);
+  await waitFor(() => workers.length === 1 && launchBehaviors.length === 1);
+  const request = {
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'profile-policy-idempotency',
+    input: { value: 1 }
+  };
+  const queued = await service.create(request, ADMIN);
+  assert.equal(queued.state, 'queued');
+  assert.equal(queued.behavior, 'fast');
+  assert.equal((await service.getInternal(queued.id)).requestHashVersion, 2);
+
+  store.profile.defaultBehavior = 'human';
+  assert.equal((await service.create(request, ADMIN)).id, queued.id);
+  await assert.rejects(
+    service.create({ ...request, input: { value: 2 } }, ADMIN),
+    { code: 'IDEMPOTENCY_CONFLICT' }
+  );
+
+  workers[0].emit('message', {
+    type: 'result',
+    result: {
+      summary: 'Blocker done',
+      evidence: [{ kind: 'message', value: 'Profile queue released in FIFO order' }]
+    }
+  });
+  workers[0].emit('message', { type: 'state', state: 'completed' });
+  workers[0].emit('message', { type: 'cleanup', browserClosed: true });
+  workers[0].finish();
+  await waitFor(async () => (await service.get(blocker.id, ADMIN)).cleanup.settled === true);
+  const completed = await waitFor(async () => {
+    const current = await service.get(queued.id, ADMIN);
+    return current.state === 'completed' && current.cleanup.settled ? current : null;
+  });
+  assert.deepEqual(launchBehaviors, ['fast', 'human']);
+  assert.equal(completed.behavior, 'human');
+  assert.equal(completed.history[0].behavior, 'human');
   await service.close();
 });
 
@@ -979,6 +1066,8 @@ test('a later failed attempt cannot resume from an older attempt checkpoint', as
   const modulePath = path.join(root, 'task.mjs');
   await writeFile(modulePath, 'export const meta = { supportsResume: true }; export async function run() {}\n');
   const store = fakeProfileStore(root);
+  store.profile.kind = 'ephemeral';
+  store.profile.defaultBehavior = 'fast';
   const service = createTaskService({
     stateDir: path.join(root, 'state'),
     profileStore: store,
@@ -1021,12 +1110,17 @@ test('a later failed attempt cannot resume from an older attempt checkpoint', as
     profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'resume-generation-original'
   }, ADMIN);
   await waitFor(async () => (await service.get(created.id, ADMIN)).resumeAvailable === true);
-  await service.resume(created.id, { resumeKey: 'resume-generation-attempt-2' }, ADMIN);
+  store.profile.defaultBehavior = 'human';
+  const resumed = await service.resume(created.id, { resumeKey: 'resume-generation-attempt-2' }, ADMIN);
+  assert.equal(resumed.behavior, 'human');
+  assert.equal(resumed.history.find((entry) => entry.attempt === 2)?.behavior, 'human');
   const secondFailure = await waitFor(async () => {
     const current = await service.get(created.id, ADMIN);
     return current.attempt === 2 && current.cleanup.settled ? current : null;
   });
   assert.equal(secondFailure.state, 'failed');
+  assert.equal(secondFailure.history.find((entry) => entry.attempt === 1)?.behavior, 'fast');
+  assert.equal(secondFailure.history.find((entry) => entry.attempt === 2)?.behavior, 'human');
   assert.equal(secondFailure.resumeAvailable, false);
   await assert.rejects(
     service.resume(created.id, { resumeKey: 'resume-generation-attempt-3' }, ADMIN),

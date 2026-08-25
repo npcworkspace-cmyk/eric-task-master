@@ -77,6 +77,7 @@ const ObservationSchema = z.strictObject({
 const AttemptHistorySchema = z.strictObject({
   attempt: z.number().int(),
   resumed: z.boolean().optional(),
+  behavior: z.enum(BEHAVIOR_MODES).optional(),
   state: z.string().optional(),
   errorCode: z.string().optional(),
   startedAt: z.string().optional(),

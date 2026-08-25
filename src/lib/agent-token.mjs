@@ -9,6 +9,9 @@ const CLIENT_ID = /^[a-zA-Z0-9._:-]{1,128}$/;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const SIGNATURE = /^[A-Za-z0-9_-]{43}$/;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/u;
+// Reject characters that can reorder, split, or invisibly spoof an identity in
+// a terminal or Dashboard. ZWJ remains allowed so ordinary emoji still work.
+const DISPLAY_CONTROL = /[\u061c\u200b\u200e\u200f\u2028-\u202e\u2060\u2066-\u2069\ufeff]/u;
 const FATAL_UTF8 = new TextDecoder('utf-8', { fatal: true });
 
 export class AgentTokenError extends TypeError {
@@ -48,8 +51,8 @@ export function normalizeAgentName(value) {
     fail('INVALID_AGENT_NAME', 'name must be a string');
   }
   // Reject controls before trimming so a tab/newline cannot be silently hidden.
-  if (CONTROL_CHARACTER.test(value)) {
-    fail('INVALID_AGENT_NAME', 'name must not contain control characters');
+  if (CONTROL_CHARACTER.test(value) || DISPLAY_CONTROL.test(value)) {
+    fail('INVALID_AGENT_NAME', 'name must not contain control or display-control characters');
   }
   const normalized = value.normalize('NFC').trim();
   if (FATAL_UTF8.decode(Buffer.from(normalized, 'utf8')) !== normalized) {
