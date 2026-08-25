@@ -141,8 +141,8 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
   const fixture = await fixtureServer();
   let profile;
   let ephemeralProfile;
-    const tasks = [];
-    const acceptanceReports = [];
+  const tasks = [];
+  const acceptanceReports = [];
   try {
     const health = await api(baseUrl, '/v1/health');
     add('manager health', health.ok && health.service === 'eric-task-master');
@@ -169,11 +169,27 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       token,
       body: {
         name: `Acceptance ${Date.now()}`,
-        defaultBehavior: 'fast',
+        browserEngine: 'chromium',
         headless: true
       }
     }));
-    add('isolated profile creation', profile?.id && profile.state === 'idle' && profile.headless === true);
+    add(
+      'persistent Profile policy',
+      profile?.id && profile.state === 'idle' && profile.headless === true &&
+      profile.browserEngine === 'chromium' && profile.defaultBehavior === 'human'
+    );
+
+    let persistentBehaviorFixed = false;
+    try {
+      await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, {
+        method: 'PATCH',
+        token,
+        body: { defaultBehavior: 'human' }
+      });
+    } catch (error) {
+      persistentBehaviorFixed = error.code === 'PERSISTENT_BEHAVIOR_FIXED';
+    }
+    add('persistent Profile behavior is immutable', persistentBehaviorFixed);
 
     const dashboardAuthorization = await api(baseUrl, '/v1/dashboard/authorize', {
       method: 'POST',
@@ -219,15 +235,54 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
 
     const uploadPath = resolve(ROOT, 'test', 'fixtures', 'upload.txt');
     const acceptanceRunId = Date.now().toString(36);
+    ({ profile: ephemeralProfile } = await api(baseUrl, '/v1/profiles', {
+      method: 'POST',
+      token,
+      body: {
+        name: `Ephemeral acceptance ${Date.now()}`,
+        kind: 'ephemeral',
+        defaultBehavior: 'adaptive',
+        headless: true
+      }
+    }));
+    add(
+      'ephemeral Profile policy',
+      ephemeralProfile?.id && ephemeralProfile.kind === 'ephemeral' &&
+      ephemeralProfile.state === 'idle' && ephemeralProfile.browserEngine === 'chromium' &&
+      ephemeralProfile.defaultBehavior === 'adaptive'
+    );
+
+    let taskBehaviorRejected = false;
+    try {
+      await api(baseUrl, '/v1/tasks', {
+        method: 'POST',
+        token,
+        body: {
+          profileId: ephemeralProfile.id,
+          taskType: 'acceptance',
+          idempotencyKey: `acceptance-${acceptanceRunId}-override-rejected`,
+          behavior: 'fast',
+          input: { url: fixture.url, uploadPath }
+        }
+      });
+    } catch (error) {
+      taskBehaviorRejected = error.code === 'INVALID_TASK_CREATE';
+    }
+    add('task behavior override removed', taskBehaviorRejected);
+
     for (const behavior of ['fast', 'human', 'adaptive']) {
+      await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}`, {
+        method: 'PATCH',
+        token,
+        body: { defaultBehavior: behavior }
+      });
       const created = await api(baseUrl, '/v1/tasks', {
         method: 'POST',
         token,
         body: {
-          profileId: profile.id,
+          profileId: ephemeralProfile.id,
           taskType: 'acceptance',
           idempotencyKey: `acceptance-${acceptanceRunId}-${behavior}`,
-          behavior,
           timeoutMs: 90_000,
           input: { url: fixture.url, uploadPath }
         }
@@ -285,21 +340,6 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       acceptanceReports.every((report) => Array.isArray(report.evidence) && report.evidence.length >= 10)
     );
 
-    ({ profile: ephemeralProfile } = await api(baseUrl, '/v1/profiles', {
-      method: 'POST',
-      token,
-      body: {
-        name: `Ephemeral acceptance ${Date.now()}`,
-        kind: 'ephemeral',
-        defaultBehavior: 'adaptive',
-        headless: true
-      }
-    }));
-    add(
-      'ephemeral Profile creation',
-      ephemeralProfile?.id && ephemeralProfile.kind === 'ephemeral' && ephemeralProfile.state === 'idle'
-    );
-
     let ephemeralOpenRejected = false;
     try {
       await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}/open`, {
@@ -322,7 +362,6 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
           profileId: ephemeralProfile.id,
           taskType: 'acceptance',
           idempotencyKey: `acceptance-${acceptanceRunId}-ephemeral-${index}`,
-          behavior: 'adaptive',
           timeoutMs: 90_000,
           input: { url: fixture.url, uploadPath, expectCleanStart: true }
         }
@@ -360,7 +399,6 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
         profileId: ephemeralProfile.id,
         taskType: 'handoff-acceptance',
         idempotencyKey: `acceptance-${acceptanceRunId}-handoff`,
-        behavior: 'adaptive',
         timeoutMs: 90_000,
         input: { url: fixture.url }
       }

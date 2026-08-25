@@ -46,6 +46,7 @@ function fakeProfiles(root) {
     name: 'Durable',
     userDataDir: path.join(root, 'profile'),
     defaultBehavior: 'fast',
+    browserEngine: 'chromium',
     headless: true,
     state: 'idle',
     lease: null

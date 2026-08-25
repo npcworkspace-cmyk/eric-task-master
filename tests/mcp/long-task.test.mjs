@@ -172,7 +172,12 @@ test('a real Playwright action failure returns its diagnostic screenshot through
     stateDir: manager.dataDir,
     clientId: 'diagnostic.agent'
   });
-  const profile = await client.createProfile({ name: 'Diagnostic Profile', headless: true });
+  const profile = await client.createProfile({
+    name: 'Diagnostic Profile',
+    kind: 'ephemeral',
+    defaultBehavior: 'fast',
+    headless: true
+  });
   const task = await client.startTask({
     profileId: profile.id,
     taskType: 'diagnostic-fixture',

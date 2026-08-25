@@ -83,6 +83,7 @@ function fakeProfileStore(root) {
     name: 'Test',
     userDataDir: path.join(root, 'profile'),
     defaultBehavior: 'fast',
+    browserEngine: 'chromium',
     state: 'idle',
     lease: null
   };

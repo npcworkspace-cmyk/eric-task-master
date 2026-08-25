@@ -17,6 +17,7 @@ const ui = Object.freeze({
   createProfileForm: document.querySelector('#create-profile-form'),
   profileName: document.querySelector('#profile-name'),
   profileKind: document.querySelector('#profile-kind'),
+  profileEngine: document.querySelector('#profile-engine'),
   profileMode: document.querySelector('#profile-mode'),
   profileHeadless: document.querySelector('#profile-headless'),
   profiles: document.querySelector('#profiles'),
@@ -118,8 +119,21 @@ function profileState(profile) {
 }
 
 function profileMode(profile) {
-  const value = profile.defaultBehavior || profile.behavior || profile.behaviorMode;
-  return MODES.includes(value) ? value : 'fast';
+  if (profile.kind !== 'ephemeral') return 'human';
+  const value = profile.defaultBehavior;
+  return MODES.includes(value) ? value : 'adaptive';
+}
+
+function profileEngine(profile) {
+  return profile.browserEngine === 'chrome' ? '本机稳定版 Chrome' : '项目锁定 Chromium';
+}
+
+function syncCreatePolicy() {
+  const persistent = ui.profileKind.value === 'persistent';
+  ui.profileEngine.value = persistent ? 'chrome' : 'chromium';
+  ui.profileMode.value = persistent ? 'human' : 'adaptive';
+  ui.profileMode.disabled = persistent;
+  ui.profileMode.title = persistent ? '持久 Profile 固定使用拟人行为' : '临时 Profile 的任务行为策略';
 }
 
 function renderProfiles() {
@@ -135,7 +149,11 @@ function renderProfiles() {
     const accessLabel = profile.access === 'private'
       ? (profile.createdBy ? '仅创建者 Agent' : '仅管理面板')
       : '本机 Agent 共享';
-    const meta = element('p', 'profile-meta', `${kind} · ${accessLabel} · ID ${profile.id} · 最后使用 ${formatTime(profile.lastUsedAt)}`);
+    const meta = element(
+      'p',
+      'profile-meta',
+      `${kind} · ${profileEngine(profile)} · ${profileMode(profile)} · ${accessLabel} · ID ${profile.id} · 最后使用 ${formatTime(profile.lastUsedAt)}`
+    );
     const controls = element('div', 'profile-controls');
     const mode = document.createElement('select');
     mode.title = '默认行为模式';
@@ -146,15 +164,20 @@ function renderProfiles() {
       mode.append(option);
     }
     mode.value = profileMode(profile);
-    mode.addEventListener('change', () => updateProfile(profile.id, { defaultBehavior: mode.value }));
+    const isEphemeral = profile.kind === 'ephemeral';
+    mode.disabled = !isEphemeral;
+    mode.title = isEphemeral ? '此 Profile 的任务行为策略' : '持久 Profile 固定使用拟人行为';
+    if (isEphemeral) {
+      mode.addEventListener('change', () => updateProfile(profile.id, { defaultBehavior: mode.value }));
+    }
 
     const headless = element('label', 'checkbox-label');
-    headless.title = '不显示 Playwright 浏览器窗口';
+    headless.title = '仅任务运行时不显示窗口；人工打开持久 Profile 始终可见';
     const headlessInput = document.createElement('input');
     headlessInput.type = 'checkbox';
     headlessInput.checked = Boolean(profile.headless);
     headlessInput.addEventListener('change', () => updateProfile(profile.id, { headless: headlessInput.checked }));
-    headless.append(headlessInput, '后台运行');
+    headless.append(headlessInput, '任务后台');
 
     const shared = element('label', 'checkbox-label');
     shared.title = '开启后，本机其他已注册 Agent 可以使用此 Profile；任务结果仍相互隔离';
@@ -167,11 +190,12 @@ function renderProfiles() {
     shared.append(sharedInput, 'Agent 共享');
 
     const isOpen = ['open', 'leased', 'starting'].includes(profileState(profile));
-    const isEphemeral = profile.kind === 'ephemeral';
     const rename = button('改名', 'ghost', () => renameProfile(profile));
     const toggle = button(isOpen ? '关闭' : '打开', '', () => setProfileOpen(profile, !isOpen));
     toggle.disabled = isEphemeral;
-    toggle.title = isEphemeral ? '隐身 Profile 仅在任务中临时启动，结束后自动销毁' : '';
+    toggle.title = isEphemeral
+      ? '隐身 Profile 仅在任务中临时启动，结束后自动销毁'
+      : '人工打开始终使用可见浏览器窗口';
     const remove = button('删除', 'danger', () => deleteProfile(profile));
     remove.disabled = profileState(profile) !== 'idle';
     controls.append(mode, headless, shared, rename, toggle, remove);
@@ -358,12 +382,14 @@ async function createProfile(event) {
       body: {
         name,
         kind: ui.profileKind.value,
+        browserEngine: ui.profileEngine.value,
         defaultBehavior: ui.profileMode.value,
         headless: ui.profileHeadless.checked
       }
     });
     ui.profileName.value = '';
     ui.profileHeadless.checked = false;
+    syncCreatePolicy();
     setMessage('Profile 已创建', 'success');
     await refresh();
   } catch (error) {
@@ -438,7 +464,9 @@ const initialCode = consumeCodeFromLocation();
 managerToken = sessionStorage.getItem(TOKEN_KEY) || '';
 ui.tokenForm.addEventListener('submit', saveToken);
 ui.createProfileForm.addEventListener('submit', createProfile);
+ui.profileKind.addEventListener('change', syncCreatePolicy);
 ui.refreshAll.addEventListener('click', refresh);
+syncCreatePolicy();
 void (async () => {
   if (initialCode) {
     try {

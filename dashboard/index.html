@@ -53,14 +53,18 @@
               <option value="persistent">持久登录</option>
               <option value="ephemeral">隐身临时</option>
             </select>
+            <select id="profile-engine" aria-label="浏览器引擎">
+              <option value="chrome">本机稳定版 Chrome</option>
+              <option value="chromium">项目锁定 Chromium</option>
+            </select>
             <select id="profile-mode" aria-label="默认行为模式">
               <option value="fast">快速</option>
               <option value="human">拟人</option>
               <option value="adaptive">自适应</option>
             </select>
-            <label class="checkbox-label" title="不显示 Playwright 浏览器窗口">
+            <label class="checkbox-label" title="仅任务运行时不显示窗口；人工打开持久 Profile 始终可见">
               <input id="profile-headless" type="checkbox">
-              后台运行
+              任务后台
             </label>
             <button class="button primary" type="submit">创建 Profile</button>
           </form>

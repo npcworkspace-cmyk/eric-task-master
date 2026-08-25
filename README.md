@@ -83,6 +83,8 @@ The Agent then uses one durable loop: discover a task type, start once with an i
 - **persistent** — isolated reusable state for logged-in and recurring work; open it from the Dashboard and sign in directly in its Playwright window;
 - **ephemeral / 隐身临时** — a clean non-persistent browser for each no-login task, destroyed after cleanup.
 
+New persistent Profiles default to the local stable Chrome channel and fixed `human` behavior. New ephemeral Profiles default to the project-pinned Chromium and `adaptive` behavior, with `fast`, `adaptive`, or `human` selectable on the Profile. The engine is immutable and never falls back automatically. Manual persistent-Profile windows are always visible; `headless` affects task runs only.
+
 ### Behavior
 
 - **fast** — minimum necessary waiting for deterministic, data-heavy work;
@@ -90,6 +92,7 @@ The Agent then uses one durable loop: discover a task type, start once with an i
 - **adaptive** — starts fast and temporarily becomes cautious or human-paced after dynamic-page signals, occlusion, timeout, uncertain navigation, action failure, or rate limiting.
 
 Human pacing is a reliability policy, not a promise to bypass website controls or protect an account from platform enforcement.
+Behavior is selected on the Profile; task start does not accept a behavior override.
 
 ## Build specialized production workers
 

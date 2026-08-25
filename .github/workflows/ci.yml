@@ -32,7 +32,15 @@ jobs:
       - name: Install Chromium on Windows or macOS
         if: runner.os != 'Linux'
         run: npx playwright install chromium
-      - run: npm run check
+      - name: Run release gate with a visible-browser display
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum npm run check
+        env:
+          TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
+          TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
+      - name: Run release gate
+        if: runner.os != 'Linux'
+        run: npm run check
         env:
           TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
           TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json

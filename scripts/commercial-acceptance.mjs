@@ -78,7 +78,7 @@ export async function runCommercialAcceptance() {
     const manualProfile = await client.createProfile({
       name: 'Commercial persistent manual login',
       kind: 'persistent',
-      defaultBehavior: 'adaptive',
+      browserEngine: 'chromium',
       headless: true
     });
     const openedManualProfile = await client.openProfile(manualProfile.id);
@@ -107,7 +107,6 @@ export async function runCommercialAcceptance() {
       Array.from({ length: 4 }, (_, taskIndex) => client.startTask({
         profileId: profile.id,
         taskType: 'durable-delay',
-        behavior: 'adaptive',
         input: { steps: 3, delayMs: 40 },
         timeoutMs: 30_000,
         idempotencyKey: `commercial-${profileIndex}-${taskIndex}-${Date.now()}`

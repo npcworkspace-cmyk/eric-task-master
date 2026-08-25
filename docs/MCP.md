@@ -63,6 +63,8 @@ Every tool publishes an input schema, output schema, and MCP annotations. Generi
 
 The MCP surface never accepts arbitrary module paths, JavaScript evaluation, cookie/session transfer, authorization headers, filesystem paths, or raw Playwright handles.
 
+Profile creation accepts an immutable `browserEngine` of `chrome` or `chromium`. Persistent Profiles default to `chrome` with fixed `human` behavior; ephemeral Profiles default to `chromium` with Profile-owned `adaptive` behavior. `taskmaster_tasks_start` accepts no task-level behavior override.
+
 ## Long tasks, progress, and cancellation
 
 `taskmaster_tasks_start` returns immediately with a durable task ID. Use `taskmaster_tasks_get` for a snapshot or `taskmaster_tasks_wait` for a bounded wait of at most 30 seconds. When the MCP request contains a progress token, the wait tool forwards bounded progress notifications. A wait also returns early when a task enters `waiting_user` or its health becomes `stalled`, so the Agent can inspect diagnostics rather than sleeping through an attention state.

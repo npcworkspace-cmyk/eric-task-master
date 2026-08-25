@@ -26,6 +26,8 @@ If registration reports `registered_pending_restart`, ask the user to reload tha
 - choose `persistent` for login state or recurring account work. Open it from the Dashboard and let the user sign in directly in that Playwright window;
 - choose `ephemeral` for no-login temporary work. It starts clean for every task, retains no browser state after cleanup, and cannot be opened manually.
 
+Persistent Profiles default to stable local Chrome and fixed `human` behavior. Ephemeral Profiles default to pinned Chromium and Profile-owned `adaptive` behavior, with all three modes selectable. Choose the engine and behavior when creating the Profile; the engine is immutable, persistent behavior cannot be patched, and task start has no behavior override. A manual persistent-Profile window is always visible even when its task `headless` setting is enabled.
+
 An Agent-created Profile is private to that stable Agent client ID by default. Set `access: "shared"` only when the user explicitly wants other registered local Agents to use the same browser state. Sharing a Profile never shares task status, results, or artifacts.
 
 Treat one registered MCP client ID as one local Agent principal. Different registered hosts/client IDs are isolated; parallel conversations using the same host registration intentionally share that principal's task ledger. Use a distinct registration/client ID when strict tenant separation is required.
@@ -43,13 +45,13 @@ Treat one registered MCP client ID as one local Agent principal. Different regis
 
 Same-Profile tasks queue in FIFO order; different Profiles may run concurrently within the Manager resource budget. Queueing is normal, not a reason to retry.
 
-## Behavior choice
+## Profile behavior choice
 
 - `fast`: deterministic Playwright with minimum necessary waiting. Default for stable, data-heavy work.
 - `human`: bounded pointer curves, in-target clicks, typing rhythm, eased scrolling, and explicit reading dwell.
 - `adaptive`: starts fast, uses a brief cautious tier for ordinary dynamic content, and temporarily uses guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. It returns to fast after successful actions and never auto-replays an unknown effect.
 
-The task status exposes configured/effective behavior and active cooldown timing. Human-like pacing is a reliability option, not a promise to evade website controls or protect an account from platform enforcement.
+Set behavior on an ephemeral Profile before submitting work. Persistent Profiles always use `human`. The task status exposes configured/effective behavior and active cooldown timing. Human-like pacing is a reliability option, not a promise to evade website controls or protect an account from platform enforcement.
 
 ## Diagnostics and handoff
 

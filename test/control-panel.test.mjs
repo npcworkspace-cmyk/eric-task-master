@@ -16,6 +16,7 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.match(html, /id="profiles"/);
   assert.match(html, /id="tasks"/);
   assert.match(html, /id="profile-headless"/);
+  assert.match(html, /id="profile-engine"/);
   assert.match(html, /id="task-result-dialog"/);
   assert.match(source, /request\('\/v1\/profiles'/);
   assert.match(source, /request\('\/v1\/tasks'/);
@@ -23,6 +24,10 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.match(source, /setInterval\(\(\) => void refresh\(\), 5000\)/);
   assert.match(source, /url\.origin === location\.origin/);
   assert.match(source, /showTaskResult\(task\)/);
+  assert.match(source, /browserEngine: ui\.profileEngine\.value/);
+  assert.match(source, /ui\.profileMode\.disabled = persistent/);
+  assert.match(source, /mode\.disabled = !isEphemeral/);
+  assert.match(source, /人工打开始终使用可见浏览器窗口/);
   assert.match(source, /sessionStorage\.setItem\(TOKEN_KEY/);
   assert.match(source, /history\.replaceState/);
   assert.doesNotMatch(source, /localStorage/);
