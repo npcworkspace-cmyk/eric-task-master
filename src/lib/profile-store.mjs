@@ -80,7 +80,18 @@ function ensureBrowserEngine(value) {
   return value;
 }
 
-function migrateBrowserEngine(profile) {
+function migrateBrowserEngine(profile, { allowLegacyChannel }) {
+  if (!allowLegacyChannel) {
+    if (profile.browserEngine === undefined || Object.hasOwn(profile, 'browserChannel')) {
+      throw new ProfileStoreError(
+        'PROFILE_ENGINE_MIGRATION_REQUIRED',
+        `Profile ${profile.id || '[unknown]'} has invalid browser engine metadata for this store version`,
+        409
+      );
+    }
+    profile.browserEngine = ensureBrowserEngine(profile.browserEngine);
+    return;
+  }
   if (profile.browserEngine !== undefined && !Object.hasOwn(profile, 'browserChannel')) {
     profile.browserEngine = ensureBrowserEngine(profile.browserEngine);
     return;
@@ -196,10 +207,11 @@ export class ProfileStore {
           409
         );
       }
+      const allowLegacyChannel = data.version === undefined || data.version === 1;
       for (const profile of data.profiles) {
         profile.kind ||= 'persistent';
         ensureProfileKind(profile.kind);
-        migrateBrowserEngine(profile);
+        migrateBrowserEngine(profile, { allowLegacyChannel });
         migrateProfileBehavior(profile);
         profile.ownerClientId ??= null;
         profile.access ||= 'shared';

@@ -70,6 +70,44 @@ function workerConfig(root, modulePath, outputBudget) {
   };
 }
 
+test('task worker launches Chrome with the Profile headless policy and never falls back', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-chrome-launch-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const persistentLaunches = [];
+  let fallbackLaunches = 0;
+  const config = workerConfig(root, modulePath);
+  config.profile = {
+    ...config.profile,
+    kind: 'persistent',
+    browserEngine: 'chrome',
+    headless: true
+  };
+
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({
+      chromium: {
+        async launchPersistentContext(userDataDir, options) {
+          persistentLaunches.push({ userDataDir, options });
+          throw Object.assign(new Error('Chrome is unavailable'), { code: 'CHROME_UNAVAILABLE' });
+        },
+        async launch() {
+          fallbackLaunches += 1;
+          throw new Error('Chromium fallback must not run');
+        }
+      }
+    })
+  });
+
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'CHROME_UNAVAILABLE');
+  assert.deepEqual(persistentLaunches, [{
+    userDataDir: config.profile.userDataDir,
+    options: { channel: 'chrome', headless: true }
+  }]);
+  assert.equal(fallbackLaunches, 0);
+});
+
 test('output budget preserves user files and reserves bounded diagnostic capacity', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-output-budget-');
   const output = path.join(root, 'output');

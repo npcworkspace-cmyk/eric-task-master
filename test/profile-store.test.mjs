@@ -148,6 +148,34 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   assert.equal(await readFile(config.filePath, 'utf8'), before);
 });
 
+test('ProfileStore rejects incomplete v2/v3 engine metadata without rewriting the store', async (t) => {
+  const { config, store } = await fixture(t);
+  await store.create({ name: 'Versioned engine', browserEngine: 'chrome' });
+  const baseline = JSON.parse(await readFile(config.filePath, 'utf8'));
+
+  for (const version of [2, 3]) {
+    for (const corruption of ['missing-engine', 'legacy-channel']) {
+      const data = structuredClone(baseline);
+      data.version = version;
+      if (corruption === 'missing-engine') delete data.profiles[0].browserEngine;
+      else data.profiles[0].browserChannel = 'chrome';
+      const before = `${JSON.stringify(data)}\n`;
+      await writeFile(config.filePath, before);
+
+      const reopened = new ProfileStore(config);
+      await assert.rejects(
+        reopened.init(),
+        { code: 'PROFILE_ENGINE_MIGRATION_REQUIRED', statusCode: 409 }
+      );
+      assert.equal(
+        await readFile(config.filePath, 'utf8'),
+        before,
+        `v${version} ${corruption} must remain byte-for-byte unchanged`
+      );
+    }
+  }
+});
+
 test('ProfileStore enforces exclusive leases and recovers only expired dead owners', async (t) => {
   let currentTime = Date.parse('2026-08-23T00:00:00.000Z');
   const livingPids = new Set([101]);
