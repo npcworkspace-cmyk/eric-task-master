@@ -43,6 +43,10 @@ async function staticChecks() {
     readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
     readFile(resolve(ROOT, '.github', 'workflows', 'release.yml'), 'utf8')
   ]);
+  const releaseCreation = releaseWorkflow.indexOf('gh release create');
+  const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
+  const releaseVersionChecks = [...releaseWorkflow.matchAll(/scripts\/assert-release-version\.mjs/g)]
+    .map((match) => match.index);
   invariant(launcher.includes("['ci', '--ignore-scripts', '--no-audit', '--no-fund']"), 'fixed launcher lacks dependency bootstrap');
   invariant(
     launcher.includes('playwrightInstallArguments(') &&
@@ -108,7 +112,9 @@ async function staticChecks() {
       !releaseWorkflow.match(/group:\s*manual-release[^\r\n]*inputs\.confirm_version/) &&
       releaseWorkflow.includes('MAIN_SHA_NOW=') &&
       releaseWorkflow.includes('CI_RUN_NOW=') &&
-      releaseWorkflow.lastIndexOf('scripts/assert-release-version.mjs') < releaseWorkflow.indexOf('gh release create'),
+      releaseVersionChecks.length >= 2 &&
+      releaseVersionChecks.at(-1) > mainPublicationRecheck &&
+      releaseVersionChecks.at(-1) < releaseCreation,
     'release publication must be globally serialized and revalidated immediately before draft creation'
   );
   invariant(
@@ -183,7 +189,6 @@ async function staticChecks() {
   );
   const immutablePreflight = releaseWorkflow.indexOf('repos/${GITHUB_REPOSITORY}/immutable-releases');
   const immutableRecheck = releaseWorkflow.lastIndexOf('repos/${GITHUB_REPOSITORY}/immutable-releases');
-  const releaseCreation = releaseWorkflow.indexOf('gh release create');
   invariant(
     immutablePreflight >= 0 && immutableRecheck > immutablePreflight && releaseCreation > immutableRecheck &&
       releaseWorkflow.includes('secrets.RELEASE_ADMIN_TOKEN') &&

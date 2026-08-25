@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -41,6 +41,19 @@ test('release version assertion rejects any non-increasing published version', (
   });
   assert.notEqual(rejected.status, 0);
   assert.match(rejected.stderr, /must be greater than published version 2\.0\.0/);
+});
+
+test('release workflow revalidates version monotonicity immediately before publication', async () => {
+  const workflow = await readFile(
+    path.resolve(import.meta.dirname, '..', '.github', 'workflows', 'release.yml'),
+    'utf8'
+  );
+  const checks = [...workflow.matchAll(/scripts\/assert-release-version\.mjs/g)].map((match) => match.index);
+  const mainRecheck = workflow.indexOf('MAIN_SHA_NOW=');
+  const releaseCreate = workflow.indexOf('gh release create');
+  assert.ok(checks.length >= 2, 'release workflow must check published versions at least twice');
+  assert.ok(checks.at(-1) > mainRecheck, 'final version check must follow the main SHA recheck');
+  assert.ok(checks.at(-1) < releaseCreate, 'final version check must precede Release creation');
 });
 
 test('standalone Skill wrapper rejects an incompatible runtime before launching it', async (t) => {
