@@ -15,9 +15,12 @@ async function staticChecks() {
   const packageJson = JSON.parse(await readFile(resolve(ROOT, 'package.json'), 'utf8'));
   const lock = JSON.parse(await readFile(resolve(ROOT, 'package-lock.json'), 'utf8'));
   const manifest = JSON.parse(await readFile(resolve(ROOT, 'extension', 'manifest.json'), 'utf8'));
+  const license = await readFile(resolve(ROOT, 'LICENSE'), 'utf8');
   invariant(packageJson.version === VERSION, 'package.json version drift');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock.json version drift');
   invariant(manifest.version === VERSION, 'extension manifest version drift');
+  invariant(packageJson.license === 'MIT', 'package license drift');
+  invariant(license.startsWith('MIT License\n'), 'MIT license file is missing or malformed');
   invariant(
     JSON.stringify(Object.keys(packageJson.dependencies || {}).sort()) ===
       JSON.stringify(['@modelcontextprotocol/server', 'playwright', 'zod'].sort()),
@@ -153,7 +156,7 @@ async function staticChecks() {
   );
   const popup = await readFile(resolve(ROOT, 'extension', 'popup.js'), 'utf8');
   invariant(popup.includes('http://127.0.0.1:19946'), 'extension and manager port contract drift');
-  return { passed: 28, total: 28 };
+  return { passed: 30, total: 30 };
 }
 
 function run(command, args, env = {}) {

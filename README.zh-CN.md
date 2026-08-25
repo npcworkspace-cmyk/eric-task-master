@@ -128,3 +128,7 @@ node scripts/taskmaster.mjs manager stop --json
 ```
 
 新 Agent 从 [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md) 开始。技术细节位于 [`ARCHITECTURE.md`](./ARCHITECTURE.md)、[`docs/MCP.md`](./docs/MCP.md) 和 [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md)。
+
+## 开源许可
+
+[MIT](./LICENSE)。你可以自由使用、修改和分发 Task Master，也可以在其上构建开源或商业化的 Skill 与 Task Pack。

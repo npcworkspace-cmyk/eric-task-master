@@ -130,3 +130,7 @@ node scripts/taskmaster.mjs manager stop --json
 ```
 
 Start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Technical details live in [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md).
+
+## License
+
+[MIT](./LICENSE). Use, modify, distribute, and build open or proprietary Skills and Task Packs on top of Task Master.

@@ -6,6 +6,7 @@
 - Defined one non-divergent GitHub-to-task bootstrap and clarified that the portable Skill is an Agent instruction adapter while the complete cloned repository remains the runtime.
 - Added authenticated, fail-closed migration from an idle older Manager; busy or unverifiable Managers remain untouched and return an actionable error instead of prompting Agents to invent another controller.
 - Added integration coverage for successful idle migration and refusal to interrupt an older Manager with active work.
+- Published the project under the MIT License so independent Skills, Task Packs, and commercial integrations can build on the core runtime.
 
 ## 1.0.3 - 2026-08-25
 
