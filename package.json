@@ -17,7 +17,6 @@
     "acceptance": "node scripts/acceptance.mjs",
     "acceptance:commercial": "node scripts/commercial-acceptance.mjs",
     "check": "node scripts/check.mjs",
-    "generate:icons": "node scripts/generate-icons.mjs",
     "mcp": "node src/mcp/stdio.mjs",
     "mcp:register": "node scripts/register-mcp.mjs install --json",
     "mcp:status": "node scripts/register-mcp.mjs status --json",

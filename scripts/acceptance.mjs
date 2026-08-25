@@ -164,14 +164,6 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     });
     add('pinned Manager identity challenge', true);
 
-    const manifest = JSON.parse(await readFile(resolve(ROOT, 'extension', 'manifest.json'), 'utf8'));
-    add('extension manifest', manifest.manifest_version === 3 && manifest.version === VERSION);
-    const manifestText = JSON.stringify(manifest);
-    add(
-      'extension control-only boundary',
-      !manifestText.includes('debugger') && !manifestText.includes('devtools') && !manifest.content_scripts
-    );
-
     ({ profile } = await api(baseUrl, '/v1/profiles', {
       method: 'POST',
       token,
@@ -183,72 +175,47 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     }));
     add('isolated profile creation', profile?.id && profile.state === 'idle' && profile.headless === true);
 
-    const extensionOrigin = `chrome-extension://${'a'.repeat(32)}`;
-    const approval = await api(baseUrl, '/v1/pair/authorize', {
+    const dashboardAuthorization = await api(baseUrl, '/v1/dashboard/authorize', {
       method: 'POST',
       token,
       body: {}
     });
-    const challenge = await api(baseUrl, '/v1/pair/challenge', {
-      headers: {
-        Origin: extensionOrigin,
-        'X-Taskmaster-Pairing-Code': approval.pairingCode
-      }
-    });
-    const paired = await api(baseUrl, '/v1/pair/extension', {
+    const dashboardSession = await api(baseUrl, '/v1/dashboard/session', {
       method: 'POST',
-      headers: { Origin: extensionOrigin },
-      body: {
-        challenge: challenge.challenge,
-        pairingCode: approval.pairingCode,
-        name: 'Acceptance extension'
-      }
+      body: { code: dashboardAuthorization.code }
     });
-    add('extension challenge pairing', typeof paired.token === 'string' && paired.token.length >= 32);
-
-    const fixtureOrigin = new URL(fixture.url).origin;
-    const secretMarker = 'secret-must-not-echo';
-    const imported = await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}/session`, {
-      method: 'POST',
-      token: paired.token,
-      headers: { Origin: extensionOrigin },
-      timeoutMs: 60_000,
-      body: {
-        origin: fixtureOrigin,
-        cookies: [{
-          name: 'taskmaster_imported',
-          value: 'accepted',
-          domain: '127.0.0.1',
-          path: '/',
-          hostOnly: true,
-          session: true,
-          httpOnly: false,
-          secure: false,
-          sameSite: 'lax'
-        }, {
-          name: 'taskmaster_private_marker',
-          value: secretMarker,
-          domain: '127.0.0.1',
-          path: '/',
-          hostOnly: true,
-          session: true,
-          httpOnly: true,
-          secure: false,
-          sameSite: 'lax'
-        }],
-        localStorage: [{ name: 'taskmaster_imported', value: 'accepted' }],
-        source: { extensionId: 'ignored-by-manager', tabUrl: fixtureOrigin }
-      }
+    let dashboardCodeWasOneTime = false;
+    try {
+      await api(baseUrl, '/v1/dashboard/session', {
+        method: 'POST',
+        body: { code: dashboardAuthorization.code }
+      });
+    } catch (error) {
+      dashboardCodeWasOneTime = error.code === 'INVALID_DASHBOARD_CODE';
+    }
+    add(
+      'dashboard one-time authorization',
+      typeof dashboardSession.dashboardToken === 'string' && dashboardCodeWasOneTime
+    );
+    const dashboardProfiles = await api(baseUrl, '/v1/profiles', {
+      token: dashboardSession.dashboardToken
     });
     add(
-      'session bridge privacy and import',
-      imported.status === 'partial' &&
-      imported.verification === 'storage_replaced_not_login_verified' &&
-      imported.cookieCount === 2 &&
-      imported.localStorageCount === 1 &&
-      imported.sessionCookieRetentionHours === 12 &&
-      !JSON.stringify(imported).includes(secretMarker)
+      'dashboard scoped Profile access',
+      dashboardProfiles.profiles.some((item) => item.id === profile.id)
     );
+
+    let removedSessionRoute = false;
+    try {
+      await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}/session`, {
+        method: 'POST',
+        token,
+        body: {}
+      });
+    } catch (error) {
+      removedSessionRoute = error.code === 'NOT_FOUND';
+    }
+    add('session transfer route removed', removedSessionRoute);
 
     const uploadPath = resolve(ROOT, 'test', 'fixtures', 'upload.txt');
     const acceptanceRunId = Date.now().toString(36);
@@ -262,7 +229,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
           idempotencyKey: `acceptance-${acceptanceRunId}-${behavior}`,
           behavior,
           timeoutMs: 90_000,
-          input: { url: fixture.url, uploadPath, expectedSession: true }
+          input: { url: fixture.url, uploadPath }
         }
       });
       const task = await waitForTask(baseUrl, token, created.task.id);
@@ -306,10 +273,6 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     add('click and select', allTrue('checkbox') && allTrue('select'));
     add('file upload', allTrue('upload'));
     add('cookie and local storage', allTrue('cookie') && allTrue('localStorage'));
-    add(
-      'imported session persisted',
-      allTrue('session-import-cookie') && allTrue('session-import-storage')
-    );
     add('file download', allTrue('download'));
     add('screenshot fallback primitive', allTrue('screenshot'));
     add(
@@ -337,31 +300,17 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       ephemeralProfile?.id && ephemeralProfile.kind === 'ephemeral' && ephemeralProfile.state === 'idle'
     );
 
-    for (const operation of ['open', 'session']) {
-      let rejected = false;
-      try {
-        await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}/${operation}`, {
-          method: 'POST',
-          token: operation === 'session' ? paired.token : token,
-          ...(operation === 'session' ? {
-            headers: { Origin: extensionOrigin },
-            body: {
-              origin: fixtureOrigin,
-              cookies: [],
-              localStorage: [],
-              source: { tabUrl: fixtureOrigin }
-            }
-          } : { body: {} })
-        });
-      } catch (error) {
-        rejected = error.code === (
-          operation === 'open'
-            ? 'EPHEMERAL_PROFILE_OPEN_UNSUPPORTED'
-            : 'EPHEMERAL_PROFILE_SESSION_UNSUPPORTED'
-        );
-      }
-      add(`ephemeral Profile rejects ${operation}`, rejected);
+    let ephemeralOpenRejected = false;
+    try {
+      await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}/open`, {
+        method: 'POST',
+        token,
+        body: {}
+      });
+    } catch (error) {
+      ephemeralOpenRejected = error.code === 'EPHEMERAL_PROFILE_OPEN_UNSUPPORTED';
     }
+    add('ephemeral Profile rejects open', ephemeralOpenRejected);
 
     const ephemeralTasks = [];
     const ephemeralReports = [];

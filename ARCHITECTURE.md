@@ -3,7 +3,7 @@
 ## Invariants
 
 1. Browser work is executed only through Playwright APIs.
-2. The everyday-browser extension is control-plane only. Its sole page-data capability is a user-clicked, origin-scoped session transfer.
+2. The same-origin Web Dashboard is the only human control plane. Login state is created directly inside a persistent Playwright Profile.
 3. Every Profile has at most one live lease. A persistent Profile owns browser state; an ephemeral Profile is a clean task-scoped context template and retains none after confirmed cleanup.
 4. Every task has a state, heartbeat, progress record, output directory, and fail-closed cleanup proof. An unconfirmed browser close blocks the Profile lease.
 5. Unknown action outcomes are inspected before retrying.
@@ -11,36 +11,33 @@
 7. Core runtime remains site-agnostic; specialized Skills provide site behavior.
 8. Agent hosts receive scoped MCP identities; no host configuration contains Manager, browser, or account credentials.
 9. Agent-visible task results contain bounded summaries and declared artifacts only after completion verification, never local execution paths.
-10. A persistent Ed25519 Manager identity authenticates the loopback endpoint before any admin, extension, or session credential leaves its owner.
+10. A persistent Ed25519 Manager identity authenticates the loopback endpoint before an admin or scoped Agent credential is sent.
 
 ## Components
 
 - `src/manager.mjs`: loopback HTTP manager and API.
 - `src/runtime/task-worker.mjs`: isolated Playwright task process.
-- `src/runtime/import-session-worker.mjs`: memory-to-profile session importer.
 - `src/cli.mjs`: fixed Agent entrypoint.
 - `src/mcp/`: standard STDIO MCP server and scoped Manager client.
 - `src/registration/`: transactional, per-host MCP configuration adapters.
 - `dashboard/`: full management interface served by the manager.
-- `extension/`: thin Chromium control panel and explicit session bridge.
 - `skills/eric-task-master/`: progressive-disclosure Agent instructions.
 
 ## Manager API v1
 
-All responses are JSON. Loopback is the only supported bind address. Manager admin, scoped Agent, extension, and short-lived Dashboard credentials have separate roles.
+All responses are JSON. Loopback is the only supported bind address. Manager admin, scoped Agent, and short-lived Dashboard credentials have separate roles.
 
 The first Manager state initialization persists an Ed25519 key pair beside the protected admin credential. `POST /v1/identity/challenge` signs a caller-generated 256-bit nonce together with the exact service, version, API version, host, and listening port. CLI and MCP verify that proof against the public key pinned in local state before sending the Manager admin credential. A port occupant, wrong key, stale signature, or binding mismatch fails closed.
 
-### Health and pairing
+### Health and authorization
 
 - `GET /v1/health`
 - `POST /v1/identity/challenge`
 - `POST /v1/agents/issue`
-- `POST /v1/pair/authorize`
-- `GET /v1/pair/challenge`
-- `POST /v1/pair/extension`
+- `POST /v1/dashboard/authorize`
+- `POST /v1/dashboard/session`
 
-`connect` returns one `ETM1.<approval>.<fingerprint>` pairing code. The fingerprint is the full SHA-256 digest of the Manager public key. The MV3 popup verifies a fresh signed identity challenge against that fingerprint before sending the pairing code, and stores the resulting public identity pin only in `chrome.storage` trusted contexts. Every later request carrying the extension token re-verifies the pin. Session transfer additionally verifies identity before reading page state, rechecks tab and origin before sending, and revokes its temporary origin permission in `finally`.
+`connect` verifies the Manager identity pinned in local state, uses the protected Manager credential to mint one short-lived Dashboard authorization code, and returns a Dashboard URL containing only that one-use code. The Dashboard immediately exchanges it for an in-memory session and removes the code from browser history.
 
 ### Profiles
 
@@ -50,11 +47,10 @@ The first Manager state initialization persists an Ed25519 key pair beside the p
 - `DELETE /v1/profiles/:id`
 - `POST /v1/profiles/:id/open`
 - `POST /v1/profiles/:id/close`
-- `POST /v1/profiles/:id/session`
 
-`kind` is immutable. Agent-created Profiles are `private` by default and may be changed to `shared` only by their owner or the local control plane. Private Profiles are hidden from and unusable by other scoped Agents. Shared Profile access never grants access to another Agent's task record or artifacts. Legacy Profiles without an access field migrate as shared for compatibility. `persistent` Profiles can be opened and receive explicit origin-scoped session transfer. `ephemeral` Profiles reject both operations and launch `browser.newContext()` inside each task; cleanup closes the context and owning browser.
+`kind` is immutable. Agent-created Profiles are `private` by default and may be changed to `shared` only by their owner or the local control plane. Private Profiles are hidden from and unusable by other scoped Agents. Shared Profile access never grants access to another Agent's task record or artifacts. Legacy Profiles without an access field migrate as shared for compatibility. A `persistent` Profile can be opened from the Dashboard so the user can sign in directly in its Playwright window; its native `userDataDir` retains that state. An `ephemeral` Profile cannot be opened manually and launches `browser.newContext()` inside each task; cleanup closes the context and owning browser.
 
-Agent authorization is scoped to one stable registered MCP client ID and role tuple. Internal Manager, Dashboard, extension, task, Profile, and session principal names/prefixes cannot be issued as Agent IDs. Different host registrations/client IDs are separate principals. Multiple conversations that reuse one host registration intentionally share that principal; deployments needing tenant isolation assign distinct client IDs.
+Agent authorization is scoped to one stable registered MCP client ID and role tuple. Internal and legacy-reserved Manager, Dashboard, extension, task, Profile, and session principal names/prefixes cannot be issued as Agent IDs. Different host registrations/client IDs are separate principals. Multiple conversations that reuse one host registration intentionally share that principal; deployments needing tenant isolation assign distinct client IDs.
 
 ### Tasks
 
@@ -78,7 +74,7 @@ Agent authorization is scoped to one stable registered MCP client ID and role tu
 - `POST /v1/dashboard/authorize`
 - `POST /v1/dashboard/session`
 
-Dashboard URLs never contain the Manager admin credential. A Manager admin or paired extension creates a one-use authorization code; the page exchanges it for an in-memory, expiring Dashboard session.
+Dashboard URLs never contain the Manager admin credential. A Manager admin creates a one-use authorization code; the page exchanges it for an in-memory, expiring Dashboard session.
 
 ## Profile states
 
@@ -92,7 +88,7 @@ An active task changes the state to `leased`. A stale non-browser lock is recove
 
 Manager owns a bounded FIFO scheduler. Different Profiles may occupy independent slots; work for the same Profile remains queued until the previous Worker exits and its lease is released. Queue position/reason are public. Manager restart preserves never-started queued tasks and fails interrupted active work closed.
 
-Task and manually opened Profile leases renew through a serialized barrier. Finalization first stops new renewals, drains the in-flight renewal, then releases exactly once. A live session import/manual Profile is treated as busy; a dead owner without cleanup proof blocks queued work instead of being mistaken for ordinary contention.
+Task and manually opened Profile leases renew through a serialized barrier. Finalization first stops new renewals, drains the in-flight renewal, then releases exactly once. A manually opened Profile is treated as busy; a dead owner without cleanup proof blocks queued work instead of being mistaken for ordinary contention. Legacy `session-import:*` leases are migration-only: a matching cleanup receipt may release them, while missing proof keeps the Profile quarantined.
 
 Side states are `waiting_user`, `cooling_down`, `recovering`, `failed`, and `cancelled`. Terminal tasks always pass through cleanup.
 

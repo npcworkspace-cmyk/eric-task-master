@@ -40,7 +40,7 @@ Task Master does not replace Agent reasoning. It gives that reasoning a dependab
 ## The three-layer model
 
 1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, and cleanup.
-2. **Real-browser control panel** — the Chromium extension manages Profiles, opens the Dashboard, and transfers the current site's login only after an explicit user click. It never becomes the page-automation engine.
+2. **Web control center** — the same-origin Dashboard manages Profiles and tasks. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
 This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
@@ -62,14 +62,13 @@ If a user gives you this GitHub URL, follow the steps below in order. Do not inv
 
 5. `connect` installs the lockfile-pinned runtime and matching Playwright Chromium, safely migrates an idle older Manager, starts the loopback Manager, runs real-browser acceptance, and registers supported local MCP hosts. If an older Manager still has work, migration stops without interrupting it.
 6. Follow the returned `nextAction`. After correcting the named precondition, retry the same command at most once; do not branch into a speculative replacement controller.
-7. If the Chromium extension is already installed from this checkout, reload it after a version update. Otherwise load [`extension/`](./extension/) as an unpacked extension.
-8. Ask the user to paste the returned one-time `ETM1...` code into the extension and click **Pair**. This is the only required human authorization in the normal bootstrap.
-9. If a host reports `registered_pending_restart`, ask the user to reload that Agent host once.
-10. Call `taskmaster_status`, then `taskmaster_profiles_list`. When both succeed, ask the user what browser task to run.
+7. Open the returned Dashboard URL when Profile or task management is needed. It contains a short-lived one-use authorization code, never the Manager credential.
+8. If a host reports `registered_pending_restart`, ask the user to reload that Agent host once.
+9. Call `taskmaster_status`, then `taskmaster_profiles_list`. When both succeed, ask the user what browser task to run.
 
 Copyable request for a new Agent:
 
-> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. The Chromium extension is already installed. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Ask me only when the extension pairing code is ready; after status and Profile discovery succeed, ask what task I want to run.
+> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Return the authorized Dashboard URL; after status and Profile discovery succeed, ask what task I want to run.
 
 ## Everyday use
 
@@ -81,7 +80,7 @@ The Agent then uses one durable loop: discover a task type, start once with an i
 
 ### Profiles
 
-- **persistent** — isolated reusable state for logged-in and recurring work;
+- **persistent** — isolated reusable state for logged-in and recurring work; open it from the Dashboard and sign in directly in its Playwright window;
 - **ephemeral / 隐身临时** — a clean non-persistent browser for each no-login task, destroyed after cleanup.
 
 ### Behavior

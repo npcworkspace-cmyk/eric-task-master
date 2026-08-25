@@ -47,7 +47,6 @@ Usage:
   taskmaster artifacts list TASK_ID [--json]
   taskmaster artifacts read TASK_ID --artifact ARTIFACT_ID [--offset N] [--max-bytes N]
   taskmaster mcp status|register|unregister|rollback [--json]
-  taskmaster extension-path [--json]
 
 Task run follows progress until terminal state by default.`;
 
@@ -444,9 +443,6 @@ async function connect(options, json) {
       'Read the registration result, resolve the named conflict, and rerun connect once.'
     );
   }
-  const pairing = await requestJson(config.baseUrl, '/v1/pair/authorize', {
-    method: 'POST', body: {}, token
-  });
   const dashboardAuthorization = await requestJson(config.baseUrl, '/v1/dashboard/authorize', {
     method: 'POST', body: {}, token
   });
@@ -460,12 +456,6 @@ async function connect(options, json) {
     },
     acceptance,
     mcpRegistration: registration,
-    extensionPairing: {
-      pairingCode: pairing.pairingCode,
-      expiresInMs: pairing.expiresInMs,
-      nextAction: 'Enter this one-time code in the Task Master extension panel.'
-    },
-    extensionPath: resolve(ROOT, 'extension'),
     dashboard: `${config.baseUrl}/dashboard#${new URLSearchParams({ code: dashboardAuthorization.code })}`,
     nextAction: registration.results?.some((item) => item.status === 'registered_pending_restart')
       ? 'Restart or reload the registered Agent host once, then use Task Master MCP tools.'
@@ -927,10 +917,6 @@ async function main() {
   if (command === 'status') {
     const config = settings(options);
     emit({ ok: true, manager: await health(config) }, json);
-    return;
-  }
-  if (command === 'extension-path') {
-    emit({ ok: true, path: resolve(ROOT, 'extension') }, json);
     return;
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown command: ${command}`);

@@ -85,11 +85,6 @@ export function parseBearer(request) {
   return match?.[1] ?? null;
 }
 
-export function isChromeExtensionOrigin(origin) {
-  if (typeof origin !== 'string') return false;
-  return /^chrome-extension:\/\/[a-p]{32}$/.test(origin);
-}
-
 export function requestOrigin(request) {
   const origin = request.headers.origin;
   return typeof origin === 'string' ? origin : null;
@@ -99,7 +94,7 @@ export function corsHeaders(origin) {
   return {
     'access-control-allow-origin': origin,
     'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'access-control-allow-headers': 'authorization, content-type, x-taskmaster-pairing-code, x-taskmaster-extension-id',
+    'access-control-allow-headers': 'authorization, content-type',
     'access-control-max-age': '600',
     vary: 'Origin'
   };

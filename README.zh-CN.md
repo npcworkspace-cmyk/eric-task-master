@@ -38,7 +38,7 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 ## 三层模型
 
 1. **Task Master 运行时**：纯 Playwright 执行、持久化与临时 Profile、任务队列、进度、恢复、证据和清理。
-2. **真实浏览器控制面板**：Chromium 扩展负责管理 Profile、打开 Dashboard，以及在用户明确点击后同步当前网站登录态；扩展不承担页面自动化。
+2. **Web 控制中台**：同源 Dashboard 统一管理 Profile 和任务；用户直接在隔离的 Playwright 持久 Profile 中登录。
 3. **MCP + Skills + Task Packs**：Agent 只接触精简的高级任务接口，行业和网站能力独立叠加，不污染核心。
 
 这样可以用一个稳定的万能基座，持续定义不同的专属批量行动助手。
@@ -60,14 +60,13 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 
 5. `connect` 会安装锁定依赖和匹配的 Playwright Chromium；在旧 Manager 空闲时完成可信的优雅升级；启动本地 Manager；执行真实浏览器验收；并注册已支持的 MCP 宿主。如果旧 Manager 还有任务，升级会停止且不会打断原任务。
 6. 严格执行返回的 `nextAction`。修复明确前置条件后，最多原样重试同一条命令一次；不要发散成另一套临时控制器。
-7. 浏览器扩展已经从当前项目目录安装时，版本更新后点击一次“重新加载”；没有安装时，把 [`extension/`](./extension/) 作为已解压扩展加载。
-8. 让用户把返回的 `ETM1...` 一次性配对码粘贴进扩展并点击“配对”。这是正常启动流程中唯一必须由用户完成的授权动作。
-9. 如果宿主返回 `registered_pending_restart`，让用户只重启或重新加载该 Agent 宿主一次。
-10. 调用 `taskmaster_status` 和 `taskmaster_profiles_list`。两项成功后，再询问用户要执行什么浏览器任务。
+7. 需要管理 Profile 或任务时，打开返回的 Dashboard URL。它只包含短时一次性授权码，不包含 Manager 凭据。
+8. 如果宿主返回 `registered_pending_restart`，让用户只重启或重新加载该 Agent 宿主一次。
+9. 调用 `taskmaster_status` 和 `taskmaster_profiles_list`。两项成功后，再询问用户要执行什么浏览器任务。
 
 可以直接复制给新 Agent：
 
-> 安装并启动 `https://github.com/npcworkspace-cmyk/eric-task-master`。Chromium 扩展已经安装。拉取完整仓库，阅读或安装 `skills/eric-task-master`，只运行 `node scripts/taskmaster.mjs connect --json`，不要发明其他控制器或端口。扩展配对码准备好时再通知我；状态和 Profile 检查成功后，询问我要执行什么任务。
+> 安装并启动 `https://github.com/npcworkspace-cmyk/eric-task-master`。拉取完整仓库，阅读或安装 `skills/eric-task-master`，只运行 `node scripts/taskmaster.mjs connect --json`，不要发明其他控制器或端口。返回已授权的 Dashboard URL；状态和 Profile 检查成功后，询问我要执行什么任务。
 
 ## 日常使用
 
@@ -79,7 +78,7 @@ Agent 随后只走一条持久任务路径：发现任务类型、使用幂等�
 
 ### Profile
 
-- **persistent**：适合登录态和重复账号工作，每个 Profile 独立保存浏览器状态；
+- **persistent**：适合登录态和重复账号工作；从 Dashboard 打开后，直接在该 Playwright 窗口中登录；
 - **ephemeral / 隐身临时**：每个无登录任务都使用全新非持久浏览器，清理后销毁。
 
 ### 行为模式

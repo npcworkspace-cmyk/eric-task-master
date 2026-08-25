@@ -7,7 +7,6 @@ import { createHmac } from 'node:crypto';
 import { createManager } from '../src/manager.mjs';
 import { VERSION } from '../src/contracts.mjs';
 
-const EXTENSION_ORIGIN = `chrome-extension://${'a'.repeat(32)}`;
 
 async function json(response) {
   const body = await response.json();
@@ -30,7 +29,7 @@ async function managerFixture(t) {
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Task Master</title>');
 
   const tasks = new Map();
-  const calls = { open: [], close: [], imports: [], resumes: [] };
+  const calls = { open: [], close: [], resumes: [] };
   let taskService;
   const buildTaskService = ({ profileStore }) => taskService = {
     async list() {
@@ -78,21 +77,6 @@ async function managerFixture(t) {
         await profileStore.releaseLease(id, `profile-open:${id}`);
       }
     },
-    async importSession(id, bundle) {
-      calls.imports.push({ id, bundle });
-      if (bundle.cookies[0]?.value === 'throw-secret') {
-        throw Object.assign(new Error(`Import rejected ${bundle.cookies[0].value}`), {
-          code: 'SESSION_IMPORT_REJECTED',
-          statusCode: 400
-        });
-      }
-      return {
-        status: 'partial',
-        verification: 'storage_replaced_not_login_verified',
-        cookieCount: bundle.cookies.length,
-        localStorageCount: bundle.localStorage.length
-      };
-    },
     async close() {
       for (const profile of await profileStore.list()) {
         if (profile.lease?.ownerId === `profile-open:${profile.id}`) {
@@ -110,38 +94,6 @@ async function managerFixture(t) {
   await manager.start();
   t.after(() => manager.stop());
   return { root, manager, taskService, calls, baseUrl: manager.baseUrl };
-}
-
-async function pair(baseUrl, managerToken) {
-  const approval = await json(await fetch(`${baseUrl}/v1/pair/authorize`, {
-    method: 'POST',
-    headers: headers(managerToken),
-    body: '{}'
-  }));
-  assert.equal(approval.response.status, 201);
-  assert.match(approval.body.pairingCode, /^ETM1\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/);
-  const challengeResult = await json(await fetch(`${baseUrl}/v1/pair/challenge`, {
-    headers: {
-      origin: EXTENSION_ORIGIN,
-      'x-taskmaster-pairing-code': approval.body.pairingCode
-    }
-  }));
-  assert.equal(challengeResult.response.status, 200);
-  assert.equal(
-    challengeResult.response.headers.get('access-control-allow-origin'),
-    EXTENSION_ORIGIN
-  );
-  const pairResult = await json(await fetch(`${baseUrl}/v1/pair/extension`, {
-    method: 'POST',
-    headers: { origin: EXTENSION_ORIGIN, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      challenge: challengeResult.body.challenge,
-      pairingCode: approval.body.pairingCode,
-      name: 'Test panel'
-    })
-  }));
-  assert.equal(pairResult.response.status, 201);
-  return pairResult.body.token;
 }
 
 async function issueAgent(baseUrl, managerToken, clientId) {
@@ -241,29 +193,25 @@ test('Agent credentials cannot occupy an internal principal namespace', async (t
   assert.equal(rejectedLegacy.body.error.code, 'INVALID_TOKEN');
 });
 
-test('manager requires auth and pairs only a Chrome extension origin', async (t) => {
-  const { manager, baseUrl } = await managerFixture(t);
+test('manager requires auth and removed extension routes stay unavailable', async (t) => {
+  const { baseUrl } = await managerFixture(t);
   const unauthorized = await json(await fetch(`${baseUrl}/v1/profiles`));
   assert.equal(unauthorized.response.status, 401);
   assert.equal(unauthorized.body.error.code, 'AUTH_REQUIRED');
 
-  const webChallenge = await json(await fetch(`${baseUrl}/v1/pair/challenge`, {
-    headers: { origin: 'https://example.com' }
-  }));
-  assert.equal(webChallenge.response.status, 403);
-  assert.equal(webChallenge.response.headers.get('access-control-allow-origin'), null);
-
-  const extensionToken = await pair(baseUrl, manager.token);
-  const bearerWithoutOrigin = await json(await fetch(`${baseUrl}/v1/profiles`, {
-    headers: { authorization: `Bearer ${extensionToken}` }
-  }));
-  assert.equal(bearerWithoutOrigin.response.status, 403);
-
-  const listed = await json(await fetch(`${baseUrl}/v1/profiles`, {
-    headers: headers(extensionToken, EXTENSION_ORIGIN)
-  }));
-  assert.equal(listed.response.status, 200);
-  assert.deepEqual(listed.body.profiles, []);
+  for (const [method, pathname] of [
+    ['POST', '/v1/pair/authorize'],
+    ['GET', '/v1/pair/challenge'],
+    ['POST', '/v1/pair/extension']
+  ]) {
+    const removed = await json(await fetch(`${baseUrl}${pathname}`, {
+      method,
+      headers: method === 'POST' ? { 'content-type': 'application/json' } : {},
+      ...(method === 'POST' ? { body: '{}' } : {})
+    }));
+    assert.equal(removed.response.status, 404, pathname);
+    assert.equal(removed.body.error.code, 'NOT_FOUND', pathname);
+  }
 });
 
 test('profile CRUD, behavior policy, open and close are exposed without leaking paths', async (t) => {
@@ -398,67 +346,6 @@ test('Agent-created Profiles are private until their owner explicitly shares the
   }));
   assert.equal(privateAgain.response.status, 200);
   assert.equal(privateAgain.body.profile.access, 'private');
-});
-
-test('session import is extension-only, origin scoped, and never echoes authentication data', async (t) => {
-  const { manager, baseUrl, calls } = await managerFixture(t);
-  const profileResult = await json(await fetch(`${baseUrl}/v1/profiles`, {
-    method: 'POST',
-    headers: headers(manager.token),
-    body: JSON.stringify({ name: 'Session target' })
-  }));
-  const profileId = profileResult.body.profile.id;
-  const extensionToken = await pair(baseUrl, manager.token);
-  const bundle = {
-    origin: 'https://example.com',
-    cookies: [{ name: 'session', value: 'top-secret', domain: '.example.com', path: '/' }],
-    localStorage: [{ name: 'access_token', value: 'also-secret' }],
-    source: { extensionId: 'untrusted', tabUrl: 'https://example.com/account' }
-  };
-
-  const managerAttempt = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/session`, {
-    method: 'POST',
-    headers: headers(manager.token),
-    body: JSON.stringify(bundle)
-  }));
-  assert.equal(managerAttempt.response.status, 403);
-
-  const imported = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/session`, {
-    method: 'POST',
-    headers: headers(extensionToken, EXTENSION_ORIGIN),
-    body: JSON.stringify(bundle)
-  }));
-  assert.equal(imported.response.status, 200);
-  assert.deepEqual(imported.body, {
-    profileId,
-    status: 'partial',
-    verification: 'storage_replaced_not_login_verified',
-    cookieCount: 1,
-    localStorageCount: 1
-  });
-  assert.equal(JSON.stringify(imported.body).includes('top-secret'), false);
-  assert.equal(calls.imports[0].bundle.source.extensionId, 'a'.repeat(32));
-  assert.equal(calls.imports[0].bundle.cookies[0].value, 'top-secret');
-
-  const mismatch = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/session`, {
-    method: 'POST',
-    headers: headers(extensionToken, EXTENSION_ORIGIN),
-    body: JSON.stringify({ ...bundle, source: { tabUrl: 'https://other.example/page' } })
-  }));
-  assert.equal(mismatch.response.status, 400);
-  assert.equal(mismatch.body.error.code, 'SESSION_SOURCE_ORIGIN_MISMATCH');
-
-  const rejected = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/session`, {
-    method: 'POST',
-    headers: headers(extensionToken, EXTENSION_ORIGIN),
-    body: JSON.stringify({
-      ...bundle,
-      cookies: [{ ...bundle.cookies[0], value: 'throw-secret' }]
-    })
-  }));
-  assert.equal(rejected.response.status, 400);
-  assert.equal(rejected.body.message, 'Session import failed');
-  assert.equal(JSON.stringify(rejected.body).includes('throw-secret'), false);
 });
 
 test('task routes delegate to taskService and strip private task fields', async (t) => {

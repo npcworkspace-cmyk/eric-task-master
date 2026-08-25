@@ -8,11 +8,9 @@ import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs'
 import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
 import { removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
-import { SESSION_IMPORT_DEADLINES } from './session-import-deadlines.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
 const PROFILE_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
-const IMPORT_WORKER = fileURLToPath(new URL('./import-session-worker.mjs', import.meta.url));
 const PROJECT_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const ACCEPTANCE_TASK = fileURLToPath(new URL('../../examples/tasks/acceptance-task.mjs', import.meta.url));
 const READ_PAGE_TASK = fileURLToPath(new URL('../../examples/tasks/read-page-task.mjs', import.meta.url));
@@ -43,13 +41,7 @@ export const TASK_SERVICE_DEADLINES = Object.freeze({
   workerHardKillGraceMs: 5_000,
   profileOpenMs: 30_000,
   profileCloseMs: 25_000,
-  profileKillGraceMs: 5_000,
-  sessionImportMs: SESSION_IMPORT_DEADLINES.operationMs,
-  sessionImportCleanupGraceMs: SESSION_IMPORT_DEADLINES.cleanupGraceMs,
-  sessionImportHardKillGraceMs: SESSION_IMPORT_DEADLINES.hardKillGraceMs,
-  sessionImportWorstCaseMs: SESSION_IMPORT_DEADLINES.managerWorstCaseMs,
-  // Compatibility alias for embedders that configured the old option name.
-  sessionImportRollbackGraceMs: SESSION_IMPORT_DEADLINES.cleanupGraceMs
+  profileKillGraceMs: 5_000
 });
 
 const ARTIFACT_MIME_TYPES = Object.freeze({
@@ -101,7 +93,7 @@ function callerIdentity(caller = {}) {
 
 function profileCallerIdentity(caller = {}) {
   if (
-    ['manager-admin', 'agent', 'extension'].includes(caller.role) &&
+    ['manager-admin', 'agent'].includes(caller.role) &&
     typeof caller.clientId === 'string' && caller.clientId &&
     !(caller.role === 'agent' && isReservedAgentClientId(caller.clientId))
   ) {
@@ -125,7 +117,7 @@ function isSamePrincipal(entry, caller) {
 }
 
 function canUseProfile(profile, caller) {
-  if (['manager-admin', 'extension'].includes(caller.role)) return true;
+  if (caller.role === 'manager-admin') return true;
   if (caller.role !== 'agent') return false;
   return profile?.ownerClientId === caller.clientId || (profile?.access || 'shared') === 'shared';
 }
@@ -437,10 +429,6 @@ export function createTaskService({
   progressFailureMs = PROGRESS_FAILURE_MS,
   maxConcurrentTasks = 4,
   maxQueuedTasks = 100,
-  sessionImportTimeoutMs = TASK_SERVICE_DEADLINES.sessionImportMs,
-  sessionImportCleanupGraceMs,
-  sessionImportRollbackGraceMs,
-  sessionImportHardKillGraceMs = TASK_SERVICE_DEADLINES.sessionImportHardKillGraceMs,
   cleanupReconcileIntervalMs = CLEANUP_RECONCILE_INTERVAL_MS,
   cleanupReconcileGraceMs = CLEANUP_RECONCILE_GRACE_MS,
   taskTypeRegistry,
@@ -486,18 +474,6 @@ export function createTaskService({
   if (!Number.isSafeInteger(maxQueuedTasks) || maxQueuedTasks < 1 || maxQueuedTasks > 10_000) {
     throw new TypeError('maxQueuedTasks must be an integer from 1 to 10000');
   }
-  if (!Number.isFinite(sessionImportTimeoutMs) || sessionImportTimeoutMs <= 0) {
-    throw new TypeError('sessionImportTimeoutMs must be positive');
-  }
-  const effectiveSessionImportCleanupGraceMs = sessionImportCleanupGraceMs ??
-    sessionImportRollbackGraceMs ??
-    TASK_SERVICE_DEADLINES.sessionImportCleanupGraceMs;
-  if (!Number.isFinite(effectiveSessionImportCleanupGraceMs) || effectiveSessionImportCleanupGraceMs <= 0) {
-    throw new TypeError('sessionImportCleanupGraceMs must be positive');
-  }
-  if (!Number.isFinite(sessionImportHardKillGraceMs) || sessionImportHardKillGraceMs <= 0) {
-    throw new TypeError('sessionImportHardKillGraceMs must be positive');
-  }
   if (!Number.isFinite(cleanupReconcileIntervalMs) || cleanupReconcileIntervalMs <= 0) {
     throw new TypeError('cleanupReconcileIntervalMs must be positive');
   }
@@ -511,7 +487,6 @@ export function createTaskService({
   const children = new Map();
   const openProfiles = new Map();
   const openingProfiles = new Map();
-  const activeSessionImports = new Map();
   const persistChains = new Map();
   const cleanupReconcileTails = new Map();
   const artifactDigestCache = new Map();
@@ -549,7 +524,7 @@ export function createTaskService({
     return path.join(cleanupReceiptsRoot, `profile-${digest}.json`);
   }
 
-  function sessionCleanupReceiptPath(ownerId) {
+  function legacySessionCleanupReceiptPath(ownerId) {
     const digest = createHash('sha256').update(ownerId).digest('hex');
     return path.join(cleanupReceiptsRoot, `session-${digest}.json`);
   }
@@ -591,11 +566,11 @@ export function createTaskService({
     return true;
   }
 
-  async function reconcileSessionCleanup(profile) {
+  async function reconcileLegacySessionCleanup(profile) {
     const lease = profile?.lease;
     if (!lease || !/^session-import:/u.test(lease.ownerId || '')) return false;
     if (await processAlive(lease.pid)) return false;
-    const receiptPath = sessionCleanupReceiptPath(lease.ownerId);
+    const receiptPath = legacySessionCleanupReceiptPath(lease.ownerId);
     const confirmed = await verifyCleanupReceipt(receiptPath, {
       kind: 'session',
       profileId: profile.id,
@@ -619,7 +594,7 @@ export function createTaskService({
     const profiles = await profileStore.list();
     for (const profile of profiles) {
       await reconcileProfileCleanup(profile);
-      await reconcileSessionCleanup(profile);
+      await reconcileLegacySessionCleanup(profile);
     }
   }
 
@@ -646,7 +621,7 @@ export function createTaskService({
       // recoverable when their task-bound receipt proves browser cleanup.
       if (current.lease.cleanupRequired !== true && !/^task:/u.test(ownerId)) return current;
       if (/^profile-open:/u.test(ownerId)) await reconcileProfileCleanup(current);
-      else if (/^session-import:/u.test(ownerId)) await reconcileSessionCleanup(current);
+      else if (/^session-import:/u.test(ownerId)) await reconcileLegacySessionCleanup(current);
       else if (/^task:/u.test(ownerId)) await reconcileTaskCleanup(current);
       return profileStore.get(profileId);
     });
@@ -902,13 +877,12 @@ export function createTaskService({
       const openProfileEntry = openProfiles.get(task.profileId);
       const knownLiveProfileOwner = openProfileEntry?.exited !== true &&
         openProfileEntry?.ownerId === activeLeaseOwner;
-      const knownLiveSessionOwner = activeSessionImports.get(task.profileId) === activeLeaseOwner;
       const leaseProcessAlive = Number.isSafeInteger(profile.lease?.pid) && profile.lease.pid > 0
         ? await processAlive(profile.lease.pid)
         : false;
       if (
         profile.state !== 'idle' && profile.lease?.ownerId !== task.leaseOwner &&
-        (knownLiveProfileOwner || knownLiveSessionOwner || leaseProcessAlive)
+        (knownLiveProfileOwner || leaseProcessAlive)
       ) {
         profileBlocked = true;
         task.queueReason = PROFILE_BUSY_QUEUE_REASON;
@@ -2882,224 +2856,6 @@ export function createTaskService({
     return registry.describe(name);
   }
 
-  async function importSession(profileId, bundle) {
-    await ready;
-    requireServiceOpen();
-    let profile = await profileStore.get(profileId);
-    profile = await reconcileAnyCleanup(profile);
-    if ((profile.kind || 'persistent') === 'ephemeral') {
-      throw new TaskServiceError(
-        'EPHEMERAL_PROFILE_SESSION_UNSUPPORTED',
-        'Ephemeral Profiles never accept or retain browser sessions',
-        409
-      );
-    }
-    if (profile.state !== 'idle' || profile.lease) {
-      throw new TaskServiceError('PROFILE_IN_USE', 'Target profile must be idle before session import', 409);
-    }
-    const ownerId = `session-import:${randomUUID().replaceAll('-', '')}`;
-    const cleanupReceiptPath = sessionCleanupReceiptPath(ownerId);
-    await rm(cleanupReceiptPath, { force: true });
-    let child = null;
-    let leaseAcquired = false;
-    let workerExited = false;
-    let workerExit = null;
-    let hardKilled = false;
-    let cleanupHandled = false;
-    let workerTerminationHandled = false;
-    let importSent = false;
-    let resolveExit;
-    const exitPromise = new Promise((resolve) => { resolveExit = resolve; });
-    try {
-      child = workerFactory(IMPORT_WORKER, 'session-import');
-      if (
-        !child ||
-        typeof child.once !== 'function' ||
-        typeof child.on !== 'function' ||
-        typeof child.send !== 'function' ||
-        typeof child.kill !== 'function'
-      ) {
-        throw new TaskServiceError('SESSION_IMPORT_WORKER_INVALID', 'Session import worker could not be initialized', 500);
-      }
-      child.once('exit', (code, signal) => {
-        workerExited = true;
-        workerExit = { code, signal: signal || null };
-        resolveExit(workerExit);
-      });
-      await profileStore.acquireLease(profileId, ownerId, {
-        pid: child.pid,
-        ttlMs: sessionImportTimeoutMs + effectiveSessionImportCleanupGraceMs +
-          (2 * sessionImportHardKillGraceMs) + 60_000,
-        cleanupRequired: true
-      });
-      leaseAcquired = true;
-      activeSessionImports.set(profileId, ownerId);
-      let finishTerminal;
-      const terminalPromise = new Promise((resolve) => {
-        let terminalSettled = false;
-        let timeoutRequested = false;
-        let timer;
-        let hardStopTimer;
-        const finish = (value) => {
-          if (terminalSettled) return;
-          terminalSettled = true;
-          clearTimeout(timer);
-          clearTimeout(hardStopTimer);
-          resolve({ ...value, timeoutRequested });
-        };
-        finishTerminal = finish;
-        child.once('exit', (code, signal) => finish({ kind: 'exit', code, signal: signal || null }));
-        child.once('error', (error) => finish({ kind: 'worker-error', error }));
-        child.on('message', (message) => {
-          if (message?.type === 'result') finish({ kind: 'result', result: message.result });
-          if (message?.type === 'error') finish({ kind: 'error', error: message.error });
-        });
-        timer = setTimeout(() => {
-          timeoutRequested = true;
-          send(child, { type: 'cancel' });
-          hardStopTimer = setTimeout(() => {
-            hardKilled = true;
-            finish({ kind: 'hard-kill' });
-            child.kill('SIGKILL');
-          }, effectiveSessionImportCleanupGraceMs);
-        }, sessionImportTimeoutMs);
-        if (workerExited) {
-          finish({ kind: 'exit', ...workerExit });
-        }
-      });
-      if (!workerExited) {
-        importSent = await sendChildMessageConfirmed(child, {
-          type: 'import',
-          config: {
-            profile,
-            bundle,
-            cleanupReceiptPath,
-            cleanupReceipt: { kind: 'session', profileId, ownerId }
-          }
-        });
-        if (!importSent) {
-          finishTerminal({
-            kind: 'worker-error',
-            error: new TaskServiceError('SESSION_IMPORT_SEND_FAILED', 'Session import worker is unavailable', 500)
-          });
-        }
-      }
-      const terminal = await terminalPromise;
-
-      if (!workerExited) {
-        if (terminal.kind === 'hard-kill') {
-          await waitForEntry(exitPromise, sessionImportHardKillGraceMs);
-        } else if (!(await waitForEntry(exitPromise, sessionImportHardKillGraceMs))) {
-          hardKilled = true;
-          child.kill?.('SIGKILL');
-          await waitForEntry(exitPromise, sessionImportHardKillGraceMs);
-        }
-      }
-      workerTerminationHandled = true;
-
-      const rawErrorCode = terminal.kind === 'error' ? terminal.error?.code : null;
-      const expectedOutcomes = terminal.kind === 'result'
-        ? ['committed']
-        : terminal.kind === 'error' && rawErrorCode !== 'SESSION_IMPORT_ROLLBACK_FAILED'
-          ? ['rolled_back']
-          : ['committed', 'rolled_back'];
-      let receiptConfirmed = false;
-      if (workerExited && !hardKilled && rawErrorCode !== 'SESSION_IMPORT_ROLLBACK_FAILED') {
-        for (const outcome of expectedOutcomes) {
-          receiptConfirmed = await verifyCleanupReceipt(cleanupReceiptPath, {
-            kind: 'session',
-            profileId,
-            ownerId,
-            workerPid: child.pid,
-            outcome
-          });
-          if (receiptConfirmed) break;
-        }
-      }
-      if (receiptConfirmed) {
-        receiptConfirmed = await profileStore.releaseLease(profileId, ownerId, {
-          cleanupConfirmed: true
-        }).catch(() => false);
-        if (receiptConfirmed) await removeCleanupReceipt(cleanupReceiptPath).catch(() => {});
-      }
-      if (!receiptConfirmed) await markCleanupUnknown(profileId, ownerId);
-      cleanupHandled = true;
-
-      if (terminal.kind === 'result') {
-        if (!receiptConfirmed) {
-          throw new TaskServiceError(
-            'SESSION_IMPORT_CLEANUP_UNCONFIRMED',
-            'Session import completed but browser cleanup could not be confirmed',
-            500
-          );
-        }
-        const result = terminal.result || {};
-        return {
-          status: result.status === 'verified' ? 'verified' : 'partial',
-          cookieCount: Number(result.cookieCount) || 0,
-          localStorageCount: Number(result.localStorageCount) || 0,
-          sessionCookieRetentionHours: Number(result.sessionCookieRetentionHours) || 0,
-          verification: typeof result.verification === 'string'
-            ? result.verification
-            : 'storage_replaced_not_login_verified',
-          message: result.status === 'verified'
-            ? 'Session was imported and verified'
-            : 'Session material was imported; account login still requires site-level verification'
-        };
-      }
-      if (terminal.kind === 'error') {
-        if (terminal.timeoutRequested && rawErrorCode !== 'SESSION_IMPORT_ROLLBACK_FAILED') {
-          throw new TaskServiceError('SESSION_IMPORT_TIMEOUT', 'Session import timed out', 504);
-        }
-        throw Object.assign(new Error(terminal.error?.message), terminal.error);
-      }
-      if (terminal.timeoutRequested || terminal.kind === 'hard-kill') {
-        throw new TaskServiceError(
-          'SESSION_IMPORT_ROLLBACK_FAILED',
-          'Session import timed out and rollback could not be confirmed',
-          500
-        );
-      }
-      if (terminal.kind === 'worker-error') throw terminal.error;
-      throw new TaskServiceError(
-        'SESSION_IMPORT_EXITED',
-        'Session import worker exited before returning a result',
-        500
-      );
-    } catch (error) {
-      if (child && !leaseAcquired && !importSent) {
-        child.kill?.('SIGKILL');
-        workerTerminationHandled = true;
-      } else if (child && !workerExited && !workerTerminationHandled) {
-        if (importSent) send(child, { type: 'cancel' });
-        const gracefulMs = importSent
-          ? effectiveSessionImportCleanupGraceMs
-          : sessionImportHardKillGraceMs;
-        if (!(await waitForEntry(exitPromise, gracefulMs))) {
-          hardKilled = importSent;
-          child.kill?.('SIGKILL');
-          await waitForEntry(exitPromise, sessionImportHardKillGraceMs);
-        }
-      }
-      if (!cleanupHandled && !importSent) {
-        if (!leaseAcquired) {
-          cleanupHandled = true;
-        } else {
-          const released = await profileStore.releaseLease(profileId, ownerId, {
-            cleanupConfirmed: true
-          }).catch(() => false);
-          cleanupHandled = released === true;
-        }
-      }
-      if (!cleanupHandled) await markCleanupUnknown(profileId, ownerId);
-      throw error;
-    } finally {
-      bundle = null;
-      if (activeSessionImports.get(profileId) === ownerId) activeSessionImports.delete(profileId);
-      void scheduleQueuedTasks().catch(() => {});
-    }
-  }
-
   async function openProfile(
     profileId,
     suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
@@ -3110,6 +2866,13 @@ export function createTaskService({
     let requestedProfile = requireProfileUse(await profileStore.get(profileId), caller);
     requestedProfile = await reconcileAnyCleanup(requestedProfile);
     requireProfileUse(requestedProfile, caller);
+    if (/^session-import:/u.test(requestedProfile.lease?.ownerId || '')) {
+      throw new TaskServiceError(
+        'LEGACY_SESSION_IMPORT_CLEANUP_UNCONFIRMED',
+        'A legacy session import has no trusted cleanup proof; this Profile remains quarantined',
+        409
+      );
+    }
     const existing = openProfiles.get(profileId);
     if (existing) {
       if (caller.role !== 'manager-admin' && !isSamePrincipal(existing, caller)) {
@@ -3568,7 +3331,6 @@ export function createTaskService({
     installTaskPack,
     listTaskTypes,
     describeTaskType,
-    importSession,
     openProfile,
     closeProfile,
     close

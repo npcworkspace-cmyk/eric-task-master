@@ -75,6 +75,26 @@ export async function runCommercialAcceptance() {
       clientId: CLIENT_ID,
       clientName: 'Commercial acceptance agent'
     });
+    const manualProfile = await client.createProfile({
+      name: 'Commercial persistent manual login',
+      kind: 'persistent',
+      defaultBehavior: 'adaptive',
+      headless: true
+    });
+    const openedManualProfile = await client.openProfile(manualProfile.id);
+    assertCheck(
+      checks,
+      'persistent Profile opens through Playwright without an extension',
+      openedManualProfile.state === 'open'
+    );
+    const closedManualProfile = await client.closeProfile(manualProfile.id);
+    assertCheck(
+      checks,
+      'persistent Profile close confirms cleanup and releases its lease',
+      closedManualProfile.state === 'idle'
+    );
+    await manager.profileStore.remove(manualProfile.id);
+
     const profiles = await Promise.all(Array.from({ length: 3 }, (_, index) => client.createProfile({
       name: `Commercial ephemeral ${index + 1}`,
       kind: 'ephemeral',

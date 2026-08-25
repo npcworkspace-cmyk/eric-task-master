@@ -18,7 +18,6 @@ export const meta = Object.freeze({
     properties: {
       url: { type: 'string', minLength: 8, maxLength: 4096 },
       uploadPath: { type: 'string', minLength: 1, maxLength: 4096 },
-      expectedSession: { type: 'boolean' },
       expectCleanStart: { type: 'boolean' }
     }
   }
@@ -40,15 +39,6 @@ export async function run({ page, context, input, outputDir, action, progress, c
       kind: 'ephemeral-clean-start',
       ok: !initialCookies.some((cookie) => cookie.name === 'taskmaster_fixture') && initialStorage === null
     });
-  }
-  if (input.expectedSession) {
-    const importedCookies = await context.cookies(input.url);
-    const importedStorage = await page.evaluate(() => localStorage.getItem('taskmaster_imported'));
-    evidence.push({
-      kind: 'session-import-cookie',
-      ok: importedCookies.some((cookie) => cookie.name === 'taskmaster_imported' && cookie.value === 'accepted')
-    });
-    evidence.push({ kind: 'session-import-storage', ok: importedStorage === 'accepted' });
   }
   await progress({ current: 1, total: 9, message: 'Fixture loaded' });
 

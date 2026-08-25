@@ -96,8 +96,6 @@ jobs:
           mkdir -p dist
           git archive --format=zip --prefix="eric-task-master-v${VERSION}/" \
             --output="dist/eric-task-master-v${VERSION}.zip" HEAD
-          git archive --format=zip --prefix="eric-task-master-extension-v${VERSION}/" \
-            --output="dist/eric-task-master-extension-v${VERSION}.zip" HEAD:extension
           git archive --format=zip --prefix="eric-task-master-skill-v${VERSION}/" \
             --output="dist/eric-task-master-skill-v${VERSION}.zip" HEAD:skills/eric-task-master
           (cd dist && sha256sum ./*.zip > SHA256SUMS)

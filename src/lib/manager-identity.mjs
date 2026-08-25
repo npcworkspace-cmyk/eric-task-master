@@ -11,13 +11,11 @@ import {
 
 export const MANAGER_IDENTITY_PROTOCOL = 'eric-task-master-identity-v1';
 export const MANAGER_SERVICE = 'eric-task-master';
-export const PAIRING_CODE_PREFIX = 'ETM1';
 
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const PUBLIC_KEY_BYTES = 32;
 const SIGNATURE_BYTES = 64;
 const FINGERPRINT_BYTES = 32;
-const PAIRING_APPROVAL_BYTES = 16;
 
 function identityError(code, message) {
   return Object.assign(new Error(message), { code });
@@ -212,34 +210,4 @@ export function verifyManagerIdentityProof(payload, expectedIdentity, expectedBi
     throw identityError('MANAGER_IDENTITY_SIGNATURE_INVALID', 'Manager identity signature is invalid');
   }
   return pin;
-}
-
-export function createPairingApprovalCode() {
-  return randomBytes(PAIRING_APPROVAL_BYTES).toString('base64url');
-}
-
-export function createPairingCode(approvalCode, fingerprint) {
-  decodeBase64Url(approvalCode, PAIRING_APPROVAL_BYTES, 'Pairing approval');
-  decodeBase64Url(fingerprint, FINGERPRINT_BYTES, 'Manager identity fingerprint');
-  return `${PAIRING_CODE_PREFIX}.${approvalCode}.${fingerprint}`;
-}
-
-export function parsePairingCode(value, expectedFingerprint) {
-  if (typeof value !== 'string') {
-    throw identityError('INVALID_PAIRING_CODE', 'Pairing code is invalid');
-  }
-  const parts = value.split('.');
-  if (parts.length !== 3 || parts[0] !== PAIRING_CODE_PREFIX) {
-    throw identityError('INVALID_PAIRING_CODE', 'Pairing code is invalid');
-  }
-  try {
-    decodeBase64Url(parts[1], PAIRING_APPROVAL_BYTES, 'Pairing approval');
-    decodeBase64Url(parts[2], FINGERPRINT_BYTES, 'Manager identity fingerprint');
-  } catch {
-    throw identityError('INVALID_PAIRING_CODE', 'Pairing code is invalid');
-  }
-  if (expectedFingerprint !== undefined && !secureEqualString(parts[2], expectedFingerprint)) {
-    throw identityError('PAIRING_IDENTITY_MISMATCH', 'Pairing code is for a different Manager identity');
-  }
-  return { approvalCode: parts[1], fingerprint: parts[2], pairingCode: value };
 }

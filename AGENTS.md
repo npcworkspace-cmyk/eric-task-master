@@ -2,8 +2,8 @@
 
 Read `ARCHITECTURE.md` before changing code.
 
-- Keep browser execution pure Playwright. Do not add CDP, Puppeteer, Chrome debugger, or page automation to the extension.
-- Keep the extension control-plane only; session transfer must remain origin-scoped and user-clicked.
+- Keep browser execution pure Playwright. Do not add CDP, Puppeteer, Chrome debugger, or a second browser-control plane.
+- Keep Profile and task management in the same-origin Web Dashboard; do not reintroduce browser extensions or session transfer.
 - Keep site-specific behavior in task modules or specialized Skills.
 - Preserve Profile exclusive leases, task heartbeat/progress, diagnostic screenshots, and deterministic cleanup.
 - Never expose cookies, tokens, authentication headers, or profile paths in public API responses or logs.

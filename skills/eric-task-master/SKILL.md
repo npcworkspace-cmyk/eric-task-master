@@ -19,12 +19,12 @@ node scripts/taskmaster.mjs connect --json
 
 Installation is incomplete until this command returns `ok: true` and its real-browser acceptance checks pass. It installs lockfile-pinned dependencies and Chromium when missing, safely migrates an idle authenticated older Manager, starts Manager, and registers STDIO MCP in detected supported Agent hosts. A busy older Manager returns `MANAGER_UPGRADE_BUSY` without interrupting its work; wait for it to settle and rerun the same command once. For any other startup failure, follow the exact `error.code` and `nextAction`, retry the same command at most once after fixing that precondition, and do not branch into speculative controllers.
 
-If the extension is already installed from the current checkout, reload it only after a version update. Otherwise load the repository's `extension/` directory. Ask the user to paste the returned `ETM1...` code and click **Pair**; never attempt to approve pairing for them.
+Open the `dashboard` URL returned by `connect` when the user needs to manage Profiles or tasks. It contains a short-lived one-use code, never the Manager credential.
 
 If registration reports `registered_pending_restart`, ask the user to reload that host once. Then call `taskmaster_status`, followed by `taskmaster_profiles_list`. When both succeed, ask what browser task to run. Create a Profile only when no suitable one exists because creation is non-idempotent:
 
-- choose `persistent` for login state or recurring account work;
-- choose `ephemeral` for no-login temporary work. It starts clean for every task and retains no browser state after cleanup. It cannot receive session transfer or be opened manually.
+- choose `persistent` for login state or recurring account work. Open it from the Dashboard and let the user sign in directly in that Playwright window;
+- choose `ephemeral` for no-login temporary work. It starts clean for every task, retains no browser state after cleanup, and cannot be opened manually.
 
 An Agent-created Profile is private to that stable Agent client ID by default. Set `access: "shared"` only when the user explicitly wants other registered local Agents to use the same browser state. Sharing a Profile never shares task status, results, or artifacts.
 

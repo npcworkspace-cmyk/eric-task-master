@@ -38,20 +38,14 @@ await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 
 const replacements = [
   ['src/contracts.mjs', `export const VERSION = '${current}';`, `export const VERSION = '${next}';`],
-  ['README.md', `Version: **${current}**`, `Version: **${next}**`],
-  ['extension/manifest.json', `"version": "${current}"`, `"version": "${next}"`]
+  ['README.md', `Version: **${current}**`, `Version: **${next}**`]
 ];
 
 for (const [relative, from, to] of replacements) {
   const file = resolve(root, relative);
-  try {
-    const source = await readFile(file, 'utf8');
-    if (!source.includes(from)) throw new Error(`${relative} does not contain ${from}`);
-    await writeFile(file, source.replace(from, to));
-  } catch (error) {
-    if (error.code === 'ENOENT' && relative === 'extension/manifest.json') continue;
-    throw error;
-  }
+  const source = await readFile(file, 'utf8');
+  if (!source.includes(from)) throw new Error(`${relative} does not contain ${from}`);
+  await writeFile(file, source.replace(from, to));
 }
 
 process.stdout.write(JSON.stringify({ previous: current, version: next }) + '\n');

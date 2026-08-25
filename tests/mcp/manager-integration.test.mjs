@@ -48,7 +48,6 @@ test('HTTP client matches the scoped Manager task and artifact APIs', async (t) 
     },
     async openProfile() {},
     async closeProfile() {},
-    async importSession() {},
     async close() {}
   };
   const manager = await createManager({

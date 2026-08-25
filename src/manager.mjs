@@ -8,11 +8,8 @@ import { JsonStore } from './lib/json-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import {
   createManagerIdentityProof,
-  createPairingApprovalCode,
-  createPairingCode,
   generateManagerIdentity,
   MANAGER_SERVICE,
-  parsePairingCode,
   validateIdentityNonce,
   validateManagerIdentity
 } from './lib/manager-identity.mjs';
@@ -22,7 +19,6 @@ import { isReservedAgentClientId } from './lib/principal.mjs';
 import {
   HttpError,
   corsHeaders,
-  isChromeExtensionOrigin,
   parseBearer,
   readJson,
   requestOrigin,
@@ -39,8 +35,6 @@ import {
   publicTask
 } from './contracts.mjs';
 
-const PAIRING_CHALLENGE_TTL_MS = 60_000;
-const PAIRING_APPROVAL_TTL_MS = 2 * 60_000;
 const DASHBOARD_APPROVAL_TTL_MS = 2 * 60_000;
 const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60_000;
 const MANAGER_NAME = MANAGER_SERVICE;
@@ -117,11 +111,6 @@ function isLoopbackRequestHost(hostHeader) {
   }
 }
 
-function publicExtension(extension) {
-  const { tokenHash: _tokenHash, ...safe } = extension;
-  return safe;
-}
-
 function publicAgent(agent) {
   return { clientId: agent.clientId, name: agent.name };
 }
@@ -158,14 +147,14 @@ function serviceCaller(auth) {
 }
 
 function canUseProfile(profile, auth) {
-  if (['manager-admin', 'dashboard', 'extension'].includes(auth?.role)) return true;
+  if (['manager-admin', 'dashboard'].includes(auth?.role)) return true;
   return auth?.role === 'agent' && (
     profile?.ownerClientId === auth.clientId || profile?.access === 'shared'
   );
 }
 
 function canManageProfile(profile, auth) {
-  if (['manager-admin', 'dashboard', 'extension'].includes(auth?.role)) return true;
+  if (['manager-admin', 'dashboard'].includes(auth?.role)) return true;
   return auth?.role === 'agent' && profile?.ownerClientId === auth.clientId;
 }
 
@@ -200,95 +189,6 @@ function requireTaskMethod(service, name) {
     throw new HttpError(501, 'TASK_SERVICE_UNAVAILABLE', `Task service does not implement ${name}`);
   }
   return service[name].bind(service);
-}
-
-function validatedSessionBundle(body, extension) {
-  const allowed = new Set(['origin', 'cookies', 'localStorage', 'source']);
-  const unknown = Object.keys(body).filter((key) => !allowed.has(key));
-  if (unknown.length) {
-    throw new HttpError(400, 'INVALID_SESSION_BUNDLE', `Unsupported fields: ${unknown.join(', ')}`);
-  }
-  let origin;
-  try {
-    const parsed = new URL(body.origin);
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== body.origin) throw new Error();
-    origin = parsed.origin;
-  } catch {
-    throw new HttpError(400, 'INVALID_SESSION_ORIGIN', 'origin must be an HTTP(S) origin');
-  }
-  if (!Array.isArray(body.cookies) || body.cookies.length > 5_000) {
-    throw new HttpError(400, 'INVALID_SESSION_COOKIES', 'cookies must be an array of at most 5000 items');
-  }
-  for (const cookie of body.cookies) {
-    if (
-      !cookie ||
-      typeof cookie !== 'object' ||
-      typeof cookie.name !== 'string' ||
-      typeof cookie.value !== 'string'
-    ) {
-      throw new HttpError(400, 'INVALID_SESSION_COOKIE', 'Each cookie must contain string name and value');
-    }
-  }
-  if (!Array.isArray(body.localStorage) || body.localStorage.length > 10_000) {
-    throw new HttpError(
-      400,
-      'INVALID_LOCAL_STORAGE',
-      'localStorage must be an array of at most 10000 items'
-    );
-  }
-  for (const item of body.localStorage) {
-    if (!item || typeof item.name !== 'string' || typeof item.value !== 'string') {
-      throw new HttpError(
-        400,
-        'INVALID_LOCAL_STORAGE_ITEM',
-        'Each localStorage item must contain string name and value'
-      );
-    }
-  }
-  if (!body.source || typeof body.source !== 'object' || typeof body.source.tabUrl !== 'string') {
-    throw new HttpError(400, 'INVALID_SESSION_SOURCE', 'source.tabUrl is required');
-  }
-  try {
-    if (new URL(body.source.tabUrl).origin !== origin) throw new Error();
-  } catch {
-    throw new HttpError(400, 'SESSION_SOURCE_ORIGIN_MISMATCH', 'source.tabUrl must match origin');
-  }
-
-  return {
-    origin,
-    cookies: body.cookies,
-    localStorage: body.localStorage,
-    source: {
-      extensionId: extension.id,
-      tabUrl: body.source.tabUrl
-    }
-  };
-}
-
-function safeSessionResult(profileId, result) {
-  const allowedStatuses = new Set(['partial', 'manual_login_required', 'failed']);
-  const status = allowedStatuses.has(result?.status) ? result.status : 'failed';
-  const response = {
-    profileId,
-    status,
-    verification: typeof result?.verification === 'string'
-      ? result.verification.slice(0, 100)
-      : status
-  };
-  if (Number.isSafeInteger(result?.cookieCount) && result.cookieCount >= 0) {
-    response.cookieCount = result.cookieCount;
-  }
-  if (Number.isSafeInteger(result?.localStorageCount) && result.localStorageCount >= 0) {
-    response.localStorageCount = result.localStorageCount;
-  }
-  if (
-    Number.isSafeInteger(result?.sessionCookieRetentionHours) &&
-    result.sessionCookieRetentionHours >= 0 &&
-    result.sessionCookieRetentionHours <= 24
-  ) {
-    response.sessionCookieRetentionHours = result.sessionCookieRetentionHours;
-  }
-  return response;
 }
 
 function errorResponse(error) {
@@ -360,7 +260,6 @@ export async function createManager({
     managerToken: token(),
     managerIdentity: generateManagerIdentity(),
     createdAt: new Date(now()).toISOString(),
-    extensions: [],
     agents: []
   }));
   await configStore.init();
@@ -374,12 +273,11 @@ export async function createManager({
   if (typeof config.managerToken !== 'string' || config.managerToken.length < 32) {
     config = await configStore.update((draft) => {
       draft.managerToken = token();
-      draft.extensions = Array.isArray(draft.extensions) ? draft.extensions : [];
     });
   }
-  if (!Array.isArray(config.extensions)) {
+  if (config.extensions !== undefined) {
     config = await configStore.update((draft) => {
-      draft.extensions = [];
+      delete draft.extensions;
     });
   }
   // Scoped Agent bearers are stateless and stable per registered host. Clear
@@ -413,8 +311,6 @@ export async function createManager({
     })
     : suppliedTaskService;
   const taskService = normalizeTaskService(createdTaskService);
-  const challenges = new Map();
-  const pairingApprovals = new Map();
   const dashboardApprovals = new Map();
   const dashboardSessions = new Map();
   let server;
@@ -450,30 +346,13 @@ export async function createManager({
     } catch {
       sameManager = false;
     }
-    if (sameManager || isChromeExtensionOrigin(origin)) return corsHeaders(origin);
+    if (sameManager) return corsHeaders(origin);
     throw new HttpError(403, 'ORIGIN_NOT_ALLOWED', 'Request origin is not allowed');
-  }
-
-  function extensionRequestOrigin(request) {
-    const origin = requestOrigin(request);
-    const claimedId = request.headers['x-taskmaster-extension-id'];
-    const claimedOrigin = typeof claimedId === 'string' && /^[a-p]{32}$/.test(claimedId)
-      ? `chrome-extension://${claimedId}`
-      : null;
-    if (origin) {
-      if (!isChromeExtensionOrigin(origin)) return null;
-      return claimedOrigin && claimedOrigin !== origin ? null : origin;
-    }
-    // Chrome's privileged extension fetch may omit Origin. The one-time pairing
-    // approval authenticates first contact; subsequent calls also require the
-    // private extension token bound to this claimed, strictly validated ID.
-    return claimedOrigin;
   }
 
   async function authenticate(request) {
     const bearer = parseBearer(request);
     if (!bearer) throw new HttpError(401, 'AUTH_REQUIRED', 'Bearer token is required');
-    const origin = requestOrigin(request);
     if (secureEqual(bearer, config.managerToken)) {
       return { role: 'manager-admin', clientId: 'manager-admin' };
     }
@@ -490,60 +369,7 @@ export async function createManager({
         return { role: 'dashboard', clientId: dashboard.clientId };
       }
     }
-    const extension = config.extensions.find((item) => secureEqual(item.tokenHash, hashed));
-    if (!extension) throw new HttpError(401, 'INVALID_TOKEN', 'Bearer token is invalid');
-    if (extensionRequestOrigin(request) !== extension.origin) {
-      throw new HttpError(403, 'EXTENSION_ORIGIN_MISMATCH', 'Extension credential origin does not match');
-    }
-    return { role: 'extension', clientId: `extension:${extension.id}`, extension };
-  }
-
-  async function pairExtension(request, response, cors) {
-    const origin = extensionRequestOrigin(request);
-    if (!origin) {
-      throw new HttpError(403, 'EXTENSION_ORIGIN_REQUIRED', 'Chrome extension origin is required');
-    }
-    const body = await readJson(request, { maxBytes: 16 * 1024 });
-    const challengeValue = typeof body.challenge === 'string' ? body.challenge : '';
-    const pairingCode = typeof body.pairingCode === 'string' ? body.pairingCode : '';
-    let parsedPairing;
-    try {
-      parsedPairing = parsePairingCode(pairingCode, managerIdentity.fingerprint);
-    } catch {
-      throw new HttpError(401, 'INVALID_PAIRING_CODE', 'Pairing code is invalid or expired');
-    }
-    const pending = challenges.get(challengeValue);
-    challenges.delete(challengeValue);
-    const approval = pairingApprovals.get(pairingCode);
-    pairingApprovals.delete(pairingCode);
-    if (
-      !pending ||
-      pending.origin !== origin ||
-      pending.expiresAt < now() ||
-      !approval ||
-      approval.expiresAt < now() ||
-      !secureEqual(pending.approvalHash, tokenHash(pairingCode)) ||
-      !secureEqual(parsedPairing.approvalCode, approval.approvalCode)
-    ) {
-      throw new HttpError(401, 'INVALID_PAIRING_CHALLENGE', 'Pairing challenge is invalid or expired');
-    }
-    const extensionId = origin.slice('chrome-extension://'.length);
-    const extensionToken = token();
-    const name = typeof body.name === 'string' && body.name.trim()
-      ? body.name.trim().slice(0, 80)
-      : `Chrome extension ${extensionId.slice(0, 8)}`;
-    const paired = {
-      id: extensionId,
-      name,
-      origin,
-      tokenHash: tokenHash(extensionToken),
-      createdAt: new Date(now()).toISOString()
-    };
-    config = await configStore.update((draft) => {
-      draft.extensions = draft.extensions.filter((item) => item.origin !== origin);
-      draft.extensions.push(paired);
-    });
-    sendJson(response, 201, { extension: publicExtension(paired), token: extensionToken }, cors);
+    throw new HttpError(401, 'INVALID_TOKEN', 'Bearer token is invalid');
   }
 
   async function route(request, response) {
@@ -636,30 +462,9 @@ export async function createManager({
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/v1/pair/authorize') {
-      const auth = await authenticate(request);
-      requireRole(auth, 'manager-admin');
-      await readJson(request, { maxBytes: 4 * 1024 });
-      for (const [code, approval] of pairingApprovals) {
-        if (approval.expiresAt < now()) pairingApprovals.delete(code);
-      }
-      while (pairingApprovals.size >= 8) pairingApprovals.delete(pairingApprovals.keys().next().value);
-      const approvalCode = createPairingApprovalCode();
-      const pairingCode = createPairingCode(approvalCode, managerIdentity.fingerprint);
-      pairingApprovals.set(pairingCode, {
-        approvalCode,
-        expiresAt: now() + PAIRING_APPROVAL_TTL_MS
-      });
-      sendJson(response, 201, {
-        pairingCode,
-        expiresInMs: PAIRING_APPROVAL_TTL_MS
-      }, cors);
-      return;
-    }
-
     if (request.method === 'POST' && url.pathname === '/v1/dashboard/authorize') {
       const auth = await authenticate(request);
-      requireRole(auth, 'manager-admin', 'extension');
+      requireRole(auth, 'manager-admin');
       await readJson(request, { maxBytes: 4 * 1024 });
       for (const [code, approval] of dashboardApprovals) {
         if (approval.expiresAt <= now()) dashboardApprovals.delete(code);
@@ -698,40 +503,6 @@ export async function createManager({
       return;
     }
 
-    if (request.method === 'GET' && url.pathname === '/v1/pair/challenge') {
-      const origin = extensionRequestOrigin(request);
-      if (!origin) {
-        throw new HttpError(403, 'EXTENSION_ORIGIN_REQUIRED', 'Chrome extension origin is required');
-      }
-      for (const [value, pending] of challenges) {
-        if (pending.expiresAt < now() || pending.origin === origin) challenges.delete(value);
-      }
-      const pairingCode = request.headers['x-taskmaster-pairing-code'];
-      let parsedPairing;
-      try {
-        parsedPairing = parsePairingCode(pairingCode, managerIdentity.fingerprint);
-      } catch {
-        parsedPairing = null;
-      }
-      const approval = parsedPairing ? pairingApprovals.get(pairingCode) : null;
-      if (!approval || approval.expiresAt < now()) {
-        throw new HttpError(401, 'PAIRING_APPROVAL_REQUIRED', 'A valid one-time pairing approval is required');
-      }
-      const challenge = token();
-      challenges.set(challenge, {
-        origin,
-        approvalHash: tokenHash(pairingCode),
-        expiresAt: now() + PAIRING_CHALLENGE_TTL_MS
-      });
-      sendJson(response, 200, { challenge, expiresInMs: PAIRING_CHALLENGE_TTL_MS }, cors);
-      return;
-    }
-
-    if (request.method === 'POST' && url.pathname === '/v1/pair/extension') {
-      await pairExtension(request, response, cors);
-      return;
-    }
-
     if (request.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
       await serveStatic(response, dashboardDir, 'index.html');
       return;
@@ -742,7 +513,7 @@ export async function createManager({
     }
 
     const profileMatch = /^\/v1\/profiles\/([^/]+)$/.exec(url.pathname);
-    const profileActionMatch = /^\/v1\/profiles\/([^/]+)\/(open|close|session)$/.exec(url.pathname);
+    const profileActionMatch = /^\/v1\/profiles\/([^/]+)\/(open|close)$/.exec(url.pathname);
     const taskTypeMatch = /^\/v1\/task-types\/([^/]+)$/.exec(url.pathname);
     const taskMatch = /^\/v1\/tasks\/([^/]+)$/.exec(url.pathname);
     const taskActionMatch = /^\/v1\/tasks\/([^/]+)\/(cancel|resume|continue)$/.exec(url.pathname);
@@ -751,7 +522,7 @@ export async function createManager({
 
     if (request.method === 'GET' && url.pathname === '/v1/profiles') {
       const auth = await authenticate(request);
-      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const profiles = (await profileStore.list())
         .filter((profile) => canUseProfile(profile, auth))
         .map(publicProfile);
@@ -760,7 +531,7 @@ export async function createManager({
     }
     if (request.method === 'POST' && url.pathname === '/v1/profiles') {
       const auth = await authenticate(request);
-      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const requested = validateProfileCreate(await readJson(request));
       const { access, ...profileInput } = requested;
       const profile = await profileStore.create(profileInput, {
@@ -772,7 +543,7 @@ export async function createManager({
     }
     if (profileMatch && request.method === 'PATCH') {
       const auth = await authenticate(request);
-      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const profileId = decodeURIComponent(profileMatch[1]);
       requireProfileAccess(await profileStore.get(profileId), auth, { manage: true });
       const profile = await profileStore.update(
@@ -794,26 +565,7 @@ export async function createManager({
       const profileId = decodeURIComponent(profileActionMatch[1]);
       const actionName = profileActionMatch[2];
       const auth = await authenticate(request);
-      if (actionName === 'session') {
-        requireRole(auth, 'extension');
-        const bundle = validatedSessionBundle(await readJson(request), auth.extension);
-        const importSession = requireTaskMethod(taskService, 'importSession');
-        requireProfileAccess(await profileStore.get(profileId), auth);
-        let result;
-        try {
-          result = await importSession(profileId, bundle);
-        } catch (error) {
-          throw new HttpError(
-            Number.isInteger(error?.statusCode) ? error.statusCode : 500,
-            typeof error?.code === 'string' ? error.code : 'SESSION_IMPORT_FAILED',
-            'Session import failed'
-          );
-        }
-        sendJson(response, 200, safeSessionResult(profileId, result), cors);
-        return;
-      }
-
-      requireRole(auth, 'manager-admin', 'agent', 'extension', 'dashboard');
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       requireProfileAccess(await profileStore.get(profileId), auth);
 
       if (actionName === 'open') {

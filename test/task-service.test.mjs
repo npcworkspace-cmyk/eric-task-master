@@ -11,7 +11,6 @@ import {
   sendChildMessageConfirmed,
   TASK_SERVICE_DEADLINES
 } from '../src/runtime/task-service.mjs';
-import { runSessionImport } from '../src/runtime/import-session-worker.mjs';
 
 let nextPid = 40_000;
 const ADMIN = Object.freeze({ role: 'manager-admin', clientId: 'manager-admin' });
@@ -1139,10 +1138,7 @@ test('service close rejects every operation that could launch or mutate new work
     () => service.create({
       profileId: 'profile_test', taskType: 'late', idempotencyKey: 'late-create-after-close'
     }, ADMIN),
-    () => service.openProfile('profile_test', ADMIN),
-    () => service.importSession('profile_test', {
-      origin: 'https://example.com', cookies: [], localStorage: []
-    })
+    () => service.openProfile('profile_test', ADMIN)
   ]) {
     await assert.rejects(operation(), { code: 'SERVICE_CLOSING' });
   }
@@ -1477,243 +1473,7 @@ test('returning from a long cooldown gets a fresh progress window', async (t) =>
   await service.close();
 });
 
-test('session import response never echoes cookie or localStorage values', async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-import-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const store = fakeProfileStore(root);
-  let finishImport;
-  let reportResult;
-  const resultReported = new Promise((resolve) => { reportResult = resolve; });
-  const service = createTaskService({
-    stateDir: path.join(root, 'state'),
-    profileStore: store,
-    workerFactory(_workerPath, kind) {
-      assert.equal(kind, 'session-import');
-      return new FakeWorker((message, child) => {
-        if (message.type !== 'import') return;
-        setImmediate(() => void (async () => {
-          await writeSessionReceipt(message, child, 'committed');
-          child.emit('message', {
-            type: 'result',
-            result: {
-              status: 'partial',
-              cookieCount: 1,
-              localStorageCount: 1,
-              verification: 'storage_replaced_not_login_verified'
-            }
-          });
-          finishImport = () => child.finish(0);
-          reportResult();
-        })());
-      });
-    }
-  });
-  const importOperation = service.importSession('profile_test', {
-    origin: 'https://example.test',
-    cookies: [{ name: 'session', value: 'cookie-secret' }],
-    localStorage: [{ name: 'token', value: 'storage-secret' }],
-    source: { extensionId: 'fixture', tabUrl: 'https://example.test/' }
-  });
-  await resultReported;
-  assert.equal(store.profile.state, 'leased');
-  assert.match(store.profile.lease.ownerId, /^session-import:/u);
-  finishImport();
-  const result = await importOperation;
-
-  assert.equal(result.status, 'partial');
-  assert.equal(result.cookieCount, 1);
-  assert.equal(result.localStorageCount, 1);
-  assert.equal(result.verification, 'storage_replaced_not_login_verified');
-  assert.doesNotMatch(JSON.stringify(result), /cookie-secret|storage-secret/);
-  assert.equal(store.profile.state, 'idle');
-  assert.equal(store.events[0][3], true);
-  assert.equal(store.events[1][0], 'release');
-  await service.close();
-});
-
-test('a task queued behind a live session import wakes when the Profile becomes idle', async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-import-queue-wakeup-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const modulePath = path.join(root, 'task.mjs');
-  await writeFile(modulePath, 'export async function run() {}\n');
-  const store = fakeProfileStore(root);
-  let finishImport;
-  let reportImportReady;
-  const importReady = new Promise((resolve) => { reportImportReady = resolve; });
-  let taskStarts = 0;
-  const service = createTaskService({
-    stateDir: path.join(root, 'state'),
-    profileStore: store,
-    allowedTaskRoots: [root],
-    seedTaskTypes: [],
-    cleanupReconcileIntervalMs: 20,
-    workerFactory(_workerPath, kind) {
-      if (kind === 'session-import') {
-        return new FakeWorker((message, child) => {
-          if (message.type !== 'import') return;
-          setImmediate(() => {
-            finishImport = async () => {
-              await writeSessionReceipt(message, child, 'committed');
-              child.emit('message', {
-                type: 'result',
-                result: { status: 'verified', cookieCount: 0, localStorageCount: 0 }
-              });
-              child.finish(0);
-            };
-            reportImportReady();
-          });
-        });
-      }
-      return new FakeWorker((message, child) => {
-        if (message.type !== 'start') return;
-        taskStarts += 1;
-        setImmediate(() => {
-          child.emit('message', {
-            type: 'result',
-            result: { summary: 'Started after import', evidence: [{ kind: 'message', value: 'woke' }] }
-          });
-          child.emit('message', { type: 'state', state: 'completed' });
-          child.emit('message', { type: 'cleanup', browserClosed: true });
-          child.finish();
-        });
-      });
-    }
-  });
-  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
-  const importOperation = service.importSession('profile_test', {
-    origin: 'https://example.test', cookies: [], localStorage: []
-  });
-  await importReady;
-  const queued = await service.create({
-    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'queued-behind-session-import'
-  }, ADMIN);
-  const waiting = await service.get(queued.id, ADMIN);
-  assert.equal(waiting.state, 'queued');
-  assert.equal(waiting.queueReason, 'Waiting for Profile to become idle');
-  assert.equal(taskStarts, 0);
-  await finishImport();
-  await importOperation;
-  const completed = await waitFor(async () => {
-    const current = await service.get(queued.id, ADMIN);
-    return current.cleanup.settled ? current : null;
-  }, 2_000);
-  assert.equal(completed.state, 'completed');
-  assert.equal(taskStarts, 1);
-  await service.close();
-});
-
-test('session import timeout requests rollback before releasing the Profile lease', async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-import-timeout-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const store = fakeProfileStore(root);
-  const messages = [];
-  const service = createTaskService({
-    stateDir: path.join(root, 'state'),
-    profileStore: store,
-    sessionImportTimeoutMs: 20,
-    sessionImportRollbackGraceMs: 100,
-    workerFactory(_workerPath, kind) {
-      assert.equal(kind, 'session-import');
-      return new FakeWorker((message, child) => {
-        messages.push(message.type);
-        if (message.type === 'cancel') {
-          setImmediate(() => void (async () => {
-            const importMessage = child.importMessage;
-            await writeSessionReceipt(importMessage, child, 'rolled_back');
-            child.emit('message', {
-              type: 'error',
-              error: { code: 'SESSION_IMPORT_CANCELLED', message: 'Session import was cancelled' }
-            });
-            child.finish(0);
-          })());
-        }
-        if (message.type === 'import') child.importMessage = message;
-      });
-    }
-  });
-
-  await assert.rejects(service.importSession('profile_test', {
-    origin: 'https://example.test',
-    cookies: [{ name: 'session', value: 'cookie-secret' }],
-    localStorage: [{ name: 'token', value: 'storage-secret' }],
-    source: { extensionId: 'fixture', tabUrl: 'https://example.test/' }
-  }), { code: 'SESSION_IMPORT_TIMEOUT' });
-  assert.deepEqual(messages, ['import', 'cancel']);
-  assert.equal(store.profile.state, 'idle');
-  await service.close();
-});
-
-test('session import hard kill without a receipt keeps the Profile blocked', async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-import-hard-kill-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const store = fakeProfileStore(root);
-  const service = createTaskService({
-    stateDir: path.join(root, 'state'),
-    profileStore: store,
-    sessionImportTimeoutMs: 20,
-    sessionImportRollbackGraceMs: 20,
-    workerFactory(_workerPath, kind) {
-      assert.equal(kind, 'session-import');
-      return new FakeWorker(() => {});
-    }
-  });
-
-  await assert.rejects(service.importSession('profile_test', {
-    origin: 'https://example.test',
-    cookies: [],
-    localStorage: [],
-    source: { extensionId: 'fixture', tabUrl: 'https://example.test/' }
-  }), { code: 'SESSION_IMPORT_ROLLBACK_FAILED' });
-  assert.equal(store.profile.state, 'error');
-  assert.match(store.profile.lease.ownerId, /^session-import:/u);
-  assert.equal(store.profile.lease.cleanupRequired, true);
-  assert.ok(store.events.some((event) => event[0] === 'cleanup-unknown'));
-  assert.equal(store.events.some((event) => event[0] === 'release'), false);
-  await assert.rejects(service.close(), { code: 'SERVICE_SHUTDOWN_UNCONFIRMED' });
-});
-
-test('session import rollback failure never releases even when a close receipt exists', async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-import-rollback-failed-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const store = fakeProfileStore(root);
-  let receiptPath;
-  const service = createTaskService({
-    stateDir: path.join(root, 'state'),
-    profileStore: store,
-    workerFactory(_workerPath, kind) {
-      assert.equal(kind, 'session-import');
-      return new FakeWorker((message, child) => {
-        if (message.type !== 'import') return;
-        receiptPath = message.config.cleanupReceiptPath;
-        setImmediate(() => void (async () => {
-          await writeSessionReceipt(message, child, 'rolled_back');
-          child.emit('message', {
-            type: 'error',
-            error: {
-              code: 'SESSION_IMPORT_ROLLBACK_FAILED',
-              message: 'Session import rollback failed'
-            }
-          });
-          child.finish(0);
-        })());
-      });
-    }
-  });
-
-  await assert.rejects(service.importSession('profile_test', {
-    origin: 'https://example.test',
-    cookies: [],
-    localStorage: [],
-    source: { extensionId: 'fixture', tabUrl: 'https://example.test/' }
-  }), { code: 'SESSION_IMPORT_ROLLBACK_FAILED' });
-  assert.equal(store.profile.state, 'error');
-  assert.match(store.profile.lease.ownerId, /^session-import:/u);
-  assert.equal(store.events.some((event) => event[0] === 'release'), false);
-  assert.match(await readFile(receiptPath, 'utf8'), /"outcome":"rolled_back"/u);
-  await assert.rejects(service.close(), { code: 'SERVICE_SHUTDOWN_UNCONFIRMED' });
-});
-
-test('Manager restart reconciles only a valid session cleanup receipt', async (t) => {
+test('legacy session-import lease migration requires a valid cleanup receipt', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-import-restart-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const store = fakeProfileStore(root);
@@ -1766,6 +1526,10 @@ test('Manager restart reconciles only a valid session cleanup receipt', async (t
   assert.equal(store.profile.state, 'error');
   assert.equal(store.profile.lease.ownerId, missingOwnerId);
   assert.equal(store.profile.lease.cleanupRequired, true);
+  await assert.rejects(
+    blocked.openProfile('profile_test', ADMIN),
+    { code: 'LEGACY_SESSION_IMPORT_CLEANUP_UNCONFIRMED' }
+  );
   await assert.rejects(blocked.close(), { code: 'SERVICE_SHUTDOWN_UNCONFIRMED' });
 });
 
@@ -1862,102 +1626,6 @@ test('a queued task automatically resumes after a late session cleanup receipt',
   assert.equal(store.profile.state, 'idle');
   assert.equal(store.profile.lease, null);
   await service.close();
-});
-
-test('session import worker maps Chrome state into a persistent context without a state file', async () => {
-  const calls = [];
-  const sourceCookies = [{
-    name: 'persistent',
-    value: 'secret',
-    domain: '.example.test',
-    path: '/',
-    httpOnly: true,
-    secure: true,
-    sameSite: 'no_restriction',
-    expirationDate: 2_000_000_000
-  }, {
-    name: 'session',
-    value: 'temporary-secret',
-    domain: '.example.test',
-    path: '/',
-    session: true,
-    httpOnly: true,
-    secure: true,
-    sameSite: 'lax'
-  }];
-  let currentUrl = 'about:blank';
-  let storedCookies = [];
-  let storedEntries = [];
-  const page = {
-    async route() {},
-    async unroute() {},
-    async goto(url, options) {
-      currentUrl = url;
-      calls.push(['goto', url, options]);
-    },
-    url() { return currentUrl; },
-    async evaluate(_callback, entries) {
-      if (Array.isArray(entries)) {
-        storedEntries = structuredClone(entries);
-        calls.push(['evaluate-write', entries.length]);
-        return entries.length;
-      }
-      calls.push(['evaluate-read', storedEntries.length]);
-      return structuredClone(storedEntries);
-    }
-  };
-  const context = {
-    pages() { return [page]; },
-    async addCookies(cookies) {
-      calls.push(['cookies', cookies]);
-      storedCookies = cookies.map((cookie) => ({
-        ...cookie,
-        domain: cookie.domain || new URL(cookie.url).hostname,
-        path: cookie.path || new URL(cookie.url).pathname || '/',
-        expires: cookie.expires ?? -1,
-        sameSite: cookie.sameSite || 'Lax'
-      }));
-    },
-    async clearCookies() { storedCookies = []; },
-    async cookies() { return structuredClone(storedCookies); },
-    async close() { calls.push(['close']); }
-  };
-  const result = await runSessionImport({
-    profile: { userDataDir: 'fixture-profile' },
-    bundle: {
-      origin: 'https://www.example.test',
-      cookies: sourceCookies,
-      localStorage: [{ name: 'state', value: 'private' }],
-      source: { extensionId: 'fixture', tabUrl: 'https://www.example.test/account' }
-    }
-  }, {
-    loadPlaywright: async () => ({
-      chromium: {
-        async launchPersistentContext(userDataDir, options) {
-          calls.push(['launch', userDataDir, options]);
-          return context;
-        }
-      }
-    })
-  });
-
-  assert.equal(result.status, 'partial');
-  assert.equal(result.verification, 'storage_replaced_not_login_verified');
-  assert.equal(result.cookieCount, 2);
-  assert.equal(result.localStorageCount, 1);
-  const importedCookies = calls.find((item) => item[0] === 'cookies')[1];
-  const importedCookie = importedCookies.find((cookie) => cookie.name === 'persistent');
-  assert.equal(importedCookie.sameSite, 'None');
-  assert.equal(importedCookie.expires, 2_000_000_000);
-  const importedSessionCookie = importedCookies.find((cookie) => cookie.name === 'session');
-  const twelveHoursFromNow = Math.floor(Date.now() / 1_000) + 12 * 60 * 60;
-  assert.ok(Math.abs(importedSessionCookie.expires - twelveHoursFromNow) <= 2);
-  assert.equal(result.sessionCookieRetentionHours, 12);
-  assert.equal(calls.find((item) => item[0] === 'launch')[2].headless, true);
-  assert.equal(calls.find((item) => item[0] === 'launch')[2].serviceWorkers, 'block');
-  assert.deepEqual(storedEntries, [{ name: 'state', value: 'private' }]);
-  assert.equal(calls.at(-1)[0], 'close');
-  assert.doesNotMatch(JSON.stringify(result), /secret|private/);
 });
 
 test('manual profile window holds one lease until it closes', async (t) => {

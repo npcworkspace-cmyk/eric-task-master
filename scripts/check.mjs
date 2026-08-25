@@ -14,11 +14,9 @@ function invariant(condition, message) {
 async function staticChecks() {
   const packageJson = JSON.parse(await readFile(resolve(ROOT, 'package.json'), 'utf8'));
   const lock = JSON.parse(await readFile(resolve(ROOT, 'package-lock.json'), 'utf8'));
-  const manifest = JSON.parse(await readFile(resolve(ROOT, 'extension', 'manifest.json'), 'utf8'));
   const license = await readFile(resolve(ROOT, 'LICENSE'), 'utf8');
   invariant(packageJson.version === VERSION, 'package.json version drift');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock.json version drift');
-  invariant(manifest.version === VERSION, 'extension manifest version drift');
   invariant(packageJson.license === 'MIT', 'package license drift');
   invariant(/^MIT License\r?\n/.test(license), 'MIT license file is missing or malformed');
   invariant(
@@ -32,14 +30,14 @@ async function staticChecks() {
     'MCP protocol test dependency boundary drift'
   );
   invariant(!packageJson.dependencies?.['@modelcontextprotocol/sdk'], 'Legacy monolithic MCP SDK is forbidden');
-  invariant(manifest.manifest_version === 3, 'extension must use Manifest V3');
-  invariant(!manifest.content_scripts, 'extension must not register content scripts');
-  invariant(!(manifest.permissions || []).includes('debugger'), 'extension must not request debugger');
-  invariant(manifest.action?.default_icon?.['128'] === 'icons/icon-128.png', 'extension icon contract drift');
+  const extensionRemoved = await access(resolve(ROOT, 'extension', 'manifest.json'))
+    .then(() => false, (error) => error?.code === 'ENOENT');
+  invariant(extensionRemoved, 'extension must not be shipped');
   await access(resolve(ROOT, 'scripts', 'taskmaster.mjs'));
-  const [launcher, bootstrapPolicy, taskWorker, taskService, workflow, releaseWorkflow] = await Promise.all([
+  const [launcher, bootstrapPolicy, manager, taskWorker, taskService, workflow, releaseWorkflow] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'manager.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-service.mjs'), 'utf8'),
     readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
@@ -58,6 +56,13 @@ async function staticChecks() {
   invariant(
     taskService.includes('scheduleQueuedTasks') && taskService.includes('TASK_PROGRESS_STALLED'),
     'task scheduler or progress-health boundary drift'
+  );
+  invariant(
+    !manager.includes('/v1/pair/extension') &&
+      !manager.includes('(open|close|session)') &&
+      !manager.includes('validatedSessionBundle') &&
+      !taskService.includes('importSession'),
+    'extension or session-transfer runtime must remain removed'
   );
   invariant(
     workflow.includes('windows-latest') && workflow.includes('macos-latest') &&
@@ -90,7 +95,7 @@ async function staticChecks() {
   );
   invariant(
     releaseWorkflow.includes('git archive --format=zip') &&
-      releaseWorkflow.includes('HEAD:extension') &&
+      !releaseWorkflow.includes('HEAD:extension') &&
       releaseWorkflow.includes('HEAD:skills/eric-task-master') &&
       releaseWorkflow.includes('SHA256SUMS'),
     'release archive or checksum boundary drift'
@@ -113,18 +118,11 @@ async function staticChecks() {
     access(resolve(ROOT, 'src', 'lib', 'user-handoff.mjs')),
     access(resolve(ROOT, 'docs', 'RELEASE-GATE.md'))
   ]);
-  await Promise.all([16, 32, 48, 128].map((size) => (
-    access(resolve(ROOT, 'extension', 'icons', `icon-${size}.png`))
-  )));
-
   const codeFiles = [
     'src/manager.mjs',
     'src/runtime/task-service.mjs',
     'src/runtime/task-worker.mjs',
-    'src/runtime/profile-worker.mjs',
-    'src/runtime/import-session-worker.mjs',
-    'extension/service-worker.js',
-    'extension/popup.js'
+    'src/runtime/profile-worker.mjs'
   ];
   const forbidden = /chrome\.debugger|newCDPSession|connectOverCDP|Runtime\.evaluate|puppeteer/i;
   for (const relative of codeFiles) {
@@ -154,8 +152,6 @@ async function staticChecks() {
       readmeZh.includes('https://github.com/npcworkspace-cmyk/eric-task-master'),
     'GitHub-to-task bootstrap contract drift'
   );
-  const popup = await readFile(resolve(ROOT, 'extension', 'popup.js'), 'utf8');
-  invariant(popup.includes('http://127.0.0.1:19946'), 'extension and manager port contract drift');
   return { passed: 30, total: 30 };
 }
 

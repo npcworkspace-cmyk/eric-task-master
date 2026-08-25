@@ -12,10 +12,10 @@ npm run check
 
 `npm run check` performs:
 
-1. static version, dependency, Manifest V3, pure-Playwright, icon, launcher, and Skill-boundary checks;
+1. static version, dependency, pure-Playwright, Web Dashboard, launcher, and Skill-boundary checks;
 2. serial unit, integration, security, registration, protocol, recovery, and real-browser tests;
-3. real Chromium feature acceptance across fast/human/adaptive behavior, session import, click/input/select, upload/download, storage, screenshot, progress, checkpoint, artifacts, ephemeral isolation, user handoff, and cleanup;
-4. a commercial acceptance workload with bounded concurrency, same-Profile FIFO pressure, queued cancellation, browser timeout diagnostics, ephemeral zero-state verification, quiescence, and Manager restart history recovery.
+3. real Chromium feature acceptance across fast/human/adaptive behavior, persistent Profile open/close, click/input/select, upload/download, storage, screenshot, progress, checkpoint, artifacts, ephemeral isolation, user handoff, and cleanup;
+4. a commercial acceptance workload with persistent Profile cleanup, bounded concurrency, same-Profile FIFO pressure, queued cancellation, browser timeout diagnostics, ephemeral zero-state verification, quiescence, and Manager restart history recovery.
 
 Any failed assertion blocks release. The commercial workload report can be persisted with:
 
@@ -46,7 +46,7 @@ gh workflow run release.yml \
   -f confirm_immutable=true
 ```
 
-Before dispatch, an authenticated repository administrator must verify Release immutability through the repository setting or its Administration API; the Actions token intentionally does not receive that administrator permission. The workflow requires that explicit confirmation, rejects a non-current `main` commit, a commit without a successful same-SHA `main` push CI, a mismatched package version, and any existing tag or Release. It creates a complete draft with the source, unpacked extension, base Skill, and `SHA256SUMS`, publishes it once, and then verifies that GitHub reports the published Release as immutable. Published versions and assets are never replaced. Pull requests, candidate branches, forks, manual CI runs, failed gates, and non-`main` commits cannot publish.
+Before dispatch, an authenticated repository administrator must verify Release immutability through the repository setting or its Administration API; the Actions token intentionally does not receive that administrator permission. The workflow requires that explicit confirmation, rejects a non-current `main` commit, a commit without a successful same-SHA `main` push CI, a mismatched package version, and any existing tag or Release. It creates a complete draft with the source, base Skill, and `SHA256SUMS`, publishes it once, and then verifies that GitHub reports the published Release as immutable. Published versions and assets are never replaced. Pull requests, candidate branches, forks, manual CI runs, failed gates, and non-`main` commits cannot publish.
 
 ## Faults covered
 
@@ -63,7 +63,7 @@ Before dispatch, an authenticated repository administrator must verify Release i
 - missing, changed, hard-linked, or unstable artifacts;
 - wrong/replayed Manager identity, role violations, and credential redaction;
 - task-module inspection timeout/exit/error and transactional Task Pack conflicts;
-- extension session-transfer drift, permission revocation, rollback, and cleanup.
+- one-time Dashboard authorization and legacy session-import lease fail-closed migration.
 
 ## Honest boundary
 
