@@ -13,6 +13,7 @@ import {
   MANAGER_SERVICE,
   verifyManagerIdentityProof
 } from '../src/lib/manager-identity.mjs';
+import { HttpError } from '../src/lib/http-utils.mjs';
 import { startManager } from '../src/manager.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -234,14 +235,15 @@ test('Manager errorResponse redacts message and nested details', async (t) => {
     dataDir: stateDir,
     taskService: {
       async listTaskTypes() {
-        throw Object.assign(new Error(`private_key=${marker}`), {
-          statusCode: 400,
-          code: 'FIXTURE_REJECTED',
-          details: {
-            safe: `Authorization: Bearer ${marker}`,
+        throw new HttpError(
+          400,
+          'FIXTURE_REJECTED',
+          `private_key=${marker}; ENOENT C:\\Users\\eric\\private.txt; https://user:pass@example.test/callback?code=${marker}`,
+          {
+            safe: `Authorization: Bearer ${marker}; /home/eric/private.txt`,
             managerToken: marker
           }
-        });
+        );
       }
     }
   });
@@ -256,5 +258,8 @@ test('Manager errorResponse redacts message and nested details', async (t) => {
   const text = await response.text();
   assert.equal(response.status, 400);
   assert.equal(text.includes(marker), false);
+  assert.equal(text.includes('C:\\Users\\eric'), false);
+  assert.equal(text.includes('/home/eric'), false);
+  assert.equal(text.includes('user:pass'), false);
   assert.match(text, /\[REDACTED\]/);
 });

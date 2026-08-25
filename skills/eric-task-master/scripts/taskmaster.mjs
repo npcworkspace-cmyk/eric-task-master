@@ -5,28 +5,38 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const runtimeContract = JSON.parse(readFileSync(join(here, '..', 'runtime.json'), 'utf8'));
 const candidates = [
   process.env.ERIC_TASK_MASTER_ROOT,
   resolve(here, '..', '..', '..'),
   process.cwd()
 ].filter(Boolean);
 
-function isProjectRoot(candidate) {
+function inspectProjectRoot(candidate) {
   const packagePath = join(candidate, 'package.json');
-  if (!existsSync(packagePath)) return false;
+  if (!existsSync(packagePath)) return { compatible: false, found: false };
   try {
-    return JSON.parse(readFileSync(packagePath, 'utf8')).name === 'eric-task-master';
+    const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+    const found = packageJson.name === runtimeContract.runtimeName;
+    return {
+      compatible: found && packageJson.version === runtimeContract.runtimeVersion,
+      found,
+      version: packageJson.version
+    };
   } catch {
-    return false;
+    return { compatible: false, found: false };
   }
 }
 
-const root = candidates.find(isProjectRoot);
+const inspected = candidates.map((candidate) => ({ candidate, ...inspectProjectRoot(candidate) }));
+const root = inspected.find((item) => item.compatible)?.candidate;
 if (!root) {
+  const mismatch = inspected.find((item) => item.found);
   process.stderr.write(JSON.stringify({
     ok: false,
-    error: 'TASKMASTER_ROOT_NOT_FOUND',
-    nextAction: 'Clone https://github.com/npcworkspace-cmyk/eric-task-master, then set ERIC_TASK_MASTER_ROOT to that complete repository.'
+    error: mismatch ? 'TASKMASTER_RUNTIME_VERSION_MISMATCH' : 'TASKMASTER_ROOT_NOT_FOUND',
+    ...(mismatch ? { expected: runtimeContract.runtimeVersion, actual: mismatch.version } : {}),
+    nextAction: `Clone ${runtimeContract.repository} at ${runtimeContract.releaseTag}, then set ERIC_TASK_MASTER_ROOT to that complete repository.`
   }) + '\n');
   process.exit(1);
 }

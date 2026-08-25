@@ -2,10 +2,12 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { nextVersion } from '../src/lib/semver.mjs';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const packagePath = resolve(root, 'package.json');
 const lockPath = resolve(root, 'package-lock.json');
+const skillRuntimePath = resolve(root, 'skills', 'eric-task-master', 'runtime.json');
 const packageJson = JSON.parse(await readFile(packagePath, 'utf8'));
 const current = packageJson.version;
 const requested = process.argv[2];
@@ -14,17 +16,11 @@ if (!requested) {
   throw new Error('Usage: npm run version:bump -- <patch|minor|major|x.y.z>');
 }
 
-function nextVersion(value, instruction) {
-  if (/^\d+\.\d+\.\d+$/.test(instruction)) return instruction;
-  const parts = value.split('.').map(Number);
-  if (parts.length !== 3 || parts.some(Number.isNaN)) throw new Error(`Invalid current version: ${value}`);
-  if (instruction === 'patch') return `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
-  if (instruction === 'minor') return `${parts[0]}.${parts[1] + 1}.0`;
-  if (instruction === 'major') return `${parts[0] + 1}.0.0`;
-  throw new Error(`Invalid bump: ${instruction}`);
-}
-
 const next = nextVersion(current, requested);
+const skillRuntime = JSON.parse(await readFile(skillRuntimePath, 'utf8'));
+if (skillRuntime.runtimeName !== packageJson.name || skillRuntime.runtimeVersion !== current) {
+  throw new Error('Skill runtime contract does not match the current package version');
+}
 packageJson.version = next;
 await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
 
@@ -35,6 +31,10 @@ if (!lock.packages?.['']) {
 }
 lock.packages[''].version = next;
 await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+skillRuntime.runtimeVersion = next;
+skillRuntime.releaseTag = `v${next}`;
+await writeFile(skillRuntimePath, `${JSON.stringify(skillRuntime, null, 2)}\n`);
 
 const replacements = [
   ['src/contracts.mjs', `export const VERSION = '${current}';`, `export const VERSION = '${next}';`],

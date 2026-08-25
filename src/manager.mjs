@@ -20,7 +20,7 @@ import {
   validateManagerIdentity
 } from './lib/manager-identity.mjs';
 import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
-import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
+import { redactPublicText, redactPublicValue } from './lib/redaction.mjs';
 import {
   HttpError,
   corsHeaders,
@@ -183,10 +183,10 @@ function requireTaskMethod(service, name) {
 
 function errorResponse(error) {
   if (error instanceof HttpError || error instanceof ProfileStoreError) {
-    const message = redactSensitiveText(error.message);
+    const message = redactPublicText(error.message);
     const details = error.details === undefined
       ? undefined
-      : redactSensitiveValue(error.details);
+      : redactPublicValue(error.details);
     return {
       statusCode: error.statusCode,
       body: {
@@ -201,7 +201,7 @@ function errorResponse(error) {
     };
   }
   if (Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode < 600) {
-    const message = redactSensitiveText(
+    const message = redactPublicText(
       typeof error.message === 'string' ? error.message : 'Request failed'
     );
     return {

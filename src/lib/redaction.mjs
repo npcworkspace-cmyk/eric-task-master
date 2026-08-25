@@ -70,3 +70,22 @@ export function redactSensitiveValue(value, { depth = 0, maxDepth = 12, maxItems
   }
   return safe;
 }
+
+export function redactPublicValue(value, { depth = 0, maxDepth = 12, maxItems = 1_000 } = {}) {
+  if (depth > maxDepth) return '[truncated]';
+  if (typeof value === 'string') return redactPublicText(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, maxItems).map((item) => redactPublicValue(item, {
+      depth: depth + 1,
+      maxDepth,
+      maxItems
+    }));
+  }
+  if (!value || typeof value !== 'object') return value;
+  const safe = {};
+  for (const [key, item] of Object.entries(value).slice(0, maxItems)) {
+    if (isSensitiveKey(key)) continue;
+    safe[key] = redactPublicValue(item, { depth: depth + 1, maxDepth, maxItems });
+  }
+  return safe;
+}

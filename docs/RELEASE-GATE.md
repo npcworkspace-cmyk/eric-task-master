@@ -42,7 +42,7 @@ CI keeps the default managed Chromium engine so the cross-platform matrix remain
 
 ## Cross-platform boundary
 
-The GitHub Actions matrix runs the same gate on Windows, macOS, and Linux. Local Windows success does not prove macOS. A platform becomes release-verified only after its own matrix job passes on the release commit. Until then it is “implementation audited / CI pending,” not “tested.”
+The GitHub Actions matrix runs the same gate on Windows, macOS, and Linux and forces the persistent-Profile workload through each runner's stable Chrome channel; ephemeral work remains on the lockfile-pinned Chromium. Local Windows success does not prove macOS. A platform becomes release-verified only after its own matrix job passes on the release commit. Until then it is “implementation audited / CI pending,” not “tested.”
 
 Pushes to `upgrade/**` branches and pull requests run the same six-job matrix without publishing. After the candidate is reviewed and merged, the exact same-repository `main` push commit must pass all six jobs again.
 
@@ -56,7 +56,7 @@ gh workflow run release.yml \
   -f confirm_immutable=true
 ```
 
-Before dispatch, an authenticated repository administrator must verify Release immutability through the repository setting or its Administration API; the Actions token intentionally does not receive that administrator permission. The workflow requires that explicit confirmation, rejects a non-current `main` commit, a commit without a successful same-SHA `main` push CI, a mismatched package version, and any existing tag or Release. It creates a complete draft with the source, base Skill, and `SHA256SUMS`, publishes it once, and then verifies that GitHub reports the published Release as immutable. Published versions and assets are never replaced. Pull requests, candidate branches, forks, manual CI runs, failed gates, and non-`main` commits cannot publish.
+Before dispatch, enable Release immutability and configure `RELEASE_ADMIN_TOKEN` as a fine-grained repository secret with read-only Administration permission. The workflow uses it only to query GitHub's server-side immutability setting before creating a draft; a missing token, disabled setting, or unreadable setting fails before any Release exists. The normal Actions token performs publication. The workflow also requires explicit confirmation, rejects a non-current `main` commit, a commit without a successful same-SHA `main` push CI (including stable-Chrome acceptance), a mismatched or non-increasing package version, and any existing tag or Release. It creates a complete draft with the source, version-bound base Skill, matching MIT license, and `SHA256SUMS`, publishes it once, and then verifies that GitHub reports the published Release as immutable. Published versions and assets are never replaced. Pull requests, candidate branches, forks, manual CI runs, failed gates, and non-`main` commits cannot publish.
 
 ## Faults covered
 

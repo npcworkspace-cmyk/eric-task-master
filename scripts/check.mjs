@@ -130,12 +130,25 @@ async function staticChecks() {
     invariant(!forbidden.test(source), `${relative} bypasses the pure Playwright boundary`);
   }
 
-  const [skill, readme, readmeZh] = await Promise.all([
+  const [skill, skillRuntimeSource, skillLicense, skillWrapper, readme, readmeZh] = await Promise.all([
     readFile(resolve(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8'),
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'runtime.json'), 'utf8'),
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'LICENSE'), 'utf8'),
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'README.md'), 'utf8'),
     readFile(resolve(ROOT, 'README.zh-CN.md'), 'utf8')
   ]);
+  const skillRuntime = JSON.parse(skillRuntimeSource);
   invariant(skill.startsWith('---\nname: eric-task-master\n'), 'Skill frontmatter is invalid');
+  invariant(
+    skillLicense.replaceAll('\r\n', '\n') === license.replaceAll('\r\n', '\n'),
+    'Standalone Skill license must match the project MIT license'
+  );
+  invariant(
+    skillRuntime.runtimeName === packageJson.name && skillRuntime.runtimeVersion === VERSION &&
+      skillRuntime.releaseTag === `v${VERSION}` && skillWrapper.includes('TASKMASTER_RUNTIME_VERSION_MISMATCH'),
+    'Skill and runtime version contract drift'
+  );
   invariant(skill.includes('node scripts/taskmaster.mjs connect --json'), 'Skill lacks the fixed startup command');
   invariant(
     skill.includes('taskmaster_task_types_describe') && skill.includes('taskmaster_tasks_continue') &&
@@ -153,7 +166,21 @@ async function staticChecks() {
       readmeZh.includes('https://github.com/npcworkspace-cmyk/eric-task-master'),
     'GitHub-to-task bootstrap contract drift'
   );
-  return { passed: 30, total: 30 };
+  invariant(
+    workflow.includes('TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome'),
+    'cross-platform CI must exercise the stable Chrome persistent-Profile path'
+  );
+  const immutablePreflight = releaseWorkflow.indexOf('repos/${GITHUB_REPOSITORY}/immutable-releases');
+  const releaseCreation = releaseWorkflow.indexOf('gh release create');
+  invariant(
+    immutablePreflight >= 0 && releaseCreation > immutablePreflight &&
+      releaseWorkflow.includes('secrets.RELEASE_ADMIN_TOKEN') &&
+      releaseWorkflow.includes('scripts/assert-release-version.mjs') &&
+      releaseWorkflow.includes('${SKILL_PREFIX}/LICENSE') &&
+      releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
+    'release preflight, monotonic version, or standalone Skill archive proof drift'
+  );
+  return { passed: 35, total: 35 };
 }
 
 function run(command, args, env = {}) {

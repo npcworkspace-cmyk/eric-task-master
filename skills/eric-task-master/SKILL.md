@@ -9,7 +9,7 @@ Task Master is the browser execution layer. Use its registered high-level task t
 
 ## Fixed GitHub-to-task bootstrap
 
-This Skill is the instruction adapter, not the browser runtime. It requires the complete `eric-task-master` repository. When the user supplies the GitHub URL, authenticate if needed, clone the full repository, and read or install this Skill from `skills/eric-task-master`. If this Skill is installed elsewhere, set `ERIC_TASK_MASTER_ROOT` to that clone.
+This Skill is the instruction adapter, not the browser runtime. It requires the complete `eric-task-master` repository at the exact version declared in `runtime.json`. When the user supplies the GitHub URL, authenticate if needed, clone the full repository at that matching release tag, and read or install this Skill from `skills/eric-task-master`. If this Skill is installed elsewhere, set `ERIC_TASK_MASTER_ROOT` to that clone. The wrapper rejects an older or future incompatible runtime instead of silently driving it.
 
 From the cloned project root run exactly:
 
