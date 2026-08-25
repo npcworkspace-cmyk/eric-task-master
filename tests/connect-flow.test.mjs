@@ -74,6 +74,7 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
     APPDATA: path.join(home, 'AppData', 'Roaming'),
     LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
     CODEX_HOME: codexHome,
+    TASKMASTER_CLAUDE_DESKTOP_CONFIG: claudeDesktopConfig,
     CLAUDE_CONFIG_DIR: path.join(home, 'claude-code'),
     HERMES_HOME: path.join(home, 'hermes'),
     WORKBUDDY_HOME: path.join(home, 'workbuddy'),

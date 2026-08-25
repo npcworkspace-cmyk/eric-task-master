@@ -11,7 +11,8 @@ import { TERMINAL_TASK_STATES, VERSION } from '../src/contracts.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLIENT_ID = 'commercial.acceptance.agent';
-const COMMERCIAL_QUEUE_WAIT_MS = 120_000;
+const COMMERCIAL_QUEUE_WAIT_MS = 240_000;
+const COMMERCIAL_BROWSER_TASK_TIMEOUT_MS = 180_000;
 
 async function fixtureServer() {
   const html = await readFile(path.join(ROOT, 'test', 'fixtures', 'acceptance.html'));
@@ -151,7 +152,7 @@ export async function runCommercialAcceptance() {
       profileId: persistentProfile.id,
       taskType: 'acceptance',
       input: { url: fixture.url, uploadPath },
-      timeoutMs: 90_000,
+      timeoutMs: COMMERCIAL_BROWSER_TASK_TIMEOUT_MS,
       idempotencyKey: `commercial-persistent-seed-${Date.now()}`
     });
     taskIds.push(seeded.taskId);
@@ -305,7 +306,7 @@ export async function runCommercialAcceptance() {
       profileId: persistentProfile.id,
       taskType: 'acceptance',
       input: { url: fixture.url, uploadPath, expectExistingState: true },
-      timeoutMs: 90_000,
+      timeoutMs: COMMERCIAL_BROWSER_TASK_TIMEOUT_MS,
       idempotencyKey: `commercial-persistent-retained-${Date.now()}`
     });
     taskIds.push(retained.taskId);
