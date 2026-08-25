@@ -11,6 +11,10 @@ test('semantic versions compare according to release precedence', () => {
   assert.equal(compareSemver('2.0.0', '2.0.0'), 0);
   assert.equal(compareSemver('2.0.0-rc.2', '2.0.0-rc.1'), 1);
   assert.equal(compareSemver('2.0.0', '2.0.0-rc.99'), 1);
+  assert.equal(compareSemver('2.0.0-A', '2.0.0-a'), -1);
+  assert.equal(compareSemver('2.0.0-alpha-1', '2.0.0-alpha.1'), 1);
+  assert.equal(compareSemver(`2.0.0-${'9'.repeat(80)}`, `2.0.0-${'8'.repeat(79)}`), 1);
+  assert.equal(compareSemver('9007199254740993.0.0', '9007199254740992.0.0'), 1);
   assert.throws(() => parseSemver('02.0.0'));
 });
 
@@ -20,6 +24,7 @@ test('version bumps reject equal or lower explicit versions', () => {
   assert.equal(nextVersion('2.0.0', 'major'), '3.0.0');
   assert.throws(() => nextVersion('2.0.0', '2.0.0'), /must increase monotonically/);
   assert.throws(() => nextVersion('2.0.0', '1.0.5'), /must increase monotonically/);
+  assert.throws(() => nextVersion('2.0.0-a', '2.0.0-A'), /must increase monotonically/);
   assert.equal(assertVersionIncrease('2.0.0-rc.1', '2.0.0'), '2.0.0');
 });
 

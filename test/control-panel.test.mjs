@@ -28,17 +28,21 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.match(source, /document\.visibilityState === 'hidden'/);
   assert.match(source, /return 10_000/);
   assert.match(source, /return live \? 1_000 : 5_000/);
+  assert.match(source, /POLLING_TASK_STATES\.has/);
   assert.match(source, /setTimeout\(async \(\) =>/);
+  assert.match(source, /refreshTimer = setTimeout\(async \(\) => \{\s+await refresh\(\)/);
   assert.match(source, /if \(pollingStopped\) return/);
   assert.match(source, /if \(!pollingStopped\) scheduleRefresh\(\)/);
   assert.match(source, /document\.addEventListener\('visibilitychange', scheduleRefresh\)/);
   assert.match(source, /window\.addEventListener\('pagehide'/);
   assert.match(source, /window\.addEventListener\('pageshow'/);
+  assert.match(source, /window\.addEventListener\('hashchange'/);
+  assert.match(source, /connectFromDashboardCode\(consumeCodeFromLocation\(\)\)/);
   assert.doesNotMatch(source, /setInterval/);
   assert.match(source, /url\.origin === location\.origin/);
   assert.match(source, /showTaskResult\(task\)/);
   assert.match(source, /task\.taskType \|\| '未命名任务'/);
-  assert.match(source, /task\.agent\?\.name \|\| task\.createdBy/);
+  assert.match(source, /task\.agent\?\.name \|\| task\.agent\?\.clientId \|\| task\.createdBy/);
   assert.match(source, /element\('bdi'/);
   assert.match(source, /`Agent · \$\{task\.agent\.clientId\}`/);
   assert.match(source, /task\.currentActivity \|\| \{\}/);
@@ -48,11 +52,22 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.match(source, /mode\.disabled = !isEphemeral/);
   assert.match(source, /人工打开始终使用可见浏览器窗口/);
   assert.match(source, /sessionStorage\.setItem\(TOKEN_KEY/);
+  assert.match(source, /disconnectDashboard\(error\.message\)/);
+  assert.match(source, /renderProfiles\(true\)/);
+  assert.match(source, /renderTasks\(true\)/);
+  assert.match(source, /isInteractingWith\(ui\.profiles\)/);
+  assert.match(source, /isInteractingWith\(ui\.tasks\)/);
+  assert.match(source, /role', 'progressbar'/);
+  assert.match(source, /aria-current', 'true'/);
   assert.match(source, /history\.replaceState/);
   assert.doesNotMatch(source, /localStorage/);
   assert.doesNotMatch(source, /console\.(?:log|info|debug|warn|error)/);
   assert.match(css, /\.task-focused/);
+  assert.match(css, /min-height: 44px/);
+  assert.match(css, /outline: 2px solid var\(--signal-ink\)/);
   assert.match(css, /prefers-reduced-motion: reduce/);
+  assert.match(html, /id="profile-count">—</);
+  assert.match(html, /连接 Manager 后显示任务/);
 });
 
 test('dashboard authorization stays one-time, focused, and same-origin', async () => {

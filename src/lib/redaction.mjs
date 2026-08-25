@@ -7,9 +7,10 @@ const AUTH_HEADER = /((?:^|[^a-z0-9_-])(?:authorization|proxy[-_]?authorization)
 const COOKIE_HEADER = /((?:^|[\r\n])\s*(?:cookie|set-cookie)\s*:\s*)[^\r\n]*/gi;
 const BEARER_VALUE = /(\bbearer\s+)[a-z0-9._~+/=-]+/gi;
 const HTTP_URL = /https?:\/\/[^\s"'<>]+/gi;
+const FILE_URL = /file:\/\/\/[^\s"'<>]+/gi;
 const WINDOWS_ABSOLUTE_PATH = /(^|[^A-Za-z0-9+.-])([A-Za-z]:[\\/][^\s"'<>]*)/gm;
 const UNC_ABSOLUTE_PATH = /(^|[\s("'=,:;])(\\\\[^\s"'<>]+)/gm;
-const POSIX_PRIVATE_PATH = /(^|[\s("'=,:;])(\/(?:Users|home|tmp|var\/folders)\/[^\s"'<>]*)/gm;
+const POSIX_ABSOLUTE_PATH = /(^|[\s("'=,:;])(\/(?!\/)[^\s"'<>),;}:]+)/gm;
 
 export function isSensitiveKey(key) {
   const normalized = String(key ?? '').trim();
@@ -45,11 +46,18 @@ function sanitizePublicHttpUrl(value) {
 }
 
 export function redactPublicText(value, { pathReplacement = '[local-path-hidden]' } = {}) {
-  return redactSensitiveText(value)
-    .replace(HTTP_URL, sanitizePublicHttpUrl)
+  const urls = [];
+  const withUrlPlaceholders = redactSensitiveText(value)
+    .replace(HTTP_URL, (url) => {
+      const index = urls.push(sanitizePublicHttpUrl(url)) - 1;
+      return `\uE000${index}\uE001`;
+    });
+  return withUrlPlaceholders
+    .replace(FILE_URL, pathReplacement)
     .replace(WINDOWS_ABSOLUTE_PATH, (_match, prefix) => `${prefix}${pathReplacement}`)
     .replace(UNC_ABSOLUTE_PATH, (_match, prefix) => `${prefix}${pathReplacement}`)
-    .replace(POSIX_PRIVATE_PATH, (_match, prefix) => `${prefix}${pathReplacement}`);
+    .replace(POSIX_ABSOLUTE_PATH, (_match, prefix) => `${prefix}${pathReplacement}`)
+    .replace(/\uE000(\d+)\uE001/g, (_match, index) => urls[Number(index)] ?? '[REDACTED_URL]');
 }
 
 export function redactSensitiveValue(value, { depth = 0, maxDepth = 12, maxItems = 1_000 } = {}) {

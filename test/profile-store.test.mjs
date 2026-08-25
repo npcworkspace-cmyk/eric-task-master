@@ -220,6 +220,40 @@ test('ProfileStore enforces exclusive leases and recovers only expired dead owne
   assert.equal((await store.get(profile.id)).state, 'idle');
 });
 
+test('ProfileStore lease acquisition cannot overwrite a concurrent same-owner renewal', async (t) => {
+  let currentTime = Date.parse('2026-08-23T00:00:00.000Z');
+  let announceProbe;
+  let releaseProbe;
+  const probeStarted = new Promise((resolve) => { announceProbe = resolve; });
+  const probeBarrier = new Promise((resolve) => { releaseProbe = resolve; });
+  const { store } = await fixture(t, {
+    now: () => currentTime,
+    processAlive: async (pid) => {
+      if (pid === 101) {
+        announceProbe();
+        await probeBarrier;
+        return false;
+      }
+      return true;
+    }
+  });
+  const profile = await store.create({ name: 'Lease CAS race' });
+  await store.acquireLease(profile.id, 'task:owner-a', { pid: 101, ttlMs: 1_000 });
+  currentTime += 2_000;
+
+  const contender = store.acquireLease(profile.id, 'task:owner-b', { pid: 303, ttlMs: 1_000 });
+  await probeStarted;
+  const renewed = await store.acquireLease(profile.id, 'task:owner-a', { pid: 202, ttlMs: 60_000 });
+  assert.equal(renewed.lease.pid, 202);
+  releaseProbe();
+
+  await assert.rejects(contender, { code: 'PROFILE_LEASED', statusCode: 409 });
+  const final = await store.get(profile.id);
+  assert.equal(final.lease.ownerId, 'task:owner-a');
+  assert.equal(final.lease.pid, 202);
+  assert.equal(final.lease.expiresAt, renewed.lease.expiresAt);
+});
+
 test('Profile access revocation is atomic with scoped lease acquisition', async (t) => {
   const { store } = await fixture(t);
   const profile = await store.create(

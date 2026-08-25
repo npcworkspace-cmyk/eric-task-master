@@ -5,9 +5,9 @@ export function parseSemver(value) {
   if (!match) throw new Error(`Invalid semantic version: ${value}`);
   return {
     source: match[0],
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3]),
+    major: BigInt(match[1]),
+    minor: BigInt(match[2]),
+    patch: BigInt(match[3]),
     prerelease: match[4] ? match[4].split('.') : []
   };
 }
@@ -15,9 +15,12 @@ export function parseSemver(value) {
 function compareIdentifier(left, right) {
   const leftNumeric = /^\d+$/.test(left);
   const rightNumeric = /^\d+$/.test(right);
-  if (leftNumeric && rightNumeric) return Number(left) - Number(right);
+  if (leftNumeric && rightNumeric) {
+    if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+    return left === right ? 0 : (left < right ? -1 : 1);
+  }
   if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
-  return left.localeCompare(right, 'en');
+  return left === right ? 0 : (left < right ? -1 : 1);
 }
 
 export function compareSemver(leftValue, rightValue) {
@@ -53,9 +56,9 @@ export function nextVersion(current, instruction) {
   const parsed = parseSemver(current);
   let next;
   if (SEMVER.test(String(instruction ?? ''))) next = String(instruction);
-  else if (instruction === 'patch') next = `${parsed.major}.${parsed.minor}.${parsed.patch + 1}`;
-  else if (instruction === 'minor') next = `${parsed.major}.${parsed.minor + 1}.0`;
-  else if (instruction === 'major') next = `${parsed.major + 1}.0.0`;
+  else if (instruction === 'patch') next = `${parsed.major}.${parsed.minor}.${parsed.patch + 1n}`;
+  else if (instruction === 'minor') next = `${parsed.major}.${parsed.minor + 1n}.0`;
+  else if (instruction === 'major') next = `${parsed.major + 1n}.0.0`;
   else throw new Error(`Invalid bump: ${instruction}`);
   return assertVersionIncrease(current, next);
 }

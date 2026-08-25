@@ -1,6 +1,7 @@
 import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { isBehaviorMode, isBrowserEngine, isProfileKind } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
 
@@ -689,15 +690,12 @@ export class ProfileStore {
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
       requireLeaseAccess(profile, authorizedClientId);
-      if (profile.lease && profile.lease.ownerId !== ownerId) {
-        // A competing acquisition may have won after the liveness check.
-        if (profile.lease.ownerId !== existing.lease?.ownerId) {
-          throw new ProfileStoreError(
-            'PROFILE_LEASED',
-            `Profile ${profileId} was leased concurrently`,
-            409
-          );
-        }
+      if (!isDeepStrictEqual(profile.lease, existing.lease)) {
+        throw new ProfileStoreError(
+          'PROFILE_LEASED',
+          `Profile ${profileId} lease changed concurrently`,
+          409
+        );
       }
       const nowMs = this.#now();
       profile.lease = {

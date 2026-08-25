@@ -60,13 +60,18 @@ test('central object redaction drops sensitive keys and scrubs nested strings', 
 test('public text redaction preserves ordinary URLs while removing URL credentials and embedded local paths', () => {
   assert.equal(redactPublicText('https://example.test/path'), 'https://example.test/path');
   const redacted = redactPublicText(
-    "ENOENT C:\\Users\\eric\\private.txt /home/eric/private.txt https://user:pass@example.test/callback?code=oauth-secret#fragment"
+    "ENOENT C:\\Users\\eric\\private.txt /home/eric/private.txt /root/acme/private.db /workspace/customer/auth-state.json /etc/taskmaster/internal.conf /opt/vendor/private.log file:///root/private.txt https://user:pass@example.test/callback?code=oauth-secret#fragment"
   );
   assert.equal(redacted.includes('C:\\Users'), false);
   assert.equal(redacted.includes('/home/eric'), false);
+  for (const privatePath of ['/root/acme', '/workspace/customer', '/etc/taskmaster', '/opt/vendor']) {
+    assert.equal(redacted.includes(privatePath), false);
+  }
   assert.equal(redacted.includes('user:pass'), false);
   assert.equal(redacted.includes('oauth-secret'), false);
+  assert.equal(redacted.includes('file:///'), false);
   assert.equal(redacted.includes('https://example.test/callback'), true);
+  assert.doesNotThrow(() => new URL(redacted.split(' ').at(-1)));
 });
 
 test('Manager Profile view is an allowlist that ignores future private runtime fields', () => {

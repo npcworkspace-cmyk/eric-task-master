@@ -95,10 +95,21 @@ async function staticChecks() {
   );
   invariant(
     releaseWorkflow.includes('git archive --format=zip') &&
+      releaseWorkflow.includes('ARCHIVE_MTIME="@$(git show -s --format=%ct "${RELEASE_SHA}")"') &&
+      releaseWorkflow.includes('--mtime="${ARCHIVE_MTIME}"') &&
+      releaseWorkflow.includes('cmp "dist/eric-task-master-skill-v${VERSION}.zip"') &&
       !releaseWorkflow.includes('HEAD:extension') &&
       releaseWorkflow.includes('HEAD:skills/eric-task-master') &&
       releaseWorkflow.includes('SHA256SUMS'),
     'release archive or checksum boundary drift'
+  );
+  invariant(
+    releaseWorkflow.includes('group: manual-release-${{ github.repository }}') &&
+      !releaseWorkflow.match(/group:\s*manual-release[^\r\n]*inputs\.confirm_version/) &&
+      releaseWorkflow.includes('MAIN_SHA_NOW=') &&
+      releaseWorkflow.includes('CI_RUN_NOW=') &&
+      releaseWorkflow.lastIndexOf('scripts/assert-release-version.mjs') < releaseWorkflow.indexOf('gh release create'),
+    'release publication must be globally serialized and revalidated immediately before draft creation'
   );
   invariant(
     releaseWorkflow.includes('actions: read') && releaseWorkflow.includes('contents: write') &&
@@ -171,9 +182,10 @@ async function staticChecks() {
     'cross-platform CI must exercise the stable Chrome persistent-Profile path'
   );
   const immutablePreflight = releaseWorkflow.indexOf('repos/${GITHUB_REPOSITORY}/immutable-releases');
+  const immutableRecheck = releaseWorkflow.lastIndexOf('repos/${GITHUB_REPOSITORY}/immutable-releases');
   const releaseCreation = releaseWorkflow.indexOf('gh release create');
   invariant(
-    immutablePreflight >= 0 && releaseCreation > immutablePreflight &&
+    immutablePreflight >= 0 && immutableRecheck > immutablePreflight && releaseCreation > immutableRecheck &&
       releaseWorkflow.includes('secrets.RELEASE_ADMIN_TOKEN') &&
       releaseWorkflow.includes('scripts/assert-release-version.mjs') &&
       releaseWorkflow.includes('${SKILL_PREFIX}/LICENSE') &&

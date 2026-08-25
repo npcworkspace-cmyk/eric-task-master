@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: manual-release-${{ inputs.confirm_version }}
+  group: manual-release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -115,10 +115,15 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
           mkdir -p dist
-          git archive --format=zip --prefix="eric-task-master-v${VERSION}/" \
+          ARCHIVE_MTIME="@$(git show -s --format=%ct "${RELEASE_SHA}")"
+          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-v${VERSION}/" \
             --output="dist/eric-task-master-v${VERSION}.zip" HEAD
-          git archive --format=zip --prefix="eric-task-master-skill-v${VERSION}/" \
+          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-skill-v${VERSION}/" \
             --output="dist/eric-task-master-skill-v${VERSION}.zip" HEAD:skills/eric-task-master
+          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-skill-v${VERSION}/" \
+            --output="dist/eric-task-master-skill-v${VERSION}.repro.zip" HEAD:skills/eric-task-master
+          cmp "dist/eric-task-master-skill-v${VERSION}.zip" "dist/eric-task-master-skill-v${VERSION}.repro.zip"
+          rm "dist/eric-task-master-skill-v${VERSION}.repro.zip"
           SKILL_PREFIX="eric-task-master-skill-v${VERSION}"
           unzip -Z1 "dist/eric-task-master-skill-v${VERSION}.zip" | grep -Fx "${SKILL_PREFIX}/LICENSE"
           unzip -Z1 "dist/eric-task-master-skill-v${VERSION}.zip" | grep -Fx "${SKILL_PREFIX}/runtime.json"
@@ -128,10 +133,44 @@ jobs:
           test "$(unzip -p "dist/eric-task-master-skill-v${VERSION}.zip" "${SKILL_PREFIX}/runtime.json" \
             | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).runtimeVersion))')" = "${VERSION}"
           (cd dist && sha256sum ./*.zip > SHA256SUMS)
+      - name: Reverify immutable Release enforcement immediately before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN}" || {
+            echo "RELEASE_ADMIN_TOKEN with repository Administration:read is required." >&2
+            exit 1
+          }
+          IMMUTABLE_ENABLED_NOW="$(gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)"
+          test "${IMMUTABLE_ENABLED_NOW}" = true || {
+            echo "Repository Release immutability changed after preflight; no Release was created." >&2
+            exit 1
+          }
       - name: Create complete draft and publish immutable Release
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          MAIN_SHA_NOW="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          test "${MAIN_SHA_NOW}" = "${RELEASE_SHA}" || {
+            echo "Main moved to ${MAIN_SHA_NOW} after release preflight; no Release was created." >&2
+            exit 1
+          }
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name' \
+            | node scripts/assert-release-version.mjs "${VERSION}"
+          CI_RUN_NOW="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&head_sha=${RELEASE_SHA}&per_page=20" \
+            --jq '.workflow_runs[] | select(.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .conclusion == "success") | .id' \
+            | head -n 1)"
+          test -n "${CI_RUN_NOW}" || {
+            echo "Exact-SHA main push CI is no longer verifiable; no Release was created." >&2
+            exit 1
+          }
           gh release create "${TAG}" dist/* --draft --target "${RELEASE_SHA}" --generate-notes \
             --title "Eric Task Master ${TAG}" --repo "${GITHUB_REPOSITORY}"
           gh release edit "${TAG}" --draft=false --repo "${GITHUB_REPOSITORY}"

@@ -9,10 +9,10 @@
   <body>
     <header class="topbar">
       <a class="brand" href="/dashboard" aria-label="Task Master 首页">
-        <span class="brand-mark">◉</span>
+        <span class="brand-mark" aria-hidden="true">NPC</span>
         <span><strong>Eric Task Master</strong><small>Playwright Operations</small></span>
       </a>
-      <div class="connection">
+      <div class="connection" role="status" aria-live="polite">
         <span id="connection-dot" class="dot disconnected"></span>
         <span id="connection-label">未连接</span>
         <button id="refresh-all" class="button ghost" type="button">刷新</button>
@@ -26,6 +26,7 @@
           <p>请让 Agent 启动任务面板，或使用 <code>taskmaster connect</code>；授权短码只能使用一次。</p>
         </div>
         <form id="token-form">
+          <label class="sr-only" for="manager-token">一次性 Dashboard 授权短码</label>
           <input id="manager-token" type="password" autocomplete="off" placeholder="一次性 Dashboard 授权短码" required>
           <button class="button primary" type="submit">连接</button>
         </form>
@@ -38,9 +39,9 @@
           <p>管理独立 Profile、查看实时进度，并在需要时取消或接管任务。</p>
         </div>
         <div class="summary-grid" aria-label="任务摘要">
-          <div><strong id="profile-count">0</strong><span>Profiles</span></div>
-          <div><strong id="running-count">0</strong><span>运行中</span></div>
-          <div><strong id="attention-count">0</strong><span>需关注</span></div>
+          <div><strong id="profile-count">—</strong><span>Profiles</span></div>
+          <div><strong id="running-count">—</strong><span>运行中</span></div>
+          <div><strong id="attention-count">—</strong><span>需关注</span></div>
         </div>
       </section>
 
@@ -48,28 +49,29 @@
         <div class="panel-heading">
           <div><p class="eyebrow">PROFILES</p><h2>Playwright Profiles</h2></div>
           <form id="create-profile-form" class="inline-form">
-            <input id="profile-name" maxlength="60" placeholder="Profile 名称" required>
-            <select id="profile-kind" aria-label="Profile 类型">
+            <label class="sr-only" for="profile-name">Profile 名称</label>
+            <input id="profile-name" maxlength="60" placeholder="Profile 名称" required disabled>
+            <select id="profile-kind" aria-label="Profile 类型" disabled>
               <option value="persistent">持久登录</option>
               <option value="ephemeral">隐身临时</option>
             </select>
-            <select id="profile-engine" aria-label="浏览器引擎">
+            <select id="profile-engine" aria-label="浏览器引擎" disabled>
               <option value="chrome">本机稳定版 Chrome</option>
               <option value="chromium">项目锁定 Chromium</option>
             </select>
-            <select id="profile-mode" aria-label="默认行为模式">
+            <select id="profile-mode" aria-label="默认行为模式" disabled>
               <option value="fast">快速</option>
               <option value="human">拟人</option>
               <option value="adaptive">自适应</option>
             </select>
             <label class="checkbox-label" title="仅任务运行时不显示窗口；人工打开持久 Profile 始终可见">
-              <input id="profile-headless" type="checkbox">
+              <input id="profile-headless" type="checkbox" disabled>
               任务后台
             </label>
-            <button class="button primary" type="submit">创建 Profile</button>
+            <button class="button primary" type="submit" disabled>创建 Profile</button>
           </form>
         </div>
-        <div id="profiles" class="profile-grid"></div>
+        <div id="profiles" class="profile-grid"><p class="empty">连接 Manager 后显示 Profiles。</p></div>
       </section>
 
       <section class="panel">
@@ -77,10 +79,10 @@
           <div><p class="eyebrow">TASKS</p><h2>任务与进度</h2></div>
           <span id="last-refresh" class="muted">尚未刷新</span>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap" tabindex="0" aria-label="任务列表，可横向滚动">
           <table>
             <thead><tr><th>任务</th><th>Agent</th><th>Profile</th><th>状态</th><th>当前活动</th><th>业务进度</th><th>最近反馈</th><th>操作</th></tr></thead>
-            <tbody id="tasks"></tbody>
+            <tbody id="tasks"><tr><td class="empty" colspan="8">连接 Manager 后显示任务。</td></tr></tbody>
           </table>
         </div>
       </section>

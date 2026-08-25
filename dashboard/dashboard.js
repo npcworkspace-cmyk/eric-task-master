@@ -1,6 +1,7 @@
 const MODES = ['fast', 'human', 'adaptive'];
 const ACTIVE_TASK_STATES = new Set(['queued', 'acquiring_profile', 'starting_browser', 'running', 'cooling_down', 'recovering', 'verifying']);
 const ATTENTION_TASK_STATES = new Set(['waiting_user', 'failed']);
+const POLLING_TASK_STATES = new Set(['waiting_user']);
 const TERMINAL_TASK_STATES = new Set(['completed', 'failed', 'cancelled']);
 const TOKEN_KEY = 'taskmaster.dashboardToken';
 const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -60,6 +61,7 @@ let refreshTimer = null;
 let refreshInFlight = null;
 let focusedTaskApplied = false;
 let pollingStopped = false;
+let dashboardConnected = false;
 
 function focusTaskFromLocation() {
   const value = new URL(location.href).searchParams.get('task');
@@ -85,9 +87,12 @@ function setMessage(message = '', kind = '') {
 }
 
 function setConnected(connected) {
+  dashboardConnected = connected;
   ui.connectionDot.className = `dot ${connected ? 'connected' : 'disconnected'}`;
   ui.connectionLabel.textContent = connected ? '本机 Manager 已连接' : 'Manager 未连接';
   ui.tokenPanel.classList.toggle('hidden', connected);
+  for (const control of ui.createProfileForm.elements) control.disabled = !connected;
+  if (connected) syncCreatePolicy();
 }
 
 async function request(path, { method = 'GET', body } = {}) {
@@ -105,6 +110,7 @@ async function request(path, { method = 'GET', body } = {}) {
   if (!response.ok) {
     const error = new Error(payload?.message || payload?.error?.message || `请求失败 (${response.status})`);
     error.status = response.status;
+    if (response.status === 401 || response.status === 403) disconnectDashboard(error.message);
     throw error;
   }
   return payload;
@@ -122,6 +128,18 @@ async function exchangeDashboardCode(code) {
   }
   managerToken = payload.dashboardToken;
   sessionStorage.setItem(TOKEN_KEY, managerToken);
+}
+
+async function connectFromDashboardCode(code) {
+  if (!code) return false;
+  try {
+    await exchangeDashboardCode(code);
+    await refresh({ forceRender: true });
+    return true;
+  } catch (error) {
+    setMessage(error.message, 'error');
+    return false;
+  }
 }
 
 function unpackList(payload, key) {
@@ -143,6 +161,30 @@ function button(label, className, action) {
   node.type = 'button';
   node.addEventListener('click', action);
   return node;
+}
+
+function isInteractingWith(container) {
+  const active = document.activeElement;
+  return Boolean(active && container.contains(active) && /^(?:A|BUTTON|INPUT|SELECT|TEXTAREA)$/.test(active.tagName));
+}
+
+function disconnectDashboard(message = '') {
+  managerToken = '';
+  sessionStorage.removeItem(TOKEN_KEY);
+  profiles = [];
+  tasks = [];
+  setConnected(false);
+  renderProfiles(true);
+  renderTasks(true);
+  updateSummary();
+  ui.lastRefresh.textContent = '等待连接';
+  ui.resultTitle.textContent = '任务结果';
+  ui.resultSummary.textContent = '';
+  ui.resultEvidence.textContent = '';
+  ui.resultOutput.textContent = '';
+  ui.resultOutputRow.classList.add('hidden');
+  if (ui.resultDialog.open) ui.resultDialog.close();
+  if (message) setMessage(message, 'error');
 }
 
 function profileState(profile) {
@@ -167,7 +209,8 @@ function syncCreatePolicy() {
   ui.profileMode.title = persistent ? '持久 Profile 固定使用拟人行为' : '临时 Profile 的任务行为策略';
 }
 
-function renderProfiles() {
+function renderProfiles(force = false) {
+  if (!force && isInteractingWith(ui.profiles)) return;
   ui.profiles.replaceChildren();
   for (const profile of profiles) {
     const card = element('article', 'profile-card');
@@ -233,13 +276,19 @@ function renderProfiles() {
     card.append(top, meta, controls);
     ui.profiles.append(card);
   }
-  if (!profiles.length) ui.profiles.append(element('p', 'empty', '还没有 Profile。创建一个独立环境开始任务。'));
+  if (!profiles.length) {
+    ui.profiles.append(element(
+      'p',
+      'empty',
+      dashboardConnected ? '还没有 Profile。创建一个独立环境开始任务。' : '连接 Manager 后显示 Profiles。'
+    ));
+  }
 }
 
 function taskProgress(task) {
   const current = Number(task.progress?.current ?? 0);
   const total = Number(task.progress?.total ?? 0);
-  const percent = total > 0 ? Math.max(0, Math.min(100, Math.round(current / total * 100))) : 0;
+  const percent = total > 0 ? Math.max(0, Math.min(100, Math.round(current / total * 100))) : null;
   let message = task.progress?.message || '';
   if (task.state === 'queued' && task.queuePosition) {
     message = `队列 #${task.queuePosition} · ${task.queueReason || '等待调度'}`;
@@ -272,16 +321,23 @@ function resultUrl(task) {
   }
 }
 
-function renderTasks() {
+function renderTasks(force = false) {
+  if (!force && isInteractingWith(ui.tasks)) return;
   ui.tasks.replaceChildren();
   for (const task of tasks) {
     const row = document.createElement('tr');
     row.dataset.taskId = task.id;
     if (task.id === focusedTaskId) {
       row.classList.add('task-focused');
+      row.tabIndex = -1;
+      row.setAttribute('aria-current', 'true');
+      row.setAttribute('aria-label', `当前任务 ${task.taskType || task.id}`);
       if (!focusedTaskApplied) {
         focusedTaskApplied = true;
-        queueMicrotask(() => row.scrollIntoView({ block: 'center' }));
+        queueMicrotask(() => {
+          row.focus({ preventScroll: true });
+          row.scrollIntoView({ block: 'center' });
+        });
       }
     }
     const name = element('td', 'task-name');
@@ -291,10 +347,10 @@ function renderTasks() {
     );
     const agent = element('td', 'agent-name');
     const agentName = element('strong');
-    agentName.append(element('bdi', '', task.agent?.name || task.createdBy || '本机管理员'));
+    agentName.append(element('bdi', '', task.agent?.name || task.agent?.clientId || task.createdBy || '本机管理员'));
     agent.append(
       agentName,
-      ...(task.agent?.name && task.agent?.clientId
+      ...(task.agent?.clientId && task.agent?.clientId !== task.agent?.name
         ? [element('small', '', `Agent · ${task.agent.clientId}`)]
         : [])
     );
@@ -314,13 +370,22 @@ function renderTasks() {
     const progress = taskProgress(task);
     const progressCell = element('td', 'progress');
     const track = element('div', 'progress-track');
+    track.setAttribute('role', 'progressbar');
+    track.setAttribute('aria-label', `${task.taskType || task.id} 进度`);
+    track.setAttribute('aria-valuemin', '0');
+    if (progress.total > 0) {
+      track.setAttribute('aria-valuemax', '100');
+      track.setAttribute('aria-valuenow', String(progress.percent));
+    } else {
+      track.setAttribute('aria-valuetext', '进行中，尚无总量');
+    }
     const fill = element('div', 'progress-fill');
-    fill.style.width = `${progress.percent}%`;
+    fill.style.width = `${progress.percent ?? 0}%`;
     track.append(fill);
     const progressCopy = element('div', 'progress-copy');
     progressCopy.append(
       element('span', '', progress.phase || `${progress.current}/${progress.total || '?'}`),
-      element('span', '', `${progress.percent}%`)
+      element('span', '', progress.percent === null ? '进行中' : `${progress.percent}%`)
     );
     progressCell.append(track, progressCopy);
     const feedback = element('td', 'latest-feedback');
@@ -353,7 +418,7 @@ function renderTasks() {
   }
   if (!tasks.length) {
     const row = document.createElement('tr');
-    const cell = element('td', 'empty', '当前没有任务');
+    const cell = element('td', 'empty', dashboardConnected ? '当前没有任务' : '连接 Manager 后显示任务。');
     cell.colSpan = 8;
     row.append(cell);
     ui.tasks.append(row);
@@ -371,6 +436,7 @@ async function showTaskResult(task) {
     artifacts = unpackList(payload, 'artifacts');
   } catch (error) {
     setMessage(error.message, 'error');
+    if (error.status === 401 || error.status === 403) return;
   }
   ui.resultOutputRow.classList.toggle('hidden', artifacts.length === 0);
   ui.resultOutput.textContent = artifacts
@@ -395,13 +461,19 @@ async function continueTask(task) {
       }
     });
     setMessage('已发送新指令，任务正在核验当前页面', 'success');
-    await refresh();
+    await refresh({ forceRender: true });
   } catch (error) {
     setMessage(error.message, 'error');
   }
 }
 
 function updateSummary() {
+  if (!dashboardConnected) {
+    ui.profileCount.textContent = '—';
+    ui.runningCount.textContent = '—';
+    ui.attentionCount.textContent = '—';
+    return;
+  }
   ui.profileCount.textContent = String(profiles.length);
   ui.runningCount.textContent = String(tasks.filter((task) => ACTIVE_TASK_STATES.has(task.state || task.status)).length);
   ui.attentionCount.textContent = String(tasks.filter((task) => (
@@ -415,11 +487,11 @@ function formatTime(value) {
   return Number.isNaN(date.valueOf()) ? '—' : new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(date);
 }
 
-async function refresh() {
+async function refresh({ forceRender = false } = {}) {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
     if (!managerToken) {
-      setConnected(false);
+      disconnectDashboard();
       return;
     }
     try {
@@ -429,17 +501,13 @@ async function refresh() {
       ]);
       profiles = unpackList(profilePayload, 'profiles');
       tasks = unpackList(taskPayload, 'tasks');
-      renderProfiles();
-      renderTasks();
+      setConnected(true);
+      renderProfiles(forceRender);
+      renderTasks(forceRender);
       updateSummary();
       ui.lastRefresh.textContent = `刷新于 ${formatTime(new Date())}`;
-      setConnected(true);
     } catch (error) {
-      if (error.status === 401 || error.status === 403) {
-        managerToken = '';
-        sessionStorage.removeItem(TOKEN_KEY);
-      }
-      setConnected(false);
+      if (error.status !== 401 && error.status !== 403) setConnected(false);
       setMessage(error.message, 'error');
     }
   })();
@@ -453,7 +521,7 @@ async function refresh() {
 function pollingDelay() {
   if (document.visibilityState === 'hidden') return 10_000;
   const live = tasks.some((task) => (
-    ACTIVE_TASK_STATES.has(task.state || task.status) || ATTENTION_TASK_STATES.has(task.state || task.status)
+    ACTIVE_TASK_STATES.has(task.state || task.status) || POLLING_TASK_STATES.has(task.state || task.status)
   ));
   return live ? 1_000 : 5_000;
 }
@@ -486,7 +554,7 @@ async function createProfile(event) {
     ui.profileHeadless.checked = false;
     syncCreatePolicy();
     setMessage('Profile 已创建', 'success');
-    await refresh();
+    await refresh({ forceRender: true });
   } catch (error) {
     setMessage(error.message, 'error');
   }
@@ -495,10 +563,10 @@ async function createProfile(event) {
 async function updateProfile(id, patch) {
   try {
     await request(`/v1/profiles/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch });
-    await refresh();
+    await refresh({ forceRender: true });
   } catch (error) {
     setMessage(error.message, 'error');
-    await refresh();
+    await refresh({ forceRender: true });
   }
 }
 
@@ -511,7 +579,7 @@ async function setProfileOpen(profile, shouldOpen) {
   try {
     await request(`/v1/profiles/${encodeURIComponent(profile.id)}/${shouldOpen ? 'open' : 'close'}`, { method: 'POST' });
     setMessage(shouldOpen ? 'Profile 正在打开' : 'Profile 已关闭', 'success');
-    await refresh();
+    await refresh({ forceRender: true });
   } catch (error) {
     setMessage(error.message, 'error');
   }
@@ -525,7 +593,7 @@ async function deleteProfile(profile) {
   try {
     await request(`/v1/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE' });
     setMessage('Profile 已删除', 'success');
-    await refresh();
+    await refresh({ forceRender: true });
   } catch (error) {
     setMessage(error.message, 'error');
   }
@@ -536,7 +604,7 @@ async function cancelTask(task) {
   try {
     await request(`/v1/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST' });
     setMessage('取消请求已发送', 'success');
-    await refresh();
+    await refresh({ forceRender: true });
   } catch (error) {
     setMessage(error.message, 'error');
   }
@@ -549,7 +617,7 @@ async function saveToken(event) {
   if (!code) return;
   try {
     await exchangeDashboardCode(code);
-    await refresh();
+    await refresh({ forceRender: true });
   } catch (error) {
     setMessage(error.message, 'error');
   }
@@ -563,16 +631,13 @@ ui.profileKind.addEventListener('change', syncCreatePolicy);
 ui.refreshAll.addEventListener('click', () => void refresh());
 syncCreatePolicy();
 void (async () => {
-  if (initialCode) {
-    try {
-      await exchangeDashboardCode(initialCode);
-    } catch (error) {
-      setMessage(error.message, 'error');
-    }
-  }
-  await refresh();
+  const connectedFromCode = await connectFromDashboardCode(initialCode);
+  if (!connectedFromCode) await refresh();
   scheduleRefresh();
 })();
+window.addEventListener('hashchange', () => {
+  void connectFromDashboardCode(consumeCodeFromLocation());
+});
 document.addEventListener('visibilitychange', scheduleRefresh);
 window.addEventListener('pagehide', () => {
   pollingStopped = true;

@@ -238,7 +238,7 @@ test('Manager errorResponse redacts message and nested details', async (t) => {
         throw new HttpError(
           400,
           'FIXTURE_REJECTED',
-          `private_key=${marker}; ENOENT C:\\Users\\eric\\private.txt; https://user:pass@example.test/callback?code=${marker}`,
+          `private_key=${marker}; ENOENT C:\\Users\\eric\\private.txt; /root/acme/private.db; /workspace/customer/auth-state.json; /etc/taskmaster/internal.conf; /opt/vendor/private.log; https://user:pass@example.test/callback?code=${marker}`,
           {
             safe: `Authorization: Bearer ${marker}; /home/eric/private.txt`,
             managerToken: marker
@@ -260,6 +260,9 @@ test('Manager errorResponse redacts message and nested details', async (t) => {
   assert.equal(text.includes(marker), false);
   assert.equal(text.includes('C:\\Users\\eric'), false);
   assert.equal(text.includes('/home/eric'), false);
+  for (const privatePath of ['/root/acme', '/workspace/customer', '/etc/taskmaster', '/opt/vendor']) {
+    assert.equal(text.includes(privatePath), false);
+  }
   assert.equal(text.includes('user:pass'), false);
   assert.match(text, /\[REDACTED\]/);
 });
