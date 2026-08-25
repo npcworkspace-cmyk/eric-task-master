@@ -47,7 +47,7 @@ test('Task Pack batch install is all-or-nothing and exposes progressive discover
     'export const meta = {',
     `  version: ${JSON.stringify(version)},`,
     `  intents: [${JSON.stringify(intent)}],`,
-    "  tags: ['pack-fixture'], outputs: ['json'], preferredBehavior: 'adaptive',",
+    "  tags: ['pack-fixture'], outputs: ['json'],",
     "  risk: 'read', readOnly: true, supportsResume: true,",
     "  inputSchema: { type: 'object', properties: { url: { type: 'string' } } }",
     '};',

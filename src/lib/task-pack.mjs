@@ -156,7 +156,6 @@ export async function scaffoldTaskPack(directory, { name } = {}) {
     "  intents: ['read-page'],",
     "  tags: ['example'],",
     "  outputs: ['json'],",
-    "  preferredBehavior: 'fast',",
     "  risk: 'read',",
     '  readOnly: true,',
     '  supportsResume: false,',

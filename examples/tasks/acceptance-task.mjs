@@ -8,7 +8,6 @@ export const meta = Object.freeze({
   intents: ['accept-browser'],
   tags: ['acceptance', 'builtin'],
   outputs: ['json', 'png', 'download'],
-  preferredBehavior: 'fast',
   risk: 'mixed',
   supportsResume: false,
   inputSchema: {

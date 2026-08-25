@@ -8,7 +8,6 @@ export const meta = Object.freeze({
   intents: ['read-page'],
   tags: ['template'],
   outputs: ['json'],
-  preferredBehavior: 'fast',
   risk: 'read',
   readOnly: true,
   supportsResume: false,

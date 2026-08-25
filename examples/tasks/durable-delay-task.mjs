@@ -8,7 +8,6 @@ export const meta = Object.freeze({
   intents: ['test-durability'],
   tags: ['acceptance', 'builtin'],
   outputs: ['json'],
-  preferredBehavior: 'fast',
   risk: 'read',
   readOnly: true,
   supportsResume: true,

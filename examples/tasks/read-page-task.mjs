@@ -8,7 +8,6 @@ export const meta = Object.freeze({
   intents: ['extract-text', 'read-page'],
   tags: ['builtin', 'observation'],
   outputs: ['json', 'screenshot'],
-  preferredBehavior: 'fast',
   risk: 'read',
   readOnly: true,
   supportsResume: false,

@@ -3,7 +3,6 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isBehaviorMode } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
 
 const MAX_TASK_MODULE_BYTES = 2 * 1024 * 1024;
@@ -60,7 +59,6 @@ function publicType(record, { includeSchema = true, includeIntegrity = true } = 
     ...(record.intents?.length ? { intents: [...record.intents] } : {}),
     ...(record.tags?.length ? { tags: [...record.tags] } : {}),
     ...(record.outputs?.length ? { outputs: [...record.outputs] } : {}),
-    ...(record.preferredBehavior ? { preferredBehavior: record.preferredBehavior } : {}),
     ...(record.risk ? { risk: record.risk } : {}),
     ...(record.pack ? { pack: { name: record.pack.name, version: record.pack.version } } : {}),
     supportsResume: record.supportsResume === true,
@@ -201,10 +199,10 @@ function safeMetadata(meta, expectedName) {
   const intents = boundedTokenList(source.intents, 'intents', 16);
   const tags = boundedTokenList(source.tags, 'tags');
   const outputs = boundedTokenList(source.outputs, 'outputs');
-  if (source.preferredBehavior !== undefined && !isBehaviorMode(source.preferredBehavior)) {
+  if (source.preferredBehavior !== undefined) {
     throw new TaskTypeRegistryError(
-      'INVALID_TASK_METADATA',
-      'meta.preferredBehavior must be fast, human, or adaptive'
+      'TASK_BEHAVIOR_PROFILE_OWNED',
+      'Task behavior belongs to the selected Profile; remove meta.preferredBehavior'
     );
   }
   if (source.risk !== undefined && !TASK_RISKS.has(source.risk)) {
@@ -223,7 +221,6 @@ function safeMetadata(meta, expectedName) {
     ...(intents ? { intents } : {}),
     ...(tags ? { tags } : {}),
     ...(outputs ? { outputs } : {}),
-    ...(source.preferredBehavior ? { preferredBehavior: source.preferredBehavior } : {}),
     ...(source.risk ? { risk: source.risk } : {}),
     supportsResume: source.supportsResume === true
   };

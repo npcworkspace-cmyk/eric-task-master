@@ -8,7 +8,6 @@ export const meta = Object.freeze({
   intents: ['accept-handoff'],
   tags: ['acceptance', 'builtin'],
   outputs: ['json'],
-  preferredBehavior: 'fast',
   risk: 'read',
   readOnly: true,
   supportsResume: false,

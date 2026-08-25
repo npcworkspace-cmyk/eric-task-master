@@ -283,7 +283,6 @@ export function publicTaskType(taskType, { includeSchema = true } = {}) {
     ['intents', stringList(taskType?.intents, 16)],
     ['tags', stringList(taskType?.tags, 32)],
     ['outputs', stringList(taskType?.outputs, 32)],
-    ['preferredBehavior', stringValue(taskType?.preferredBehavior, 32)],
     ['risk', stringValue(taskType?.risk, 16)],
     ['pack', taskType?.pack && typeof taskType.pack === 'object' ? definedEntries([
       ['name', stringValue(taskType.pack.name, 80)],

@@ -52,6 +52,47 @@ test('a short-lived inspector accepts a valid task module and bounded metadata',
   assert.match(installed.sha256, /^[a-f0-9]{64}$/);
 });
 
+test('task modules cannot override Profile-owned behavior policy', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  const modulePath = await writeModule(allowed, 'behavior-owned.mjs', [
+    'export const meta = { preferredBehavior: "fast" };',
+    'export async function run() { return { summary: "unused", evidence: [] }; }',
+    ''
+  ].join('\n'));
+
+  await assert.rejects(
+    registry.install({ name: 'behavior-owned', modulePath }),
+    {
+      code: 'TASK_BEHAVIOR_PROFILE_OWNED',
+      message: 'Task behavior belongs to the selected Profile; remove meta.preferredBehavior'
+    }
+  );
+});
+
+test('legacy registry records remain readable without exposing preferredBehavior', async (t) => {
+  const { allowed, snapshotRoot, filePath, registry } = await fixture(t);
+  const modulePath = await writeModule(
+    allowed,
+    'legacy-behavior.mjs',
+    'export async function run() { return { summary: "ok", evidence: [] }; }\n'
+  );
+  await registry.install({ name: 'legacy-behavior', modulePath });
+  const persisted = JSON.parse(await readFile(filePath, 'utf8'));
+  persisted.types[0].preferredBehavior = 'fast';
+  await writeFile(filePath, `${JSON.stringify(persisted)}\n`, 'utf8');
+
+  const reopened = new TaskTypeRegistry({
+    filePath,
+    snapshotRoot,
+    allowedRoots: [allowed],
+    seedTypes: []
+  });
+  const [listed] = await reopened.list();
+  const described = await reopened.describe('legacy-behavior');
+  assert.equal(Object.hasOwn(listed, 'preferredBehavior'), false);
+  assert.equal(Object.hasOwn(described, 'preferredBehavior'), false);
+});
+
 test('top-level process.exit is contained to the inspector process', async (t) => {
   const { allowed, registry } = await fixture(t);
   const exiting = await writeModule(allowed, 'exit.mjs', [

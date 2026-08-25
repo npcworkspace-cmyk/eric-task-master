@@ -167,7 +167,6 @@ const TaskTypeSchema = z.strictObject({
   intents: z.array(z.string()).optional(),
   tags: z.array(z.string()).optional(),
   outputs: z.array(z.string()).optional(),
-  preferredBehavior: z.enum(BEHAVIOR_MODES).optional(),
   risk: z.enum(['read', 'write', 'mixed']).optional(),
   pack: z.strictObject({ name: z.string(), version: z.string() }).optional(),
   supportsResume: z.boolean().optional(),
