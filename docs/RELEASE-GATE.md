@@ -5,7 +5,7 @@ Task Master uses evidence gates rather than a blanket “commercial-grade” cla
 ## Mandatory local gate
 
 ```bash
-npm ci
+npm ci --ignore-scripts --no-audit --no-fund
 npx playwright install chromium
 npm run check
 ```
@@ -38,7 +38,7 @@ npm run acceptance:commercial
 Remove-Item Env:TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE
 ```
 
-CI keeps the default managed Chromium engine so the cross-platform matrix remains reproducible.
+The local command records the actual engine in its report. CI repeats this commercial workload on every advertised platform with the stable Chrome channel, while all ephemeral Profile checks continue to use the lockfile-pinned Chromium.
 
 ## Cross-platform boundary
 
