@@ -1,7 +1,7 @@
 {
   "name": "eric-task-master",
-  "version": "1.0.3",
-  "description": "Playwright-first browser task runtime with a real-browser control panel.",
+  "version": "1.0.4",
+  "description": "Playwright browser automation runtime for AI agents with MCP, persistent Profiles, durable tasks, and unattended workflows.",
   "type": "module",
   "private": true,
   "engines": {

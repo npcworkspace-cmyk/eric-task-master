@@ -7,17 +7,21 @@ description: Install, connect, and use Eric Task Master for durable Playwright b
 
 Task Master is the browser execution layer. Use its registered high-level task types; do not invent another daemon, port, controller, browser launcher, or task-follow loop.
 
-## Fixed startup and acceptance
+## Fixed GitHub-to-task bootstrap
 
-From the cloned project root or this Skill directory, run exactly:
+This Skill is the instruction adapter, not the browser runtime. It requires the complete `eric-task-master` repository. When the user supplies the GitHub URL, authenticate if needed, clone the full repository, and read or install this Skill from `skills/eric-task-master`. If this Skill is installed elsewhere, set `ERIC_TASK_MASTER_ROOT` to that clone.
+
+From the cloned project root run exactly:
 
 ```bash
 node scripts/taskmaster.mjs connect --json
 ```
 
-Installation is incomplete until this command returns `ok: true` and its real-browser acceptance checks pass. It installs lockfile-pinned dependencies and Chromium when missing, starts Manager, and safely registers STDIO MCP in detected supported Agent hosts. If it reports `registered_pending_restart`, ask the user to reload that Agent host once. If startup fails, retry this same command once, then report the exact `error.code` and `nextAction`; do not branch into speculative controllers.
+Installation is incomplete until this command returns `ok: true` and its real-browser acceptance checks pass. It installs lockfile-pinned dependencies and Chromium when missing, safely migrates an idle authenticated older Manager, starts Manager, and registers STDIO MCP in detected supported Agent hosts. A busy older Manager returns `MANAGER_UPGRADE_BUSY` without interrupting its work; wait for it to settle and rerun the same command once. For any other startup failure, follow the exact `error.code` and `nextAction`, retry the same command at most once after fixing that precondition, and do not branch into speculative controllers.
 
-After reload, call `taskmaster_status`, then `taskmaster_profiles_list`. Create a Profile only when no suitable one exists because creation is non-idempotent:
+If the extension is already installed from the current checkout, reload it only after a version update. Otherwise load the repository's `extension/` directory. Ask the user to paste the returned `ETM1...` code and click **Pair**; never attempt to approve pairing for them.
+
+If registration reports `registered_pending_restart`, ask the user to reload that host once. Then call `taskmaster_status`, followed by `taskmaster_profiles_list`. When both succeed, ask what browser task to run. Create a Profile only when no suitable one exists because creation is non-idempotent:
 
 - choose `persistent` for login state or recurring account work;
 - choose `ephemeral` for no-login temporary work. It starts clean for every task and retains no browser state after cleanup. It cannot receive session transfer or be opened manually.

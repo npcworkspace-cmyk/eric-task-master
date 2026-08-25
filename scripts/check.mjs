@@ -129,16 +129,31 @@ async function staticChecks() {
     invariant(!forbidden.test(source), `${relative} bypasses the pure Playwright boundary`);
   }
 
-  const skill = await readFile(resolve(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8');
+  const [skill, readme, readmeZh] = await Promise.all([
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8'),
+    readFile(resolve(ROOT, 'README.md'), 'utf8'),
+    readFile(resolve(ROOT, 'README.zh-CN.md'), 'utf8')
+  ]);
   invariant(skill.startsWith('---\nname: eric-task-master\n'), 'Skill frontmatter is invalid');
   invariant(skill.includes('node scripts/taskmaster.mjs connect --json'), 'Skill lacks the fixed startup command');
   invariant(
     skill.includes('taskmaster_task_types_describe') && skill.includes('taskmaster_tasks_continue'),
     'Skill lacks progressive discovery or same-task handoff'
   );
+  invariant(
+    readme.includes('[简体中文](./README.zh-CN.md)') && readmeZh.includes('[English](./README.md)'),
+    'Bilingual README navigation drift'
+  );
+  invariant(
+    readme.includes('node scripts/taskmaster.mjs connect --json') &&
+      readmeZh.includes('node scripts/taskmaster.mjs connect --json') &&
+      readme.includes('https://github.com/npcworkspace-cmyk/eric-task-master') &&
+      readmeZh.includes('https://github.com/npcworkspace-cmyk/eric-task-master'),
+    'GitHub-to-task bootstrap contract drift'
+  );
   const popup = await readFile(resolve(ROOT, 'extension', 'popup.js'), 'utf8');
   invariant(popup.includes('http://127.0.0.1:19946'), 'extension and manager port contract drift');
-  return { passed: 26, total: 26 };
+  return { passed: 28, total: 28 };
 }
 
 function run(command, args, env = {}) {

@@ -139,7 +139,7 @@ async function readManagerCredentials(stateDir) {
   return { token: config.managerToken, identity };
 }
 
-async function verifyManagerEndpoint(config, identity, timeoutMs = 2_500) {
+async function verifyManagerEndpoint(config, identity, timeoutMs = 2_500, expectedVersion = VERSION) {
   const nonce = createIdentityNonce();
   let proof;
   try {
@@ -150,7 +150,7 @@ async function verifyManagerEndpoint(config, identity, timeoutMs = 2_500) {
     });
     verifyManagerIdentityProof(proof, identity, {
       service: MANAGER_SERVICE,
-      version: VERSION,
+      version: expectedVersion,
       apiVersion: API_VERSION,
       host: config.host,
       port: config.port,
@@ -207,12 +207,12 @@ async function requestJson(baseUrl, pathname, { method = 'GET', body, token, tim
   return payload;
 }
 
-async function health(config, timeoutMs = 1_500) {
+async function health(config, timeoutMs = 1_500, expectedVersion = VERSION) {
   const result = await requestJson(config.baseUrl, '/v1/health', { timeoutMs });
   if (result.service !== 'eric-task-master') {
     throw cliError('PORT_OCCUPIED', `Port ${config.port} belongs to another service`);
   }
-  if (result.version !== VERSION) {
+  if (expectedVersion !== null && result.version !== expectedVersion) {
     throw cliError(
       'MANAGER_VERSION_MISMATCH',
       `Manager ${result.version} does not match project ${VERSION}`,
@@ -241,10 +241,16 @@ async function waitForManager(config, timeoutMs = 20_000) {
 }
 
 async function ensureManager(config) {
+  let migratedFrom;
   try {
     return { health: await health(config), started: false };
   } catch (error) {
-    if (!['MANAGER_UNREACHABLE'].includes(error.code)) throw error;
+    if (error.code === 'MANAGER_VERSION_MISMATCH') {
+      const stopped = await shutdownManager(config, { requireIdle: true });
+      migratedFrom = stopped.version;
+    } else if (error.code !== 'MANAGER_UNREACHABLE') {
+      throw error;
+    }
   }
   await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
   const child = spawn(process.execPath, [
@@ -267,7 +273,11 @@ async function ensureManager(config) {
     )));
   });
   child.unref();
-  return { health: await Promise.race([waitForManager(config), spawnFailure]), started: true };
+  return {
+    health: await Promise.race([waitForManager(config), spawnFailure]),
+    started: true,
+    ...(migratedFrom ? { migratedFrom } : {})
+  };
 }
 
 async function serve(config, json) {
@@ -443,7 +453,11 @@ async function connect(options, json) {
   const result = {
     ok: true,
     version: VERSION,
-    manager: { ...connection.health, startedNow: connection.started },
+    manager: {
+      ...connection.health,
+      startedNow: connection.started,
+      ...(connection.migratedFrom ? { migratedFrom: connection.migratedFrom } : {})
+    },
     acceptance,
     mcpRegistration: registration,
     extensionPairing: {
@@ -461,11 +475,10 @@ async function connect(options, json) {
   return result;
 }
 
-async function stopManager(options, json) {
-  const config = settings(options);
+async function shutdownManager(config, { requireIdle = false } = {}) {
   let running;
   try {
-    running = await health(config);
+    running = await health(config, 1_500, null);
   } catch (error) {
     if (error.code === 'MANAGER_UNREACHABLE') {
       const pidFile = join(config.stateDir, 'manager.json');
@@ -474,8 +487,7 @@ async function stopManager(options, json) {
         recorded = JSON.parse(await readFile(pidFile, 'utf8'));
       } catch (readError) {
         if (readError?.code === 'ENOENT') {
-          emit({ ok: true, stopped: false, message: 'Manager is not running' }, json);
-          return;
+          return { ok: true, stopped: false, message: 'Manager is not running' };
         }
         throw cliError('MANAGER_PID_UNAVAILABLE', 'Manager PID record is unreadable; shutdown status is unconfirmed.');
       }
@@ -488,7 +500,40 @@ async function stopManager(options, json) {
     throw error;
   }
   const credentials = await readManagerCredentials(config.stateDir);
-  await verifyManagerEndpoint(config, credentials.identity);
+  await verifyManagerEndpoint(config, credentials.identity, 2_500, running.version);
+  if (requireIdle) {
+    const counts = running.counts;
+    const countKeys = ['active', 'queued', 'waitingUser', 'stalled'];
+    if (
+      !counts ||
+      countKeys.some((key) => !Number.isInteger(counts[key]) || counts[key] < 0)
+    ) {
+      throw cliError(
+        'MANAGER_UPGRADE_STATUS_UNAVAILABLE',
+        `Manager ${running.version} did not provide a trustworthy idle-state summary.`,
+        'Finish or stop the older Manager explicitly, then rerun connect once.'
+      );
+    }
+    const { profiles } = await requestJson(config.baseUrl, '/v1/profiles', {
+      token: credentials.token
+    });
+    if (!Array.isArray(profiles)) {
+      throw cliError(
+        'MANAGER_UPGRADE_STATUS_UNAVAILABLE',
+        `Manager ${running.version} did not provide a trustworthy Profile summary.`,
+        'Finish or stop the older Manager explicitly, then rerun connect once.'
+      );
+    }
+    const busyTasks = countKeys.reduce((total, key) => total + counts[key], 0);
+    const busyProfiles = profiles.filter((profile) => profile?.state !== 'idle').length;
+    if (busyTasks > 0 || busyProfiles > 0) {
+      throw cliError(
+        'MANAGER_UPGRADE_BUSY',
+        `Manager ${running.version} still has ${busyTasks} active/queued tasks and ${busyProfiles} non-idle Profiles.`,
+        'Wait for those tasks and Profiles to settle, then rerun the exact same connect command once.'
+      );
+    }
+  }
   let recorded;
   try {
     recorded = JSON.parse(await readFile(join(config.stateDir, 'manager.json'), 'utf8'));
@@ -532,7 +577,17 @@ async function stopManager(options, json) {
   const deadline = Date.now() + 270_000;
   while (Date.now() < deadline) {
     try {
-      await health(config, 500);
+      const observed = await health(config, 500, null);
+      if (
+        observed.pid !== recorded.pid ||
+        observed.version !== recorded.version ||
+        (observed.baseUrl !== undefined && observed.baseUrl !== recorded.baseUrl)
+      ) {
+        throw cliError(
+          'MANAGER_SHUTDOWN_REPLACED',
+          'The Manager endpoint changed identity while shutdown was in progress.'
+        );
+      }
     } catch (error) {
       if (error.code === 'MANAGER_UNREACHABLE') {
         const cleanShutdown = await waitForManagerShutdownProof(pidFile, recorded);
@@ -543,14 +598,25 @@ async function stopManager(options, json) {
             `Keep the Manager state directory intact and inspect ${join(config.stateDir, 'manager-shutdown-failure.json')} before restarting.`
           );
         }
-        emit({ ok: true, stopped: true, graceful: gracefulRequested, pid: recorded.pid }, json);
-        return;
+        return {
+          ok: true,
+          stopped: true,
+          graceful: gracefulRequested,
+          pid: recorded.pid,
+          version: running.version
+        };
       }
       throw error;
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
   }
   throw cliError('MANAGER_STOP_TIMEOUT', `Manager process ${recorded.pid} did not stop in time`);
+}
+
+async function stopManager(options, json) {
+  const result = await shutdownManager(settings(options));
+  emit(result, json);
+  return result;
 }
 
 async function profileCommand(action, args, options, json) {

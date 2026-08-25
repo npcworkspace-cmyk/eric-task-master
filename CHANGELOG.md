@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.4 - 2026-08-25
+
+- Reframed the English and Simplified Chinese project introductions around durable, unattended browser work for AI agents, with realistic production possibilities and naturally integrated GitHub discovery terms.
+- Defined one non-divergent GitHub-to-task bootstrap and clarified that the portable Skill is an Agent instruction adapter while the complete cloned repository remains the runtime.
+- Added authenticated, fail-closed migration from an idle older Manager; busy or unverifiable Managers remain untouched and return an actionable error instead of prompting Agents to invent another controller.
+- Added integration coverage for successful idle migration and refusal to interrupt an older Manager with active work.
+
 ## 1.0.3 - 2026-08-25
 
 - Replaced automatic post-CI publication with an explicitly authorized manual Release that accepts an exact `main` SHA and confirmed version.

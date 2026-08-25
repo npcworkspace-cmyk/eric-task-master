@@ -26,7 +26,7 @@ if (!root) {
   process.stderr.write(JSON.stringify({
     ok: false,
     error: 'TASKMASTER_ROOT_NOT_FOUND',
-    nextAction: 'Set ERIC_TASK_MASTER_ROOT to the cloned eric-task-master repository.'
+    nextAction: 'Clone https://github.com/npcworkspace-cmyk/eric-task-master, then set ERIC_TASK_MASTER_ROOT to that complete repository.'
   }) + '\n');
   process.exit(1);
 }
