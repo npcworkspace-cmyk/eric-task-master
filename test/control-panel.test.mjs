@@ -57,6 +57,8 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.match(source, /renderTasks\(true\)/);
   assert.match(source, /isInteractingWith\(ui\.profiles\)/);
   assert.match(source, /isInteractingWith\(ui\.tasks\)/);
+  assert.match(source, /const taskRowToRefocus = activeTaskRowId\(\)/);
+  assert.match(source, /replacement\.focus\(\{ preventScroll: true \}\)/);
   assert.match(source, /role', 'progressbar'/);
   assert.match(source, /aria-current', 'true'/);
   assert.match(source, /history\.replaceState/);
@@ -64,6 +66,7 @@ test('dashboard manages profiles and tasks with refresh, cancel, and same-origin
   assert.doesNotMatch(source, /console\.(?:log|info|debug|warn|error)/);
   assert.match(css, /\.task-focused/);
   assert.match(css, /min-height: 44px/);
+  assert.match(css, /min-width: 44px/);
   assert.match(css, /outline: 2px solid var\(--signal-ink\)/);
   assert.match(css, /prefers-reduced-motion: reduce/);
   assert.match(html, /id="profile-count">—</);

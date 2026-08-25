@@ -168,6 +168,12 @@ function isInteractingWith(container) {
   return Boolean(active && container.contains(active) && /^(?:A|BUTTON|INPUT|SELECT|TEXTAREA)$/.test(active.tagName));
 }
 
+function activeTaskRowId() {
+  const active = document.activeElement;
+  if (!active || active.tagName !== 'TR' || !ui.tasks.contains(active)) return '';
+  return active.dataset.taskId || '';
+}
+
 function disconnectDashboard(message = '') {
   managerToken = '';
   sessionStorage.removeItem(TOKEN_KEY);
@@ -323,6 +329,7 @@ function resultUrl(task) {
 
 function renderTasks(force = false) {
   if (!force && isInteractingWith(ui.tasks)) return;
+  const taskRowToRefocus = activeTaskRowId();
   ui.tasks.replaceChildren();
   for (const task of tasks) {
     const row = document.createElement('tr');
@@ -422,6 +429,14 @@ function renderTasks(force = false) {
     cell.colSpan = 8;
     row.append(cell);
     ui.tasks.append(row);
+  }
+  if (taskRowToRefocus) {
+    const replacement = [...ui.tasks.rows].find((row) => row.dataset.taskId === taskRowToRefocus);
+    if (replacement) {
+      queueMicrotask(() => {
+        if (document.activeElement === document.body) replacement.focus({ preventScroll: true });
+      });
+    }
   }
 }
 

@@ -101,7 +101,7 @@ input, select {
 }
 .checkbox-label input { width: 20px; height: 20px; min-height: 0; margin: 0; }
 
-.button { min-height: 44px; padding: 0 14px; border: 1px solid var(--control-border); border-radius: 10px; color: #292d2b; background: #f7f5f0; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.button { min-width: 44px; min-height: 44px; padding: 0 14px; border: 1px solid var(--control-border); border-radius: 10px; color: #292d2b; background: #f7f5f0; font-size: 12px; font-weight: 700; white-space: nowrap; }
 .button.primary { border-color: var(--ink); color: var(--ink); background: linear-gradient(135deg, var(--signal) 0%, #ff6845 72%, #ff8ac5 135%); box-shadow: 0 10px 24px rgba(255, 75, 35, .18); }
 .button.danger { border-color: #e5bdbd; color: #a52e2e; background: #fff5f5; }
 .button.ghost { background: transparent; }
@@ -160,7 +160,7 @@ td.muted span + span { margin-top: 3px; }
 .progress-fill { height: 100%; border-radius: inherit; background: var(--signal); }
 .progress-copy { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; color: var(--muted); font-size: 10px; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 5px; }
-.result-link { display: inline-grid; min-height: 44px; padding: 0 10px; place-items: center; border: 1px solid var(--control-border); border-radius: 9px; color: #2b302d; font-size: 11px; font-weight: 700; text-decoration: none; }
+.result-link { display: inline-grid; min-width: 44px; min-height: 44px; padding: 0 10px; place-items: center; border: 1px solid var(--control-border); border-radius: 9px; color: #2b302d; font-size: 11px; font-weight: 700; text-decoration: none; }
 
 .empty { padding: 26px; color: var(--muted); text-align: center; }
 .muted { color: var(--muted); font-size: 11px; }
