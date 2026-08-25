@@ -295,7 +295,7 @@ export class HttpTaskMasterClient {
   }
 
   async createProfile(input) {
-    assertAllowedKeys(input, new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel', 'access']), 'Profile request');
+    assertAllowedKeys(input, new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserEngine', 'access']), 'Profile request');
     return (await this.#request('/v1/profiles', { method: 'POST', body: input })).profile;
   }
 
@@ -303,7 +303,7 @@ export class HttpTaskMasterClient {
     assertIdentifier(profileId, 'profileId');
     assertAllowedKeys(
       patch,
-      new Set(['name', 'defaultBehavior', 'headless', 'browserChannel', 'access']),
+      new Set(['name', 'defaultBehavior', 'headless', 'access']),
       'Profile patch'
     );
     return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}`, {

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { createActionHelper } from '../lib/behavior.mjs';
+import { resolveBrowserEngine } from './browser-engine.mjs';
 import { createCooldownHelper } from '../lib/cooldown.mjs';
 import { createEffectJournal } from '../lib/effect-journal.mjs';
 import { captureBoundedDiagnosticImage } from '../lib/diagnostic-screenshot.mjs';
@@ -443,22 +444,20 @@ export async function runTaskWorker(config, {
 
     safeSend({ type: 'state', state: 'starting_browser' });
     const playwright = await awaitExecution(loadPlaywright());
-    const browserName = config.profile.browser || 'chromium';
-    const browserType = playwright[browserName];
+    const { browserType, launchOptions: engineLaunchOptions } = resolveBrowserEngine(playwright, config.profile);
     const profileKind = config.profile.kind || 'persistent';
     if (
       (profileKind === 'persistent' && !browserType?.launchPersistentContext) ||
       (profileKind === 'ephemeral' && !browserType?.launch)
     ) {
-      const error = new Error(`Unsupported Playwright browser: ${browserName}`);
+      const error = new Error('Unsupported Playwright browser');
       error.code = 'BROWSER_UNSUPPORTED';
       throw error;
     }
 
     const launchOptions = {
-      headless: config.profile.headless ?? false,
-      ...(config.profile.browserChannel ? { channel: config.profile.browserChannel } : {}),
-      ...(config.profile.launchOptions || {})
+      ...engineLaunchOptions,
+      headless: config.profile.headless ?? false
     };
     if (profileKind === 'ephemeral') {
       browser = await awaitExecution(browserType.launch(launchOptions));

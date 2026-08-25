@@ -1,5 +1,6 @@
 import { redactSensitiveText } from '../lib/redaction.mjs';
 import { writeCleanupReceipt } from '../lib/cleanup-receipt.mjs';
+import { resolveBrowserEngine } from './browser-engine.mjs';
 
 function safeSend(message) {
   if (typeof process.send !== 'function' || !process.connected) return;
@@ -52,12 +53,11 @@ export async function runOpenProfile(profile, {
   let heartbeat = null;
   try {
     const playwright = await loadPlaywright();
-    const browserType = playwright[profile.browser || 'chromium'];
+    const { browserType, launchOptions } = resolveBrowserEngine(playwright, profile);
     if (!browserType?.launchPersistentContext) throw new Error('Unsupported Playwright browser');
     context = await browserType.launchPersistentContext(profile.userDataDir, {
-      headless: profile.headless ?? false,
-      ...(profile.browserChannel ? { channel: profile.browserChannel } : {}),
-      ...(profile.launchOptions || {})
+      ...launchOptions,
+      headless: false
     });
     if (context.pages().length === 0) await context.newPage();
     safeSend({ type: 'ready' });

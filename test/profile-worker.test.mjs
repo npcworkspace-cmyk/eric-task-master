@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { closeProfileBrowserSession, runOpenProfile } from '../src/runtime/profile-worker.mjs';
 
-test('manual Profile launch respects its configured headless mode', async () => {
+test('manual Profile launch is always visible and uses its fixed engine', async () => {
   const controller = new AbortController();
   controller.abort();
   let launch;
@@ -14,7 +14,7 @@ test('manual Profile launch respects its configured headless mode', async () => 
   await runOpenProfile({
     userDataDir: '/isolated/profile',
     headless: true,
-    browserChannel: 'chromium'
+    browserEngine: 'chrome'
   }, {
     signal: controller.signal,
     loadPlaywright: async () => ({
@@ -28,8 +28,27 @@ test('manual Profile launch respects its configured headless mode', async () => 
   });
   assert.deepEqual(launch, {
     userDataDir: '/isolated/profile',
-    options: { headless: true, channel: 'chromium' }
+    options: { channel: 'chrome', headless: false }
   });
+});
+
+test('manual Profile never falls back after a Chrome launch failure', async () => {
+  let launches = 0;
+  await runOpenProfile({
+    userDataDir: '/isolated/profile',
+    browserEngine: 'chrome'
+  }, {
+    signal: AbortSignal.abort(),
+    loadPlaywright: async () => ({
+      chromium: {
+        async launchPersistentContext() {
+          launches += 1;
+          throw new Error('Chrome is unavailable');
+        }
+      }
+    })
+  });
+  assert.equal(launches, 1);
 });
 
 test('profile cleanup falls back to authoritative browser close', async () => {

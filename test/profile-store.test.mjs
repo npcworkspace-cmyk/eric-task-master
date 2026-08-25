@@ -24,22 +24,21 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
     name: '  Research  ',
     defaultBehavior: 'fast',
     headless: true,
-    browserChannel: 'chrome'
+    browserEngine: 'chrome'
   });
 
   assert.equal(created.name, 'Research');
   assert.equal(created.kind, 'persistent');
   assert.equal(created.state, 'idle');
   assert.equal(created.headless, true);
-  assert.equal(created.browserChannel, 'chrome');
+  assert.equal(created.browserEngine, 'chrome');
   assert.match(created.id, /^profile_[a-f0-9]{32}$/);
   assert.equal(created.userDataDir, join(config.profilesRoot, created.id));
 
   const updated = await store.update(created.id, {
     name: 'Research primary',
     defaultBehavior: 'adaptive',
-    headless: false,
-    browserChannel: null
+    headless: false
   });
   assert.equal(updated.name, 'Research primary');
   assert.equal(updated.defaultBehavior, 'adaptive');
@@ -50,6 +49,10 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   );
   await assert.rejects(
     store.update(created.id, { userDataDir: 'elsewhere' }),
+    { code: 'INVALID_PROFILE_PATCH' }
+  );
+  await assert.rejects(
+    store.update(created.id, { browserEngine: 'chromium' }),
     { code: 'INVALID_PROFILE_PATCH' }
   );
 
@@ -76,6 +79,7 @@ test('ProfileStore creates ephemeral templates and migrates pre-kind records to 
   const { config, store } = await fixture(t);
   const temporary = await store.create({ name: 'Anonymous work', kind: 'ephemeral' });
   assert.equal(temporary.kind, 'ephemeral');
+  assert.equal(temporary.browserEngine, 'chromium');
 
   const data = JSON.parse(await readFile(config.filePath, 'utf8'));
   delete data.profiles[0].kind;
@@ -92,6 +96,39 @@ test('ProfileStore creates ephemeral templates and migrates pre-kind records to 
     reopened.update(temporary.id, { kind: 'ephemeral' }),
     { code: 'INVALID_PROFILE_PATCH' }
   );
+});
+
+test('ProfileStore defaults new engines by kind and migrates legacy channels without fallback', async (t) => {
+  const { config, store } = await fixture(t);
+  const persistent = await store.create({ name: 'Persistent default' });
+  const ephemeral = await store.create({ name: 'Ephemeral default', kind: 'ephemeral' });
+  assert.equal(persistent.browserEngine, 'chrome');
+  assert.equal(ephemeral.browserEngine, 'chromium');
+
+  const data = JSON.parse(await readFile(config.filePath, 'utf8'));
+  data.version = 1;
+  delete data.profiles[0].browserEngine;
+  data.profiles[0].browserChannel = 'chrome';
+  delete data.profiles[1].browserEngine;
+  data.profiles[1].browserChannel = 'chromium';
+  await writeFile(config.filePath, `${JSON.stringify(data)}\n`);
+
+  const migrated = new ProfileStore(config);
+  await migrated.init();
+  assert.equal((await migrated.get(persistent.id)).browserEngine, 'chrome');
+  assert.equal((await migrated.get(ephemeral.id)).browserEngine, 'chromium');
+  const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
+  assert.equal(persisted.version, 2);
+  assert.equal(persisted.profiles.some((profile) => Object.hasOwn(profile, 'browserChannel')), false);
+
+  persisted.version = 1;
+  delete persisted.profiles[0].browserEngine;
+  persisted.profiles[0].browserChannel = 'chrome-beta';
+  await writeFile(config.filePath, `${JSON.stringify(persisted)}\n`);
+  const before = await readFile(config.filePath, 'utf8');
+  const rejected = new ProfileStore(config);
+  await assert.rejects(rejected.init(), { code: 'PROFILE_ENGINE_MIGRATION_REQUIRED' });
+  assert.equal(await readFile(config.filePath, 'utf8'), before);
 });
 
 test('ProfileStore enforces exclusive leases and recovers only expired dead owners', async (t) => {

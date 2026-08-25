@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { BEHAVIOR_MODES, PROFILE_KINDS, VERSION } from '../contracts.mjs';
+import { BEHAVIOR_MODES, BROWSER_ENGINES, PROFILE_KINDS, VERSION } from '../contracts.mjs';
 import { TaskMasterClientError, toPublicError } from './errors.mjs';
 import {
   MAX_ARTIFACT_CHUNK_BYTES,
@@ -36,7 +36,7 @@ const ProfileSchema = z.strictObject({
   state: z.string().optional(),
   defaultBehavior: z.string().optional(),
   headless: z.boolean().optional(),
-  browserChannel: z.string().optional(),
+  browserEngine: z.enum(BROWSER_ENGINES).optional(),
   access: z.enum(['private', 'shared']).optional(),
   createdBy: z.string().optional(),
   createdAt: z.string().optional(),
@@ -353,7 +353,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       kind: z.enum(PROFILE_KINDS).default('persistent'),
       defaultBehavior: z.enum(BEHAVIOR_MODES).optional(),
       headless: z.boolean().optional(),
-      browserChannel: z.string().trim().min(1).max(64).optional(),
+      browserEngine: z.enum(BROWSER_ENGINES).optional(),
       access: z.enum(['private', 'shared']).optional()
     }),
     outputSchema: z.strictObject({ profile: ProfileSchema }),
@@ -370,7 +370,6 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       name: z.string().trim().min(1).max(80).optional(),
       defaultBehavior: z.enum(BEHAVIOR_MODES).optional(),
       headless: z.boolean().optional(),
-      browserChannel: z.string().trim().min(1).max(64).nullable().optional(),
       access: z.enum(['private', 'shared']).optional()
     }).refine(
       ({ profileId: _profileId, ...patch }) => Object.keys(patch).length > 0,

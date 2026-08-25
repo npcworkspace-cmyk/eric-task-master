@@ -30,7 +30,7 @@ Usage:
   taskmaster status [--json]
   taskmaster manager stop [--json]
   taskmaster profiles list [--json]
-  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--behavior MODE] [--access private|shared] [--headless]
+  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior MODE] [--access private|shared] [--headless]
   taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE] [--access private|shared]
   taskmaster profiles open|close|delete PROFILE_ID
   taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
@@ -624,7 +624,7 @@ async function profileCommand(action, args, options, json) {
       defaultBehavior: options.behavior || 'fast',
       headless: options.headless === true || options.headless === 'true',
       ...(options.access ? { access: options.access } : {}),
-      ...(options.channel ? { browserChannel: options.channel } : {})
+      ...(options.engine ? { browserEngine: options.engine } : {})
     };
     const result = await requestJson(context.config.baseUrl, '/v1/profiles', { method: 'POST', body, token: context.token });
     emit({ ok: true, ...result }, json);
@@ -637,7 +637,6 @@ async function profileCommand(action, args, options, json) {
     if (options.name !== undefined) body.name = options.name;
     if (options.behavior !== undefined) body.defaultBehavior = options.behavior;
     if (options.headless !== undefined) body.headless = options.headless === true || options.headless === 'true';
-    if (options.channel !== undefined) body.browserChannel = options.channel === 'none' ? null : options.channel;
     if (options.access !== undefined) body.access = options.access;
     const result = await requestJson(context.config.baseUrl, `/v1/profiles/${encodeURIComponent(profileId)}`, {
       method: 'PATCH', body, token: context.token

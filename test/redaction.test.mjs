@@ -64,7 +64,7 @@ test('Manager Profile view is an allowlist that ignores future private runtime f
     state: 'idle',
     defaultBehavior: 'fast',
     headless: true,
-    browserChannel: null,
+    browserEngine: 'chromium',
     userDataDir: 'C:/private/profile',
     lease: { ownerId: 'secret' },
     launchOptions: { proxy: { username: 'eric', password: MARKER } },
@@ -76,7 +76,7 @@ test('Manager Profile view is an allowlist that ignores future private runtime f
     state: 'idle',
     defaultBehavior: 'fast',
     headless: true,
-    browserChannel: null
+    browserEngine: 'chromium'
   });
   assert.equal(JSON.stringify(safe).includes(MARKER), false);
 });
@@ -89,7 +89,7 @@ test('Manager and MCP Profile views share the same nullable public contract', ()
     state: 'idle',
     defaultBehavior: 'adaptive',
     headless: false,
-    browserChannel: null,
+    browserEngine: 'chromium',
     access: 'private',
     ownerClientId: 'agent-owner',
     createdAt: '2026-08-24T00:00:00.000Z',
@@ -192,7 +192,7 @@ test('task worker scrubs a module result before it crosses the child-process bou
     checkpointPath: path.join(root, 'checkpoint.json'),
     input: {},
     behavior: 'fast',
-    profile: { userDataDir: path.join(root, 'profile') },
+    profile: { userDataDir: path.join(root, 'profile'), browserEngine: 'chromium' },
     heartbeatMs: 1_000,
     timeoutMs: 5_000
   }, {

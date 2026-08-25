@@ -45,7 +45,7 @@ function workerConfig(root, modulePath, outputBudget) {
     attempt: 1,
     input: {},
     behavior: 'fast',
-    profile: { userDataDir: path.join(root, 'profile') },
+    profile: { userDataDir: path.join(root, 'profile'), browserEngine: 'chromium' },
     heartbeatMs: 1_000,
     timeoutMs: 5_000,
     outputBudget

@@ -167,7 +167,7 @@ function requireProfileAccess(profile, auth, { manage = false } = {}) {
 }
 
 function validateProfilePatch(body) {
-  const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel', 'access']);
+  const allowed = new Set(['name', 'defaultBehavior', 'headless', 'access']);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_PROFILE_PATCH', `Unsupported fields: ${unknown.join(', ')}`);
@@ -176,7 +176,7 @@ function validateProfilePatch(body) {
 }
 
 function validateProfileCreate(body) {
-  const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel', 'access']);
+  const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserEngine', 'access']);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_PROFILE_CREATE', `Unsupported fields: ${unknown.join(', ')}`);

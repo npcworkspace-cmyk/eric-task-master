@@ -1,7 +1,7 @@
 import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { isBehaviorMode, isProfileKind } from '../contracts.mjs';
+import { isBehaviorMode, isBrowserEngine, isProfileKind } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
 
 const DEFAULT_LEASE_TTL_MS = 60_000;
@@ -70,15 +70,43 @@ function ensureProfileKind(value) {
   return value;
 }
 
-function ensureBrowserChannel(value) {
-  if (value === null || value === undefined || value === '') return null;
-  if (typeof value !== 'string' || !/^[a-zA-Z0-9._-]{1,40}$/.test(value)) {
+function ensureBrowserEngine(value) {
+  if (!isBrowserEngine(value)) {
     throw new ProfileStoreError(
-      'INVALID_BROWSER_CHANNEL',
-      'browserChannel must be a simple browser channel name'
+      'INVALID_BROWSER_ENGINE',
+      'browserEngine must be chrome or chromium'
     );
   }
   return value;
+}
+
+function migrateBrowserEngine(profile) {
+  if (profile.browserEngine !== undefined && !Object.hasOwn(profile, 'browserChannel')) {
+    profile.browserEngine = ensureBrowserEngine(profile.browserEngine);
+    return;
+  }
+  const legacyChannel = profile.browserChannel;
+  let migratedEngine;
+  if (legacyChannel === undefined || legacyChannel === null || legacyChannel === '' || legacyChannel === 'chromium') {
+    migratedEngine = 'chromium';
+  } else if (legacyChannel === 'chrome') {
+    migratedEngine = 'chrome';
+  } else {
+    throw new ProfileStoreError(
+      'PROFILE_ENGINE_MIGRATION_REQUIRED',
+      `Profile ${profile.id || '[unknown]'} uses unsupported legacy browser channel ${String(legacyChannel)}`,
+      409
+    );
+  }
+  if (profile.browserEngine !== undefined && profile.browserEngine !== migratedEngine) {
+    throw new ProfileStoreError(
+      'PROFILE_ENGINE_MIGRATION_REQUIRED',
+      `Profile ${profile.id || '[unknown]'} has conflicting browser engine metadata`,
+      409
+    );
+  }
+  profile.browserEngine = ensureBrowserEngine(profile.browserEngine ?? migratedEngine);
+  delete profile.browserChannel;
 }
 
 function ensureProfileAccess(value) {
@@ -135,7 +163,7 @@ export class ProfileStore {
     removePath = rm
   }) {
     if (!profilesRoot) throw new TypeError('profilesRoot is required');
-    this.#store = new JsonStore(filePath, { version: 1, profiles: [] });
+    this.#store = new JsonStore(filePath, { version: 2, profiles: [] });
     this.#profilesRoot = profilesRoot;
     this.#now = now;
     this.#processAlive = processAlive;
@@ -149,8 +177,16 @@ export class ProfileStore {
     // v0.x Profile records predate explicit persistence semantics. Preserve
     // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
+      if (data.version !== undefined && ![1, 2].includes(data.version)) {
+        throw new ProfileStoreError(
+          'PROFILE_STORE_VERSION_UNSUPPORTED',
+          `Profile store version ${String(data.version)} is unsupported`,
+          409
+        );
+      }
       for (const profile of data.profiles) {
         profile.kind ||= 'persistent';
+        migrateBrowserEngine(profile);
         profile.ownerClientId ??= null;
         profile.access ||= 'shared';
         if (
@@ -161,6 +197,7 @@ export class ProfileStore {
           profile.lease.cleanupRequired = true;
         }
       }
+      data.version = 2;
     });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
@@ -180,7 +217,7 @@ export class ProfileStore {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new ProfileStoreError('INVALID_PROFILE', 'Profile input must be an object');
     }
-    const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserChannel']);
+    const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserEngine']);
     const unknown = Object.keys(input).filter((key) => !allowed.has(key));
     if (unknown.length) {
       throw new ProfileStoreError(
@@ -193,13 +230,15 @@ export class ProfileStore {
       kind = 'persistent',
       defaultBehavior = 'fast',
       headless = false,
-      browserChannel: requestedBrowserChannel = null
+      browserEngine: requestedBrowserEngine
     } = input;
     const normalizedName = normalizeName(name);
     ensureProfileKind(kind);
     ensureBehaviorMode(defaultBehavior);
     ensureHeadless(headless);
-    const browserChannel = ensureBrowserChannel(requestedBrowserChannel);
+    const browserEngine = ensureBrowserEngine(
+      requestedBrowserEngine ?? (kind === 'persistent' ? 'chrome' : 'chromium')
+    );
     const ownerClientId = ensureOwnerClientId(ownership.ownerClientId);
     const access = ensureProfileAccess(ownership.access ?? (ownerClientId ? 'private' : 'shared'));
     const now = new Date(this.#now()).toISOString();
@@ -224,7 +263,7 @@ export class ProfileStore {
           userDataDir,
           defaultBehavior,
           headless,
-          browserChannel,
+          browserEngine,
           ownerClientId,
           access,
           state: 'idle',
@@ -243,7 +282,7 @@ export class ProfileStore {
   }
 
   async update(profileId, patch = {}) {
-    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'browserChannel', 'access']);
+    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'access']);
     const unknown = Object.keys(patch).filter((key) => !allowed.has(key));
     if (unknown.length) {
       throw new ProfileStoreError(
@@ -256,9 +295,6 @@ export class ProfileStore {
       patch = { ...patch, defaultBehavior: ensureBehaviorMode(patch.defaultBehavior) };
     }
     if ('headless' in patch) patch = { ...patch, headless: ensureHeadless(patch.headless) };
-    if ('browserChannel' in patch) {
-      patch = { ...patch, browserChannel: ensureBrowserChannel(patch.browserChannel) };
-    }
     if ('access' in patch) patch = { ...patch, access: ensureProfileAccess(patch.access) };
     let updated;
     await this.#store.update((data) => {

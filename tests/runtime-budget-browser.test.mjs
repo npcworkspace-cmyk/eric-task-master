@@ -60,6 +60,7 @@ test('real Playwright worker enforces output budget, captures evidence, and exit
       behavior: 'fast',
       profile: {
         userDataDir: path.join(root, 'profile'),
+        browserEngine: 'chromium',
         headless: true
       },
       heartbeatMs: 1_000,

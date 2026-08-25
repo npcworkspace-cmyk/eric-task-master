@@ -5,6 +5,7 @@ export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
 export const BEHAVIOR_MODES = Object.freeze(['fast', 'human', 'adaptive']);
+export const BROWSER_ENGINES = Object.freeze(['chrome', 'chromium']);
 export const PROFILE_KINDS = Object.freeze(['persistent', 'ephemeral']);
 export const PROFILE_STATES = Object.freeze(['idle', 'starting', 'open', 'leased', 'deleting', 'error']);
 export const TASK_STATES = Object.freeze([
@@ -30,6 +31,10 @@ export function isBehaviorMode(value) {
   return BEHAVIOR_MODES.includes(value);
 }
 
+export function isBrowserEngine(value) {
+  return BROWSER_ENGINES.includes(value);
+}
+
 export function isProfileKind(value) {
   return PROFILE_KINDS.includes(value);
 }
@@ -43,7 +48,7 @@ export function publicProfile(profile) {
     'state',
     'defaultBehavior',
     'headless',
-    'browserChannel',
+    'browserEngine',
     'access',
     'createdAt',
     'updatedAt',
