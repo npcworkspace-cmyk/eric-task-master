@@ -16,8 +16,15 @@ async function fixture(t) {
 
 test('Manager stop succeeds only after the serving process removes its own PID record', async (t) => {
   const { pidFile, record } = await fixture(t);
-  const removal = setTimeout(() => void unlink(pidFile).catch(() => {}), 25);
-  t.after(() => clearTimeout(removal));
+  // Windows can briefly deny deletion while the proof reader has the file
+  // open. A real Manager retries cleanup, so the fixture must not turn one
+  // transient sharing violation into a false shutdown failure.
+  const removal = setInterval(() => {
+    void unlink(pidFile).then(() => clearInterval(removal)).catch((error) => {
+      if (error?.code === 'ENOENT') clearInterval(removal);
+    });
+  }, 10);
+  t.after(() => clearInterval(removal));
 
   assert.equal(await waitForManagerShutdownProof(pidFile, record, {
     timeoutMs: 500,

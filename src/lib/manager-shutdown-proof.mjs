@@ -1,5 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
+const TRANSIENT_READ_ERRORS = new Set(['EACCES', 'EBUSY', 'EPERM']);
+
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -19,6 +21,10 @@ export async function waitForManagerShutdownProof(pidFile, expected, {
       ) return false;
     } catch (error) {
       if (error?.code === 'ENOENT') return true;
+      if (TRANSIENT_READ_ERRORS.has(error?.code) && Date.now() < deadline) {
+        await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+        continue;
+      }
       return false;
     }
     if (Date.now() >= deadline) break;
