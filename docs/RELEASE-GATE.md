@@ -30,6 +30,16 @@ $env:TASKMASTER_COMMERCIAL_REPORT = '.\release-evidence\commercial.json'
 npm run acceptance:commercial
 ```
 
+On the release maintainer's machine, also exercise the locally installed stable Chrome engine before publishing:
+
+```powershell
+$env:TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE = 'chrome'
+npm run acceptance:commercial
+Remove-Item Env:TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE
+```
+
+CI keeps the default managed Chromium engine so the cross-platform matrix remains reproducible.
+
 ## Cross-platform boundary
 
 The GitHub Actions matrix runs the same gate on Windows, macOS, and Linux. Local Windows success does not prove macOS. A platform becomes release-verified only after its own matrix job passes on the release commit. Until then it is “implementation audited / CI pending,” not “tested.”

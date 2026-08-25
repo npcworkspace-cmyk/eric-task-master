@@ -111,6 +111,12 @@ async function createRuntime(dataDir) {
 }
 
 export async function runCommercialAcceptance() {
+  const persistentEngine = process.env.TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE || 'chromium';
+  if (!['chrome', 'chromium'].includes(persistentEngine)) {
+    throw Object.assign(new Error(
+      'TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE must be chrome or chromium'
+    ), { code: 'COMMERCIAL_ACCEPTANCE_ENGINE_INVALID' });
+  }
   const root = await mkdtemp(path.join(tmpdir(), 'eric-task-master-commercial-'));
   const dataDir = path.join(root, 'data');
   const checks = [];
@@ -131,9 +137,15 @@ export async function runCommercialAcceptance() {
     persistentProfile = await client.createProfile({
       name: 'Commercial persistent lifecycle',
       kind: 'persistent',
-      browserEngine: 'chromium',
+      browserEngine: persistentEngine,
       headless: true
     });
+    assertCheck(
+      checks,
+      'persistent Profile uses the requested immutable engine',
+      persistentProfile.browserEngine === persistentEngine,
+      persistentProfile.browserEngine
+    );
     const uploadPath = path.join(ROOT, 'test', 'fixtures', 'upload.txt');
     const seeded = await client.startTask({
       profileId: persistentProfile.id,
@@ -331,6 +343,7 @@ export async function runCommercialAcceptance() {
         taskCount: taskIds.length,
         maxActive,
         maxQueued,
+        persistentEngine,
         managerRestarted: true
       },
       checkedAt: new Date().toISOString()
