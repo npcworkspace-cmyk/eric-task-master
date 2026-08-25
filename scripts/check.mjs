@@ -20,7 +20,7 @@ async function staticChecks() {
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock.json version drift');
   invariant(manifest.version === VERSION, 'extension manifest version drift');
   invariant(packageJson.license === 'MIT', 'package license drift');
-  invariant(license.startsWith('MIT License\n'), 'MIT license file is missing or malformed');
+  invariant(/^MIT License\r?\n/.test(license), 'MIT license file is missing or malformed');
   invariant(
     JSON.stringify(Object.keys(packageJson.dependencies || {}).sort()) ===
       JSON.stringify(['@modelcontextprotocol/server', 'playwright', 'zod'].sort()),
