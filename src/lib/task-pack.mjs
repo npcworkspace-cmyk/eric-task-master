@@ -1,5 +1,7 @@
 import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { validateTaskModule } from './task-type-registry.mjs';
+import { createTaskRecipeSource, TASK_RECIPES } from './task-recipes.mjs';
 
 const PACK_NAME = /^[a-z][a-z0-9._-]{0,79}$/;
 const TASK_NAME = /^[a-z][a-z0-9._-]{0,79}$/;
@@ -130,62 +132,56 @@ export async function readTaskPack(location) {
   };
 }
 
-export async function scaffoldTaskPack(directory, { name } = {}) {
+export async function preflightTaskPack(location) {
+  const loaded = await readTaskPack(location);
+  const results = await Promise.allSettled(loaded.modules.map((module) => validateTaskModule({
+    name: module.name,
+    modulePath: module.modulePath,
+    allowedRoots: [loaded.root]
+  })));
+  const checks = results.map((result, index) => {
+    const name = loaded.modules[index].name;
+    if (result.status === 'fulfilled') {
+      return { taskType: name, ok: true, metadata: result.value.taskType };
+    }
+    return {
+      taskType: name,
+      ok: false,
+      code: typeof result.reason?.code === 'string' ? result.reason.code : 'TASK_MODULE_INVALID',
+      message: typeof result.reason?.message === 'string' ? result.reason.message : 'Task module validation failed'
+    };
+  });
+  const ok = checks.every((check) => check.ok);
+  return {
+    ok,
+    taskPack: loaded.pack,
+    checks,
+    nextAction: ok
+      ? 'Install this validated Pack, then run one bounded task with a disposable Profile and inspect its artifacts and completion evidence.'
+      : 'Fix only the reported module contracts, run preflight again, and stop after two failed repair rounds instead of inventing another controller.'
+  };
+}
+
+export async function scaffoldTaskPack(directory, { name, recipe = 'single-page' } = {}) {
   const packName = boundedText(name, 'Task Pack name', 80, { required: true });
   if (!PACK_NAME.test(packName)) {
     throw new TaskPackError('INVALID_TASK_PACK', 'Task Pack name must be a lowercase identifier');
   }
+  if (!TASK_RECIPES.includes(recipe)) {
+    throw new TaskPackError('INVALID_TASK_RECIPE', `Recipe must be one of: ${TASK_RECIPES.join(', ')}`);
+  }
   const root = path.resolve(directory);
   await mkdir(path.join(root, 'tasks'), { recursive: true, mode: 0o700 });
-  const taskName = `${packName}.example`;
+  const taskName = `${packName}.${recipe}`;
   const manifest = {
     name: packName,
     version: '1.0.0',
     title: packName,
     description: 'Reusable Task Master task pack.',
-    tasks: [{ name: taskName, module: 'tasks/example.mjs' }]
+    tasks: [{ name: taskName, module: `tasks/${recipe}.mjs` }]
   };
-  const moduleSource = [
-    "import { mkdir, writeFile } from 'node:fs/promises';",
-    "import path from 'node:path';",
-    '',
-    'export const meta = Object.freeze({',
-    `  name: ${JSON.stringify(taskName)},`,
-    "  version: '1.0.0',",
-    "  description: 'Read one page into a bounded JSON artifact.',",
-    "  intents: ['read-page'],",
-    "  tags: ['example'],",
-    "  outputs: ['json'],",
-    "  risk: 'read',",
-    '  readOnly: true,',
-    '  supportsResume: false,',
-    '  inputSchema: {',
-    "    type: 'object', additionalProperties: false, required: ['url'],",
-    "    properties: { url: { type: 'string', minLength: 8, maxLength: 4096 } }",
-    '  }',
-    '});',
-    '',
-    'export async function run({ page, input, outputDir, action, progress, checkpoint }) {',
-    '  const target = new URL(input.url);',
-    "  if (!['http:', 'https:'].includes(target.protocol)) throw new TypeError('url must use HTTP(S)');",
-    '  await mkdir(outputDir, { recursive: true });',
-    "  await action.goto(target.href, { waitUntil: 'domcontentloaded', timeout: 30_000 });",
-    "  await progress({ current: 1, total: 2, message: 'Page loaded' });",
-    "  const data = await page.locator('body').evaluate((body) => ({",
-    '    title: document.title.slice(0, 500), url: location.href,',
-    "    text: (body.innerText || body.textContent || '').slice(0, 20_000)",
-    '  }));',
-    "  const file = 'result.json';",
-    "  await writeFile(path.join(outputDir, file), `${JSON.stringify(data, null, 2)}\\n`, { mode: 0o600 });",
-    "  await checkpoint({ stage: 'complete', artifact: file, url: data.url });",
-    "  await progress({ current: 2, total: 2, message: 'Artifact persisted' });",
-    '  return { summary: `Captured ${data.text.length} characters`, evidence: [',
-    "    { kind: 'url', value: data.url }, { kind: 'artifact', file, agentVisible: true }",
-    '  ] };',
-    '}',
-    ''
-  ].join('\n');
+  const moduleSource = createTaskRecipeSource(taskName, recipe);
   await writeFile(path.join(root, 'taskpack.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-  await writeFile(path.join(root, 'tasks', 'example.mjs'), moduleSource, { flag: 'wx', mode: 0o600 });
+  await writeFile(path.join(root, 'tasks', `${recipe}.mjs`), moduleSource, { flag: 'wx', mode: 0o600 });
   return readTaskPack(root);
 }

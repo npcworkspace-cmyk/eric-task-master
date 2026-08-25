@@ -69,14 +69,16 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   await assert.rejects(reopened.get(created.id), { code: 'PROFILE_NOT_FOUND' });
 });
 
-test('ProfileStore rejects an explicitly empty access value', async (t) => {
+test('ProfileStore ignores legacy ownership and access without persisting either field', async (t) => {
   const { store } = await fixture(t);
-
-  await assert.rejects(
-    store.create({ name: 'Invalid empty access' }, { access: '' }),
-    { code: 'INVALID_PROFILE_ACCESS' }
+  const profile = await store.create(
+    { name: 'Globally shared' },
+    { ownerClientId: 'legacy-agent', access: 'private' }
   );
-  assert.deepEqual(await store.list(), []);
+  assert.equal(Object.hasOwn(profile, 'ownerClientId'), false);
+  assert.equal(Object.hasOwn(profile, 'access'), false);
+  const unchanged = await store.update(profile.id, { access: 'private' });
+  assert.equal(Object.hasOwn(unchanged, 'access'), false);
 });
 
 test('ProfileStore creates ephemeral templates and migrates pre-kind records to persistent', async (t) => {
@@ -135,7 +137,7 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   assert.equal((await migrated.get(persistent.id)).browserEngine, 'chrome');
   assert.equal((await migrated.get(ephemeral.id)).browserEngine, 'chromium');
   const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
-  assert.equal(persisted.version, 3);
+  assert.equal(persisted.version, 4);
   assert.equal(persisted.profiles.some((profile) => Object.hasOwn(profile, 'browserChannel')), false);
 
   persisted.version = 1;
@@ -254,39 +256,52 @@ test('ProfileStore lease acquisition cannot overwrite a concurrent same-owner re
   assert.equal(final.lease.expiresAt, renewed.lease.expiresAt);
 });
 
-test('Profile access revocation is atomic with scoped lease acquisition', async (t) => {
-  const { store } = await fixture(t);
+test('ProfileStore migrates private ownership metadata in place and keeps global lease exclusion', async (t) => {
+  const { config, store } = await fixture(t);
   const profile = await store.create(
-    { name: 'Shared access race' },
-    { ownerClientId: 'agent-a', access: 'shared' }
+    { name: 'Global lease' },
+    { ownerClientId: 'agent-a', access: 'private' }
   );
+  const before = JSON.parse(await readFile(config.filePath, 'utf8'));
+  before.version = 3;
+  before.profiles[0].ownerClientId = 'agent-a';
+  before.profiles[0].createdBy = 'agent-a';
+  before.profiles[0].access = 'private';
+  const originalPath = before.profiles[0].userDataDir;
+  await writeFile(join(originalPath, 'login-state-marker.txt'), 'preserved');
+  await writeFile(config.filePath, `${JSON.stringify(before)}\n`);
 
-  await store.acquireLease(profile.id, 'task:agent-b', {
+  const migrated = new ProfileStore(config);
+  await migrated.init();
+  const migratedProfile = await migrated.get(profile.id);
+  assert.equal(migratedProfile.userDataDir, originalPath);
+  assert.equal(await readFile(join(originalPath, 'login-state-marker.txt'), 'utf8'), 'preserved');
+  assert.equal(Object.hasOwn(migratedProfile, 'ownerClientId'), false);
+  assert.equal(Object.hasOwn(migratedProfile, 'createdBy'), false);
+  assert.equal(Object.hasOwn(migratedProfile, 'access'), false);
+  const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
+  assert.equal(persisted.version, 4);
+
+  await migrated.acquireLease(profile.id, 'task:agent-b', {
     pid: 701,
     ttlMs: 1_000,
     authorizedClientId: 'agent-b'
   });
   await assert.rejects(
-    store.update(profile.id, { access: 'private' }),
-    { code: 'PROFILE_IN_USE', statusCode: 409 }
-  );
-  assert.equal((await store.get(profile.id)).access, 'shared');
-  await store.releaseLease(profile.id, 'task:agent-b');
-  assert.equal((await store.update(profile.id, { access: 'private' })).access, 'private');
-  await assert.rejects(
-    store.acquireLease(profile.id, 'task:agent-b-again', {
+    migrated.acquireLease(profile.id, 'task:agent-a', {
       pid: 702,
       ttlMs: 1_000,
-      authorizedClientId: 'agent-b'
+      authorizedClientId: 'agent-a'
     }),
-    { code: 'PROFILE_ACCESS_DENIED', statusCode: 403 }
+    { code: 'PROFILE_LEASED', statusCode: 409 }
   );
-  const ownerLease = await store.acquireLease(profile.id, 'task:agent-a', {
+  await migrated.releaseLease(profile.id, 'task:agent-b');
+  const nextLease = await migrated.acquireLease(profile.id, 'task:agent-a', {
     pid: 703,
     ttlMs: 1_000,
     authorizedClientId: 'agent-a'
   });
-  assert.equal(ownerLease.lease.ownerId, 'task:agent-a');
+  assert.equal(nextLease.lease.ownerId, 'task:agent-a');
 });
 
 test('ProfileStore startup clears an expired lease after proving its process absent', async (t) => {

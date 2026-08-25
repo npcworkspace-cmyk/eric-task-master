@@ -13,6 +13,7 @@ const TASK_TYPE_PATTERN = /^[a-z][a-z0-9._-]{0,79}$/;
 const INPUT_SCHEMA_TYPES = new Set(['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']);
 const TASK_RISKS = new Set(['read', 'write', 'mixed']);
 const DISCOVERY_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
+const PACK_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const INPUT_SCHEMA_KEYS = new Set([
   'additionalProperties',
   'default',
@@ -61,6 +62,9 @@ function publicType(record, { includeSchema = true, includeIntegrity = true } = 
     ...(record.outputs?.length ? { outputs: [...record.outputs] } : {}),
     ...(record.risk ? { risk: record.risk } : {}),
     ...(record.pack ? { pack: { name: record.pack.name, version: record.pack.version } } : {}),
+    lifecycle: record.deprecatedAt ? 'deprecated' : 'active',
+    ...(record.deprecatedAt ? { deprecatedAt: record.deprecatedAt } : {}),
+    ...(record.replacedBy ? { replacedBy: record.replacedBy } : {}),
     supportsResume: record.supportsResume === true,
     ...(includeIntegrity ? {
       sha256: record.sha256,
@@ -337,6 +341,54 @@ async function verifySnapshot(snapshotPath, sha256) {
   return source;
 }
 
+export async function validateTaskModule({
+  name,
+  modulePath,
+  allowedRoots = [],
+  inspectionTimeoutMs = DEFAULT_INSPECTION_TIMEOUT_MS
+} = {}) {
+  if (typeof name !== 'string' || !TASK_TYPE_PATTERN.test(name)) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_TYPE',
+      'Task type must use 1-80 lowercase letters, numbers, dots, underscores, or hyphens'
+    );
+  }
+  if (typeof modulePath !== 'string' || path.extname(modulePath).toLowerCase() !== '.mjs') {
+    throw new TaskTypeRegistryError('INVALID_TASK_MODULE', 'Task module must be a .mjs file');
+  }
+  if (!Number.isInteger(inspectionTimeoutMs) || inspectionTimeoutMs < 100 || inspectionTimeoutMs > 30_000) {
+    throw new TypeError('inspectionTimeoutMs must be an integer from 100 to 30000');
+  }
+  const requested = path.resolve(modulePath);
+  const stats = await lstat(requested).catch(() => null);
+  if (!stats?.isFile() || stats.isSymbolicLink() || stats.size < 1 || stats.size > MAX_TASK_MODULE_BYTES) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_MODULE_SIZE',
+      `Task module must be one regular .mjs file containing 1 to ${MAX_TASK_MODULE_BYTES} bytes`
+    );
+  }
+  const canonical = await realpath(requested);
+  const roots = [];
+  for (const root of allowedRoots) roots.push(await realpath(path.resolve(root)));
+  if (roots.length && !roots.some((root) => inside(root, canonical))) {
+    throw new TaskTypeRegistryError('TASK_MODULE_OUTSIDE_ALLOWED_ROOTS', 'Task module is outside the validation roots', 403);
+  }
+  const source = await readFile(canonical);
+  const sha256 = createHash('sha256').update(source).digest('hex');
+  const metadata = await inspectTaskModule(canonical, sha256, name, inspectionTimeoutMs);
+  await verifySnapshot(canonical, sha256);
+  return {
+    ok: true,
+    taskType: {
+      id: name,
+      name,
+      ...metadata,
+      sha256,
+      size: source.length
+    }
+  };
+}
+
 export class TaskTypeRegistry {
   #store;
   #snapshotRoot;
@@ -380,6 +432,12 @@ export class TaskTypeRegistry {
       }
     }
     this.#allowedRoots = [...new Set(canonicalRoots)];
+    await this.#store.update((data) => {
+      for (const record of data.types) {
+        record.deprecatedAt = typeof record.deprecatedAt === 'string' ? record.deprecatedAt : null;
+        record.replacedBy = typeof record.replacedBy === 'string' ? record.replacedBy : null;
+      }
+    });
     for (const seed of this.#seedTypes) {
       await this.#install(seed, { allowUpdate: true });
     }
@@ -399,12 +457,24 @@ export class TaskTypeRegistry {
     if (new Set(names).size !== names.length) {
       throw new TaskTypeRegistryError('INVALID_TASK_PACK', 'Task Pack task names must be unique');
     }
+    const packReference = pack === undefined
+      ? null
+      : (
+          pack &&
+          typeof pack.name === 'string' && DISCOVERY_TOKEN.test(pack.name) &&
+          typeof pack.version === 'string' && PACK_VERSION_PATTERN.test(pack.version) && pack.version.length <= 64
+            ? { name: pack.name, version: pack.version }
+            : null
+        );
+    if (pack !== undefined && !packReference) {
+      throw new TaskTypeRegistryError('INVALID_TASK_PACK', 'Task Pack name or version is invalid');
+    }
     const snapshot = await this.#store.read();
     const prepared = [];
     for (const input of inputs) {
       const candidate = await this.#prepareInstall(input, { currentTypes: snapshot.types });
-      if (candidate.changed && pack) {
-        candidate.record.pack = { name: pack.name, version: pack.version };
+      if (candidate.changed && packReference) {
+        candidate.record.pack = { ...packReference };
       }
       prepared.push(candidate);
     }
@@ -422,10 +492,20 @@ export class TaskTypeRegistry {
             409
           );
         }
+        if (current?.pack && packReference && current.pack.name !== packReference.name) {
+          throw new TaskTypeRegistryError(
+            'TASK_TYPE_PACK_CONFLICT',
+            `Task type ${candidate.record.name} already belongs to Task Pack ${current.pack.name}`,
+            409
+          );
+        }
       }
       for (const candidate of prepared) {
         const current = data.types.find((item) => item.name === candidate.record.name);
-        if (current) installed.push(current);
+        if (current) {
+          if (packReference) current.pack = { ...packReference };
+          installed.push(current);
+        }
         else {
           data.types.push(candidate.record);
           installed.push(candidate.record);
@@ -537,18 +617,20 @@ export class TaskTypeRegistry {
     return publicType(installed);
   }
 
-  async list() {
+  async list({ includeDeprecated = true } = {}) {
     await this.#ready;
     const data = await this.#store.read();
     return data.types
+      .filter((record) => includeDeprecated || !record.deprecatedAt)
       .map(publicType)
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  async listSummaries() {
+  async listSummaries({ includeDeprecated = false } = {}) {
     await this.#ready;
     const data = await this.#store.read();
     return data.types
+      .filter((record) => includeDeprecated || !record.deprecatedAt)
       .map((record) => publicType(record, { includeSchema: false, includeIntegrity: false }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -570,6 +652,15 @@ export class TaskTypeRegistry {
     if (!record) {
       throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
     }
+    if (record.deprecatedAt) {
+      throw new TaskTypeRegistryError(
+        'TASK_TYPE_DEPRECATED',
+        record.replacedBy
+          ? `Task type ${name} is deprecated; use ${record.replacedBy}`
+          : `Task type ${name} is deprecated and has no replacement`,
+        409
+      );
+    }
     const candidate = path.resolve(this.#snapshotRoot, record.snapshotName);
     if (!inside(this.#snapshotRoot, candidate)) {
       throw new TaskTypeRegistryError('INVALID_TASK_SNAPSHOT', 'Task snapshot path is invalid', 500);
@@ -584,5 +675,43 @@ export class TaskTypeRegistry {
       throw new TaskTypeRegistryError('TASK_SNAPSHOT_CHANGED', 'Task snapshot integrity check failed', 500);
     }
     return { ...publicType(record), modulePath: candidate };
+  }
+
+  async deprecate(name, { replacedBy = null } = {}) {
+    await this.#ready;
+    if (typeof name !== 'string' || !TASK_TYPE_PATTERN.test(name)) {
+      throw new TaskTypeRegistryError('INVALID_TASK_TYPE', 'Task type name is invalid');
+    }
+    if (replacedBy !== null && (typeof replacedBy !== 'string' || !TASK_TYPE_PATTERN.test(replacedBy) || replacedBy === name)) {
+      throw new TaskTypeRegistryError('INVALID_TASK_REPLACEMENT', 'Replacement must be a different installed task type');
+    }
+    let deprecated;
+    await this.#store.update((data) => {
+      const record = data.types.find((item) => item.name === name);
+      if (!record) throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
+      if (replacedBy) {
+        const replacement = data.types.find((item) => item.name === replacedBy && !item.deprecatedAt);
+        if (!replacement) {
+          throw new TaskTypeRegistryError('TASK_TYPE_REPLACEMENT_NOT_FOUND', `Active replacement ${replacedBy} was not found`, 404);
+        }
+      }
+      record.deprecatedAt ??= new Date().toISOString();
+      record.replacedBy = replacedBy;
+      deprecated = record;
+    });
+    return publicType(deprecated, { includeSchema: false, includeIntegrity: false });
+  }
+
+  async restore(name) {
+    await this.#ready;
+    let restored;
+    await this.#store.update((data) => {
+      const record = data.types.find((item) => item.name === name);
+      if (!record) throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
+      record.deprecatedAt = null;
+      record.replacedBy = null;
+      restored = record;
+    });
+    return publicType(restored, { includeSchema: false, includeIntegrity: false });
   }
 }

@@ -74,11 +74,13 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
     browserEngine: 'chromium',
     defaultBehavior: 'adaptive',
     headless: true,
-    access: 'private',
     state: 'idle'
   };
+  const issuedConnections = new Set();
   const waitingTask = {
     id: 'task_cli',
+    jobId: 'job_cli',
+    revision: 3,
     profileId: profile.id,
     taskType: 'fixture.read',
     state: 'waiting_user',
@@ -94,6 +96,7 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
       method: request.method,
       url: request.url,
       authorization: request.headers.authorization,
+      connectionId: request.headers['x-taskmaster-connection-id'],
       body
     });
     if (request.url === '/v1/health') {
@@ -113,11 +116,18 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
     }
     if (request.url === '/v1/agents/issue') {
       assert.equal(request.headers.authorization, `Bearer ${ADMIN_TOKEN}`);
-      assert.deepEqual(body, { clientId: agentId, name: agentName });
+      assert.deepEqual(Object.keys(body).sort(), ['clientId', 'connectionId', 'name']);
+      assert.equal(body.clientId, agentId);
+      assert.equal(body.name, agentName);
+      assert.match(body.connectionId, /^mcp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+      assert.equal(request.headers['x-taskmaster-connection-id'], body.connectionId);
+      assert.equal(issuedConnections.has(body.connectionId), false);
+      issuedConnections.add(body.connectionId);
       reply(response, 201, { agentToken, agent: { clientId: agentId, name: agentName } });
       return;
     }
     assert.equal(request.headers.authorization, `Bearer ${agentToken}`);
+    assert.equal(issuedConnections.has(request.headers['x-taskmaster-connection-id']), true);
     const origin = `http://${request.headers.host}`;
     if (request.url === '/v1/dashboard/authorize') {
       reply(response, 201, {
@@ -160,6 +170,26 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
     }
     if (request.url === `/v1/tasks/${waitingTask.id}/continue`) {
       reply(response, 202, { task: { ...waitingTask, state: 'running', userRequest: null } });
+      return;
+    }
+    if (request.url === '/v1/agent/inbox/claim') {
+      reply(response, 200, {
+        commands: [{ commandId: 'command_cli', taskId: waitingTask.id, kind: 'ask', revision: 3 }]
+      });
+      return;
+    }
+    if (request.url === `/v1/tasks/${waitingTask.id}/commands/command_cli`) {
+      reply(response, 200, {
+        task: { ...waitingTask, revision: 4 },
+        command: { commandId: 'command_cli', status: body.status, response: body.message }
+      });
+      return;
+    }
+    if (request.url === `/v1/tasks/${waitingTask.id}/report`) {
+      reply(response, 200, {
+        task: { ...waitingTask, revision: 4 },
+        report: { reportId: body.reportId, status: body.status, title: body.title, summary: body.summary, sections: body.sections }
+      });
       return;
     }
     if (request.url === `/v1/tasks/${waitingTask.id}/cancel`) {
@@ -205,6 +235,8 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
 
   const profiles = singleJson(await runCli(['profiles', 'list', ...common]));
   assert.deepEqual(profiles.profiles, [profile]);
+  assert.equal(Object.hasOwn(profiles.profiles[0], 'access'), false);
+  assert.equal(Object.hasOwn(profiles.profiles[0], 'createdBy'), false);
   const created = singleJson(await runCli([
     'profiles', 'create', '--name', 'Fresh CLI Profile', '--kind', 'ephemeral', ...common
   ]));
@@ -240,6 +272,34 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
   assert.equal(waited.timedOut, false);
   assert.equal(waited.task.state, 'waiting_user');
   assert.equal(singleJson(await runCli(['task', 'status', waitingTask.id, ...common])).task.id, waitingTask.id);
+  const inbox = singleJson(await runCli(['task', 'inbox', '--limit', '5', ...common]));
+  assert.equal(inbox.commands[0].commandId, 'command_cli');
+  const commandResponse = singleJson(await runCli([
+    'task', 'command-respond', waitingTask.id, '--command-id', 'command_cli', '--revision', '3',
+    '--status', 'applied', '--message', 'Instruction accepted', ...common
+  ]));
+  assert.equal(commandResponse.command.status, 'applied');
+  const report = singleJson(await runCli([
+    'task', 'report', waitingTask.id, '--report-id', 'report_cli', '--revision', '3',
+    '--status', 'final', '--title', 'CLI report', '--summary', 'Human-readable result',
+    '--sections', '[{"heading":"Result","body":"Done"}]', ...common
+  ]));
+  assert.equal(report.report.status, 'final');
+  assert.deepEqual(report.report.sections, [{ heading: 'Result', body: 'Done' }]);
+  assert.deepEqual(requests.find((request) => request.url === '/v1/agent/inbox/claim').body, { limit: 5 });
+  assert.deepEqual(requests.find((request) => request.url.endsWith('/commands/command_cli')).body, {
+    expectedRevision: 3,
+    status: 'applied',
+    message: 'Instruction accepted'
+  });
+  assert.deepEqual(requests.find((request) => request.url.endsWith('/report')).body, {
+    reportId: 'report_cli',
+    expectedRevision: 3,
+    status: 'final',
+    title: 'CLI report',
+    summary: 'Human-readable result',
+    sections: [{ heading: 'Result', body: 'Done' }]
+  });
   assert.equal(singleJson(await runCli([
     'task', 'continue', waitingTask.id, '--request-id', 'request_cli', '--note', 'Continue', ...common
   ])).task.state, 'running');

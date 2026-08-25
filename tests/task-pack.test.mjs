@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { readTaskPack, scaffoldTaskPack } from '../src/lib/task-pack.mjs';
+import { preflightTaskPack, readTaskPack, scaffoldTaskPack } from '../src/lib/task-pack.mjs';
 import { TaskTypeRegistry } from '../src/lib/task-type-registry.mjs';
 
 async function registryFixture(t) {
@@ -27,9 +27,10 @@ test('Task Pack scaffold is portable, bounded, and path-safe', async (t) => {
   const destination = path.join(root, 'sample');
   const created = await scaffoldTaskPack(destination, { name: 'sample-pack' });
   assert.equal(created.pack.name, 'sample-pack');
-  assert.equal(created.pack.tasks[0].name, 'sample-pack.example');
+  assert.equal(created.pack.tasks[0].name, 'sample-pack.single-page');
   assert.equal((await readTaskPack(path.join(destination, 'taskpack.json'))).modules.length, 1);
-  assert.match(await readFile(path.join(destination, 'tasks', 'example.mjs'), 'utf8'), /supportsResume/u);
+  assert.match((await preflightTaskPack(destination)).nextAction, /^Install this validated Pack/u);
+  assert.match(await readFile(path.join(destination, 'tasks', 'single-page.mjs'), 'utf8'), /supportsResume/u);
 
   const outside = path.join(root, 'outside.mjs');
   await writeFile(outside, 'export async function run() {}\n');
@@ -83,4 +84,37 @@ test('Task Pack batch install is all-or-nothing and exposes progressive discover
     { code: 'TASK_TYPE_CONFLICT', statusCode: 409 }
   );
   assert.equal((await registry.list()).some((item) => item.name === 'pack.third'), false);
+});
+
+test('Task Pack install attaches provenance to an identical standalone type without allowing reassignment', async (t) => {
+  const { allowed, registry } = await registryFixture(t);
+  const modulePath = path.join(allowed, 'shared.mjs');
+  await writeFile(modulePath, [
+    "export const meta = { version: '1.0.0', risk: 'read', readOnly: true };",
+    "export async function run() { return { summary: 'ok', evidence: [{ kind: 'message', value: 'ok' }] }; }",
+    ''
+  ].join('\n'));
+
+  const standalone = await registry.install({ name: 'pack.shared', modulePath });
+  assert.equal(standalone.pack, undefined);
+
+  const [attached] = await registry.installBatch([
+    { name: 'pack.shared', modulePath }
+  ], { pack: { name: 'sample-pack', version: '1.0.0' } });
+  assert.deepEqual(attached.pack, { name: 'sample-pack', version: '1.0.0' });
+  assert.deepEqual((await registry.describe('pack.shared')).pack, {
+    name: 'sample-pack',
+    version: '1.0.0'
+  });
+
+  await assert.rejects(
+    registry.installBatch([
+      { name: 'pack.shared', modulePath }
+    ], { pack: { name: 'other-pack', version: '1.0.0' } }),
+    { code: 'TASK_TYPE_PACK_CONFLICT', statusCode: 409 }
+  );
+  assert.deepEqual((await registry.describe('pack.shared')).pack, {
+    name: 'sample-pack',
+    version: '1.0.0'
+  });
 });

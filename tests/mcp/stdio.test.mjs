@@ -38,7 +38,29 @@ for (const [label, mode] of [
 
     if (label === 'legacy') await connection.client.ping();
     const listed = await connection.client.listTools();
-    assert.equal(listed.tools.length, 18);
+    assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [
+      'taskmaster_agent_inbox_claim',
+      'taskmaster_artifacts_list',
+      'taskmaster_artifacts_read',
+      'taskmaster_dashboard_open',
+      'taskmaster_profiles_close',
+      'taskmaster_profiles_create',
+      'taskmaster_profiles_list',
+      'taskmaster_profiles_open',
+      'taskmaster_profiles_update',
+      'taskmaster_status',
+      'taskmaster_task_command_respond',
+      'taskmaster_task_report_publish',
+      'taskmaster_task_types_describe',
+      'taskmaster_task_types_list',
+      'taskmaster_tasks_cancel',
+      'taskmaster_tasks_continue',
+      'taskmaster_tasks_get',
+      'taskmaster_tasks_list',
+      'taskmaster_tasks_resume',
+      'taskmaster_tasks_start',
+      'taskmaster_tasks_wait'
+    ]);
     const start = listed.tools.find((tool) => tool.name === 'taskmaster_tasks_start');
     assert.deepEqual(start.annotations, {
       readOnlyHint: false,
@@ -69,6 +91,9 @@ for (const [label, mode] of [
     });
     assert.ok(start.inputSchema);
     assert.ok(start.outputSchema);
+    assert.ok(listed.tools.find((tool) => tool.name === 'taskmaster_agent_inbox_claim')?.inputSchema);
+    assert.ok(listed.tools.find((tool) => tool.name === 'taskmaster_task_command_respond')?.inputSchema);
+    assert.ok(listed.tools.find((tool) => tool.name === 'taskmaster_task_report_publish')?.inputSchema);
 
     const result = await connection.client.callTool({ name: 'taskmaster_status', arguments: {} });
     assert.equal(result.isError, undefined);
@@ -79,17 +104,33 @@ for (const [label, mode] of [
   });
 }
 
-test('MCP Profile owner can explicitly share a private Profile', async (t) => {
+test('MCP exposes globally shared Profiles without legacy ownership fields', async (t) => {
   const connection = await connectedClient('legacy');
   t.after(() => connection.client.close());
 
-  const result = await connection.client.callTool({
+  const listed = await connection.client.callTool({
+    name: 'taskmaster_profiles_list',
+    arguments: {}
+  });
+  assert.equal(Object.hasOwn(listed.structuredContent.data.profiles[0], 'access'), false);
+  assert.equal(Object.hasOwn(listed.structuredContent.data.profiles[0], 'createdBy'), false);
+
+  const updated = await connection.client.callTool({
+    name: 'taskmaster_profiles_update',
+    arguments: { profileId: 'profile_fixture', name: 'Globally shared Profile' }
+  });
+  assert.equal(updated.isError, undefined);
+  assert.equal(updated.structuredContent.data.profile.name, 'Globally shared Profile');
+  assert.equal(Object.hasOwn(updated.structuredContent.data.profile, 'access'), false);
+  assert.equal(Object.hasOwn(updated.structuredContent.data.profile, 'createdBy'), false);
+  assert.equal(updated.structuredContent.data.profile.lastUsedAt, '2026-08-24T00:00:00.000Z');
+
+  const rejected = await connection.client.callTool({
     name: 'taskmaster_profiles_update',
     arguments: { profileId: 'profile_fixture', access: 'shared' }
   });
-  assert.equal(result.isError, undefined);
-  assert.equal(result.structuredContent.data.profile.access, 'shared');
-  assert.equal(result.structuredContent.data.profile.lastUsedAt, '2026-08-24T00:00:00.000Z');
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.content[0].text, /Unrecognized key/u);
 });
 
 test('non-idempotent Profile creation accepts nullable timestamps without a false failure or retry', async (t) => {
@@ -103,7 +144,53 @@ test('non-idempotent Profile creation accepts nullable timestamps without a fals
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.data.profile.lastUsedAt, null);
   assert.equal(result.structuredContent.data.profile.lastOpenedAt, null);
-  assert.equal(result.structuredContent.data.profile.createdBy, 'fixture-call-1');
+  assert.equal(Object.hasOwn(result.structuredContent.data.profile, 'createdBy'), false);
+  assert.equal(Object.hasOwn(result.structuredContent.data.profile, 'access'), false);
+});
+
+test('Owner inbox, command response, and report publication tools expose bounded contracts', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const inbox = await connection.client.callTool({
+    name: 'taskmaster_agent_inbox_claim',
+    arguments: { limit: 10 }
+  });
+  assert.equal(inbox.structuredContent.data.total, 1);
+  assert.equal(inbox.structuredContent.data.commands[0].taskId, 'task_fixture');
+  assert.equal(inbox.structuredContent.data.commands[0].revision, 3);
+  assert.equal(inbox.structuredContent.data.commands[0].command.message, 'What should happen next?');
+  assert.equal(JSON.stringify(inbox).includes('payloadHash'), false);
+
+  const response = await connection.client.callTool({
+    name: 'taskmaster_task_command_respond',
+    arguments: {
+      taskId: 'task_fixture',
+      commandId: 'command_fixture',
+      expectedRevision: 3,
+      status: 'acknowledged',
+      message: 'Acknowledged by fixture Agent.'
+    }
+  });
+  assert.equal(response.structuredContent.data.task.revision, 3);
+  assert.equal(response.structuredContent.data.command.status, 'acknowledged');
+  assert.equal(response.structuredContent.data.command.response, 'Acknowledged by fixture Agent.');
+
+  const report = await connection.client.callTool({
+    name: 'taskmaster_task_report_publish',
+    arguments: {
+      taskId: 'task_fixture',
+      reportId: 'report_fixture',
+      expectedRevision: 3,
+      status: 'final',
+      title: 'Fixture report',
+      summary: 'The fixture task completed its evidence review.',
+      sections: [{ heading: 'Outcome', body: 'One verified fixture result.' }]
+    }
+  });
+  assert.equal(report.structuredContent.data.task.report.status, 'final');
+  assert.equal(report.structuredContent.data.task.report.title, 'Fixture report');
+  assert.equal(report.structuredContent.data.task.report.sections[0].heading, 'Outcome');
 });
 
 test('stdio wire contains JSON-RPC frames only', async (t) => {

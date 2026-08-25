@@ -16,10 +16,15 @@ async function staticChecks() {
   const packageJson = JSON.parse(await readFile(resolve(ROOT, 'package.json'), 'utf8'));
   const lock = JSON.parse(await readFile(resolve(ROOT, 'package-lock.json'), 'utf8'));
   const license = await readFile(resolve(ROOT, 'LICENSE'), 'utf8');
+  const changelog = await readFile(resolve(ROOT, 'CHANGELOG.md'), 'utf8');
   invariant(packageJson.version === VERSION, 'package.json version drift');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock.json version drift');
   invariant(packageJson.license === 'MIT', 'package license drift');
   invariant(/^MIT License\r?\n/.test(license), 'MIT license file is missing or malformed');
+  invariant(
+    new RegExp(`^# Changelog\\r?\\n\\r?\\n## ${VERSION.replaceAll('.', '\\.')}(?: | -)`, 'u').test(changelog),
+    'CHANGELOG latest version drift'
+  );
   invariant(
     JSON.stringify(Object.keys(packageJson.dependencies || {}).sort()) ===
       JSON.stringify(['@modelcontextprotocol/server', 'playwright', 'zod'].sort()),
@@ -35,14 +40,32 @@ async function staticChecks() {
     .then(() => false, (error) => error?.code === 'ENOENT');
   invariant(extensionRemoved, 'extension directory or payload must not be shipped');
   await access(resolve(ROOT, 'scripts', 'taskmaster.mjs'));
-  const [launcher, bootstrapPolicy, manager, taskWorker, taskService, workflow, releaseWorkflow] = await Promise.all([
+  const [
+    launcher,
+    bootstrapPolicy,
+    manager,
+    taskWorker,
+    taskService,
+    workflow,
+    releaseWorkflow,
+    dashboard,
+    dashboardHtml,
+    agentRegistry,
+    dashboardSessions,
+    taskRecipes
+  ] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'manager.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-service.mjs'), 'utf8'),
     readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
-    readFile(resolve(ROOT, '.github', 'workflows', 'release.yml'), 'utf8')
+    readFile(resolve(ROOT, '.github', 'workflows', 'release.yml'), 'utf8'),
+    readFile(resolve(ROOT, 'dashboard', 'dashboard.js'), 'utf8'),
+    readFile(resolve(ROOT, 'dashboard', 'index.html'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'agent-registry.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'dashboard-session-store.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'task-recipes.mjs'), 'utf8')
   ]);
   const releaseCreation = releaseWorkflow.indexOf('gh release create');
   const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
@@ -62,6 +85,32 @@ async function staticChecks() {
   invariant(
     taskService.includes('scheduleQueuedTasks') && taskService.includes('TASK_PROGRESS_STALLED'),
     'task scheduler or progress-health boundary drift'
+  );
+  invariant(
+    manager.includes('DashboardSessionStore') && manager.includes('AgentRegistry') &&
+      manager.includes('/v1/dashboard/summary') && manager.includes('/v1/agents'),
+    'Owner session or Agent registry boundary drift'
+  );
+  invariant(
+    dashboard.includes('bootstrapOwnerSession') && dashboard.includes('markAuthorizationRequired') &&
+      dashboard.includes('expectedRevision') && dashboard.includes('submitTaskCommand') &&
+      dashboardHtml.includes('data-view-panel="overview"') && dashboardHtml.includes('data-view-panel="tasks"'),
+    'Owner Console bootstrap, revision, command, or navigation contract drift'
+  );
+  invariant(
+    agentRegistry.includes("status = 'revoked'") && dashboardSessions.includes('tokenHash') &&
+      dashboardSessions.includes('safeEqual') && manager.includes('HttpOnly; SameSite=Strict'),
+    'durable Agent registry or hardened Owner cookie contract drift'
+  );
+  invariant(
+    taskService.includes('pauseTask') && taskService.includes('terminateTask') &&
+      taskService.includes('publishTaskReport') && taskService.includes('claimAgentInbox'),
+    'durable task control, report, or Agent inbox boundary drift'
+  );
+  invariant(
+    ['single-page', 'paginated-list', 'list-detail', 'resumable-batch', 'form-workflow']
+      .every((recipe) => taskRecipes.includes(`'${recipe}'`)),
+    'task authoring recipe boundary drift'
   );
   invariant(
     !manager.includes('/v1/pair/extension') &&
@@ -132,6 +181,7 @@ async function staticChecks() {
   );
   await Promise.all([
     access(resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')),
+    access(resolve(ROOT, 'scripts', 'dashboard-acceptance.mjs')),
     access(resolve(ROOT, 'src', 'lib', 'semantic-observer.mjs')),
     access(resolve(ROOT, 'src', 'lib', 'task-pack.mjs')),
     access(resolve(ROOT, 'src', 'lib', 'user-handoff.mjs')),
@@ -171,7 +221,8 @@ async function staticChecks() {
   invariant(skill.includes('node scripts/taskmaster.mjs connect --json'), 'Skill lacks the fixed startup command');
   invariant(
     skill.includes('taskmaster_task_types_describe') && skill.includes('taskmaster_tasks_continue') &&
-      skill.includes('taskmaster_dashboard_open') && skill.includes('clickable Dashboard link'),
+      skill.includes('taskmaster_dashboard_open') && skill.includes('clickable Dashboard link') &&
+      skill.includes('taskmaster_agent_inbox_claim') && skill.includes('taskmaster_task_report_publish'),
     'Skill lacks progressive discovery, same-task handoff, or the fixed Dashboard link contract'
   );
   invariant(
@@ -186,8 +237,10 @@ async function staticChecks() {
     'GitHub-to-task bootstrap contract drift'
   );
   invariant(
-    workflow.includes('TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome'),
-    'cross-platform CI must exercise the stable Chrome persistent-Profile path'
+    workflow.includes('TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome') &&
+      workflow.includes('TASKMASTER_DASHBOARD_REPORT:') &&
+      workflow.includes('TASKMASTER_DASHBOARD_SCREENSHOT:'),
+    'cross-platform CI must exercise stable Chrome and retain Owner Console evidence'
   );
   const immutablePreflight = releaseWorkflow.indexOf('repos/${GITHUB_REPOSITORY}/immutable-releases');
   const immutableRecheck = releaseWorkflow.lastIndexOf('repos/${GITHUB_REPOSITORY}/immutable-releases');
@@ -199,7 +252,7 @@ async function staticChecks() {
       releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
     'release preflight, monotonic version, or standalone Skill archive proof drift'
   );
-  return { passed: 35, total: 35 };
+  return { passed: 42, total: 42 };
 }
 
 function run(command, args, env = {}) {
@@ -223,11 +276,12 @@ try {
   process.stdout.write(`${JSON.stringify({ stage: 'static', ok: true, ...staticResult })}\n`);
   await run(process.execPath, ['--test', '--test-concurrency=1'], { TASKMASTER_REAL_BROWSER: '1' });
   await run(process.execPath, [resolve(ROOT, 'scripts', 'acceptance.mjs')]);
+  await run(process.execPath, [resolve(ROOT, 'scripts', 'dashboard-acceptance.mjs')]);
   await run(process.execPath, [resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')]);
   process.stdout.write(`${JSON.stringify({
     ok: true,
     version: VERSION,
-    stages: ['static', 'tests', 'acceptance', 'commercial-acceptance']
+    stages: ['static', 'tests', 'acceptance', 'dashboard-acceptance', 'commercial-acceptance']
   })}\n`);
 } catch (error) {
   process.stderr.write(`${JSON.stringify({

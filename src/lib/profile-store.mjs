@@ -6,7 +6,6 @@ import { isBehaviorMode, isBrowserEngine, isProfileKind } from '../contracts.mjs
 import { JsonStore } from './json-store.mjs';
 
 const DEFAULT_LEASE_TTL_MS = 60_000;
-const PROFILE_ACCESS = new Set(['private', 'shared']);
 const CLIENT_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/u;
 
 export class ProfileStoreError extends Error {
@@ -133,33 +132,12 @@ function migrateProfileBehavior(profile) {
   profile.defaultBehavior = ensureBehaviorMode(profile.defaultBehavior);
 }
 
-function ensureProfileAccess(value) {
-  if (!PROFILE_ACCESS.has(value)) {
-    throw new ProfileStoreError('INVALID_PROFILE_ACCESS', 'Profile access must be private or shared');
-  }
-  return value;
-}
-
 function ensureOwnerClientId(value) {
   if (value === null || value === undefined) return null;
   if (typeof value !== 'string' || !CLIENT_ID_PATTERN.test(value)) {
     throw new ProfileStoreError('INVALID_PROFILE_OWNER', 'Profile ownerClientId is invalid');
   }
   return value;
-}
-
-function requireLeaseAccess(profile, authorizedClientId) {
-  if (
-    authorizedClientId &&
-    profile.ownerClientId !== authorizedClientId &&
-    (profile.access || 'shared') !== 'shared'
-  ) {
-    throw new ProfileStoreError(
-      'PROFILE_ACCESS_DENIED',
-      'This Agent is not authorized to use this Profile',
-      403
-    );
-  }
 }
 
 function findProfile(data, profileId) {
@@ -187,7 +165,7 @@ export class ProfileStore {
     removePath = rm
   }) {
     if (!profilesRoot) throw new TypeError('profilesRoot is required');
-    this.#store = new JsonStore(filePath, { version: 3, profiles: [] });
+    this.#store = new JsonStore(filePath, { version: 4, profiles: [] });
     this.#profilesRoot = profilesRoot;
     this.#now = now;
     this.#processAlive = processAlive;
@@ -201,7 +179,7 @@ export class ProfileStore {
     // v0.x Profile records predate explicit persistence semantics. Preserve
     // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
-      if (data.version !== undefined && ![1, 2, 3].includes(data.version)) {
+      if (data.version !== undefined && ![1, 2, 3, 4].includes(data.version)) {
         throw new ProfileStoreError(
           'PROFILE_STORE_VERSION_UNSUPPORTED',
           `Profile store version ${String(data.version)} is unsupported`,
@@ -214,8 +192,12 @@ export class ProfileStore {
         ensureProfileKind(profile.kind);
         migrateBrowserEngine(profile, { allowLegacyChannel });
         migrateProfileBehavior(profile);
-        profile.ownerClientId ??= null;
-        profile.access ||= 'shared';
+        // v4 makes Profiles machine-local shared resources. Remove only the
+        // obsolete authorization metadata; userDataDir and browser state stay
+        // byte-for-byte in their existing location.
+        delete profile.ownerClientId;
+        delete profile.createdBy;
+        delete profile.access;
         if (
           profile.lease &&
           /^(?:task:|profile-open:|session-import:)/u.test(profile.lease.ownerId || '') &&
@@ -224,7 +206,7 @@ export class ProfileStore {
           profile.lease.cleanupRequired = true;
         }
       }
-      data.version = 3;
+      data.version = 4;
     });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
@@ -274,8 +256,9 @@ export class ProfileStore {
     const browserEngine = ensureBrowserEngine(
       requestedBrowserEngine ?? (kind === 'persistent' ? 'chrome' : 'chromium')
     );
-    const ownerClientId = ensureOwnerClientId(ownership.ownerClientId);
-    const access = ensureProfileAccess(ownership.access ?? (ownerClientId ? 'private' : 'shared'));
+    // Keep the second argument as a compatibility sink for 2.0 clients. Profile
+    // ownership/access was removed in v4, so these legacy values are ignored.
+    void ownership;
     const now = new Date(this.#now()).toISOString();
     const profileId = `profile_${randomUUID().replaceAll('-', '')}`;
     const userDataDir = join(this.#profilesRoot, profileId);
@@ -299,8 +282,6 @@ export class ProfileStore {
           defaultBehavior,
           headless,
           browserEngine,
-          ownerClientId,
-          access,
           state: 'idle',
           lease: null,
           createdAt: now,
@@ -330,7 +311,12 @@ export class ProfileStore {
       patch = { ...patch, defaultBehavior: ensureBehaviorMode(patch.defaultBehavior) };
     }
     if ('headless' in patch) patch = { ...patch, headless: ensureHeadless(patch.headless) };
-    if ('access' in patch) patch = { ...patch, access: ensureProfileAccess(patch.access) };
+    // A cached 2.0 client may still send access. Accept it as a no-op while the
+    // public contract and persisted record remain globally shared.
+    if ('access' in patch) {
+      const { access: _obsoleteAccess, ...currentPatch } = patch;
+      patch = currentPatch;
+    }
     let updated;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
@@ -338,17 +324,6 @@ export class ProfileStore {
         throw new ProfileStoreError(
           'PERSISTENT_BEHAVIOR_FIXED',
           'Persistent Profile behavior cannot be changed'
-        );
-      }
-      if (
-        patch.access === 'private' &&
-        (profile.access || 'shared') !== 'private' &&
-        (profile.lease || profile.state !== 'idle')
-      ) {
-        throw new ProfileStoreError(
-          'PROFILE_IN_USE',
-          `Profile ${profileId} must be idle before shared access can be revoked`,
-          409
         );
       }
       if (
@@ -654,12 +629,11 @@ export class ProfileStore {
     if (options.cleanupRequired !== undefined && typeof options.cleanupRequired !== 'boolean') {
       throw new ProfileStoreError('INVALID_LEASE_CLEANUP', 'Lease cleanupRequired must be a boolean');
     }
-    const authorizedClientId = options.authorizedClientId === undefined
-      ? null
-      : ensureOwnerClientId(options.authorizedClientId);
+    // Validate legacy caller metadata to retain the old fail-closed input
+    // boundary, but do not use it for authorization: every Profile is shared.
+    if (options.authorizedClientId !== undefined) ensureOwnerClientId(options.authorizedClientId);
 
     const existing = await this.get(profileId);
-    requireLeaseAccess(existing, authorizedClientId);
     if (existing.state === 'deleting' || existing.deletion) {
       throw new ProfileStoreError('PROFILE_IN_USE', `Profile ${profileId} is being deleted`, 409);
     }
@@ -689,7 +663,6 @@ export class ProfileStore {
     let leased;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
-      requireLeaseAccess(profile, authorizedClientId);
       if (!isDeepStrictEqual(profile.lease, existing.lease)) {
         throw new ProfileStoreError(
           'PROFILE_LEASED',

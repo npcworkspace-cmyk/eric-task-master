@@ -2,6 +2,8 @@ import { startStdioServer } from '../../../src/mcp/stdio.mjs';
 
 const task = {
   id: 'task_fixture',
+  jobId: 'job_fixture',
+  revision: 3,
   profileId: 'profile_fixture',
   taskType: 'fixture.read',
   behavior: 'fast',
@@ -100,6 +102,49 @@ const client = {
   async waitTask(_taskId, { onProgress }) {
     await onProgress?.(task.progress, task);
     return { task, timedOut: true };
+  },
+  async claimInbox() {
+    return {
+      commands: [{
+        taskId: task.id,
+        revision: task.revision,
+        command: {
+          commandId: 'command_fixture',
+          kind: 'ask',
+          status: 'delivered',
+          expectedRevision: task.revision,
+          payload: { message: 'What should happen next?' },
+          payloadHash: 'do-not-return'
+        }
+      }],
+      total: 1
+    };
+  },
+  async respondTaskCommand(input) {
+    return {
+      task,
+      command: {
+        commandId: input.commandId,
+        kind: 'ask',
+        status: input.status,
+        expectedRevision: input.expectedRevision,
+        response: input.message
+      }
+    };
+  },
+  async publishTaskReport(input) {
+    return {
+      task: {
+        ...task,
+        report: {
+          reportId: input.reportId,
+          status: input.status,
+          title: input.title,
+          summary: input.summary,
+          sections: input.sections
+        }
+      }
+    };
   },
   async continueTask() { return { ...task, state: 'recovering' }; },
   async resumeTask() {

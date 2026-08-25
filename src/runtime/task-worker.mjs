@@ -55,6 +55,148 @@ class TaskTimeoutError extends Error {
   }
 }
 
+class TaskPauseResumeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TaskPauseResumeError';
+    this.code = 'TASK_PAUSE_RESUME_VALIDATION_FAILED';
+  }
+}
+
+/**
+ * Cooperative task pause gate. A pause request never interrupts an in-flight
+ * browser effect. It waits for every admitted action to settle, runs one
+ * bounded diagnostic callback, and only then reports `paused`. New actions and
+ * task completion remain gated until resume validation succeeds.
+ */
+export function createCooperativePauseGate({
+  signal,
+  onState = async () => {},
+  onPaused = async () => {},
+  onResumeValidate = async () => {}
+} = {}) {
+  let pauseRequested = false;
+  let paused = false;
+  let activeActions = 0;
+  let pauseCommandId = null;
+  let transition = Promise.resolve();
+  const waiters = new Set();
+  const idleWaiters = new Set();
+
+  const abortError = () => (
+    signal?.reason instanceof Error ? signal.reason : new TaskCancelledError()
+  );
+
+  function wakeWaiters(error = null) {
+    for (const waiter of waiters) {
+      if (error) waiter.reject(error);
+      else waiter.resolve();
+    }
+    waiters.clear();
+  }
+
+  function waitUntilResumed() {
+    if (!pauseRequested) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(abortError());
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject };
+      waiters.add(waiter);
+      signal?.addEventListener('abort', () => {
+        waiters.delete(waiter);
+        reject(abortError());
+      }, { once: true });
+    });
+  }
+
+  function waitUntilIdle() {
+    if (activeActions === 0) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(abortError());
+    return new Promise((resolve, reject) => idleWaiters.add({ resolve, reject }));
+  }
+
+  function queueTransition(callback) {
+    const operation = transition.catch(() => {}).then(callback);
+    transition = operation.catch(() => {});
+    return operation;
+  }
+
+  async function settlePause() {
+    if (!pauseRequested || paused || activeActions !== 0) return;
+    await onPaused({ commandId: pauseCommandId });
+    if (!pauseRequested || activeActions !== 0) return;
+    paused = true;
+    await onState('paused', { commandId: pauseCommandId });
+  }
+
+  async function requestPause(commandId = null) {
+    if (signal?.aborted) throw abortError();
+    if (pauseRequested) return { state: paused ? 'paused' : 'pause_requested', commandId: pauseCommandId };
+    pauseRequested = true;
+    paused = false;
+    pauseCommandId = commandId || null;
+    await onState('pause_requested', { commandId: pauseCommandId });
+    await queueTransition(settlePause);
+    return { state: paused ? 'paused' : 'pause_requested', commandId: pauseCommandId };
+  }
+
+  async function requestResume(commandId = null) {
+    if (signal?.aborted) throw abortError();
+    if (!pauseRequested) return { state: 'running', commandId };
+    return queueTransition(async () => {
+      // A resume racing the final in-flight effect waits for the pause boundary
+      // and its diagnostic proof before validating the live page.
+      await waitUntilIdle();
+      await settlePause();
+      await onState('recovering', { commandId });
+      await onResumeValidate({ commandId, pauseCommandId });
+      pauseRequested = false;
+      paused = false;
+      pauseCommandId = null;
+      wakeWaiters();
+      await onState('running', { commandId });
+      return { state: 'running', commandId };
+    });
+  }
+
+  async function run(callback) {
+    if (typeof callback !== 'function') throw new TypeError('pause gate callback is required');
+    await waitUntilResumed();
+    if (signal?.aborted) throw abortError();
+    activeActions += 1;
+    try {
+      return await callback();
+    } finally {
+      activeActions -= 1;
+      if (activeActions === 0) {
+        for (const waiter of idleWaiters) waiter.resolve();
+        idleWaiters.clear();
+      }
+      if (pauseRequested && activeActions === 0) await queueTransition(settlePause);
+    }
+  }
+
+  signal?.addEventListener('abort', () => {
+    const error = abortError();
+    wakeWaiters(error);
+    for (const waiter of idleWaiters) waiter.reject(error);
+    idleWaiters.clear();
+  }, { once: true });
+
+  return Object.freeze({
+    requestPause,
+    requestResume,
+    run,
+    waitIfPaused: waitUntilResumed,
+    beforeCompletion: waitUntilResumed,
+    get state() {
+      return paused ? 'paused' : pauseRequested ? 'pause_requested' : 'running';
+    },
+    get activeActions() {
+      return activeActions;
+    }
+  });
+}
+
 function safeSend(message) {
   if (typeof process.send !== 'function' || !process.connected) return;
   try {
@@ -209,6 +351,8 @@ let activeProgress = { current: 0, total: null, message: 'Starting browser' };
 let activeOutputBudget = null;
 let activeSemantic = null;
 let activeHandoff = null;
+let activePauseControl = null;
+let pendingPauseControls = [];
 let activeDiagnosticsPath = null;
 let activeDiagnostics = null;
 let activeDiagnosticsWrite = Promise.resolve();
@@ -364,6 +508,7 @@ export async function runTaskWorker(config, {
   activeOutputBudget = null;
   activeSemantic = null;
   activeHandoff = null;
+  activePauseControl = null;
   activeDiagnosticsPath = path.join(path.dirname(config.checkpointPath), 'diagnostics.json');
   activeDiagnostics = {
     version: 2,
@@ -492,7 +637,59 @@ export async function runTaskWorker(config, {
     const page = pages[0] || await awaitExecution(context.newPage());
     activePage = page;
 
+    const pauseGate = createCooperativePauseGate({
+      signal: executionSignal,
+      onState: async (state, detail = {}) => safeSend({
+        type: 'state',
+        state,
+        ...(detail.commandId ? { commandId: detail.commandId } : {})
+      }),
+      onPaused: async () => {
+        const diagnostics = await captureFailure(
+          page,
+          config.outputDir,
+          'task-paused',
+          outputBudget,
+          activeSemantic
+        );
+        if (diagnostics.screenshotPath) lastScreenshot = diagnostics.screenshotPath;
+      },
+      onResumeValidate: async () => {
+        if (page.isClosed?.()) throw new TaskPauseResumeError('Task page closed while paused');
+        try {
+          await withDeadline(Promise.all([
+            Promise.resolve(page.url()),
+            page.locator('html').count()
+          ]), 5_000);
+        } catch {
+          throw new TaskPauseResumeError('Task page could not be revalidated before resume');
+        }
+      }
+    });
+    activePauseControl = Object.freeze({
+      requestPause: (commandId) => pauseGate.requestPause(commandId).catch((error) => {
+        if (!executionSignal.aborted) executionController.abort(error);
+        throw error;
+      }),
+      requestResume: (commandId) => pauseGate.requestResume(commandId).catch((error) => {
+        if (!executionSignal.aborted) executionController.abort(error);
+        throw error;
+      })
+    });
+    const queuedControls = pendingPauseControls;
+    pendingPauseControls = [];
+    for (const control of queuedControls) {
+      try {
+        if (control.type === 'pause') await activePauseControl.requestPause(control.commandId);
+        else if (control.type === 'resume_pause') await activePauseControl.requestResume(control.commandId);
+      } catch (error) {
+        safeSend({ type: 'control_error', commandId: control.commandId, error: errorPayload(error) });
+        throw error;
+      }
+    }
+
     const progress = async ({ current, total = null, message, phase }) => {
+      await pauseGate.waitIfPaused();
       await outputBudget.assertWithinBudget();
       const normalizedCurrent = Number(current);
       const normalizedTotal = total === null ? null : Number(total);
@@ -530,6 +727,7 @@ export async function runTaskWorker(config, {
 
     let checkpointWrittenThisAttempt = false;
     const checkpoint = async (data) => {
+      await pauseGate.waitIfPaused();
       if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
         const error = new Error('Consume the frozen checkpoint before writing a new checkpoint');
         error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
@@ -613,31 +811,29 @@ export async function runTaskWorker(config, {
         lastScreenshot = diagnostics.screenshotPath;
       }
     });
-    const guardResumeAction = (method) => (...args) => {
-      if (!resumeCheckpointConsumed) {
+    const guardedAction = (method) => (...args) => pauseGate.run(() => {
+      if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
         const error = new Error('Consume the frozen checkpoint before issuing browser actions');
         error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
         throw error;
       }
       return rawAction[method](...args);
-    };
-    const action = config.resumeCheckpoint
-      ? Object.freeze({
-        get mode() { return rawAction.mode; },
-        get effectiveMode() { return rawAction.effectiveMode; },
-        get adaptiveState() { return rawAction.adaptiveState; },
-        signal: (...args) => rawAction.signal(...args),
-        run: guardResumeAction('run'),
-        goto: guardResumeAction('goto'),
-        click: guardResumeAction('click'),
-        fill: guardResumeAction('fill'),
-        type: guardResumeAction('type'),
-        hover: guardResumeAction('hover'),
-        scroll: guardResumeAction('scroll'),
-        read: (...args) => rawAction.read(...args),
-        wait: (...args) => rawAction.wait(...args)
-      })
-      : rawAction;
+    });
+    const action = Object.freeze({
+      get mode() { return rawAction.mode; },
+      get effectiveMode() { return rawAction.effectiveMode; },
+      get adaptiveState() { return rawAction.adaptiveState; },
+      signal: (...args) => rawAction.signal(...args),
+      run: guardedAction('run'),
+      goto: guardedAction('goto'),
+      click: guardedAction('click'),
+      fill: guardedAction('fill'),
+      type: guardedAction('type'),
+      hover: guardedAction('hover'),
+      scroll: guardedAction('scroll'),
+      read: guardedAction('read'),
+      wait: guardedAction('wait')
+    });
     semantic = createSemanticObserver({ page, action });
     activeSemantic = semantic;
     const handoff = createUserHandoff({
@@ -703,6 +899,7 @@ export async function runTaskWorker(config, {
     taskPromise.catch(() => {});
 
     const rawResult = await Promise.race([taskPromise, timeoutPromise, cancellationPromise, budgetPromise]);
+    await pauseGate.beforeCompletion();
     if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
       const error = new Error('Resumed task did not consume its frozen checkpoint');
       error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
@@ -765,6 +962,8 @@ export async function runTaskWorker(config, {
     activeSemantic = null;
     activeHandoff?.cancel();
     activeHandoff = null;
+    activePauseControl = null;
+    pendingPauseControls = [];
     activeDiagnosticsPath = null;
     activeDiagnostics = null;
     safeSend({
@@ -793,6 +992,20 @@ if (typeof process.send === 'function') {
       return;
     }
     if (message?.type === 'cancel') controller.abort();
+    if (message?.type === 'pause' || message?.type === 'resume_pause') {
+      const operation = message.type === 'pause' ? 'requestPause' : 'requestResume';
+      if (!activePauseControl) {
+        pendingPauseControls.push({ type: message.type, commandId: message.commandId || null });
+      } else {
+        void activePauseControl[operation](message.commandId || null).catch((error) => {
+          safeSend({
+            type: 'control_error',
+            commandId: message.commandId || null,
+            error: errorPayload(error)
+          });
+        });
+      }
+    }
     if (message?.type === 'continue') {
       void activeHandoff?.continue({ requestId: message.requestId, note: message.note });
     }

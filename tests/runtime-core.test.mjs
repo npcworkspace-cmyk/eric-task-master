@@ -319,16 +319,17 @@ test('idempotency is persistent, payload-bound, and isolated per Agent owner', a
   );
 });
 
-test('task submission enforces private Profile ownership while explicit sharing permits use', async (t) => {
+test('all Agents can use a Profile even when legacy ownership metadata remains in a fixture', async (t) => {
   const { profiles, service } = await serviceFixture(t);
   profiles.profile.ownerClientId = AGENT_A.clientId;
   profiles.profile.access = 'private';
 
-  await assert.rejects(service.create({
+  const first = await service.create({
     profileId: profiles.profile.id,
     taskType: 'fixture',
     idempotencyKey: 'profile-private-agent-b'
-  }, AGENT_B), { code: 'PROFILE_ACCESS_DENIED', statusCode: 403 });
+  }, AGENT_B);
+  await waitFor(async () => (await service.get(first.id, AGENT_B)).cleanup.settled);
 
   const owned = await service.create({
     profileId: profiles.profile.id,
@@ -337,7 +338,6 @@ test('task submission enforces private Profile ownership while explicit sharing 
   }, AGENT_A);
   await waitFor(async () => (await service.get(owned.id, AGENT_A)).cleanup.settled);
 
-  profiles.profile.access = 'shared';
   const shared = await service.create({
     profileId: profiles.profile.id,
     taskType: 'fixture',

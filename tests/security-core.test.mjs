@@ -9,11 +9,12 @@ import { ManagerLock } from '../src/lib/manager-lock.mjs';
 import { createManager } from '../src/manager.mjs';
 
 
-async function call(baseUrl, pathname, { method = 'GET', token, origin, headers = {}, body } = {}) {
+async function call(baseUrl, pathname, { method = 'GET', token, cookie, origin, headers = {}, body } = {}) {
   const response = await fetch(new URL(pathname, baseUrl), {
     method,
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(cookie ? { cookie } : {}),
       ...(origin ? { origin } : {}),
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       ...headers
@@ -21,7 +22,13 @@ async function call(baseUrl, pathname, { method = 'GET', token, origin, headers 
     ...(body === undefined ? {} : { body: JSON.stringify(body) })
   });
   const payload = await response.json();
-  return { status: response.status, payload };
+  return { status: response.status, payload, headers: response.headers };
+}
+
+function cookiePair(response) {
+  const setCookie = response.headers.get('set-cookie');
+  assert.equal(typeof setCookie, 'string');
+  return setCookie.split(';', 1)[0];
 }
 
 function serviceFixture() {
@@ -130,7 +137,7 @@ async function fixture(t) {
   return { root, manager, service, baseUrl: manager.baseUrl };
 }
 
-test('role matrix scopes MCP Agent identity and keeps removed extension routes closed', async (t) => {
+test('role matrix keeps Agent tasks scoped while the Owner Console has a global view', async (t) => {
   const { manager, service, baseUrl } = await fixture(t);
 
   const issued = await call(baseUrl, '/v1/agents/issue', {
@@ -170,21 +177,35 @@ test('role matrix scopes MCP Agent identity and keeps removed extension routes c
     method: 'POST', origin: baseUrl, body: { code: dashboardCode }
   });
   assert.equal(dashboardSession.status, 201);
-  const scopedTasks = await call(baseUrl, '/v1/tasks', { token: dashboardSession.payload.dashboardToken });
-  assert.deepEqual(scopedTasks.payload.tasks.map((task) => task.id), [agentTask.payload.task.id]);
-  const delegatedCaller = service.calls.filter((entry) => entry[0] === 'list').at(-1)[1].caller;
-  assert.equal(delegatedCaller.role, 'agent');
-  assert.equal(delegatedCaller.clientId, 'codex.fixture');
-  const dashboardCannotCreateTask = await call(baseUrl, '/v1/tasks', {
-    method: 'POST', token: dashboardSession.payload.dashboardToken, body: {
-      profileId: 'profile_fixture', taskType: 'fixture', idempotencyKey: 'dashboard-forbidden'
-    }
-  });
-  assert.equal(dashboardCannotCreateTask.status, 403);
+  assert.equal('dashboardToken' in dashboardSession.payload, false);
+  const ownerCookie = cookiePair(dashboardSession);
 
   const otherAgent = await call(baseUrl, '/v1/agents/issue', {
     method: 'POST', token: manager.token, body: { clientId: 'other.fixture', name: 'Other fixture' }
   });
+  const otherTask = await call(baseUrl, '/v1/tasks', {
+    method: 'POST', token: otherAgent.payload.agentToken, body: {
+      profileId: 'profile_fixture', taskType: 'fixture', idempotencyKey: 'fixture:2'
+    }
+  });
+  assert.equal(otherTask.status, 202);
+
+  const ownerTasks = await call(baseUrl, '/v1/tasks', { cookie: ownerCookie });
+  assert.equal(ownerTasks.status, 200);
+  assert.deepEqual(
+    ownerTasks.payload.tasks.map((task) => task.id).sort(),
+    [agentTask.payload.task.id, otherTask.payload.task.id].sort()
+  );
+  const delegatedCaller = service.calls.filter((entry) => entry[0] === 'list').at(-1)[1].caller;
+  assert.equal(delegatedCaller.role, 'manager-admin');
+  assert.equal(delegatedCaller.clientId, 'manager-admin');
+
+  const otherAgentTasks = await call(baseUrl, '/v1/tasks', { token: otherAgent.payload.agentToken });
+  assert.deepEqual(otherAgentTasks.payload.tasks.map((task) => task.id), [otherTask.payload.task.id]);
+  const otherAgentCannotReadTask = await call(baseUrl, `/v1/tasks/${agentTask.payload.task.id}`, {
+    token: otherAgent.payload.agentToken
+  });
+  assert.equal(otherAgentCannotReadTask.status, 404);
   const forbiddenFocus = await call(baseUrl, '/v1/dashboard/authorize', {
     method: 'POST', token: otherAgent.payload.agentToken, body: { focusTaskId: agentTask.payload.task.id }
   });
@@ -202,14 +223,22 @@ test('role matrix scopes MCP Agent identity and keeps removed extension routes c
   assert.equal(readArtifact.status, 200);
   assert.equal(service.calls.find((entry) => entry[0] === 'read-artifact')[4].clientId, 'codex.fixture');
 
-  const ownedProfile = await call(baseUrl, '/v1/profiles', {
+  const sharedProfile = await call(baseUrl, '/v1/profiles', {
     method: 'POST', token: issued.payload.agentToken, body: {
-      name: 'Owned private Profile', kind: 'ephemeral'
+      name: 'Globally shared Profile', kind: 'ephemeral'
     }
   });
-  assert.equal(ownedProfile.status, 201);
-  const agentDelete = await call(baseUrl, `/v1/profiles/${ownedProfile.payload.profile.id}`, {
-    method: 'DELETE', token: issued.payload.agentToken
+  assert.equal(sharedProfile.status, 201);
+  const profilesVisibleToOtherAgent = await call(baseUrl, '/v1/profiles', {
+    token: otherAgent.payload.agentToken
+  });
+  assert.equal(profilesVisibleToOtherAgent.status, 200);
+  assert.equal(
+    profilesVisibleToOtherAgent.payload.profiles.some((profile) => profile.id === sharedProfile.payload.profile.id),
+    true
+  );
+  const agentDelete = await call(baseUrl, `/v1/profiles/${sharedProfile.payload.profile.id}`, {
+    method: 'DELETE', token: otherAgent.payload.agentToken
   });
   assert.equal(agentDelete.status, 200);
 
@@ -223,8 +252,8 @@ test('role matrix scopes MCP Agent identity and keeps removed extension routes c
   }
 });
 
-test('Dashboard exchanges a one-time code for a scoped in-memory session', async (t) => {
-  const { manager, service, baseUrl } = await fixture(t);
+test('Owner Console exchanges one-time codes for persistent same-origin cookie sessions', async (t) => {
+  const { root, manager, baseUrl } = await fixture(t);
   assert.equal(manager.dashboardUrl, `${baseUrl}/dashboard`);
   assert.equal(manager.dashboardUrl.includes(manager.token), false);
 
@@ -242,7 +271,17 @@ test('Dashboard exchanges a one-time code for a scoped in-memory session', async
     body: { code: authorization.payload.code }
   });
   assert.equal(session.status, 201);
-  assert.equal(typeof session.payload.dashboardToken, 'string');
+  assert.equal(session.payload.ok, true);
+  assert.equal(typeof session.payload.session.id, 'string');
+  assert.equal(typeof session.payload.expiresInMs, 'number');
+  assert.equal('dashboardToken' in session.payload, false);
+  const setCookie = session.headers.get('set-cookie');
+  assert.match(setCookie, /^taskmaster_owner=[^;]+;/u);
+  assert.match(setCookie, /; HttpOnly(?:;|$)/iu);
+  assert.match(setCookie, /; SameSite=Strict(?:;|$)/iu);
+  assert.match(setCookie, /; Path=\/(?:;|$)/iu);
+  assert.match(setCookie, /; Max-Age=\d+(?:;|$)/iu);
+  const ownerCookie = cookiePair(session);
 
   const reused = await call(baseUrl, '/v1/dashboard/session', {
     method: 'POST',
@@ -251,34 +290,75 @@ test('Dashboard exchanges a one-time code for a scoped in-memory session', async
   });
   assert.equal(reused.status, 401);
 
-  const listed = await call(baseUrl, '/v1/tasks', { token: session.payload.dashboardToken });
-  assert.equal(listed.status, 200);
-  assert.equal(service.calls.find((entry) => entry[0] === 'list')[1].caller.role, 'manager-admin');
-
-  const cannotCreate = await call(baseUrl, '/v1/tasks', {
+  const missingOrigin = await call(baseUrl, '/v1/profiles', {
     method: 'POST',
-    token: session.payload.dashboardToken,
-    body: {
-      profileId: 'profile_fixture',
-      taskType: 'fixture',
-      idempotencyKey: 'dashboard-create-forbidden'
-    }
+    cookie: ownerCookie,
+    body: { name: 'Blocked cross-site mutation', kind: 'ephemeral' }
   });
-  assert.equal(cannotCreate.status, 403);
+  assert.equal(missingOrigin.status, 403);
+  assert.equal(missingOrigin.payload.error.code, 'DASHBOARD_ORIGIN_REQUIRED');
+
+  const foreignOrigin = await call(baseUrl, '/v1/profiles', {
+    method: 'POST',
+    cookie: ownerCookie,
+    origin: 'https://attacker.invalid',
+    body: { name: 'Blocked foreign-origin mutation', kind: 'ephemeral' }
+  });
+  assert.equal(foreignOrigin.status, 403);
+  assert.equal(foreignOrigin.payload.error.code, 'ORIGIN_NOT_ALLOWED');
+
+  // A 403 is an authorization/CSRF result, not an expired Owner session.
+  const afterForbidden = await call(baseUrl, '/v1/dashboard/summary', { cookie: ownerCookie });
+  assert.equal(afterForbidden.status, 200);
+
+  const sameOriginMutation = await call(baseUrl, '/v1/profiles', {
+    method: 'POST',
+    cookie: ownerCookie,
+    origin: baseUrl,
+    body: { name: 'Owner-created shared Profile', kind: 'ephemeral' }
+  });
+  assert.equal(sameOriginMutation.status, 201);
+
+  await manager.stop();
+  const replacementService = serviceFixture();
+  const replacement = await createManager({
+    port: 0,
+    dataDir: path.join(root, 'data'),
+    dashboardDir: path.join(root, 'dashboard'),
+    taskService: replacementService
+  });
+  await replacement.start();
+  t.after(async () => replacement.stop().catch(() => {}));
+
+  const persisted = await call(replacement.baseUrl, '/v1/dashboard/summary', { cookie: ownerCookie });
+  assert.equal(persisted.status, 200);
+
+  const logout = await call(replacement.baseUrl, '/v1/dashboard/logout', {
+    method: 'POST',
+    cookie: ownerCookie,
+    origin: replacement.baseUrl
+  });
+  assert.equal(logout.status, 200);
+  assert.match(logout.headers.get('set-cookie'), /^taskmaster_owner=;/u);
+  assert.match(logout.headers.get('set-cookie'), /; Max-Age=0(?:;|$)/iu);
+
+  const revoked = await call(replacement.baseUrl, '/v1/dashboard/summary', { cookie: ownerCookie });
+  assert.equal(revoked.status, 401);
+  assert.equal(revoked.payload.error.code, 'AUTH_REQUIRED');
 
   // A normal batch may start hundreds of tasks before anyone opens a link.
   // Keep at least 257 outstanding one-time approvals alive concurrently.
   const approvalCodes = [];
   for (let index = 0; index < 257; index += 1) {
-    const pending = await call(baseUrl, '/v1/dashboard/authorize', {
-      method: 'POST', token: manager.token, body: {}
+    const pending = await call(replacement.baseUrl, '/v1/dashboard/authorize', {
+      method: 'POST', token: replacement.token, body: {}
     });
     assert.equal(pending.status, 201);
     approvalCodes.push(pending.payload.code);
   }
   for (const code of [approvalCodes[0], approvalCodes.at(-1)]) {
-    const redeemed = await call(baseUrl, '/v1/dashboard/session', {
-      method: 'POST', origin: baseUrl, body: { code }
+    const redeemed = await call(replacement.baseUrl, '/v1/dashboard/session', {
+      method: 'POST', origin: replacement.baseUrl, body: { code }
     });
     assert.equal(redeemed.status, 201);
   }

@@ -119,6 +119,39 @@ function publicAttemptHistory(history) {
   return entries.length ? entries : undefined;
 }
 
+function publicTaskCommands(commands) {
+  if (!Array.isArray(commands)) return undefined;
+  const output = commands.slice(-100).map((command) => definedEntries([
+    ['commandId', stringValue(command?.commandId, 128)],
+    ['kind', stringValue(command?.kind, 32)],
+    ['status', stringValue(command?.status, 32)],
+    ['expectedRevision', Number.isSafeInteger(command?.expectedRevision) ? command.expectedRevision : undefined],
+    ['message', stringValue(command?.message, 8_000)],
+    ['response', stringValue(command?.response, 2_000)],
+    ['createdAt', stringValue(command?.createdAt, 64)],
+    ['updatedAt', stringValue(command?.updatedAt, 64)]
+  ])).filter((command) => command.commandId && command.kind && command.status);
+  return output.length ? output : undefined;
+}
+
+function publicTaskReport(report) {
+  if (!report || typeof report !== 'object') return undefined;
+  const sections = Array.isArray(report.sections)
+    ? report.sections.slice(0, 24).map((section) => definedEntries([
+      ['heading', stringValue(section?.heading, 200)],
+      ['body', stringValue(section?.body, 20_000)]
+    ])).filter((section) => section.heading && section.body)
+    : [];
+  return definedEntries([
+    ['reportId', stringValue(report.reportId, 128)],
+    ['status', stringValue(report.status, 16)],
+    ['title', stringValue(report.title, 200)],
+    ['summary', stringValue(report.summary, 20_000)],
+    ['sections', sections],
+    ['publishedAt', stringValue(report.publishedAt, 64)]
+  ]);
+}
+
 function publicEvidence(evidence) {
   if (!evidence || typeof evidence !== 'object' || !SAFE_EVIDENCE_KINDS.has(evidence.kind)) return undefined;
   const base = definedEntries([
@@ -238,6 +271,8 @@ export function publicTask(task, { includeResult = true } = {}) {
     : undefined;
   return definedEntries([
     ['id', stringValue(task?.id, 128)],
+    ['jobId', stringValue(task?.jobId, 128)],
+    ['revision', Number.isSafeInteger(task?.revision) ? task.revision : undefined],
     ['profileId', stringValue(task?.profileId, 128)],
     ['taskType', stringValue(task?.taskType, 128)],
     ['createdBy', stringValue(task?.createdBy, 128)],
@@ -268,6 +303,8 @@ export function publicTask(task, { includeResult = true } = {}) {
       ['savedAt', stringValue(task.checkpoint.savedAt, 64)]
     ]) : undefined],
     ['resumeAvailable', booleanValue(task?.resumeAvailable)],
+    ['commands', publicTaskCommands(task?.commands)],
+    ['report', publicTaskReport(task?.report)],
     ['summary', includeResult ? stringValue(result?.summary ?? task?.summary, 4096) : undefined],
     ['evidence', evidence?.length ? evidence : undefined],
     ['error', errorCode ? { code: errorCode, message: publicTaskErrorMessage(errorCode) } : undefined]
@@ -290,6 +327,9 @@ export function publicTaskType(taskType, { includeSchema = true } = {}) {
     ['tags', stringList(taskType?.tags, 32)],
     ['outputs', stringList(taskType?.outputs, 32)],
     ['risk', stringValue(taskType?.risk, 16)],
+    ['lifecycle', stringValue(taskType?.lifecycle, 16)],
+    ['deprecatedAt', stringValue(taskType?.deprecatedAt, 64)],
+    ['replacedBy', stringValue(taskType?.replacedBy, 128)],
     ['pack', taskType?.pack && typeof taskType.pack === 'object' ? definedEntries([
       ['name', stringValue(taskType.pack.name, 80)],
       ['version', stringValue(taskType.pack.version, 64)]

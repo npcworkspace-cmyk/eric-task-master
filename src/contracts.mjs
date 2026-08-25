@@ -1,7 +1,7 @@
 import { isSensitiveKey, redactPublicText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
-export const VERSION = '2.0.1';
+export const VERSION = '2.1.1';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -14,10 +14,13 @@ export const TASK_STATES = Object.freeze([
   'acquiring_profile',
   'starting_browser',
   'running',
+  'pause_requested',
+  'paused',
   'waiting_user',
   'cooling_down',
   'recovering',
   'verifying',
+  'cancel_requested',
   'completed',
   'failed',
   'cancelled'
@@ -50,7 +53,6 @@ export function publicProfile(profile) {
     'defaultBehavior',
     'headless',
     'browserEngine',
-    'access',
     'createdAt',
     'updatedAt',
     'lastUsedAt',
@@ -58,8 +60,6 @@ export function publicProfile(profile) {
   ]) {
     if (profile?.[key] !== undefined) safe[key] = profile[key];
   }
-  if (profile?.createdBy) safe.createdBy = profile.createdBy;
-  else if (profile?.ownerClientId) safe.createdBy = profile.ownerClientId;
   return safe;
 }
 
@@ -84,6 +84,8 @@ export function publicTask(task) {
   const safe = {};
   for (const key of [
     'id',
+    'jobId',
+    'revision',
     'profileId',
     'taskType',
     'supportsResume',
@@ -115,6 +117,37 @@ export function publicTask(task) {
       !(task.state === 'completed' && task.completion?.integrity !== 'invalid' && task.completion?.verifiedAt)
     ) continue;
     if (task?.[key] !== undefined) safe[key] = redactLocalPaths(task[key]);
+  }
+  if (Array.isArray(task?.timeline)) {
+    safe.timeline = task.timeline.slice(-200).map((event) => redactLocalPaths(event));
+  }
+  if (Array.isArray(task?.commands)) {
+    safe.commands = task.commands.slice(-100).map((command) => ({
+      commandId: command.commandId,
+      kind: command.kind,
+      status: command.status,
+      expectedRevision: command.expectedRevision,
+      createdAt: command.createdAt,
+      updatedAt: command.updatedAt,
+      ...(command.actor ? { actor: redactLocalPaths(command.actor) } : {}),
+      ...(typeof command.payload?.message === 'string'
+        ? { message: redactPublicText(command.payload.message) }
+        : {}),
+      ...(typeof command.response === 'string'
+        ? { response: redactPublicText(command.response) }
+        : {})
+    }));
+  }
+  if (task?.report && typeof task.report === 'object') {
+    safe.report = redactLocalPaths({
+      reportId: task.report.reportId,
+      status: task.report.status,
+      title: task.report.title,
+      summary: task.report.summary,
+      sections: task.report.sections,
+      author: task.report.author,
+      publishedAt: task.report.publishedAt
+    });
   }
   if (
     task?.currentActivity && typeof task.currentActivity === 'object' &&

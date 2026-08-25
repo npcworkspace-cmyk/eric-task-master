@@ -37,8 +37,6 @@ const ProfileSchema = z.strictObject({
   defaultBehavior: z.string().optional(),
   headless: z.boolean().optional(),
   browserEngine: z.enum(BROWSER_ENGINES).optional(),
-  access: z.enum(['private', 'shared']).optional(),
-  createdBy: z.string().optional(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
   lastUsedAt: z.string().nullable().optional(),
@@ -98,8 +96,35 @@ const AgentSchema = z.strictObject({
   name: z.string()
 });
 
+const TaskCommandSchema = z.strictObject({
+  commandId: IdentifierSchema,
+  kind: z.enum(['ask', 'modify', 'pause', 'resume_pause', 'terminate', 'revise_input']),
+  status: z.enum(['pending', 'delivered', 'acknowledged', 'applied', 'rejected']),
+  expectedRevision: z.number().int().positive().optional(),
+  message: z.string().optional(),
+  response: z.string().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional()
+});
+
+const TaskReportSchema = z.strictObject({
+  reportId: IdentifierSchema,
+  status: z.enum(['draft', 'final']),
+  title: z.string(),
+  summary: z.string(),
+  sections: z.array(z.strictObject({ heading: z.string(), body: z.string() })),
+  publishedAt: z.string().optional()
+});
+const InboxEntrySchema = z.strictObject({
+  taskId: IdentifierSchema,
+  revision: z.number().int().positive(),
+  command: TaskCommandSchema
+});
+
 const TaskSchema = z.strictObject({
   id: z.string(),
+  jobId: z.string().optional(),
+  revision: z.number().int().positive().optional(),
   profileId: z.string().optional(),
   taskType: z.string().optional(),
   createdBy: z.string().optional(),
@@ -160,6 +185,8 @@ const TaskSchema = z.strictObject({
   }).optional(),
   checkpoint: z.strictObject({ available: z.literal(true), savedAt: z.string().optional() }).optional(),
   resumeAvailable: z.boolean().optional(),
+  commands: z.array(TaskCommandSchema).optional(),
+  report: TaskReportSchema.optional(),
   summary: z.string().optional(),
   evidence: z.array(EvidenceSchema).optional(),
   error: z.strictObject({ code: z.string(), message: z.string().optional() }).optional()
@@ -176,6 +203,9 @@ const TaskTypeSchema = z.strictObject({
   tags: z.array(z.string()).optional(),
   outputs: z.array(z.string()).optional(),
   risk: z.enum(['read', 'write', 'mixed']).optional(),
+  lifecycle: z.enum(['active', 'deprecated']).optional(),
+  deprecatedAt: z.string().optional(),
+  replacedBy: z.string().optional(),
   pack: z.strictObject({ name: z.string(), version: z.string() }).optional(),
   supportsResume: z.boolean().optional(),
   inputSchema: z.record(z.string(), z.json()).optional()
@@ -234,6 +264,27 @@ function requireId(value, kind) {
     throw new TaskMasterClientError('INVALID_MANAGER_RESPONSE', `Task Master returned an invalid ${kind}.`);
   }
   return value;
+}
+
+function publicCommand(value) {
+  if (!value || typeof value !== 'object') {
+    throw new TaskMasterClientError('INVALID_MANAGER_RESPONSE', 'Task Master returned an invalid task command.');
+  }
+  const command = {
+    commandId: value.commandId,
+    kind: value.kind,
+    status: value.status,
+    ...(Number.isSafeInteger(value.expectedRevision) ? { expectedRevision: value.expectedRevision } : {}),
+    ...(typeof value.message === 'string' ? { message: value.message } : {}),
+    ...(typeof value.payload?.message === 'string' ? { message: value.payload.message } : {}),
+    ...(typeof value.response === 'string' ? { response: value.response } : {}),
+    ...(typeof value.createdAt === 'string' ? { createdAt: value.createdAt } : {}),
+    ...(typeof value.updatedAt === 'string' ? { updatedAt: value.updatedAt } : {})
+  };
+  if (!IDENTIFIER.test(command.commandId ?? '') || typeof command.kind !== 'string' || typeof command.status !== 'string') {
+    throw new TaskMasterClientError('INVALID_MANAGER_RESPONSE', 'Task Master returned an invalid task command.');
+  }
+  return command;
 }
 
 function success(data, text) {
@@ -319,7 +370,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   const server = new McpServer(
     { name: 'eric-task-master', version },
     {
-      instructions: 'Use registered task types only. Every task start returns a scoped Dashboard link and durable task ID; poll or wait for progress. MCP cancellation stops waiting but does not cancel the browser task.'
+      instructions: 'Use registered task types only. Claim the durable Owner inbox once after connecting and whenever task wait returns a pending command. Every task start returns the fixed Owner Console link and durable task ID; poll or wait for progress. MCP cancellation stops waiting but does not cancel the browser task. Publish a concise human report after interpreting task evidence.'
     }
   );
 
@@ -345,8 +396,8 @@ export function createMcpServer({ client, version = VERSION } = {}) {
 
   register(server, taskMaster, {
     name: 'taskmaster_dashboard_open',
-    title: 'Open scoped Task Master Dashboard',
-    description: 'Return a one-time Agent-scoped Dashboard link, optionally focused on one task. Does not open an operating-system browser.',
+    title: 'Open Task Master Owner Console',
+    description: 'Return a local Owner Console link, optionally focused on one task. The first link silently establishes the persistent Owner session. Does not open an operating-system browser.',
     inputSchema: z.strictObject({ taskId: IdentifierSchema.optional() }),
     outputSchema: z.strictObject({ taskId: IdentifierSchema.optional(), dashboardUrl: z.string().url() }),
     annotations: LOCAL_WRITE,
@@ -384,8 +435,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       kind: z.enum(PROFILE_KINDS).default('persistent'),
       defaultBehavior: z.enum(BEHAVIOR_MODES).optional(),
       headless: z.boolean().optional(),
-      browserEngine: z.enum(BROWSER_ENGINES).optional(),
-      access: z.enum(['private', 'shared']).optional()
+      browserEngine: z.enum(BROWSER_ENGINES).optional()
     }),
     outputSchema: z.strictObject({ profile: ProfileSchema }),
     annotations: LOCAL_WRITE,
@@ -395,13 +445,12 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   register(server, taskMaster, {
     name: 'taskmaster_profiles_update',
     title: 'Update browser profile',
-    description: 'Update a Profile owned by this Agent, including explicitly sharing or privatizing it.',
+    description: 'Update one globally shared local Profile. Same-Profile browser execution remains exclusive and queued.',
     inputSchema: z.strictObject({
       profileId: IdentifierSchema,
       name: z.string().trim().min(1).max(80).optional(),
       defaultBehavior: z.enum(BEHAVIOR_MODES).optional(),
-      headless: z.boolean().optional(),
-      access: z.enum(['private', 'shared']).optional()
+      headless: z.boolean().optional()
     }).refine(
       ({ profileId: _profileId, ...patch }) => Object.keys(patch).length > 0,
       { message: 'At least one Profile field must be supplied' }
@@ -536,6 +585,75 @@ export function createMcpServer({ client, version = VERSION } = {}) {
         task: requireId(publicTask(result.task), 'task'),
         timedOut: result.timedOut === true
       });
+    }
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_agent_inbox_claim',
+    title: 'Claim durable Owner messages',
+    description: 'Deliver pending Owner questions and task-change requests for this Agent. Claim once after connect and whenever a task wait returns commands; offline messages remain durable.',
+    inputSchema: z.strictObject({ limit: z.number().int().min(1).max(200).default(100) }),
+    outputSchema: z.strictObject({ commands: z.array(InboxEntrySchema), total: z.number().int() }),
+    annotations: LOCAL_WRITE,
+    handler: async ({ limit }, _ctx, api) => {
+      const result = await api.claimInbox({ limit });
+      const commands = (Array.isArray(result?.commands) ? result.commands : []).map((entry) => ({
+        taskId: entry.taskId,
+        revision: entry.revision,
+        command: publicCommand(entry.command)
+      }));
+      return success(
+        { commands, total: commands.length },
+        commands.length
+          ? `Received ${commands.length} durable Owner command(s). Acknowledge each commandId before replanning.`
+          : 'No pending Owner commands.'
+      );
+    }
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_task_command_respond',
+    title: 'Acknowledge or resolve Owner command',
+    description: 'Record that this Agent acknowledged, applied, or rejected one durable Owner command. expectedRevision prevents applying stale instructions twice.',
+    inputSchema: z.strictObject({
+      taskId: IdentifierSchema,
+      commandId: IdentifierSchema,
+      expectedRevision: z.number().int().positive(),
+      status: z.enum(['acknowledged', 'applied', 'rejected']),
+      message: z.string().max(8_000).optional()
+    }),
+    outputSchema: z.strictObject({ task: TaskSchema, command: TaskCommandSchema }),
+    annotations: LOCAL_WRITE,
+    handler: async (args, _ctx, api) => {
+      const result = await api.respondTaskCommand(args);
+      return success({
+        task: requireId(publicTask(result.task, { includeResult: false }), 'task'),
+        command: publicCommand(result.command)
+      });
+    }
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_task_report_publish',
+    title: 'Publish human-readable task report',
+    description: 'Publish the Agent interpretation that the Owner Console shows by default. This does not replace machine evidence or completion gates.',
+    inputSchema: z.strictObject({
+      taskId: IdentifierSchema,
+      reportId: IdentifierSchema,
+      expectedRevision: z.number().int().positive(),
+      status: z.enum(['draft', 'final']),
+      title: z.string().trim().min(1).max(200),
+      summary: z.string().trim().min(1).max(20_000),
+      sections: z.array(z.strictObject({
+        heading: z.string().trim().min(1).max(200),
+        body: z.string().trim().min(1).max(20_000)
+      })).max(24).default([])
+    }),
+    outputSchema: z.strictObject({ task: TaskSchema }),
+    annotations: LOCAL_WRITE,
+    handler: async (args, _ctx, api) => {
+      const result = await api.publishTaskReport(args);
+      return success({ task: requireId(publicTask(result.task), 'task') });
     }
   });
 

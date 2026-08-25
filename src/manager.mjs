@@ -3,14 +3,19 @@ import os from 'node:os';
 import { mkdir } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   AgentTokenError,
   authenticateAgentToken,
   issueAgentToken,
   validateAgentClientId
 } from './lib/agent-token.mjs';
+import { AgentRegistry, AgentRegistryError } from './lib/agent-registry.mjs';
 import { JsonStore } from './lib/json-store.mjs';
+import {
+  DASHBOARD_SESSION_TTL_MS,
+  DashboardSessionStore
+} from './lib/dashboard-session-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import {
   createManagerIdentityProof,
@@ -41,9 +46,8 @@ import {
 } from './contracts.mjs';
 
 const DASHBOARD_APPROVAL_TTL_MS = 2 * 60_000;
-const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60_000;
 const MAX_DASHBOARD_APPROVALS = 512;
-const MAX_DASHBOARD_SESSIONS = 128;
+const DASHBOARD_COOKIE = 'taskmaster_owner';
 const MANAGER_NAME = MANAGER_SERVICE;
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const RESUME_NOTICE = 'Resume is explicit: the task module must inspect its checkpoint and current site state before repeating any action whose external outcome is unknown.';
@@ -61,10 +65,6 @@ function defaultDataDirectory() {
 
 function token() {
   return randomBytes(32).toString('base64url');
-}
-
-function tokenHash(value) {
-  return createHash('sha256').update(value).digest('hex');
 }
 
 function secureEqual(left, right) {
@@ -130,22 +130,39 @@ function requireRole(auth, ...roles) {
 
 function serviceCaller(auth) {
   return auth?.role === 'dashboard'
-    ? auth.principal
+    ? { role: 'manager-admin', clientId: 'manager-admin' }
     : auth;
 }
 
+function parseCookie(request, name) {
+  const source = request.headers.cookie;
+  if (typeof source !== 'string' || source.length > 16 * 1024) return null;
+  for (const item of source.split(';')) {
+    const separator = item.indexOf('=');
+    if (separator < 1 || item.slice(0, separator).trim() !== name) continue;
+    const value = item.slice(separator + 1).trim();
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function ownerCookie(value, { clear = false } = {}) {
+  const maxAge = clear ? 0 : Math.floor(DASHBOARD_SESSION_TTL_MS / 1000);
+  return `${DASHBOARD_COOKIE}=${clear ? '' : encodeURIComponent(value)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
+}
+
 function canUseProfile(profile, auth) {
+  void profile;
   const caller = serviceCaller(auth);
-  if (caller?.role === 'manager-admin') return true;
-  return caller?.role === 'agent' && (
-    profile?.ownerClientId === caller.clientId || profile?.access === 'shared'
-  );
+  return caller?.role === 'manager-admin' || caller?.role === 'agent';
 }
 
 function canManageProfile(profile, auth) {
-  const caller = serviceCaller(auth);
-  if (caller?.role === 'manager-admin') return true;
-  return caller?.role === 'agent' && profile?.ownerClientId === caller.clientId;
+  return canUseProfile(profile, auth);
 }
 
 function requireProfileAccess(profile, auth, { manage = false } = {}) {
@@ -182,13 +199,13 @@ function requireTaskMethod(service, name) {
 }
 
 function errorResponse(error) {
-  if (error instanceof HttpError || error instanceof ProfileStoreError) {
+  if (error instanceof HttpError || error instanceof ProfileStoreError || error instanceof AgentRegistryError || error instanceof AgentTokenError) {
     const message = redactPublicText(error.message);
     const details = error.details === undefined
       ? undefined
       : redactPublicValue(error.details);
     return {
-      statusCode: error.statusCode,
+      statusCode: error.statusCode ?? 400,
       body: {
         code: error.code,
         message,
@@ -280,6 +297,13 @@ export async function createManager({
     });
   }
 
+  const agentRegistry = new AgentRegistry({
+    filePath: join(resolvedDataDir, 'agents.json'),
+    now
+  });
+  await agentRegistry.init();
+  const agentTouchAt = new Map();
+
   const profileStore = new ProfileStore({
     filePath: join(resolvedDataDir, 'profiles.json'),
     profilesRoot: join(resolvedDataDir, 'profiles'),
@@ -302,7 +326,11 @@ export async function createManager({
     : suppliedTaskService;
   const taskService = normalizeTaskService(createdTaskService);
   const dashboardApprovals = new Map();
-  const dashboardSessions = new Map();
+  const dashboardSessions = new DashboardSessionStore({
+    filePath: join(resolvedDataDir, 'dashboard-sessions.json'),
+    now
+  });
+  await dashboardSessions.init();
   let server;
   let startedAt;
   let listeningAddress;
@@ -357,7 +385,6 @@ export async function createManager({
     const code = randomBytes(24).toString('base64url');
     dashboardApprovals.set(code, {
       expiresAt: now() + DASHBOARD_APPROVAL_TTL_MS,
-      principal: { ...principal },
       focusTaskId
     });
     return {
@@ -365,6 +392,37 @@ export async function createManager({
       dashboardUrl: dashboardLink(code, focusTaskId),
       expiresInMs: DASHBOARD_APPROVAL_TTL_MS
     };
+  }
+
+  async function currentAgentActivity() {
+    if (typeof taskService.list !== 'function') return new Map();
+    const page = await taskService.list({
+      caller: { role: 'manager-admin', clientId: 'manager-admin' },
+      limit: 100,
+      cursor: null
+    });
+    const tasks = Array.isArray(page) ? page : page?.tasks ?? [];
+    const activity = new Map();
+    for (const task of tasks) {
+      const clientId = task?.ownerRole === 'agent'
+        ? task.ownerClientId
+        : task?.agent?.clientId;
+      if (typeof clientId !== 'string') continue;
+      const current = activity.get(clientId) ?? {
+        working: false,
+        currentTaskIds: [],
+        currentProfileIds: [],
+        queueDepth: 0
+      };
+      if (!['completed', 'failed', 'cancelled'].includes(task.state)) {
+        current.working = true;
+        current.currentTaskIds.push(task.id);
+        if (task.profileId) current.currentProfileIds.push(task.profileId);
+        if (task.state === 'queued') current.queueDepth += 1;
+      }
+      activity.set(clientId, current);
+    }
+    return activity;
   }
 
   function currentCors(request) {
@@ -385,28 +443,47 @@ export async function createManager({
 
   async function authenticate(request) {
     const bearer = parseBearer(request);
-    if (!bearer) throw new HttpError(401, 'AUTH_REQUIRED', 'Bearer token is required');
-    if (secureEqual(bearer, config.managerToken)) {
-      return { role: 'manager-admin', clientId: 'manager-admin' };
-    }
-    const agent = authenticateAgentToken(bearer, config.managerToken);
-    if (agent) {
-      return { role: 'agent', clientId: agent.clientId, agentName: agent.name };
-    }
-    const hashed = tokenHash(bearer);
-    const dashboard = dashboardSessions.get(hashed);
-    if (dashboard) {
-      if (dashboard.expiresAt <= now()) {
-        dashboardSessions.delete(hashed);
-      } else {
-        return {
-          role: 'dashboard',
-          principal: { ...dashboard.principal },
-          focusTaskId: dashboard.focusTaskId
-        };
+    if (bearer) {
+      if (secureEqual(bearer, config.managerToken)) {
+        return { role: 'manager-admin', clientId: 'manager-admin' };
+      }
+      const agent = authenticateAgentToken(bearer, config.managerToken);
+      if (agent) {
+        if (await agentRegistry.isRevoked(agent.clientId)) {
+          throw new HttpError(403, 'AGENT_REVOKED', 'This Agent has been revoked in the Owner Console');
+        }
+        const lastTouch = agentTouchAt.get(agent.clientId) ?? 0;
+        if (now() - lastTouch >= 10_000) {
+          await agentRegistry.touch(agent.clientId, {
+            name: agent.name,
+            connectionId: request.headers['x-taskmaster-connection-id']
+          });
+          agentTouchAt.set(agent.clientId, now());
+        }
+        return { role: 'agent', clientId: agent.clientId, agentName: agent.name };
       }
     }
-    throw new HttpError(401, 'INVALID_TOKEN', 'Bearer token is invalid');
+    const cookie = parseCookie(request, DASHBOARD_COOKIE);
+    const dashboard = cookie ? await dashboardSessions.authenticate(cookie) : null;
+    if (dashboard) {
+      const auth = {
+        role: 'dashboard',
+        principal: { role: 'manager-admin', clientId: 'manager-admin' },
+        sessionId: dashboard.id,
+        focusTaskId: dashboard.focusTaskId ?? null
+      };
+      requireDashboardMutationOrigin(request, auth);
+      return auth;
+    }
+    throw new HttpError(401, bearer ? 'INVALID_TOKEN' : 'AUTH_REQUIRED', 'A valid Manager, Agent, or Owner session is required');
+  }
+
+  function requireDashboardMutationOrigin(request, auth) {
+    if (auth?.role !== 'dashboard' || ['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return;
+    const origin = requestOrigin(request);
+    if (!origin || origin !== managerOrigin()) {
+      throw new HttpError(403, 'DASHBOARD_ORIGIN_REQUIRED', 'Owner Console mutations require the exact Manager origin');
+    }
   }
 
   async function route(request, response) {
@@ -487,6 +564,11 @@ export async function createManager({
       requireRole(auth, 'manager-admin');
       const body = await readJson(request, { maxBytes: 16 * 1024 });
       validateClientId(body.clientId);
+      const registered = await agentRegistry.register({
+        clientId: body.clientId,
+        name: body.name,
+        connectionId: body.connectionId ?? request.headers['x-taskmaster-connection-id']
+      });
       let issued;
       try {
         issued = issueAgentToken(config.managerToken, { clientId: body.clientId, name: body.name });
@@ -496,7 +578,10 @@ export async function createManager({
         }
         throw error;
       }
-      sendJson(response, 201, { agentToken: issued.token, agent: publicAgent(issued.agent) }, cors);
+      sendJson(response, 201, {
+        agentToken: issued.token,
+        agent: { ...publicAgent(issued.agent), agentId: registered.agentId, displayName: registered.displayName }
+      }, cors);
       return;
     }
 
@@ -521,22 +606,22 @@ export async function createManager({
       if (!approval || approval.expiresAt <= now()) {
         throw new HttpError(401, 'INVALID_DASHBOARD_CODE', 'Dashboard authorization code is invalid or expired');
       }
-      for (const [hash, session] of dashboardSessions) {
-        if (session.expiresAt <= now()) dashboardSessions.delete(hash);
-      }
-      while (dashboardSessions.size >= MAX_DASHBOARD_SESSIONS) {
-        dashboardSessions.delete(dashboardSessions.keys().next().value);
-      }
-      const dashboardToken = token();
-      dashboardSessions.set(tokenHash(dashboardToken), {
-        expiresAt: now() + DASHBOARD_SESSION_TTL_MS,
-        principal: { ...approval.principal },
-        focusTaskId: approval.focusTaskId
-      });
+      const issued = await dashboardSessions.create({ focusTaskId: approval.focusTaskId });
       sendJson(response, 201, {
-        dashboardToken,
+        ok: true,
+        session: issued.session,
         expiresInMs: DASHBOARD_SESSION_TTL_MS
-      }, cors);
+      }, { ...cors, 'set-cookie': ownerCookie(issued.token) });
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v1/dashboard/logout') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'dashboard');
+      requireDashboardMutationOrigin(request, auth);
+      const cookie = parseCookie(request, DASHBOARD_COOKIE);
+      if (cookie) await dashboardSessions.revoke(cookie);
+      sendJson(response, 200, { ok: true }, { ...cors, 'set-cookie': ownerCookie('', { clear: true }) });
       return;
     }
 
@@ -549,13 +634,64 @@ export async function createManager({
       return;
     }
 
+    if (request.method === 'GET' && url.pathname === '/v1/dashboard/summary') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'dashboard');
+      const counts = typeof taskService.schedulerStatus === 'function'
+        ? await taskService.schedulerStatus()
+        : {};
+      sendJson(response, 200, {
+        ok: true,
+        version: VERSION,
+        state: stopping ? 'stopping' : 'ready',
+        startedAt,
+        counts,
+        focusTaskId: auth.focusTaskId ?? null
+      }, cors);
+      return;
+    }
+
     const profileMatch = /^\/v1\/profiles\/([^/]+)$/.exec(url.pathname);
     const profileActionMatch = /^\/v1\/profiles\/([^/]+)\/(open|close)$/.exec(url.pathname);
+    const agentActionMatch = /^\/v1\/agents\/([^/]+)\/actions$/.exec(url.pathname);
     const taskTypeMatch = /^\/v1\/task-types\/([^/]+)$/.exec(url.pathname);
+    const taskTypeActionMatch = /^\/v1\/task-types\/([^/]+)\/actions$/.exec(url.pathname);
     const taskMatch = /^\/v1\/tasks\/([^/]+)$/.exec(url.pathname);
     const taskActionMatch = /^\/v1\/tasks\/([^/]+)\/(cancel|resume|continue)$/.exec(url.pathname);
+    const taskWorkbenchActionMatch = /^\/v1\/tasks\/([^/]+)\/actions$/.exec(url.pathname);
+    const taskCommandsMatch = /^\/v1\/tasks\/([^/]+)\/commands$/.exec(url.pathname);
+    const taskCommandMatch = /^\/v1\/tasks\/([^/]+)\/commands\/([^/]+)$/.exec(url.pathname);
+    const taskTimelineMatch = /^\/v1\/tasks\/([^/]+)\/timeline$/.exec(url.pathname);
+    const taskRevisionMatch = /^\/v1\/tasks\/([^/]+)\/revision$/.exec(url.pathname);
+    const taskReportMatch = /^\/v1\/tasks\/([^/]+)\/report$/.exec(url.pathname);
     const taskArtifactsMatch = /^\/v1\/tasks\/([^/]+)\/artifacts$/.exec(url.pathname);
     const taskArtifactMatch = /^\/v1\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname);
+
+    if (request.method === 'GET' && url.pathname === '/v1/agents') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const agents = await agentRegistry.list({ activityByClientId: await currentAgentActivity() });
+      sendJson(response, 200, { agents }, cors);
+      return;
+    }
+    if (agentActionMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const agentId = decodeURIComponent(agentActionMatch[1]);
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      if (body.action === 'revoke') {
+        const agent = await agentRegistry.revoke(agentId, { reason: body.reason });
+        agentTouchAt.delete(agentId);
+        sendJson(response, 200, { agent }, cors);
+        return;
+      }
+      if (body.action === 'restore') {
+        const agent = await agentRegistry.restore(agentId);
+        sendJson(response, 200, { agent }, cors);
+        return;
+      }
+      throw new HttpError(400, 'INVALID_AGENT_ACTION', 'Agent action must be revoke or restore');
+    }
 
     if (request.method === 'GET' && url.pathname === '/v1/profiles') {
       const auth = await authenticate(request);
@@ -569,13 +705,10 @@ export async function createManager({
     if (request.method === 'POST' && url.pathname === '/v1/profiles') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
-      const caller = serviceCaller(auth);
       const requested = validateProfileCreate(await readJson(request));
       const { access, ...profileInput } = requested;
-      const profile = await profileStore.create(profileInput, {
-        ownerClientId: caller.role === 'agent' ? caller.clientId : null,
-        access: access ?? (caller.role === 'agent' ? 'private' : 'shared')
-      });
+      void access; // Accepted only as a no-op for cached 2.0 clients.
+      const profile = await profileStore.create(profileInput);
       sendJson(response, 201, { profile: publicProfile(profile) }, cors);
       return;
     }
@@ -639,6 +772,29 @@ export async function createManager({
         decodeURIComponent(taskTypeMatch[1]),
         serviceCaller(auth)
       );
+      sendJson(response, 200, { taskType }, cors);
+      return;
+    }
+    if (taskTypeActionMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const name = decodeURIComponent(taskTypeActionMatch[1]);
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      let taskType;
+      if (body.action === 'deprecate') {
+        taskType = await requireTaskMethod(taskService, 'deprecateTaskType')(
+          name,
+          body.replacedBy === undefined ? {} : { replacedBy: body.replacedBy },
+          serviceCaller(auth)
+        );
+      } else if (body.action === 'restore') {
+        if (Object.keys(body).some((key) => key !== 'action')) {
+          throw new HttpError(400, 'INVALID_TASK_TYPE_LIFECYCLE', 'Restore accepts only action');
+        }
+        taskType = await requireTaskMethod(taskService, 'restoreTaskType')(name, serviceCaller(auth));
+      } else {
+        throw new HttpError(400, 'INVALID_TASK_TYPE_ACTION', 'Task type action must be deprecate or restore');
+      }
       sendJson(response, 200, { taskType }, cors);
       return;
     }
@@ -721,6 +877,101 @@ export async function createManager({
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const task = await requireTaskMethod(taskService, 'get')(decodeURIComponent(taskMatch[1]), serviceCaller(auth));
       sendJson(response, 200, { task: publicTask(task) }, cors);
+      return;
+    }
+    if (taskTimelineMatch && request.method === 'GET') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const timeline = await requireTaskMethod(taskService, 'getTaskTimeline')(
+        decodeURIComponent(taskTimelineMatch[1]),
+        {
+          afterSequence: Number(url.searchParams.get('afterSequence') ?? 0),
+          limit: Number(url.searchParams.get('limit') ?? 100)
+        },
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, timeline, cors);
+      return;
+    }
+    if (taskWorkbenchActionMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const taskId = decodeURIComponent(taskWorkbenchActionMatch[1]);
+      const body = await readJson(request, { maxBytes: 16 * 1024 });
+      const { action, ...command } = body;
+      let task;
+      if (action === 'pause' || action === 'hold') {
+        task = await requireTaskMethod(taskService, 'pauseTask')(taskId, command, serviceCaller(auth));
+      } else if (action === 'resume') {
+        task = await requireTaskMethod(taskService, 'resumePausedTask')(taskId, command, serviceCaller(auth));
+      } else if (action === 'cancel' || action === 'terminate') {
+        task = await requireTaskMethod(taskService, 'terminateTask')(taskId, command, serviceCaller(auth));
+      } else {
+        throw new HttpError(400, 'INVALID_TASK_ACTION', 'Task action must be pause, resume, or terminate');
+      }
+      sendJson(response, 202, { task: publicTask(task) }, cors);
+      return;
+    }
+    if (taskCommandsMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const body = await readJson(request, { maxBytes: 16 * 1024 });
+      const { text, ...commandBody } = body;
+      const task = await requireTaskMethod(taskService, 'submitTaskCommand')(
+        decodeURIComponent(taskCommandsMatch[1]),
+        {
+          ...commandBody,
+          kind: body.kind === 'message' ? 'ask' : body.kind,
+          message: body.message ?? text
+        },
+        serviceCaller(auth)
+      );
+      sendJson(response, 202, { task: publicTask(task) }, cors);
+      return;
+    }
+    if (taskCommandMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'agent');
+      const result = await requireTaskMethod(taskService, 'respondTaskCommand')(
+        decodeURIComponent(taskCommandMatch[1]),
+        decodeURIComponent(taskCommandMatch[2]),
+        await readJson(request, { maxBytes: 16 * 1024 }),
+        auth
+      );
+      sendJson(response, 200, { ...result, task: publicTask(result.task) }, cors);
+      return;
+    }
+    if (taskRevisionMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const task = await requireTaskMethod(taskService, 'reviseQueuedTask')(
+        decodeURIComponent(taskRevisionMatch[1]),
+        await readJson(request, { maxBytes: 128 * 1024 }),
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, { task: publicTask(task) }, cors);
+      return;
+    }
+    if (taskReportMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'agent');
+      const task = await requireTaskMethod(taskService, 'publishTaskReport')(
+        decodeURIComponent(taskReportMatch[1]),
+        await readJson(request, { maxBytes: 128 * 1024 }),
+        auth
+      );
+      sendJson(response, 201, { task: publicTask(task) }, cors);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/agent/inbox/claim') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'agent');
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      const inbox = await requireTaskMethod(taskService, 'claimAgentInbox')(
+        { limit: body.limit ?? 100 },
+        auth
+      );
+      sendJson(response, 200, inbox, cors);
       return;
     }
     if (taskActionMatch && request.method === 'POST') {

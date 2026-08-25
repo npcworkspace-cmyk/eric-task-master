@@ -800,6 +800,9 @@ test('real Playwright task resumes from checkpoint and closes both attempt windo
   }, 45_000);
   assert.equal(failed.resumeAvailable, true);
   assert.equal(failed.cleanup.browserClosed, true);
+  const failedDiagnostics = (await service.listArtifacts(failed.id, AGENT_A))
+    .filter((item) => item.kind.startsWith('diagnostic-'));
+  assert.ok(failedDiagnostics.length >= 1);
   const resumed = await service.resume(first.id, { resumeKey: 'real-resume-attempt-2' }, AGENT_A);
   assert.equal(resumed.id, first.id);
   const completed = await waitFor(async () => {
@@ -813,6 +816,13 @@ test('real Playwright task resumes from checkpoint and closes both attempt windo
   const artifact = (await service.listArtifacts(completed.id, AGENT_A))
     .find((item) => item.name === 'real-resume.json');
   assert.ok(artifact);
+  const retainedDiagnostics = (await service.listArtifacts(completed.id, AGENT_A))
+    .filter((item) => item.name.startsWith('attempt-1-'));
+  assert.equal(retainedDiagnostics.length, failedDiagnostics.length);
+  assert.deepEqual(
+    new Set(retainedDiagnostics.map((item) => item.kind)),
+    new Set(failedDiagnostics.map((item) => item.kind))
+  );
   const content = await service.readArtifact(completed.id, artifact.id, {}, AGENT_A);
   assert.equal(JSON.parse(content.chunk).resumed, true);
 });

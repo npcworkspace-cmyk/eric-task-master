@@ -196,10 +196,15 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       token,
       body: {}
     });
-    const dashboardSession = await api(baseUrl, '/v1/dashboard/session', {
+    const dashboardSessionResponse = await fetch(new URL('/v1/dashboard/session', baseUrl), {
       method: 'POST',
-      body: { code: dashboardAuthorization.code }
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: dashboardAuthorization.code }),
+      signal: AbortSignal.timeout(15_000)
     });
+    const dashboardSession = await dashboardSessionResponse.json();
+    const ownerSetCookie = dashboardSessionResponse.headers.get('set-cookie') || '';
+    const ownerCookie = ownerSetCookie.split(';', 1)[0];
     let dashboardCodeWasOneTime = false;
     try {
       await api(baseUrl, '/v1/dashboard/session', {
@@ -210,14 +215,17 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       dashboardCodeWasOneTime = error.code === 'INVALID_DASHBOARD_CODE';
     }
     add(
-      'dashboard one-time authorization',
-      typeof dashboardSession.dashboardToken === 'string' && dashboardCodeWasOneTime
+      'dashboard persistent Owner session',
+      dashboardSessionResponse.status === 201 && dashboardSession.ok === true &&
+        Object.hasOwn(dashboardSession, 'dashboardToken') === false &&
+        ownerCookie.startsWith('taskmaster_owner=') && /; HttpOnly;/iu.test(ownerSetCookie) &&
+        /; SameSite=Strict;/iu.test(ownerSetCookie) && dashboardCodeWasOneTime
     );
     const dashboardProfiles = await api(baseUrl, '/v1/profiles', {
-      token: dashboardSession.dashboardToken
+      headers: { Cookie: ownerCookie }
     });
     add(
-      'dashboard scoped Profile access',
+      'dashboard global Profile access',
       dashboardProfiles.profiles.some((item) => item.id === profile.id)
     );
 

@@ -34,8 +34,10 @@ function parseJsonDocument(source, filePath) {
   let parsed;
   try {
     parsed = JSON.parse(source);
-  } catch (error) {
-    throw Object.assign(new Error(`Could not safely merge ${filePath}: ${error.message}`), {
+  } catch {
+    // JSON.parse may include a slice of the source document in its error text.
+    // Host configuration can contain credentials, so never propagate that text.
+    throw Object.assign(new Error(`Could not safely merge ${filePath}: file is not valid JSON`), {
       code: 'INVALID_HOST_CONFIG'
     });
   }

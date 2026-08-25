@@ -589,7 +589,7 @@ test('task worker exit persistence failure is contained and makes shutdown fail 
   assert.equal(startMessage.config.taskId, task.id);
 });
 
-test('cancellation is terminal and still releases the profile lease', async (t) => {
+test('cancellation becomes terminal only after cleanup releases the profile lease', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cancel-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const modulePath = path.join(root, 'task.mjs');
@@ -629,9 +629,10 @@ test('cancellation is terminal and still releases the profile lease', async (t) 
     idempotencyKey: 'task-service-cancellation'
   }, ADMIN);
   await waitFor(async () => (await service.getInternal(created.id)).result !== null);
-  const cancelled = await service.cancel(created.id, ADMIN);
-  assert.equal(cancelled.state, 'cancelled');
-  assert.equal('result' in cancelled, false);
+  const cancellation = await service.cancel(created.id, ADMIN);
+  assert.equal(cancellation.state, 'cancel_requested');
+  assert.equal(cancellation.cleanup.settled, false);
+  assert.equal('result' in cancellation, false);
   const cleaned = await waitFor(async () => {
     const current = await service.get(created.id, ADMIN);
     return current.cleanup.settled ? current : null;

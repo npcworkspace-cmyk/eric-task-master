@@ -34,13 +34,14 @@ The result contains one record per host. Typical states are `registered_pending_
 Bootstrap is identical for every host: from the complete project root run `node scripts/taskmaster.mjs connect --json` once and follow its `nextAction`. After that, choose one path and keep it for the whole task:
 
 1. **Native MCP path:** for a host reported as `registered` or `registered_pending_restart`, reload it when requested and use only the `taskmaster_*` tools documented in [`MCP.md`](./MCP.md).
-2. **Scoped CLI path:** for a host reported as `needs_adapter`, do not invent a host configuration, daemon, port, direct Manager request, or temporary controller. Use only `node scripts/taskmaster.mjs ... --json` from the complete project root. Every scoped command requires the same `--agent-id STABLE_ID`; `--agent-name AGENT_NAME` supplies its display name. Different independent Agents need different stable IDs; the same ID intentionally shares that principal's private Profiles and task ledger. A missing or misspelled Agent ID fails closed instead of silently joining a default identity.
+2. **Scoped CLI path:** use this for `needs_adapter`, or for the current run only when a `registered_pending_restart` host cannot reload itself. Do not invent a host configuration, daemon, port, direct Manager request, or temporary controller. Use only `node scripts/taskmaster.mjs ... --json` from the complete project root. Every scoped command requires the same `--agent-id STABLE_ID`; `--agent-name AGENT_NAME` supplies its display name. Different independent Agents need different stable IDs; all trusted Agents share the Profile catalog, while the same ID intentionally shares that principal's task ledger and Owner-command inbox. A missing or misspelled Agent ID fails closed instead of silently joining a default identity. After the next host restart, use MCP for new tasks; never switch identities or mix MCP and CLI inside one task.
 
 The fixed no-adapter flow is:
 
 ```text
 node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs profiles list --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task inbox --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task-types list --query QUERY --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task-types describe TYPE --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task start --profile PROFILE_ID --type TYPE --input INPUT_JSON --request-key STABLE_REQUEST_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
@@ -60,21 +61,23 @@ node scripts/taskmaster.mjs task list --agent-id STABLE_ID --agent-name AGENT_NA
 node scripts/taskmaster.mjs task continue TASK_ID --request-id REQUEST_ID --note NOTE --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task resume TASK_ID --resume-key STABLE_RESUME_KEY --detach --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task cancel TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task command-respond TASK_ID --command-id COMMAND_ID --revision REVISION --status acknowledged --message NOTE --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task report TASK_ID --report-id REPORT_ID --revision REVISION --status final --title TITLE --summary SUMMARY --sections SECTIONS_JSON --agent-id STABLE_ID --agent-name AGENT_NAME --json
 ```
 
 Profile creation and mutable settings use the same identity:
 
 ```text
-node scripts/taskmaster.mjs profiles create --name NAME --kind persistent --engine chrome --behavior human --access private --agent-id STABLE_ID --agent-name AGENT_NAME --json
-node scripts/taskmaster.mjs profiles create --name NAME --kind ephemeral --engine chromium --behavior adaptive --access private --agent-id STABLE_ID --agent-name AGENT_NAME --json
-node scripts/taskmaster.mjs profiles update PROFILE_ID --name NAME --access private --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs profiles create --name NAME --kind persistent --engine chrome --behavior human --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs profiles create --name NAME --kind ephemeral --engine chromium --behavior adaptive --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs profiles update PROFILE_ID --name NAME --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs profiles open PROFILE_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs profiles close PROFILE_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 ```
 
 Persistent behavior is fixed to `human`; an ephemeral Profile may be updated to `fast`, `adaptive`, or `human` with `profiles update PROFILE_ID --behavior MODE ...`. The browser engine is immutable. `task-types install` and `task-packs install` are local authoring commands, not the standard no-adapter Agent task loop.
 
-CLI identities provide the same trusted-local operational scoping model as registered MCP client IDs. They prevent accidental crossover; they are not a hostile tenant boundary. Do not mix MCP and CLI identities inside one task. Mutually untrusted Agents require separate operating-system users, sandboxes, or machines.
+CLI identities provide the same trusted-local task attribution as registered MCP client IDs. Profiles are intentionally global, while task records, artifacts, reports, and command inboxes remain scoped. This is not a hostile tenant boundary. Do not mix MCP and CLI identities inside one task. Mutually untrusted Agents require separate operating-system users, sandboxes, or machines.
 
 Tasks created through the former v2.0.0 administrator CLI do not belong to a new scoped CLI identity. They remain available to the user through the locally authorized Manager Dashboard; ordinary Agent commands never fall back to administrator access to expose them.
 

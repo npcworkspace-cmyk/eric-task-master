@@ -250,11 +250,12 @@ test('foreign same-name entry aborts the whole multi-host install without partia
 
 test('invalid config fails closed and does not mutate another planned host', async () => {
   const setup = await fixture();
-  await write(setup.paths['claude-code'], '{ this is JSONC or malformed JSON }\n');
+  await write(setup.paths['claude-code'], '{"serviceCredential":LEAK42}\n');
   const before = await snapshot(setup.paths);
   const result = await setup.registrar.install({ hostKeys: ['codex', 'claude-code'] });
   assert.equal(result.ok, false);
   assert.equal(result.results.find((item) => item.hostKey === 'claude-code').error.code, 'INVALID_HOST_CONFIG');
+  assert.equal(JSON.stringify(result).includes('LEAK42'), false);
   assert.deepEqual(await snapshot(setup.paths), before);
 });
 

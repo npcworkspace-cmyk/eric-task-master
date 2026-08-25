@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.1 - 2026-08-26
+
+- Replaced short-lived, Agent-scoped Dashboard sessions with one persistent local Owner Console at `http://127.0.0.1:19946/dashboard`; a one-time bootstrap link now establishes a hardened HttpOnly cookie that survives Manager restarts and can be explicitly revoked.
+- Made every Profile a shared local resource while keeping task history, artifacts, reports, and command inboxes scoped to the Agent that started the work; legacy Profile ownership fields are migrated away without moving browser state.
+- Added a durable Agent Registry with registered, online, offline, working, and revoked states, stable connection presence, current-task visibility, and Owner revoke/restore controls.
+- Added revision-checked task pause, resume, terminate, modify, ask, command response, same-task continuation, timeline, and report publication; termination becomes final only after browser and Profile cleanup are proved.
+- Rebuilt the Owner Console as a report-first human workbench for Agents, Profiles, tasks, progress, commands, and final reports, with responsive, keyboard, reduced-motion, retry, stale-state, and inline authorization handling.
+- Added five preflighted Task Pack recipes—single page, paginated list, list-detail, resumable batch, and form workflow—plus task-type deprecation, replacement, and restoration lifecycle controls.
+- Expanded the CLI and 21-tool MCP contract with durable Agent inbox, command acknowledgement, and report publication while retaining the fixed one-command bootstrap for new Agents.
+- Added a real Manager + Playwright Owner Console acceptance gate to every local and cross-platform CI run, alongside the existing 30-check browser acceptance and 16-check stable-Chrome commercial workload.
+
 ## 2.0.1 - 2026-08-25
 
 - Added one Agent-scoped CLI path for hosts without a native MCP adapter, reusing the signed Manager identity and existing durable task APIs instead of introducing another controller.

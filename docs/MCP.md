@@ -31,7 +31,7 @@ Only after that proof succeeds does the client call:
 
 ```text
 POST /v1/agents/issue
-{ "clientId": "...", "name": "..." }
+{ "clientId": "...", "name": "...", "connectionId": "..." }
 ```
 
 The response contract is:
@@ -40,9 +40,9 @@ The response contract is:
 { "agentToken": "...", "agent": { "clientId": "...", "name": "..." } }
 ```
 
-The admin credential is used only for that exchange. Profiles, task types, tasks, and artifacts use the scoped agent token. A Manager without the identity challenge or scoped-agent endpoints fails closed. Identity failures and diagnostics go to STDERR only, so STDOUT remains exclusively MCP protocol frames.
+The admin credential is used only for that exchange. The per-process `connectionId` stays stable across ordinary requests and a 401 re-issue, allowing the Owner Console to derive presence without treating every request as a new Agent. Profiles, task types, tasks, and artifacts use the scoped agent token. A Manager without the identity challenge or scoped-agent endpoints fails closed. Identity failures and diagnostics go to STDERR only, so STDOUT remains exclusively MCP protocol frames.
 
-This is trusted-local-Agent isolation, not hostile multi-tenant security. Agent client IDs prevent accidental task/Profile crossover, but MCP processes running as the same operating-system user can read the same protected Manager bootstrap credential and are therefore trusted peers. Agent tokens have no independent revocation list: rotating the Manager credential invalidates all of them. Run mutually untrusted Agents under separate OS users, sandboxes, or machines.
+This is trusted-local-Agent coordination, not hostile multi-tenant security. Agent client IDs scope task history and the Owner-command inbox; every trusted Agent shares the Profile catalog. MCP processes running as the same operating-system user can read the same protected Manager bootstrap credential and are therefore trusted peers. The Owner can revoke an Agent in the Console, and Manager credential rotation invalidates all scoped tokens. Run mutually untrusted Agents under separate OS users, sandboxes, or machines.
 
 ## Tool surface
 
@@ -59,6 +59,9 @@ This is trusted-local-Agent isolation, not hostile multi-tenant security. Agent 
 - `taskmaster_tasks_list`
 - `taskmaster_tasks_get`
 - `taskmaster_tasks_wait`
+- `taskmaster_agent_inbox_claim`
+- `taskmaster_task_command_respond`
+- `taskmaster_task_report_publish`
 - `taskmaster_tasks_continue`
 - `taskmaster_tasks_resume`
 - `taskmaster_tasks_cancel`
@@ -71,11 +74,11 @@ The MCP surface never accepts arbitrary module paths, JavaScript evaluation, coo
 
 Profile creation accepts an immutable `browserEngine` of `chrome` or `chromium`. Persistent Profiles default to `chrome` with fixed `human` behavior; ephemeral Profiles default to `chromium` with Profile-owned `adaptive` behavior. `taskmaster_tasks_start` accepts no task-level behavior override.
 
-`taskmaster_profiles_update` changes only mutable Profile fields allowed to the owning Agent. It cannot change the browser engine, and persistent Profile behavior remains fixed to `human`.
+`taskmaster_profiles_update` changes only mutable Profile fields. Profiles have no creator or access-list field and are available to every trusted local Agent. It cannot change the browser engine, and persistent Profile behavior remains fixed to `human`.
 
 ## Long tasks, progress, and cancellation
 
-`taskmaster_tasks_start` returns immediately with a durable task ID. Use `taskmaster_tasks_get` for a snapshot or `taskmaster_tasks_wait` for a bounded wait of at most 30 seconds. When the MCP request contains a progress token, the wait tool forwards bounded progress notifications. A wait also returns early when a task enters `waiting_user` or its health becomes `stalled`, so the Agent can inspect diagnostics rather than sleeping through an attention state.
+`taskmaster_tasks_start` returns immediately with a durable task ID. Use `taskmaster_tasks_get` for a snapshot or `taskmaster_tasks_wait` for a bounded wait of at most 30 seconds. When the MCP request contains a progress token, the wait tool forwards bounded progress notifications. A wait also returns early when a task enters `waiting_user`, its health becomes `stalled`, or a durable Owner command arrives, so the Agent can inspect attention state rather than sleeping through it.
 
 Task status separates liveness from advancement:
 
@@ -92,13 +95,15 @@ When state is `waiting_user`, list/read the task's `diagnostic-observation` and 
 
 Cancelling or disconnecting a wait request stops only that wait. The browser task continues under Task Master. Only `taskmaster_tasks_cancel` requests task cancellation. This prevents a transient MCP host disconnect from destroying a long task.
 
+Call `taskmaster_agent_inbox_claim` after connection and whenever wait returns pending commands. Respond through `taskmaster_task_command_respond`; command IDs and expected task revisions prevent duplicate or stale application. Commands remain durable while the Agent is offline, but Manager cannot wake an arbitrary host process that is fully closed. Before final user handoff, publish a bounded report through `taskmaster_task_report_publish`. The Owner Console renders that report as the result and keeps diagnostics, logs, and artifacts secondary.
+
 If a failed task exposes a preserved checkpoint and settled cleanup, `taskmaster_tasks_resume` starts a new attempt on the same task ID. It requires a stable `resumeKey`; retrying the same key is idempotent, while a new key is a new explicit resume decision. Resume fails closed for the wrong owner, a non-failed task, missing checkpoint, unsettled cleanup, missing persisted context, or a changed module snapshot. The caller must inspect the checkpoint and current site state before repeating any action whose external outcome is unknown.
 
 A Worker completion claim is provisional. Manager publishes `completed` only after validating the bounded result shape, all declared Agent-visible artifacts, browser closure, Worker exit, and Profile lease release. Otherwise the task is `failed` with `TASK_COMPLETION_GATE_FAILED`.
 
 Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow.
 
-Every successful `taskmaster_tasks_start` result begins with a clickable, one-time, Agent-scoped Dashboard link focused on that task. When the user says “启动任务面板”, call `taskmaster_dashboard_open` and return its clickable link; the tool does not launch an operating-system browser.
+Every successful `taskmaster_tasks_start` result begins with a clickable Owner Console link focused on that task. The first authorized link silently creates a persistent local `HttpOnly` Owner cookie; after that the fixed bookmarked Dashboard URL works across Manager restarts. When the user says “启动任务面板”, call `taskmaster_dashboard_open` and return its clickable link; the tool does not launch an operating-system browser.
 
 ## Output and artifact bounds
 

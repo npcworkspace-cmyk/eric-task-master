@@ -291,8 +291,10 @@ export async function readJsonOptional(filePath) {
   if (!file.exists) return null;
   try {
     return JSON.parse(file.text);
-  } catch (error) {
-    throw Object.assign(new Error(`Invalid JSON state file ${filePath}: ${error.message}`), {
+  } catch {
+    // Parser messages may echo source bytes. Registration state errors must stay
+    // useful without copying potentially sensitive file contents into logs.
+    throw Object.assign(new Error(`Invalid JSON state file ${filePath}`), {
       code: 'INVALID_REGISTRATION_STATE'
     });
   }

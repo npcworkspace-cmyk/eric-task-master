@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -43,6 +44,9 @@ export const TASKMASTER_CLIENT_METHODS = Object.freeze([
   'listTasks',
   'getTask',
   'waitTask',
+  'claimInbox',
+  'respondTaskCommand',
+  'publishTaskReport',
   'continueTask',
   'resumeTask',
   'cancelTask',
@@ -226,10 +230,17 @@ function remoteError(status, payload) {
     });
   }
   if (status === 403) {
+    if (code === 'AGENT_REVOKED') {
+      return clientError(code, 'This Agent was revoked in the local Owner Console.', {
+        retryable: false,
+        statusCode: status,
+        nextAction: 'Ask the local Owner to restore this Agent in the fixed Task Master Console; do not create a replacement identity to bypass revocation.'
+      });
+    }
     return clientError(code, 'This Agent is not authorized for the requested Task Master resource.', {
       retryable: false,
       statusCode: status,
-      nextAction: 'Use a Profile owned by this Agent, or explicitly share the intended Profile.'
+      nextAction: 'Refresh Manager status and Profile state, then report the denial without creating another controller.'
     });
   }
   if (status === 404) {
@@ -278,6 +289,7 @@ export class HttpTaskMasterClient {
   #baseUrl;
   #clientId;
   #clientName;
+  #connectionId;
   #stateDir;
   #fetch;
   #requestTimeoutMs;
@@ -296,6 +308,7 @@ export class HttpTaskMasterClient {
   } = {}) {
     this.#baseUrl = normalizeBaseUrl(baseUrl ?? `http://127.0.0.1:${DEFAULT_PORT}`);
     this.#clientId = assertIdentifier(clientId, 'clientId');
+    this.#connectionId = `mcp-${randomUUID()}`;
     try {
       this.#clientName = normalizeAgentName(clientName);
     } catch {
@@ -331,7 +344,7 @@ export class HttpTaskMasterClient {
   }
 
   async createProfile(input) {
-    assertAllowedKeys(input, new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserEngine', 'access']), 'Profile request');
+    assertAllowedKeys(input, new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserEngine']), 'Profile request');
     return (await this.#request('/v1/profiles', { method: 'POST', body: input })).profile;
   }
 
@@ -339,7 +352,7 @@ export class HttpTaskMasterClient {
     assertIdentifier(profileId, 'profileId');
     assertAllowedKeys(
       patch,
-      new Set(['name', 'defaultBehavior', 'headless', 'access']),
+      new Set(['name', 'defaultBehavior', 'headless']),
       'Profile patch'
     );
     return (await this.#request(`/v1/profiles/${encodeURIComponent(profileId)}`, {
@@ -441,6 +454,12 @@ export class HttpTaskMasterClient {
       if (task?.state === 'waiting_user' || task?.health?.status === 'stalled') {
         return { task, timedOut: false };
       }
+      if (task?.commands?.some((command) => (
+        ['ask', 'modify'].includes(command?.kind) &&
+        ['pending', 'delivered', 'acknowledged'].includes(command?.status)
+      ))) {
+        return { task, timedOut: false };
+      }
       if (Date.now() >= deadline) break;
       await delay(Math.min(500, Math.max(1, deadline - Date.now())), signal);
     } while (Date.now() <= deadline);
@@ -450,6 +469,79 @@ export class HttpTaskMasterClient {
   async cancelTask(taskId) {
     assertIdentifier(taskId, 'taskId');
     return (await this.#request(`/v1/tasks/${encodeURIComponent(taskId)}/cancel`, { method: 'POST', body: {} })).task;
+  }
+
+  async claimInbox({ limit = 100 } = {}) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw clientError('INVALID_AGENT_INBOX_LIMIT', 'Inbox limit must be an integer from 1 to 200.');
+    }
+    return this.#request('/v1/agent/inbox/claim', { method: 'POST', body: { limit } });
+  }
+
+  async respondTaskCommand(input) {
+    assertAllowedKeys(
+      input,
+      new Set(['taskId', 'commandId', 'expectedRevision', 'status', 'message']),
+      'Task command response'
+    );
+    assertIdentifier(input.taskId, 'taskId');
+    assertIdentifier(input.commandId, 'commandId');
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw clientError('INVALID_TASK_REVISION', 'expectedRevision must be a positive integer.');
+    }
+    if (!['acknowledged', 'applied', 'rejected'].includes(input.status)) {
+      throw clientError('INVALID_TASK_COMMAND_STATUS', 'status must be acknowledged, applied, or rejected.');
+    }
+    if (input.message !== undefined && (typeof input.message !== 'string' || input.message.length > 8_000)) {
+      throw clientError('INVALID_TASK_COMMAND_MESSAGE', 'message must contain at most 8000 characters.');
+    }
+    return this.#request(
+      `/v1/tasks/${encodeURIComponent(input.taskId)}/commands/${encodeURIComponent(input.commandId)}`,
+      {
+        method: 'POST',
+        body: {
+          expectedRevision: input.expectedRevision,
+          status: input.status,
+          ...(input.message === undefined ? {} : { message: input.message })
+        }
+      }
+    );
+  }
+
+  async publishTaskReport(input) {
+    assertAllowedKeys(
+      input,
+      new Set(['taskId', 'reportId', 'expectedRevision', 'status', 'title', 'summary', 'sections']),
+      'Task report'
+    );
+    assertIdentifier(input.taskId, 'taskId');
+    assertIdentifier(input.reportId, 'reportId');
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw clientError('INVALID_TASK_REVISION', 'expectedRevision must be a positive integer.');
+    }
+    if (!['draft', 'final'].includes(input.status)) {
+      throw clientError('INVALID_TASK_REPORT_STATUS', 'status must be draft or final.');
+    }
+    if (typeof input.title !== 'string' || !input.title.trim() || input.title.length > 200) {
+      throw clientError('INVALID_TASK_REPORT_TITLE', 'title must contain 1 to 200 characters.');
+    }
+    if (typeof input.summary !== 'string' || !input.summary.trim() || input.summary.length > 20_000) {
+      throw clientError('INVALID_TASK_REPORT_SUMMARY', 'summary must contain 1 to 20000 characters.');
+    }
+    if (!Array.isArray(input.sections) || input.sections.length > 24) {
+      throw clientError('INVALID_TASK_REPORT_SECTIONS', 'sections must contain at most 24 entries.');
+    }
+    return this.#request(`/v1/tasks/${encodeURIComponent(input.taskId)}/report`, {
+      method: 'POST',
+      body: {
+        reportId: input.reportId,
+        expectedRevision: input.expectedRevision,
+        status: input.status,
+        title: input.title,
+        summary: input.summary,
+        sections: input.sections
+      }
+    });
   }
 
   async continueTask(input) {
@@ -612,7 +704,7 @@ export class HttpTaskMasterClient {
     try {
       payload = await this.#requestJson('/v1/agents/issue', {
         method: 'POST',
-        body: { clientId: this.#clientId, name: this.#clientName },
+        body: { clientId: this.#clientId, name: this.#clientName, connectionId: this.#connectionId },
         token: credentials.token
       });
     } catch (error) {
@@ -676,6 +768,7 @@ export class HttpTaskMasterClient {
         headers: {
           Accept: 'application/json',
           Authorization: `Bearer ${token}`,
+          'X-Taskmaster-Connection-Id': this.#connectionId,
           ...(encodedBody === undefined ? {} : { 'Content-Type': 'application/json' })
         },
         ...(encodedBody === undefined ? {} : { body: encodedBody }),

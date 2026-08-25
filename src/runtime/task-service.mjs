@@ -30,6 +30,7 @@ const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const MAX_DIAGNOSTICS_MANIFEST_BYTES = 64 * 1024;
 const SAFE_EVIDENCE_KINDS = new Set(['artifact', 'count', 'hash', 'message', 'note', 'url']);
 const MAX_ATTEMPTS = 100;
+const MAX_DIAGNOSTIC_ATTEMPTS = 16;
 const RESUME_KEY_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 const HANDOFF_ID_PATTERN = /^handoff_[a-f0-9]{32}$/;
 const PROFILE_CLEANUP_QUEUE_REASON = 'Waiting for confirmed Profile cleanup';
@@ -39,8 +40,17 @@ const CLEANUP_RECONCILE_GRACE_MS = 60_000;
 const PROGRESS_PHASE_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const WORKER_ACTIVITY_PHASES = new Set(['navigating', 'clicking', 'typing', 'hovering', 'scrolling', 'working']);
 const WORKER_ACTIVITY_STATUSES = new Set(['active', 'succeeded', 'unknown']);
+const COMMAND_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
+const REPORT_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
+const MAX_TASK_COMMANDS = 200;
+const MAX_TASK_TIMELINE = 500;
+const COMMAND_STATUSES = new Set(['pending', 'delivered', 'acknowledged', 'applied', 'rejected']);
+const AGENT_COMMAND_KINDS = new Set(['ask', 'modify']);
 const LIFECYCLE_ACTIVITY_STATUS = Object.freeze({
   queued: 'waiting',
+  pause_requested: 'waiting',
+  paused: 'waiting',
+  cancel_requested: 'cancelled',
   acquiring_profile: 'active',
   starting_browser: 'active',
   running: 'active',
@@ -126,6 +136,90 @@ function clone(value) {
   return structuredClone(value);
 }
 
+function boundedText(value, { field, maximum = 2_000, required = true } = {}) {
+  if (typeof value !== 'string' || (required && !value.trim()) || value.length > maximum) {
+    throw new TaskServiceError(
+      'INVALID_TASK_COMMAND',
+      `${field || 'text'} must be ${required ? 'a non-empty ' : ''}string of at most ${maximum} characters`
+    );
+  }
+  return redactSensitiveText(value).slice(0, maximum);
+}
+
+function taskActor(caller) {
+  return {
+    role: caller.role,
+    clientId: caller.clientId,
+    ...(caller.role === 'agent' && caller.agentName ? { name: caller.agentName } : {})
+  };
+}
+
+function normalizeTaskCoordination(task) {
+  task.revision = Number.isSafeInteger(task.revision) && task.revision >= 1 ? task.revision : 1;
+  task.jobId = typeof task.jobId === 'string' && /^job_[a-f0-9]{32}$/.test(task.jobId)
+    ? task.jobId
+    : `job_${createHash('sha256').update(task.id).digest('hex').slice(0, 32)}`;
+  task.timeline = Array.isArray(task.timeline)
+    ? task.timeline.filter((entry) => entry && typeof entry === 'object').slice(-MAX_TASK_TIMELINE)
+    : [];
+  const latestTimelineSequence = task.timeline.reduce((maximum, entry) => (
+    Number.isSafeInteger(entry.sequence) && entry.sequence > maximum ? entry.sequence : maximum
+  ), 0);
+  task.timelineSequence = Number.isSafeInteger(task.timelineSequence) && task.timelineSequence >= 0
+    ? Math.max(task.timelineSequence, latestTimelineSequence)
+    : latestTimelineSequence;
+  task.commands = Array.isArray(task.commands)
+    ? task.commands.filter((entry) => (
+        entry && typeof entry === 'object' &&
+        typeof entry.commandId === 'string' && COMMAND_ID_PATTERN.test(entry.commandId)
+      )).slice(-MAX_TASK_COMMANDS)
+    : [];
+  task.reports = Array.isArray(task.reports)
+    ? task.reports.filter((entry) => entry && typeof entry === 'object').slice(-20)
+    : [];
+  if (!task.report || typeof task.report !== 'object' || Array.isArray(task.report)) task.report = null;
+  if (task.input && typeof task.input === 'object' && !Array.isArray(task.input)) {
+    task.inputRevisionHash ||= requestHash(task.input);
+  }
+}
+
+function appendTimeline(task, type, { actor = null, message = '', commandId = null, status = null } = {}) {
+  normalizeTaskCoordination(task);
+  task.timelineSequence += 1;
+  const entry = {
+    id: `event_${randomUUID().replaceAll('-', '')}`,
+    sequence: task.timelineSequence,
+    type,
+    at: nowIso(),
+    ...(actor ? { actor: clone(actor) } : {}),
+    ...(message ? { message: redactSensitiveText(message).slice(0, 2_000) } : {}),
+    ...(commandId ? { commandId } : {}),
+    ...(status ? { status } : {})
+  };
+  task.timeline.push(entry);
+  task.timeline = task.timeline.slice(-MAX_TASK_TIMELINE);
+  return entry;
+}
+
+function requireCoordinationBody(body, allowedFields) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new TaskServiceError('INVALID_TASK_COMMAND', 'Task command body must be an object');
+  }
+  const unknown = Object.keys(body).filter((key) => !allowedFields.has(key));
+  if (unknown.length) {
+    throw new TaskServiceError('INVALID_TASK_COMMAND', `Unsupported task command fields: ${unknown.join(', ')}`);
+  }
+  if (typeof body.commandId !== 'string' || !COMMAND_ID_PATTERN.test(body.commandId)) {
+    throw new TaskServiceError(
+      'INVALID_TASK_COMMAND',
+      'commandId must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
+    );
+  }
+  if (!Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1) {
+    throw new TaskServiceError('INVALID_TASK_COMMAND', 'expectedRevision must be a positive integer');
+  }
+}
+
 function callerIdentity(caller = {}) {
   if (caller.role === 'manager-admin') {
     return { role: 'manager-admin', clientId: caller.clientId || 'manager-admin' };
@@ -172,8 +266,7 @@ function isSamePrincipal(entry, caller) {
 
 function canUseProfile(profile, caller) {
   if (caller.role === 'manager-admin') return true;
-  if (caller.role !== 'agent') return false;
-  return profile?.ownerClientId === caller.clientId || (profile?.access || 'shared') === 'shared';
+  return caller.role === 'agent' && Boolean(profile);
 }
 
 function requireProfileUse(profile, caller) {
@@ -542,6 +635,7 @@ export function createTaskService({
   const openProfiles = new Map();
   const openingProfiles = new Map();
   const persistChains = new Map();
+  const controlChains = new Map();
   const cleanupReconcileTails = new Map();
   const artifactDigestCache = new Map();
   const finalizationFailures = new Map();
@@ -703,6 +797,44 @@ export function createTaskService({
       : [];
   }
 
+  function normalizeDiagnosticHistory(task) {
+    task.diagnosticHistory = Array.isArray(task.diagnosticHistory)
+      ? task.diagnosticHistory.filter((entry) => (
+        entry && typeof entry === 'object' &&
+        Number.isSafeInteger(entry.attempt) && entry.attempt >= 1 && entry.attempt <= MAX_ATTEMPTS
+      )).slice(-MAX_DIAGNOSTIC_ATTEMPTS).map((entry) => {
+        const normalizePointer = (pointer) => (
+          pointer && typeof pointer === 'object' &&
+          typeof pointer.path === 'string' && pointer.path &&
+          pointer.attempt === entry.attempt
+            ? { ...pointer, attempt: entry.attempt }
+            : null
+        );
+        return {
+          attempt: entry.attempt,
+          screenshot: normalizePointer(entry.screenshot),
+          observation: normalizePointer(entry.observation)
+        };
+      }).filter((entry) => entry.screenshot || entry.observation)
+      : [];
+  }
+
+  function archiveAttemptDiagnostics(task) {
+    normalizeDiagnosticHistory(task);
+    const screenshot = task.lastScreenshot?.attempt === task.attempt
+      ? { ...task.lastScreenshot }
+      : null;
+    const observation = task.lastObservation?.attempt === task.attempt
+      ? { ...task.lastObservation }
+      : null;
+    if (!screenshot && !observation) return;
+    const archived = { attempt: task.attempt, screenshot, observation };
+    const existing = task.diagnosticHistory.findIndex((entry) => entry.attempt === task.attempt);
+    if (existing === -1) task.diagnosticHistory.push(archived);
+    else task.diagnosticHistory[existing] = archived;
+    task.diagnosticHistory = task.diagnosticHistory.slice(-MAX_DIAGNOSTIC_ATTEMPTS);
+  }
+
   function beginAttemptHistory(task, { resumed = false, checkpointSavedAt = null } = {}) {
     normalizeAttemptHistory(task);
     const startedAt = nowIso();
@@ -805,6 +937,8 @@ export function createTaskService({
         }
       }
       normalizeAttemptHistory(task);
+      normalizeDiagnosticHistory(task);
+      normalizeTaskCoordination(task);
       task.supportsResume = task.supportsResume === true;
       task.cleanup = {
         browserClosed: false,
@@ -815,7 +949,10 @@ export function createTaskService({
       };
       // Never trust a stale persisted `settled` bit on its own.
       refreshCleanupSettled(task);
-      const safelyQueued = task.state === 'queued' && !task.startedAt && !task.workerPid && task.leaseHeld !== true;
+      const safelyQueued = (
+        task.state === 'queued' ||
+        (task.state === 'paused' && task.pauseContext?.previousState === 'queued')
+      ) && !task.startedAt && !task.workerPid && task.leaseHeld !== true;
       tasks.set(task.id, task);
       await recoverDiagnosticsPointers(task);
       if (!safelyQueued) {
@@ -827,7 +964,26 @@ export function createTaskService({
 
         const claimedCompletion = task.state === 'verifying' || task.state === 'completed' ||
           (task.completionClaimed === true && !TERMINAL_TASK_STATES.has(task.state));
-        if (claimedCompletion && task.result && task.cleanup.settled === true) {
+        if (task.cancelRequestedAt && task.cleanup.settled === true) {
+          task.state = 'cancelled';
+          task.error = null;
+          if (task.cancelCommandId) {
+            markCommandStatus(task, task.cancelCommandId, 'applied', {
+              message: 'Cancellation cleanup confirmed during Manager recovery'
+            });
+          }
+          appendTimeline(task, 'task.cancelled', {
+            commandId: task.cancelCommandId || null,
+            status: 'applied',
+            message: 'Cancellation cleanup confirmed during Manager recovery'
+          });
+        } else if (task.cancelRequestedAt) {
+          task.state = 'failed';
+          task.error = {
+            code: 'TASK_CANCEL_CLEANUP_UNCONFIRMED',
+            message: 'Manager restarted before cancellation cleanup could be confirmed.'
+          };
+        } else if (claimedCompletion && task.result && task.cleanup.settled === true) {
           try {
             task.completion = await verifyCompletionGate(task);
             task.state = 'completed';
@@ -1050,6 +1206,98 @@ export function createTaskService({
       : lifecycleActivity(patch.state);
     Object.assign(task, patch, ...(activity ? [{ currentActivity: activity }] : []), { updatedAt: nowIso() });
     return persist(task).then(() => task);
+  }
+
+  function requireTaskAccess(id, caller, { ownerOnly = false } = {}) {
+    const task = tasks.get(id);
+    if (!task || !(ownerOnly ? isTaskOwner(task, caller) : canAccess(task, caller))) {
+      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    }
+    normalizeTaskCoordination(task);
+    return task;
+  }
+
+  function existingCommand(task, commandId, payloadHash) {
+    const command = task.commands.find((entry) => entry.commandId === commandId);
+    if (!command) return null;
+    if (command.payloadHash !== payloadHash) {
+      throw new TaskServiceError(
+        'TASK_COMMAND_ID_CONFLICT',
+        'commandId is already bound to a different task command',
+        409
+      );
+    }
+    return command;
+  }
+
+  function requireTaskRevision(task, expectedRevision) {
+    if (task.revision !== expectedRevision) {
+      throw new TaskServiceError(
+        'TASK_REVISION_CONFLICT',
+        `Task revision changed; expected ${expectedRevision}, current ${task.revision}`,
+        409
+      );
+    }
+  }
+
+  function addCommand(task, {
+    commandId,
+    kind,
+    expectedRevision,
+    actor,
+    payload = null,
+    status = 'pending'
+  }) {
+    normalizeTaskCoordination(task);
+    const payloadHash = requestHash({ kind, payload });
+    const duplicate = existingCommand(task, commandId, payloadHash);
+    if (duplicate) return { command: duplicate, duplicate: true };
+    requireTaskRevision(task, expectedRevision);
+    const at = nowIso();
+    const command = {
+      commandId,
+      kind,
+      expectedRevision,
+      payloadHash,
+      status,
+      actor: clone(actor),
+      ...(payload ? { payload: clone(payload) } : {}),
+      createdAt: at,
+      updatedAt: at
+    };
+    task.commands.push(command);
+    task.commands = task.commands.slice(-MAX_TASK_COMMANDS);
+    task.revision += 1;
+    appendTimeline(task, `command.${kind}`, {
+      actor,
+      commandId,
+      status,
+      message: payload?.message || ''
+    });
+    return { command, duplicate: false };
+  }
+
+  function markCommandStatus(task, commandId, status, { actor = null, message = '' } = {}) {
+    if (!COMMAND_STATUSES.has(status)) return null;
+    normalizeTaskCoordination(task);
+    const command = task.commands.find((entry) => entry.commandId === commandId);
+    if (!command) return null;
+    if (command.status === status) return command;
+    command.status = status;
+    command.updatedAt = nowIso();
+    if (message) command.response = redactSensitiveText(message).slice(0, 2_000);
+    appendTimeline(task, `command.${status}`, {
+      actor,
+      commandId,
+      status,
+      message
+    });
+    return command;
+  }
+
+  function publicCommand(command) {
+    const { payloadHash: _payloadHash, ...safe } = command;
+    return clone(safe);
   }
 
   async function awaitTaskPersistence(id) {
@@ -1278,7 +1526,8 @@ export function createTaskService({
     await entry?.leaseRenewalTail?.catch(() => {});
     await awaitTaskPersistence(task.id);
     const claimedCompletion = task.completionClaimed === true || task.state === 'verifying';
-    if (!claimedCompletion && !TERMINAL_TASK_STATES.has(task.state)) {
+    const cancellationRequested = Boolean(task.cancelRequestedAt);
+    if (!claimedCompletion && !cancellationRequested && !TERMINAL_TASK_STATES.has(task.state)) {
       await update(task, {
         state: 'failed',
         error: { code: 'TASK_WORKER_EXITED', message: 'Task worker exited before reporting a terminal state' }
@@ -1300,6 +1549,28 @@ export function createTaskService({
       }
     }
     refreshCleanupSettled(task);
+    if (cancellationRequested) {
+      if (task.cleanup.settled === true) {
+        task.state = 'cancelled';
+        task.error = null;
+        if (task.cancelCommandId) {
+          markCommandStatus(task, task.cancelCommandId, 'applied', {
+            message: 'Browser closed, Worker exited, and Profile lease released'
+          });
+        }
+        appendTimeline(task, 'task.cancelled', {
+          commandId: task.cancelCommandId || null,
+          status: 'applied',
+          message: 'Cancellation cleanup confirmed'
+        });
+      } else {
+        task.state = 'failed';
+        task.error = {
+          code: 'TASK_CANCEL_CLEANUP_UNCONFIRMED',
+          message: 'Cancellation was requested but browser cleanup could not be confirmed'
+        };
+      }
+    }
     task.finishedAt ||= nowIso();
     if (TERMINAL_TASK_STATES.has(task.state)) task.progress = terminalProgress(task, task.state);
     task.health = { status: task.state, checkedAt: nowIso() };
@@ -1311,6 +1582,9 @@ export function createTaskService({
       cleanup: task.cleanup,
       health: task.health,
       history: task.history,
+      commands: task.commands,
+      timeline: task.timeline,
+      timelineSequence: task.timelineSequence,
       ...(task.completion ? { completion: task.completion } : {})
     });
     if (task.cleanup.settled === true) {
@@ -1538,6 +1812,49 @@ export function createTaskService({
         return;
       }
       if (message.type === 'state' && typeof message.state === 'string') {
+        if (['pause_requested', 'paused', 'recovering', 'running'].includes(message.state) && message.commandId) {
+          const status = message.state === 'paused' || message.state === 'running' ? 'applied' : 'delivered';
+          markCommandStatus(task, message.commandId, status, {
+            message: message.state === 'paused'
+              ? 'Current browser action settled; task is paused'
+              : message.state === 'running'
+                ? 'Live page revalidated; task resumed'
+                : ''
+          });
+          if (message.state === 'running') task.pauseContext = null;
+          void update(task, {
+            state: message.state,
+            pauseContext: task.pauseContext,
+            commands: task.commands,
+            timeline: task.timeline,
+            timelineSequence: task.timelineSequence,
+            progress: {
+              ...task.progress,
+              message: message.state === 'paused'
+                ? 'Paused after current action settled; diagnostic captured'
+                : message.state === 'recovering'
+                  ? 'Revalidating live page before resume'
+                  : message.state === 'running'
+                    ? 'Task resumed after live-page validation'
+                    : 'Pause requested; settling current action'
+            },
+            health: {
+              status: message.state === 'paused' ? 'paused' : 'healthy',
+              checkedAt: nowIso()
+            },
+            ...(message.state === 'running' ? { progressAt: nowIso() } : {})
+          }).catch(() => {});
+          return;
+        }
+        if (
+          ['pause_requested', 'paused'].includes(task.state) &&
+          !['failed', 'cancelled', 'completed'].includes(message.state)
+        ) {
+          // A cooldown, handoff, or startup transition racing the pause must
+          // not make the Manager claim execution resumed while the action gate
+          // is still closed.
+          return;
+        }
         const terminal = TERMINAL_TASK_STATES.has(message.state);
         const resumedFromCooldown = task.state === 'cooling_down' && message.state === 'running';
         if (resumedFromCooldown) entry.stallDiagnoseAt = 0;
@@ -1553,6 +1870,16 @@ export function createTaskService({
           return;
         }
         if (!TERMINAL_TASK_STATES.has(task.state)) {
+          if (message.state === 'cancelled' && task.cancelRequestedAt) {
+            // Cancellation is not terminal until browser close, Worker exit,
+            // and Profile lease release are all durably confirmed.
+            void update(task, {
+              state: 'cancel_requested',
+              progress: { ...task.progress, message: 'Cancellation acknowledged; confirming cleanup' }
+            }).catch(() => {});
+            scheduleForcedStop(task, entry);
+            return;
+          }
           void update(task, {
             state: message.state,
             ...(message.state === 'cooling_down'
@@ -1620,18 +1947,32 @@ export function createTaskService({
         }
         return;
       }
+      if (message.type === 'control_error' && message.commandId) {
+        markCommandStatus(task, message.commandId, 'rejected', {
+          message: redactSensitiveText(message.error?.message || 'Task control command failed').slice(0, 2_000)
+        });
+        void update(task, {
+          commands: task.commands,
+          timeline: task.timeline,
+          timelineSequence: task.timelineSequence
+        }).catch(() => {});
+        return;
+      }
       if (message.type === 'result') {
         void update(task, { result: clone(redactSensitiveValue(message.result)) }).catch(() => {});
         return;
       }
       if (message.type === 'error') {
         if (!TERMINAL_TASK_STATES.has(task.state)) {
-          const nextState = message.state === 'cancelled' ? 'cancelled' : 'failed';
+          const cancellationPending = message.state === 'cancelled' && task.cancelRequestedAt;
+          const nextState = cancellationPending ? 'cancel_requested' : message.state === 'cancelled' ? 'cancelled' : 'failed';
           void update(task, {
             state: nextState,
             error: sanitizeError(message.error),
-            finishedAt: nowIso(),
-            progress: terminalProgress(task, nextState)
+            ...(cancellationPending ? {} : { finishedAt: nowIso() }),
+            progress: cancellationPending
+              ? { ...task.progress, message: 'Cancellation acknowledged; confirming cleanup' }
+              : terminalProgress(task, nextState)
           }).catch(() => {});
         }
         scheduleForcedStop(task, entry);
@@ -1775,14 +2116,14 @@ export function createTaskService({
     let startSent = false;
     let failureCode = 'TASK_WORKER_SPAWN_FAILED';
     try {
-      if (task.state === 'cancelled') {
+      if (task.state === 'cancelled' || task.cancelRequestedAt) {
         throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before worker launch', 409);
       }
       const cleanupReceiptPath = taskCleanupReceiptPath(task);
       await rm(cleanupReceiptPath, { force: true });
       child = workerFactory(TASK_WORKER, 'task');
       entry = attachTaskWorker(task, child);
-      if (task.state === 'cancelled') {
+      if (task.state === 'cancelled' || task.cancelRequestedAt) {
         throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before Profile acquisition', 409);
       }
       if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
@@ -1796,15 +2137,16 @@ export function createTaskService({
         ...taskLeaseAccess(task)
       });
       task.leaseHeld = true;
-      if (task.state === 'cancelled') {
+      if (task.state === 'cancelled' || task.cancelRequestedAt) {
         throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before browser startup', 409);
       }
       failureCode = 'TASK_WORKER_START_FAILED';
       const startingAt = nowIso();
       const behavior = resolveProfileBehavior(leasedProfile);
       setAttemptHistoryBehavior(task, behavior);
+      const pausePending = task.state === 'pause_requested' && Boolean(task.pauseContext?.commandId);
       await update(task, {
-        state: 'starting_browser',
+        state: pausePending ? 'pause_requested' : 'starting_browser',
         startedAt: startingAt,
         workerPid: child.pid,
         behavior,
@@ -1814,12 +2156,16 @@ export function createTaskService({
           at: startingAt
         },
         history: task.history,
-        progress: { current: 0, total: null, message: 'Starting browser' },
+        progress: {
+          current: 0,
+          total: null,
+          message: pausePending ? 'Starting browser at a requested pause boundary' : 'Starting browser'
+        },
         progressAt: startingAt,
         heartbeatAt: startingAt,
         health: { status: 'healthy', checkedAt: startingAt }
       });
-      if (task.state === 'cancelled') {
+      if (task.state === 'cancelled' || task.cancelRequestedAt) {
         throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before its start command', 409);
       }
       startSent = await sendChildMessageConfirmed(child, {
@@ -1844,7 +2190,7 @@ export function createTaskService({
       }
     } catch (error) {
       const hasWorkerPid = Number.isSafeInteger(child?.pid) && child.pid > 0;
-      if (task.state !== 'cancelled') {
+      if (task.state !== 'cancelled' && !task.cancelRequestedAt) {
         await update(task, {
           state: 'failed',
           error: sanitizeError(error, failureCode),
@@ -1964,6 +2310,13 @@ export function createTaskService({
     await mkdir(outputDir, { recursive: true, mode: 0o700 });
     const task = {
       id,
+      jobId: `job_${randomUUID().replaceAll('-', '')}`,
+      revision: 1,
+      timelineSequence: 0,
+      timeline: [],
+      commands: [],
+      reports: [],
+      report: null,
       profileId: body.profileId,
       taskType: taskType.name,
       taskTypeSha256: taskType.sha256,
@@ -1975,11 +2328,13 @@ export function createTaskService({
       idempotencyKey: body.idempotencyKey,
       requestHash: hash,
       requestHashVersion: 2,
+      inputRevisionHash: requestHash(input),
       behavior,
       input: clone(input),
       timeoutMs: body.timeoutMs ?? null,
       attempt: 1,
       history: [],
+      diagnosticHistory: [],
       resumeKeys: [],
       state: 'queued',
       currentActivity: lifecycleActivity('queued'),
@@ -2007,6 +2362,10 @@ export function createTaskService({
       leaseOwner: `task:${id}`,
       leaseHeld: false
     };
+    appendTimeline(task, 'task.created', {
+      actor: taskActor(caller),
+      message: `Task ${task.taskType} queued`
+    });
     beginAttemptHistory(task);
     tasks.set(id, task);
     await persist(task);
@@ -2336,6 +2695,7 @@ export function createTaskService({
     const profile = requireProfileUse(await profileStore.get(task.profileId), caller);
     const behavior = resolveProfileBehavior(profile);
 
+    archiveAttemptDiagnostics(task);
     task.attempt += 1;
     task.resumeKeys.push({ keyHash, attempt: task.attempt, requestedAt: nowIso() });
     task.resumeKeys = task.resumeKeys.slice(-MAX_ATTEMPTS);
@@ -2488,39 +2848,45 @@ export function createTaskService({
   function artifactDeclarations(task, { includeUnverifiedResult = false } = {}) {
     const resultVerified = task.state === 'completed' && task.completion?.integrity !== 'invalid' &&
       typeof task.completion?.verifiedAt === 'string';
-    const declarations = resultVerified || includeUnverifiedResult
+    const results = resultVerified || includeUnverifiedResult
       ? declaredArtifactFiles(task).map((relativePath) => ({ relativePath, kind: 'result' }))
       : [];
-    if (task.lastScreenshot?.attempt === task.attempt && typeof task.lastScreenshot?.path === 'string') {
-      const relativePath = path.relative(task.outputDir, task.lastScreenshot.path);
-      if (
-        relativePath &&
-        !path.isAbsolute(relativePath) &&
-        relativePath !== '..' &&
-        !relativePath.startsWith(`..${path.sep}`) &&
-        !declarations.some((item) => item.relativePath === relativePath)
-      ) {
-        // A diagnostic screenshot is the last-resort evidence for an Agent. Reserve
-        // capacity for it even when a task declares the maximum number of outputs.
-        declarations.unshift({ relativePath, kind: 'diagnostic-screenshot' });
+    normalizeDiagnosticHistory(task);
+    const diagnosticAttempts = [
+      ...task.diagnosticHistory,
+      {
+        attempt: task.attempt,
+        screenshot: task.lastScreenshot?.attempt === task.attempt ? task.lastScreenshot : null,
+        observation: task.lastObservation?.attempt === task.attempt ? task.lastObservation : null
       }
+    ];
+    const byAttempt = new Map();
+    for (const entry of diagnosticAttempts) {
+      if (entry?.screenshot || entry?.observation) byAttempt.set(entry.attempt, entry);
     }
-    if (task.lastObservation?.attempt === task.attempt && typeof task.lastObservation?.path === 'string') {
-      const relativePath = path.relative(task.outputDir, task.lastObservation.path);
+    const diagnostics = [];
+    const addDiagnostic = (pointer, kind, attempt, historical) => {
+      if (typeof pointer?.path !== 'string') return;
+      const relativePath = path.relative(task.outputDir, pointer.path);
       if (
-        relativePath &&
-        !path.isAbsolute(relativePath) &&
-        relativePath !== '..' &&
-        !relativePath.startsWith(`..${path.sep}`) &&
-        !declarations.some((item) => item.relativePath === relativePath)
-      ) {
-        declarations.unshift({ relativePath, kind: 'diagnostic-observation' });
-      }
+        !relativePath || path.isAbsolute(relativePath) || relativePath === '..' ||
+        relativePath.startsWith(`..${path.sep}`) ||
+        diagnostics.some((item) => item.relativePath === relativePath) ||
+        results.some((item) => item.relativePath === relativePath)
+      ) return;
+      diagnostics.push({ relativePath, kind, attempt, historical });
+    };
+    for (const entry of [...byAttempt.values()].sort((left, right) => right.attempt - left.attempt)) {
+      const historical = entry.attempt !== task.attempt;
+      addDiagnostic(entry.observation, 'diagnostic-observation', entry.attempt, historical);
+      addDiagnostic(entry.screenshot, 'diagnostic-screenshot', entry.attempt, historical);
     }
-    return declarations.slice(0, MAX_ARTIFACTS).map(({ relativePath, kind }) => ({
+    // Diagnostics are recovery evidence and stay ahead of result files while the
+    // total public artifact list remains bounded.
+    return [...diagnostics, ...results].slice(0, MAX_ARTIFACTS).map(({ relativePath, kind, attempt, historical }) => ({
       id: artifactId(task.id, relativePath),
       relativePath,
-      name: path.basename(relativePath).slice(0, 255),
+      name: `${historical ? `attempt-${attempt}-` : ''}${path.basename(relativePath)}`.slice(0, 255),
       kind,
       mimeType: artifactMimeType(relativePath),
       agentVisible: true
@@ -2820,34 +3186,542 @@ export function createTaskService({
     }
   }
 
-  async function cancel(id, suppliedCaller = {}) {
+  function serializeControl(id, operation) {
+    requireServiceOpen();
+    const previous = controlChains.get(id) || Promise.resolve();
+    const serialized = previous.catch(() => {}).then(operation);
+    controlChains.set(id, serialized);
+    return serialized.finally(() => {
+      if (controlChains.get(id) === serialized) controlChains.delete(id);
+    });
+  }
+
+  async function pauseTask(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision']));
+      const task = requireTaskAccess(id, caller);
+      const payload = { target: 'paused' };
+      const payloadHash = requestHash({ kind: 'pause', payload });
+      if (existingCommand(task, body.commandId, payloadHash)) return readPublicRecord(task);
+      if (!['queued', 'acquiring_profile', 'starting_browser', 'running', 'recovering'].includes(task.state)) {
+        throw new TaskServiceError(
+          'TASK_NOT_PAUSABLE',
+          'Only queued or actively executing tasks can be paused; waiting and cooling tasks already have safe wait controls',
+          409
+        );
+      }
+      const queuedPause = task.state === 'queued';
+      const entry = children.get(id);
+      if (!queuedPause && !entry) {
+        throw new TaskServiceError('TASK_WORKER_UNAVAILABLE', 'Task worker is unavailable for pause', 409);
+      }
+      const previousState = task.state;
+      const { command } = addCommand(task, {
+        commandId: body.commandId,
+        kind: 'pause',
+        expectedRevision: body.expectedRevision,
+        actor: taskActor(caller),
+        payload,
+        status: queuedPause || previousState === 'paused' ? 'applied' : 'pending'
+      });
+      task.pauseContext = {
+        previousState,
+        requestedAt: nowIso(),
+        commandId: command.commandId
+      };
+      task.state = 'paused';
+      task.health = { status: 'paused', checkedAt: nowIso() };
+      task.progress = { ...task.progress, message: queuedPause ? 'Queued task paused' : 'Pause requested' };
+      if (!queuedPause && previousState !== 'paused') task.state = 'pause_requested';
+      await update(task, {
+        state: task.state,
+        revision: task.revision,
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence,
+        pauseContext: task.pauseContext,
+        progress: task.progress,
+        health: task.health
+      });
+      if (task.state === 'pause_requested') {
+        const delivered = await sendChildMessageConfirmed(entry.child, {
+          type: 'pause',
+          commandId: command.commandId
+        });
+        if (!delivered) {
+          task.state = previousState;
+          markCommandStatus(task, command.commandId, 'rejected', {
+            message: 'Task worker did not accept the pause command'
+          });
+          await update(task, {
+            state: task.state,
+            commands: task.commands,
+            timeline: task.timeline,
+            timelineSequence: task.timelineSequence
+          });
+          throw new TaskServiceError('TASK_WORKER_UNAVAILABLE', 'Task worker is unavailable for pause', 409);
+        }
+        markCommandStatus(task, command.commandId, 'delivered');
+        await update(task, {
+          commands: task.commands,
+          timeline: task.timeline,
+          timelineSequence: task.timelineSequence
+        });
+      }
+      return readPublicRecord(task);
+    });
+  }
+
+  async function resumePausedTask(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision']));
+      const task = requireTaskAccess(id, caller);
+      const payload = { target: 'running' };
+      const payloadHash = requestHash({ kind: 'resume_pause', payload });
+      if (existingCommand(task, body.commandId, payloadHash)) return readPublicRecord(task);
+      if (!['paused', 'pause_requested'].includes(task.state)) {
+        throw new TaskServiceError('TASK_NOT_PAUSED', 'Task is not paused or waiting to pause', 409);
+      }
+      const queuedPause = task.pauseContext?.previousState === 'queued' && !children.has(id);
+      const entry = children.get(id);
+      if (!queuedPause && !entry) {
+        throw new TaskServiceError('TASK_WORKER_UNAVAILABLE', 'Task worker is unavailable for resume', 409);
+      }
+      const { command } = addCommand(task, {
+        commandId: body.commandId,
+        kind: 'resume_pause',
+        expectedRevision: body.expectedRevision,
+        actor: taskActor(caller),
+        payload,
+        status: queuedPause ? 'applied' : 'pending'
+      });
+      if (queuedPause) {
+        task.state = 'queued';
+        task.pauseContext = null;
+        task.health = { status: 'healthy', checkedAt: nowIso() };
+        task.progress = { ...task.progress, message: 'Queued task resumed' };
+      } else {
+        task.state = 'recovering';
+        task.health = { status: 'healthy', checkedAt: nowIso() };
+        task.progress = { ...task.progress, message: 'Revalidating live page before resume' };
+      }
+      await update(task, {
+        state: task.state,
+        revision: task.revision,
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence,
+        pauseContext: task.pauseContext,
+        progress: task.progress,
+        health: task.health
+      });
+      if (queuedPause) {
+        await scheduleQueuedTasks();
+      } else {
+        const delivered = await sendChildMessageConfirmed(entry.child, {
+          type: 'resume_pause',
+          commandId: command.commandId
+        });
+        if (!delivered) {
+          task.state = 'paused';
+          markCommandStatus(task, command.commandId, 'rejected', {
+            message: 'Task worker did not accept the resume command'
+          });
+          await update(task, {
+            state: task.state,
+            commands: task.commands,
+            timeline: task.timeline,
+            timelineSequence: task.timelineSequence
+          });
+          throw new TaskServiceError('TASK_WORKER_UNAVAILABLE', 'Task worker is unavailable for resume', 409);
+        }
+        markCommandStatus(task, command.commandId, 'delivered');
+        await update(task, {
+          commands: task.commands,
+          timeline: task.timeline,
+          timelineSequence: task.timelineSequence
+        });
+      }
+      return readPublicRecord(task);
+    });
+  }
+
+  async function submitTaskCommand(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision', 'kind', 'message']));
+      if (!AGENT_COMMAND_KINDS.has(body.kind)) {
+        throw new TaskServiceError('INVALID_TASK_COMMAND', 'kind must be ask or modify');
+      }
+      const task = requireTaskAccess(id, caller);
+      const message = boundedText(body.message, { field: 'message', maximum: 8_000 });
+      const payload = { message };
+      const payloadHash = requestHash({ kind: body.kind, payload });
+      if (existingCommand(task, body.commandId, payloadHash)) return readPublicRecord(task);
+      addCommand(task, {
+        commandId: body.commandId,
+        kind: body.kind,
+        expectedRevision: body.expectedRevision,
+        actor: taskActor(caller),
+        payload,
+        status: 'pending'
+      });
+      await update(task, {
+        revision: task.revision,
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence
+      });
+      return readPublicRecord(task);
+    });
+  }
+
+  async function claimTaskCommands(id, suppliedCaller = {}) {
     await ready;
     const caller = callerIdentity(suppliedCaller);
-    const task = tasks.get(id);
-    if (!task || !canAccess(task, caller)) {
-      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+    const task = requireTaskAccess(id, caller, { ownerOnly: true });
+    const actor = taskActor(caller);
+    let changed = false;
+    const commands = task.commands.filter((command) => (
+      AGENT_COMMAND_KINDS.has(command.kind) && ['pending', 'delivered', 'acknowledged'].includes(command.status)
+    ));
+    for (const command of commands) {
+      if (command.status !== 'pending') continue;
+      markCommandStatus(task, command.commandId, 'delivered', { actor });
+      changed = true;
     }
-    if (TERMINAL_TASK_STATES.has(task.state)) return readPublicRecord(task);
-    await update(task, {
-      state: 'cancelled',
-      health: { status: 'cancelled', checkedAt: nowIso() },
-      progress: terminalProgress(task, 'cancelled'),
-      finishedAt: nowIso()
+    if (changed) {
+      await update(task, {
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence
+      });
+    }
+    return { taskId: task.id, revision: task.revision, commands: commands.map(publicCommand) };
+  }
+
+  async function claimAgentInbox({ limit = 100 } = {}, suppliedCaller = {}) {
+    await ready;
+    const caller = callerIdentity(suppliedCaller);
+    if (caller.role !== 'agent') {
+      throw new TaskServiceError('AGENT_INBOX_FORBIDDEN', 'Only a scoped Agent can claim its inbox', 403);
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new TaskServiceError('INVALID_AGENT_INBOX_LIMIT', 'Inbox limit must be from 1 to 200');
+    }
+    const records = [];
+    const changedTasks = new Set();
+    const owned = [...tasks.values()]
+      .filter((task) => isTaskOwner(task, caller))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    for (const task of owned) {
+      normalizeTaskCoordination(task);
+      for (const command of task.commands) {
+        if (records.length >= limit) break;
+        if (!AGENT_COMMAND_KINDS.has(command.kind) || !['pending', 'delivered', 'acknowledged'].includes(command.status)) {
+          continue;
+        }
+        if (command.status === 'pending') {
+          markCommandStatus(task, command.commandId, 'delivered', { actor: taskActor(caller) });
+          changedTasks.add(task);
+        }
+        records.push({ taskId: task.id, revision: task.revision, command: publicCommand(command) });
+      }
+      if (records.length >= limit) break;
+    }
+    await Promise.all([...changedTasks].map((task) => update(task, {
+      commands: task.commands,
+      timeline: task.timeline,
+      timelineSequence: task.timelineSequence
+    })));
+    return { commands: records, total: records.length };
+  }
+
+  async function getTaskTimeline(id, { afterSequence = 0, limit = 100 } = {}, suppliedCaller = {}) {
+    await ready;
+    const caller = callerIdentity(suppliedCaller);
+    const task = requireTaskAccess(id, caller);
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+      throw new TaskServiceError('INVALID_TASK_TIMELINE_CURSOR', 'afterSequence must be a non-negative integer');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new TaskServiceError('INVALID_TASK_TIMELINE_LIMIT', 'Timeline limit must be from 1 to 200');
+    }
+    const events = task.timeline.filter((event) => event.sequence > afterSequence).slice(0, limit);
+    return {
+      taskId: task.id,
+      revision: task.revision,
+      events: clone(events),
+      nextSequence: events.at(-1)?.sequence ?? afterSequence
+    };
+  }
+
+  async function respondTaskCommand(id, commandId, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      const task = requireTaskAccess(id, caller, { ownerOnly: true });
+      if (typeof commandId !== 'string' || !COMMAND_ID_PATTERN.test(commandId)) {
+        throw new TaskServiceError('INVALID_TASK_COMMAND', 'commandId is invalid');
+      }
+      const allowed = new Set(['expectedRevision', 'status', 'message']);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !allowed.has(key))) {
+        throw new TaskServiceError('INVALID_TASK_COMMAND', 'Command response fields are invalid');
+      }
+      if (!Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1) {
+        throw new TaskServiceError('INVALID_TASK_COMMAND', 'expectedRevision must be a positive integer');
+      }
+      if (!['acknowledged', 'applied', 'rejected'].includes(body.status)) {
+        throw new TaskServiceError('INVALID_TASK_COMMAND', 'status must be acknowledged, applied, or rejected');
+      }
+      const command = task.commands.find((entry) => entry.commandId === commandId);
+      if (!command || !AGENT_COMMAND_KINDS.has(command.kind)) {
+        throw new TaskServiceError('TASK_COMMAND_NOT_FOUND', 'Task command was not found', 404);
+      }
+      if (command.status === body.status) return { task: await readPublicRecord(task), command: publicCommand(command) };
+      requireTaskRevision(task, body.expectedRevision);
+      const message = body.message === undefined
+        ? ''
+        : boundedText(body.message, { field: 'message', maximum: 8_000, required: false });
+      markCommandStatus(task, commandId, body.status, { actor: taskActor(caller), message });
+      task.revision += 1;
+      await update(task, {
+        revision: task.revision,
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence
+      });
+      return { task: await readPublicRecord(task), command: publicCommand(command) };
     });
-    const entry = children.get(id);
+  }
+
+  async function reviseQueuedTask(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision', 'input']));
+      const task = requireTaskAccess(id, caller);
+      const payload = { input: clone(body.input ?? {}) };
+      const commandPayload = { inputHash: requestHash(payload.input) };
+      const payloadHash = requestHash({ kind: 'revise_input', payload: commandPayload });
+      if (existingCommand(task, body.commandId, payloadHash)) return readPublicRecord(task);
+      const queuedRevision = task.state === 'queued' || (
+        task.state === 'paused' && task.pauseContext?.previousState === 'queued' && !children.has(task.id)
+      );
+      if (!queuedRevision) {
+        throw new TaskServiceError(
+          'TASK_INPUT_IMMUTABLE',
+          'Running or completed task input is immutable; submit a modify command for Agent replanning',
+          409
+        );
+      }
+      const taskType = await registry.resolve(task.taskType);
+      validateTaskInput(payload.input, taskType.inputSchema);
+      addCommand(task, {
+        commandId: body.commandId,
+        kind: 'revise_input',
+        expectedRevision: body.expectedRevision,
+        actor: taskActor(caller),
+        payload: commandPayload,
+        status: 'applied'
+      });
+      task.input = payload.input;
+      task.inputRevisionHash = requestHash(task.input);
+      task.progress = { ...task.progress, message: `Queued task input revised at revision ${task.revision}` };
+      await update(task, {
+        input: task.input,
+        inputRevisionHash: task.inputRevisionHash,
+        revision: task.revision,
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence,
+        progress: task.progress
+      });
+      return readPublicRecord(task);
+    });
+  }
+
+  async function publishTaskReport(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      const task = requireTaskAccess(id, caller);
+      const allowed = new Set(['reportId', 'expectedRevision', 'status', 'title', 'summary', 'sections']);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !allowed.has(key))) {
+        throw new TaskServiceError('INVALID_TASK_REPORT', 'Report fields are invalid');
+      }
+      if (typeof body.reportId !== 'string' || !REPORT_ID_PATTERN.test(body.reportId)) {
+        throw new TaskServiceError('INVALID_TASK_REPORT', 'reportId is invalid');
+      }
+      if (!Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1) {
+        throw new TaskServiceError('INVALID_TASK_REPORT', 'expectedRevision must be a positive integer');
+      }
+      if (!['draft', 'final'].includes(body.status)) {
+        throw new TaskServiceError('INVALID_TASK_REPORT', 'status must be draft or final');
+      }
+      const title = boundedText(body.title, { field: 'title', maximum: 200 });
+      const summary = boundedText(body.summary, { field: 'summary', maximum: 20_000 });
+      if (!Array.isArray(body.sections) || body.sections.length > 24) {
+        throw new TaskServiceError('INVALID_TASK_REPORT', 'sections must contain at most 24 entries');
+      }
+      const sections = body.sections.map((section, index) => {
+        if (!section || typeof section !== 'object' || Array.isArray(section) ||
+          Object.keys(section).some((key) => !['heading', 'body'].includes(key))) {
+          throw new TaskServiceError('INVALID_TASK_REPORT', `sections[${index}] is invalid`);
+        }
+        return {
+          heading: boundedText(section.heading, { field: `sections[${index}].heading`, maximum: 200 }),
+          body: boundedText(section.body, { field: `sections[${index}].body`, maximum: 20_000 })
+        };
+      });
+      const reportHash = requestHash({ status: body.status, title, summary, sections });
+      const existing = task.reports.find((report) => report.reportId === body.reportId);
+      if (existing) {
+        if (existing.reportHash !== reportHash) {
+          throw new TaskServiceError('TASK_REPORT_ID_CONFLICT', 'reportId is already bound to different content', 409);
+        }
+        return readPublicRecord(task);
+      }
+      requireTaskRevision(task, body.expectedRevision);
+      const report = {
+        reportId: body.reportId,
+        reportHash,
+        status: body.status,
+        title,
+        summary,
+        sections,
+        author: taskActor(caller),
+        publishedAt: nowIso()
+      };
+      task.reports.push(report);
+      task.reports = task.reports.slice(-20);
+      task.report = report;
+      task.revision += 1;
+      appendTimeline(task, 'report.published', {
+        actor: taskActor(caller),
+        status: body.status,
+        message: title
+      });
+      await update(task, {
+        revision: task.revision,
+        reports: task.reports,
+        report: task.report,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence
+      });
+      return readPublicRecord(task);
+    });
+  }
+
+  async function requestCancellation(task, { commandId = null, actor = null } = {}) {
+    task.cancelRequestedAt ||= nowIso();
+    if (commandId) task.cancelCommandId = commandId;
+    appendTimeline(task, 'task.cancel_requested', {
+      actor,
+      commandId,
+      status: 'pending',
+      message: 'Cancellation requested; waiting for cleanup proof'
+    });
+    await update(task, {
+      state: 'cancel_requested',
+      cancelRequestedAt: task.cancelRequestedAt,
+      cancelCommandId: task.cancelCommandId,
+      health: { status: 'cancel_requested', checkedAt: nowIso() },
+      progress: { ...task.progress, message: 'Cancellation requested; confirming cleanup' },
+      timeline: task.timeline,
+      timelineSequence: task.timelineSequence
+    });
+    const entry = children.get(task.id);
     if (entry) {
       send(entry.child, { type: 'cancel' });
       scheduleForcedStop(task, entry);
     } else {
-      await releaseTaskLease(task);
       task.cleanup.browserClosed = true;
       task.cleanup.workerExited = true;
+      await releaseTaskLease(task);
       refreshCleanupSettled(task);
+      if (task.cleanup.settled === true) {
+        task.state = 'cancelled';
+        task.error = null;
+        task.finishedAt = nowIso();
+        task.progress = terminalProgress(task, 'cancelled');
+        task.health = { status: 'cancelled', checkedAt: nowIso() };
+        if (commandId) markCommandStatus(task, commandId, 'applied', {
+          actor,
+          message: 'Queued task cancelled before browser startup'
+        });
+      } else {
+        task.state = 'failed';
+        task.error = {
+          code: 'TASK_CANCEL_CLEANUP_UNCONFIRMED',
+          message: 'Cancellation was requested but cleanup could not be confirmed'
+        };
+      }
       finishAttemptHistory(task);
-      await update(task, { cleanup: task.cleanup, history: task.history });
+      await update(task, {
+        state: task.state,
+        error: task.error,
+        finishedAt: task.finishedAt,
+        progress: task.progress,
+        health: task.health,
+        cleanup: task.cleanup,
+        history: task.history,
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence
+      });
     }
     void scheduleQueuedTasks().catch(() => {});
-    return publicRecord(task);
+    return readPublicRecord(task);
+  }
+
+  async function terminateTask(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision']));
+      const task = requireTaskAccess(id, caller);
+      const payload = { target: 'cancelled' };
+      const payloadHash = requestHash({ kind: 'terminate', payload });
+      if (existingCommand(task, body.commandId, payloadHash)) return readPublicRecord(task);
+      if (TERMINAL_TASK_STATES.has(task.state)) {
+        throw new TaskServiceError('TASK_ALREADY_TERMINAL', 'Task is already terminal', 409);
+      }
+      if (task.cancelRequestedAt) {
+        throw new TaskServiceError('TASK_CANCEL_ALREADY_REQUESTED', 'Task cancellation is already in progress', 409);
+      }
+      addCommand(task, {
+        commandId: body.commandId,
+        kind: 'terminate',
+        expectedRevision: body.expectedRevision,
+        actor: taskActor(caller),
+        payload,
+        status: 'pending'
+      });
+      await update(task, {
+        revision: task.revision,
+        commands: task.commands,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence
+      });
+      return requestCancellation(task, { commandId: body.commandId, actor: taskActor(caller) });
+    });
+  }
+
+  async function cancel(id, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      const task = requireTaskAccess(id, caller);
+      if (TERMINAL_TASK_STATES.has(task.state)) return readPublicRecord(task);
+      if (task.cancelRequestedAt) return readPublicRecord(task);
+      return requestCancellation(task, { actor: taskActor(caller) });
+    });
   }
 
   async function continueTask(id, body = {}, suppliedCaller = {}) {
@@ -2961,6 +3835,28 @@ export function createTaskService({
       throw new TaskServiceError('TASK_TYPE_REQUIRED', 'Task type is required');
     }
     return registry.describe(name);
+  }
+
+  async function deprecateTaskType(name, input = {}, suppliedCaller = {}) {
+    requireServiceOpen();
+    const caller = callerIdentity(suppliedCaller);
+    if (caller.role !== 'manager-admin') {
+      throw new TaskServiceError('TASK_TYPE_LIFECYCLE_FORBIDDEN', 'Only Manager admin can change task type lifecycle', 403);
+    }
+    const unknown = Object.keys(input).filter((key) => key !== 'replacedBy');
+    if (unknown.length) {
+      throw new TaskServiceError('INVALID_TASK_TYPE_LIFECYCLE', `Unsupported fields: ${unknown.join(', ')}`);
+    }
+    return registry.deprecate(name, { replacedBy: input.replacedBy ?? null });
+  }
+
+  async function restoreTaskType(name, suppliedCaller = {}) {
+    requireServiceOpen();
+    const caller = callerIdentity(suppliedCaller);
+    if (caller.role !== 'manager-admin') {
+      throw new TaskServiceError('TASK_TYPE_LIFECYCLE_FORBIDDEN', 'Only Manager admin can change task type lifecycle', 403);
+    }
+    return registry.restore(name);
   }
 
   async function openProfile(
@@ -3313,7 +4209,9 @@ export function createTaskService({
   }
 
   async function interruptTaskForShutdown(task) {
-    if (task.state === 'queued' || TERMINAL_TASK_STATES.has(task.state)) return;
+    const safelyPausedQueued = task.state === 'paused' && task.pauseContext?.previousState === 'queued' &&
+      !task.startedAt && !task.workerPid && task.leaseHeld !== true;
+    if (task.state === 'queued' || safelyPausedQueued || TERMINAL_TASK_STATES.has(task.state)) return;
     await update(task, {
       state: 'failed',
       error: {
@@ -3341,6 +4239,7 @@ export function createTaskService({
       // Let an already-running queue drain reach a stable claim boundary.
       // `closing` prevents any subsequent drain from launching more work.
       await queueTail.catch(() => {});
+      await Promise.allSettled([...controlChains.values()]);
       const exitingWorkers = [...children.values()].map((entry) => entry.exitPromise);
       const shutdownResults = await Promise.allSettled([
         ...[...tasks.values()]
@@ -3416,6 +4315,9 @@ export function createTaskService({
     return {
       active: children.size,
       queued: queuedTasks().length,
+      paused: [...tasks.values()].filter((task) => task.state === 'paused').length,
+      pauseRequested: [...tasks.values()].filter((task) => task.state === 'pause_requested').length,
+      cancelRequested: [...tasks.values()].filter((task) => task.state === 'cancel_requested').length,
       waitingUser: [...tasks.values()].filter((task) => task.state === 'waiting_user').length,
       stalled: [...tasks.values()].filter((task) => task.health?.status === 'stalled').length,
       maxConcurrent: maxConcurrentTasks,
@@ -3432,12 +4334,24 @@ export function createTaskService({
     listArtifacts,
     readArtifact,
     cancel,
+    terminateTask,
+    pauseTask,
+    resumePausedTask,
+    submitTaskCommand,
+    claimTaskCommands,
+    claimAgentInbox,
+    respondTaskCommand,
+    getTaskTimeline,
+    reviseQueuedTask,
+    publishTaskReport,
     continueTask,
     resume,
     installTaskType,
     installTaskPack,
     listTaskTypes,
     describeTaskType,
+    deprecateTaskType,
+    restoreTaskType,
     openProfile,
     closeProfile,
     close

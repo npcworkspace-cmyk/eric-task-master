@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.0.1**
+Version: **2.1.1**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -20,7 +20,7 @@ Task Master is a general execution base, not a site-specific bot. Combined with 
 - long-running batch work across hundreds of pages without keeping an Agent turn open;
 - authenticated back-office, portal, CMS, CRM, and account workflows through isolated persistent Profiles;
 - clean no-login jobs through disposable ephemeral Profiles;
-- parallel trusted-local Agents using distinct client IDs and Profiles, preventing accidental tab, login-state, and task-record crossover;
+- parallel trusted-local Agents sharing a managed Profile catalog while different live Profiles run independently; same-Profile work queues safely and task records stay attributable;
 - recurring operational workflows invoked by an Agent, scheduler, or business system;
 - browser QA, content verification, form processing, file upload/download, and evidence capture;
 - production Task Packs for lead operations, ecommerce operations, media research, supplier research, customer support, compliance checks, or internal RPA.
@@ -40,7 +40,7 @@ Task Master does not replace Agent reasoning. It gives that reasoning a dependab
 ## The three-layer model
 
 1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, and cleanup.
-2. **Web control center** — the same-origin Dashboard manages Profiles and tasks. Users sign in directly inside isolated persistent Playwright Profiles.
+2. **Owner Console** — one fixed local web address manages shared Profiles, connected Agents, live tasks, progress, commands, and human-readable reports. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
 This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
@@ -62,11 +62,11 @@ If a user gives you this GitHub URL, follow the steps below in order. Do not inv
 
 5. `connect` installs the lockfile-pinned runtime and matching Playwright Chromium, safely migrates an idle older Manager, starts the loopback Manager, runs real-browser acceptance, and registers supported local MCP hosts. If an older Manager still has work, migration stops without interrupting it.
 6. Follow the returned `nextAction`. After correcting the named precondition, retry the same command at most once; do not branch into a speculative replacement controller.
-7. Open the returned Dashboard URL when Profile or task management is needed. It contains a short-lived one-use authorization code, never the Manager credential.
-8. If a host reports `registered_pending_restart`, ask the user to reload that Agent host once.
+7. Open the returned Owner Console link once. It silently establishes a persistent local session; there is no code to type or Agent-binding flow. Bookmark `http://127.0.0.1:19946/dashboard` for later use.
+8. If a host reports `registered_pending_restart`, ask the user to reload that Agent host once. If it cannot reload during this run, use the scoped CLI with one stable Agent ID for this task only, then use MCP for new tasks after the next restart.
 9. Choose one operation path and keep it for the task:
    - if the host loaded the registered MCP server, call `taskmaster_status`, then `taskmaster_profiles_list`;
-   - if the host reports `needs_adapter`, use the fixed CLI from the repository root. Keep one stable, distinct Agent ID on every scoped command:
+   - if the host reports `needs_adapter`, or cannot reload a pending registration during this run, use the fixed CLI from the repository root. Keep one stable, distinct Agent ID on every scoped command:
 
      ```bash
      node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json
@@ -77,7 +77,7 @@ If a user gives you this GitHub URL, follow the steps below in order. Do not inv
 
 Copyable request for a new Agent:
 
-> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Use the loaded MCP path when supported; on `needs_adapter`, follow the Skill's fixed CLI path with one stable, distinct Agent ID. Return the authorized Dashboard URL; after status and Profile discovery succeed, ask what task I want to run.
+> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Use the loaded MCP path when supported; on `needs_adapter`, follow the Skill's fixed CLI path with one stable, distinct Agent ID. Return the Owner Console link; after status and Profile discovery succeed, ask what task I want to run.
 
 ## Everyday use
 
@@ -87,7 +87,7 @@ After the first bootstrap, the user should be able to ask naturally:
 
 The Agent then uses one durable loop: discover a task type, start once with an idempotency key, retain the task ID, wait or reconnect to that ID, inspect diagnostics when attention is required, and accept completion only after evidence and cleanup are verified.
 
-Every task start returns a clickable Dashboard link focused on that task. If the user says “启动任务面板”, use MCP `taskmaster_dashboard_open` or CLI `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json`, then return the fresh one-time link. Task Master does not automatically open an operating-system browser.
+Every task start returns a clickable Owner Console link focused on that task. The first link silently establishes the local Owner cookie; later visits can use the fixed bookmarked address. If the user says “启动任务面板”, use MCP `taskmaster_dashboard_open` or CLI `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json`, then return the link. Task Master does not automatically open an operating-system browser.
 
 ### Profiles
 
@@ -105,17 +105,25 @@ New persistent Profiles default to the local stable Chrome channel and fixed `hu
 Human pacing is a reliability policy, not a promise to bypass website controls or protect an account from platform enforcement.
 Behavior is selected on the Profile; task start does not accept a behavior override.
 
+### Multi-Agent workbench
+
+- Profiles are shared by all trusted local Agents; there is no meaningless “Profile creator” field. A Profile still has one live lease, so two Agents cannot corrupt the same login state.
+- The Owner Console shows which Agents are registered, online, offline, working, or revoked, plus their active tasks, Profiles, and queue depth.
+- The task workbench shows what Playwright is doing now, progress, limits, recovery state, and a timeline. The Owner can pause, resume, terminate, revise queued input, or send an ask/modify instruction.
+- Commands are durable and revision-checked. An active Agent receives them immediately through its wait/inbox loop; an offline Agent receives them after reconnecting. Task Master does not pretend it can wake a completely closed host process.
+- Completed work opens on the Agent's human-readable report. Code, logs, screenshots, artifacts, and diagnostics remain available as secondary evidence instead of becoming the “result.”
+
 ## Build specialized production workers
 
 Keep site and business logic outside the core:
 
 ```bash
-node scripts/taskmaster.mjs task-packs scaffold ./my-pack --name my-pack --json
+node scripts/taskmaster.mjs task-packs scaffold ./my-pack --name my-pack --recipe paginated-list --json
 node scripts/taskmaster.mjs task-packs validate ./my-pack --json
 node scripts/taskmaster.mjs task-packs install ./my-pack --json
 ```
 
-A Task Pack defines reusable task types. A specialized Skill teaches the Agent when to use them, how to interpret results, and which platform rules apply. Neither should rebuild Manager startup, browser lifecycle, task tracking, diagnostics, or cleanup.
+A Task Pack defines reusable task types. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. A specialized Skill teaches the Agent when to use them, how to interpret results, and which platform rules apply. Neither should rebuild Manager startup, browser lifecycle, task tracking, diagnostics, or cleanup. Publish a new task-type name, verify it, then deprecate the old type with a replacement pointer; do not overwrite divergent production logic in place.
 
 ## Host integration
 
@@ -124,7 +132,7 @@ A Task Pack defines reusable task types. A specialized Skill teaches the Agent w
 | Codex, Claude Desktop, Claude Code, Hermes | supported |
 | WorkBuddy, DeepSeek Harness, Pi, OpenClaw | adapter required; current release does not modify them automatically |
 
-The browser runtime remains usable through its fixed, Agent-scoped CLI when a host-specific MCP adapter is unavailable. Every scoped CLI command requires a stable, distinct `--agent-id` for each independent Agent; reusing an ID intentionally shares that identity's private Profiles and task ledger. See [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md) for the complete non-MCP command path and its trusted-local boundary.
+The browser runtime remains usable through its fixed, Agent-scoped CLI when a host-specific MCP adapter is unavailable. Every scoped CLI command requires a stable, distinct `--agent-id` for each independent Agent; all Agents share the Profile catalog, while reusing an ID intentionally shares that identity's task ledger and Owner inbox. See [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md) for the complete non-MCP command path and its trusted-local boundary.
 
 ## Verification and shutdown
 

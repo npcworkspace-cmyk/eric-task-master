@@ -29,7 +29,7 @@ async function managerFixture(t) {
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Task Master</title>');
 
   const tasks = new Map();
-  const calls = { open: [], close: [], resumes: [] };
+  const calls = { open: [], close: [], resumes: [], lifecycle: [] };
   let taskService;
   const buildTaskService = ({ profileStore }) => taskService = {
     async list() {
@@ -68,6 +68,14 @@ async function managerFixture(t) {
       task.state = 'queued';
       task.attempt = 2;
       return task;
+    },
+    async deprecateTaskType(name, body, caller) {
+      calls.lifecycle.push({ action: 'deprecate', name, body, caller });
+      return { name, lifecycle: 'deprecated', replacedBy: body.replacedBy ?? null };
+    },
+    async restoreTaskType(name, caller) {
+      calls.lifecycle.push({ action: 'restore', name, caller });
+      return { name, lifecycle: 'active', replacedBy: null };
     },
     async openProfile(id) {
       calls.open.push(id);
@@ -397,7 +405,7 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   assert.equal(removed.body.removed.id, profileId);
 });
 
-test('Agent-created Profiles are private until their owner explicitly shares them', async (t) => {
+test('Profiles are globally shared and the persistent Owner Console can manage Agents', async (t) => {
   const { manager, baseUrl } = await managerFixture(t);
   const tokenA = await issueAgent(baseUrl, manager.token, 'agent-profile-a');
   const tokenB = await issueAgent(baseUrl, manager.token, 'agent-profile-b');
@@ -405,39 +413,23 @@ test('Agent-created Profiles are private until their owner explicitly shares the
   const created = await json(await fetch(`${baseUrl}/v1/profiles`, {
     method: 'POST',
     headers: headers(tokenA),
-    body: JSON.stringify({ name: 'Agent A private', kind: 'persistent' })
+    body: JSON.stringify({ name: 'Global Profile', kind: 'persistent' })
   }));
   assert.equal(created.response.status, 201);
-  assert.equal(created.body.profile.access, 'private');
-  assert.equal(created.body.profile.createdBy, 'agent-profile-a');
+  assert.equal(Object.hasOwn(created.body.profile, 'access'), false);
+  assert.equal(Object.hasOwn(created.body.profile, 'createdBy'), false);
   const profileId = created.body.profile.id;
 
-  const hidden = await json(await fetch(`${baseUrl}/v1/profiles`, { headers: headers(tokenB) }));
-  assert.equal(hidden.response.status, 200);
-  assert.equal(hidden.body.profiles.some((profile) => profile.id === profileId), false);
-
-  for (const [method, suffix, body] of [
-    ['PATCH', '', { name: 'stolen' }],
-    ['POST', '/open', undefined]
-  ]) {
-    const denied = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}${suffix}`, {
-      method,
-      headers: headers(tokenB),
-      ...(body ? { body: JSON.stringify(body) } : {})
-    }));
-    assert.equal(denied.response.status, 403);
-    assert.equal(denied.body.error.code, 'PROFILE_ACCESS_DENIED');
-  }
-
-  const shared = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
-    method: 'PATCH',
-    headers: headers(tokenA),
-    body: JSON.stringify({ access: 'shared' })
-  }));
-  assert.equal(shared.response.status, 200);
-  assert.equal(shared.body.profile.access, 'shared');
   const visible = await json(await fetch(`${baseUrl}/v1/profiles`, { headers: headers(tokenB) }));
+  assert.equal(visible.response.status, 200);
   assert.equal(visible.body.profiles.some((profile) => profile.id === profileId), true);
+  const renamed = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+    method: 'PATCH',
+    headers: headers(tokenB),
+    body: JSON.stringify({ name: 'Renamed by Agent B' })
+  }));
+  assert.equal(renamed.response.status, 200);
+  assert.equal(renamed.body.profile.name, 'Renamed by Agent B');
 
   const dashboardAuthorization = await json(await fetch(`${baseUrl}/v1/dashboard/authorize`, {
     method: 'POST', headers: headers(tokenB), body: '{}'
@@ -447,44 +439,77 @@ test('Agent-created Profiles are private until their owner explicitly shares the
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ code: dashboardAuthorization.body.code })
   }));
-  const dashboardB = dashboardSession.body.dashboardToken;
+  assert.equal(dashboardSession.response.status, 201);
+  assert.equal(Object.hasOwn(dashboardSession.body, 'dashboardToken'), false);
+  const cookie = dashboardSession.response.headers.get('set-cookie').split(';', 1)[0];
 
-  const stillCannotManage = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+  const deniedWithoutOrigin = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
     method: 'PATCH',
-    headers: headers(dashboardB),
-    body: JSON.stringify({ defaultBehavior: 'human' })
+    headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'CSRF attempt' })
   }));
-  assert.equal(stillCannotManage.response.status, 403);
-  assert.equal(stillCannotManage.body.error.code, 'PROFILE_ACCESS_DENIED');
+  assert.equal(deniedWithoutOrigin.response.status, 403);
+  assert.equal(deniedWithoutOrigin.body.error.code, 'DASHBOARD_ORIGIN_REQUIRED');
 
-  const stillCannotDelete = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
-    method: 'DELETE', headers: headers(dashboardB)
-  }));
-  assert.equal(stillCannotDelete.response.status, 403);
-  assert.equal(stillCannotDelete.body.error.code, 'PROFILE_ACCESS_DENIED');
+  const summary = await json(await fetch(`${baseUrl}/v1/dashboard/summary`, { headers: { cookie } }));
+  assert.equal(summary.response.status, 200);
+  assert.equal(summary.body.version, VERSION);
+  const agents = await json(await fetch(`${baseUrl}/v1/agents`, { headers: { cookie } }));
+  assert.equal(agents.response.status, 200);
+  assert.equal(agents.body.agents.some((agent) => agent.agentId === 'agent-profile-b'), true);
 
-  const openedByB = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/open`, {
-    method: 'POST', headers: headers(dashboardB), body: '{}'
+  const revoked = await json(await fetch(`${baseUrl}/v1/agents/agent-profile-b/actions`, {
+    method: 'POST',
+    headers: { cookie, origin: baseUrl, 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'revoke', reason: 'Owner test' })
   }));
-  assert.equal(openedByB.response.status, 200);
-  const revokeWhileOpen = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
-    method: 'PATCH',
-    headers: headers(tokenA),
-    body: JSON.stringify({ access: 'private' })
+  assert.equal(revoked.response.status, 200);
+  assert.equal(revoked.body.agent.status, 'revoked');
+  assert.equal((await fetch(`${baseUrl}/v1/profiles`, { headers: headers(tokenB) })).status, 403);
+
+  const restored = await json(await fetch(`${baseUrl}/v1/agents/agent-profile-b/actions`, {
+    method: 'POST',
+    headers: { cookie, origin: baseUrl, 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'restore' })
   }));
-  assert.equal(revokeWhileOpen.response.status, 409);
-  assert.equal(revokeWhileOpen.body.error.code, 'PROFILE_IN_USE');
-  const closedByB = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}/close`, {
-    method: 'POST', headers: headers(dashboardB), body: '{}'
+  assert.equal(restored.response.status, 200);
+  assert.equal(restored.body.agent.status, 'offline');
+  assert.equal((await fetch(`${baseUrl}/v1/profiles`, { headers: headers(tokenB) })).status, 200);
+});
+
+test('task type lifecycle routes are admin-only and preserve replacement metadata', async (t) => {
+  const { manager, baseUrl, calls } = await managerFixture(t);
+  const taskTypeName = 'fixture.read';
+  const agentToken = await issueAgent(baseUrl, manager.token, 'lifecycle-agent');
+
+  const forbidden = await json(await fetch(`${baseUrl}/v1/task-types/${taskTypeName}/actions`, {
+    method: 'POST',
+    headers: headers(agentToken),
+    body: JSON.stringify({ action: 'deprecate' })
   }));
-  assert.equal(closedByB.response.status, 200);
-  const privateAgain = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
-    method: 'PATCH',
-    headers: headers(tokenA),
-    body: JSON.stringify({ access: 'private' })
+  assert.equal(forbidden.response.status, 403);
+  assert.equal(forbidden.body.error.code, 'ROLE_FORBIDDEN');
+
+  const deprecated = await json(await fetch(`${baseUrl}/v1/task-types/${taskTypeName}/actions`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify({ action: 'deprecate', replacedBy: 'fixture.read.v2' })
   }));
-  assert.equal(privateAgain.response.status, 200);
-  assert.equal(privateAgain.body.profile.access, 'private');
+  assert.equal(deprecated.response.status, 200);
+  assert.equal(deprecated.body.taskType.lifecycle, 'deprecated');
+  assert.equal(deprecated.body.taskType.replacedBy, 'fixture.read.v2');
+
+  const restored = await json(await fetch(`${baseUrl}/v1/task-types/${taskTypeName}/actions`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify({ action: 'restore' })
+  }));
+  assert.equal(restored.response.status, 200);
+  assert.equal(restored.body.taskType.lifecycle, 'active');
+  assert.deepEqual(calls.lifecycle.map(({ action, name }) => ({ action, name })), [
+    { action: 'deprecate', name: taskTypeName },
+    { action: 'restore', name: taskTypeName }
+  ]);
 });
 
 test('task routes delegate to taskService and strip private task fields', async (t) => {

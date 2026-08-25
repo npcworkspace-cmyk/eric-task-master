@@ -16,10 +16,10 @@ import {
   validateManagerIdentityPin,
   verifyManagerIdentityProof
 } from './lib/manager-identity.mjs';
-import { redactSensitiveText } from './lib/redaction.mjs';
+import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 import { waitForManagerShutdownProof } from './lib/manager-shutdown-proof.mjs';
 import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
-import { readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
+import { preflightTaskPack, readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
 import { assertSafeTaskInput, HttpTaskMasterClient } from './mcp/taskmaster-client.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -32,27 +32,32 @@ Usage:
   taskmaster dashboard-open [TASK_ID] [--json]
   taskmaster manager stop [--json]
   taskmaster profiles list [--json]
-  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior fast|adaptive|human] [--access private|shared] [--headless]
-  taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE] [--access private|shared]
+  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior fast|adaptive|human] [--headless]
+  taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE]
   taskmaster profiles open|close PROFILE_ID
   taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
   taskmaster task-types describe TASK_TYPE [--json]
   taskmaster task-types install --type NAME --module PATH [--json]
+  taskmaster task-types deprecate TASK_TYPE [--replacement TASK_TYPE] [--json]
+  taskmaster task-types restore TASK_TYPE [--json]
   taskmaster task-packs validate PATH [--json]
-  taskmaster task-packs scaffold PATH --name PACK_NAME [--json]
+  taskmaster task-packs scaffold PATH --name PACK_NAME [--recipe RECIPE] [--json]
   taskmaster task-packs install PATH [--json]
   taskmaster task list [--json]
+  taskmaster task inbox [--limit N] [--json]
   taskmaster task start --profile ID --type TYPE --request-key KEY [--input JSON] [--json]
   taskmaster task run --profile ID --type TYPE [--module PATH] [--input JSON] [--request-key KEY]
   taskmaster task status|wait|follow|cancel TASK_ID [--json]
   taskmaster task continue TASK_ID [--request-id ID] [--note TEXT] [--json]
+  taskmaster task command-respond TASK_ID --command-id ID --revision N --status acknowledged|applied|rejected [--message TEXT] [--json]
+  taskmaster task report TASK_ID --report-id ID --revision N --status draft|final --title TEXT --summary TEXT [--sections JSON_OR_@FILE] [--json]
   taskmaster task resume TASK_ID --resume-key KEY [--detach] [--json]
   taskmaster artifacts list TASK_ID [--json]
   taskmaster artifacts read TASK_ID --artifact ARTIFACT_ID [--offset N] [--max-bytes N]
   taskmaster mcp status|register|unregister|rollback [--json]
 
 Task start accepts registered task types only and returns immediately. Task wait is bounded to 30 seconds.
-Agent-scoped commands require --agent-id STABLE_ID (or ERIC_TASK_MASTER_CLIENT_ID). Use a distinct stable ID per independent Agent; the same ID intentionally shares its private Profiles and tasks.
+Agent-scoped commands require --agent-id STABLE_ID (or ERIC_TASK_MASTER_CLIENT_ID). Use a distinct stable ID per independent Agent; Profiles are global while task histories stay Agent-scoped.
 Task run follows progress until terminal state by default.`;
 
 function parseArgs(argv) {
@@ -98,8 +103,72 @@ function settings(options) {
   return { host, port, stateDir, baseUrl: `http://${host}:${port}` };
 }
 
-function cliError(code, message, nextAction) {
-  return Object.assign(new Error(message), { code, nextAction });
+function cliError(code, message, nextAction, details) {
+  return Object.assign(new Error(message), {
+    code,
+    nextAction,
+    ...(details === undefined ? {} : { details })
+  });
+}
+
+const SAFE_REGISTRATION_REASONS = new Set([
+  'No verified native registration contract is enabled for this host.',
+  'Skipped: adapter is not verified.',
+  'Named entry exists but no TaskMaster ownership state is available.',
+  'The owned entry changed after installation.'
+]);
+
+function safeRegistrationReason(result, code) {
+  const hostKey = typeof result?.hostKey === 'string' && /^[a-z0-9-]{1,80}$/u.test(result.hostKey)
+    ? result.hostKey
+    : 'host';
+  if (code === 'REGISTRATION_CONFLICT') {
+    return `Unowned ${hostKey} entry uses the name eric-task-master.`;
+  }
+  if (code === 'OWNED_ENTRY_CHANGED') {
+    return 'The owned entry changed after installation; it was not overwritten.';
+  }
+  if (code === 'INVALID_HOST_CONFIG') {
+    return 'The host configuration is not valid and was not modified.';
+  }
+  if (code === 'INVALID_REGISTRATION_STATE') {
+    return 'The registration state is not valid and was not modified.';
+  }
+  if (typeof result?.reason === 'string' && SAFE_REGISTRATION_REASONS.has(result.reason)) {
+    return result.reason;
+  }
+  if (result?.status === 'conflict') return 'The host registration conflicts with existing local state.';
+  if (result?.status === 'failed') {
+    return code ? `Host registration failed with ${code}.` : 'Host registration failed.';
+  }
+  return '';
+}
+
+function registrationFailureDetails(registration) {
+  return {
+    ok: false,
+    command: registration?.command === 'install' ? 'install' : 'registration',
+    changed: false,
+    results: Array.isArray(registration?.results)
+      ? registration.results.slice(0, 32).map((result) => {
+          const code = typeof result?.error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/u.test(result.error.code)
+            ? result.error.code
+            : '';
+          const reason = safeRegistrationReason(result, code);
+          return {
+            ...(typeof result?.hostKey === 'string' ? { hostKey: result.hostKey.slice(0, 80) } : {}),
+            ...(typeof result?.displayName === 'string' ? { displayName: result.displayName.slice(0, 120) } : {}),
+            ...(typeof result?.support === 'string' ? { support: result.support.slice(0, 32) } : {}),
+            ...(typeof result?.detected === 'boolean' ? { detected: result.detected } : {}),
+            ...(typeof result?.status === 'string' ? { status: result.status.slice(0, 64) } : {}),
+            ...(typeof result?.configPath === 'string' ? { configPath: result.configPath.slice(0, 4_096) } : {}),
+            ...(typeof result?.changed === 'boolean' ? { changed: result.changed } : {}),
+            ...(reason ? { reason } : {}),
+            ...(code ? { error: { code, message: reason || `Host registration failed with ${code}.` } } : {})
+          };
+        })
+      : []
+  };
 }
 
 function emit(value, json = false) {
@@ -484,7 +553,8 @@ async function connect(options, json) {
     throw cliError(
       'MCP_REGISTRATION_FAILED',
       'Task Master could not safely register one or more detected Agent hosts.',
-      'Read the registration result, resolve the named conflict, and rerun connect once.'
+      'Run node scripts/taskmaster.mjs mcp status --json, resolve the named conflict reported for that host, and rerun connect once.',
+      { mcpRegistration: registrationFailureDetails(registration) }
     );
   }
   const dashboardAuthorization = await requestJson(config.baseUrl, '/v1/dashboard/authorize', {
@@ -501,7 +571,7 @@ async function connect(options, json) {
     acceptance,
     mcpRegistration: registration,
     dashboard: `${config.baseUrl}/dashboard#${new URLSearchParams({ code: dashboardAuthorization.code })}`,
-    nextAction: 'Match this Agent host in mcpRegistration.results. For registered_pending_restart, reload it once; for registered, use taskmaster_status then taskmaster_profiles_list. For needs_adapter, run node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json, then profiles list with the same identity. Do not mix MCP and CLI identities. After status and Profile discovery succeed, ask for the browser task.'
+    nextAction: 'Match this Agent host in mcpRegistration.results. For registered_pending_restart, reload it once; if this host cannot reload during the current run, use the scoped CLI path with one stable Agent ID for this task only, then switch to MCP after the next host restart. For registered, use taskmaster_status then taskmaster_profiles_list. For needs_adapter, run node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json, then profiles list with the same identity. Never mix MCP and CLI identities inside one task. After status and Profile discovery succeed, ask for the browser task.'
   };
   emit(result, json);
   return result;
@@ -659,12 +729,12 @@ async function profileCommand(action, args, options, json) {
   }
   if (action === 'create') {
     if (!options.name) throw cliError('PROFILE_NAME_REQUIRED', '--name is required');
+    if (options.access !== undefined) throw cliError('UNKNOWN_ARGUMENT', '--access was removed because all Profiles are shared');
     const body = {
       name: options.name,
       kind: options.kind || 'persistent',
       headless: options.headless === true || options.headless === 'true',
       ...(options.behavior ? { defaultBehavior: options.behavior } : {}),
-      ...(options.access ? { access: options.access } : {}),
       ...(options.engine ? { browserEngine: options.engine } : {})
     };
     emit({ ok: true, profile: await context.client.createProfile(body) }, json);
@@ -673,11 +743,11 @@ async function profileCommand(action, args, options, json) {
   const profileId = args[0];
   if (!profileId) throw cliError('PROFILE_ID_REQUIRED', `profiles ${action} requires a profile ID`);
   if (action === 'update') {
+    if (options.access !== undefined) throw cliError('UNKNOWN_ARGUMENT', '--access was removed because all Profiles are shared');
     const body = {};
     if (options.name !== undefined) body.name = options.name;
     if (options.behavior !== undefined) body.defaultBehavior = options.behavior;
     if (options.headless !== undefined) body.headless = options.headless === true || options.headless === 'true';
-    if (options.access !== undefined) body.access = options.access;
     emit({ ok: true, profile: await context.client.updateProfile(profileId, body) }, json);
     return;
   }
@@ -737,6 +807,11 @@ async function taskCommand(action, args, options, json) {
     if (terminal.state !== 'completed') process.exitCode = 1;
     return;
   }
+  if (action === 'inbox') {
+    const limit = options.limit === undefined ? 100 : Number(options.limit);
+    emit({ ok: true, ...await context.client.claimInbox({ limit }) }, json);
+    return;
+  }
   const taskId = args[0];
   if (!taskId) throw cliError('TASK_ID_REQUIRED', `task ${action} requires a task ID`);
   if (action === 'resume') {
@@ -776,6 +851,43 @@ async function taskCommand(action, args, options, json) {
     emit({ ok: true, task }, json);
     return;
   }
+  if (action === 'command-respond') {
+    if (!options['command-id']) throw cliError('TASK_COMMAND_ID_REQUIRED', '--command-id is required');
+    if (!options.revision) throw cliError('TASK_REVISION_REQUIRED', '--revision is required');
+    if (!options.status) throw cliError('TASK_COMMAND_STATUS_REQUIRED', '--status is required');
+    const result = await context.client.respondTaskCommand({
+      taskId,
+      commandId: options['command-id'],
+      expectedRevision: Number(options.revision),
+      status: options.status,
+      ...(options.message === undefined ? {} : { message: options.message })
+    });
+    emit({ ok: true, ...result }, json);
+    return;
+  }
+  if (action === 'report') {
+    for (const [option, code] of [
+      ['report-id', 'TASK_REPORT_ID_REQUIRED'],
+      ['revision', 'TASK_REVISION_REQUIRED'],
+      ['status', 'TASK_REPORT_STATUS_REQUIRED'],
+      ['title', 'TASK_REPORT_TITLE_REQUIRED'],
+      ['summary', 'TASK_REPORT_SUMMARY_REQUIRED']
+    ]) {
+      if (options[option] === undefined) throw cliError(code, `--${option} is required`);
+    }
+    const sections = options.sections === undefined ? [] : await loadInput(options.sections);
+    const result = await context.client.publishTaskReport({
+      taskId,
+      reportId: options['report-id'],
+      expectedRevision: Number(options.revision),
+      status: options.status,
+      title: options.title,
+      summary: options.summary,
+      sections
+    });
+    emit({ ok: true, ...result }, json);
+    return;
+  }
   throw cliError('UNKNOWN_COMMAND', `Unknown task command: ${action}`);
 }
 
@@ -810,6 +922,24 @@ async function taskTypeCommand(action, args, options, json) {
     emit({ ok: true, ...result }, json);
     return;
   }
+  if (action === 'deprecate' || action === 'restore') {
+    const taskType = args[0];
+    if (!taskType) throw cliError('TASK_TYPE_REQUIRED', `task-types ${action} requires a task type`);
+    const admin = await apiContext(options);
+    const result = await requestJson(
+      admin.config.baseUrl,
+      `/v1/task-types/${encodeURIComponent(taskType)}/actions`,
+      {
+        method: 'POST',
+        token: admin.token,
+        body: action === 'deprecate'
+          ? { action, ...(options.replacement ? { replacedBy: options.replacement } : {}) }
+          : { action }
+      }
+    );
+    emit({ ok: true, ...result }, json);
+    return;
+  }
   throw cliError('UNKNOWN_COMMAND', `Unknown task-types command: ${action}`);
 }
 
@@ -827,13 +957,14 @@ async function taskPackCommand(action, args, options, json) {
   const location = args[0];
   if (!location) throw cliError('TASK_PACK_PATH_REQUIRED', `task-packs ${action} requires a path`);
   if (action === 'validate') {
-    const loaded = await readTaskPack(location);
-    emit({ ok: true, taskPack: publicPack(loaded.pack) }, json);
+    const result = await preflightTaskPack(location);
+    emit({ ...result, taskPack: publicPack(result.taskPack) }, json);
+    if (!result.ok) process.exitCode = 1;
     return;
   }
   if (action === 'scaffold') {
     if (!options.name) throw cliError('TASK_PACK_NAME_REQUIRED', '--name is required');
-    const created = await scaffoldTaskPack(location, { name: options.name });
+    const created = await scaffoldTaskPack(location, { name: options.name, recipe: options.recipe });
     emit({ ok: true, taskPack: publicPack(created.pack) }, json);
     return;
   }
@@ -951,7 +1082,8 @@ main().catch((error) => {
     ok: false,
     error: {
       code: error.code || 'TASKMASTER_FAILED',
-      message: redactSensitiveText(error.message)
+      message: redactSensitiveText(error.message),
+      ...(error.details === undefined ? {} : { details: redactSensitiveValue(error.details) })
     },
     nextAction: redactSensitiveText(
       error.nextAction || 'Read the error, correct the stated cause, and retry the same command once.'

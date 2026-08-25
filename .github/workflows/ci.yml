@@ -37,6 +37,8 @@ jobs:
         run: xvfb-run --auto-servernum npm run check
         env:
           TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
+          TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
+          TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
           TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
           TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
       - name: Run release gate
@@ -44,6 +46,8 @@ jobs:
         run: npm run check
         env:
           TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
+          TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
+          TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
           TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
           TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
       - if: always()

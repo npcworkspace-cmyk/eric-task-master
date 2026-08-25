@@ -82,7 +82,13 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   const agentToken = scopedToken('codex-fixture', 'Codex fixture');
   const connection = await fixture(t, async (request, response) => {
     const body = await readJson(request);
-    requests.push({ method: request.method, url: request.url, authorization: request.headers.authorization, body });
+    requests.push({
+      method: request.method,
+      url: request.url,
+      authorization: request.headers.authorization,
+      connectionId: request.headers['x-taskmaster-connection-id'],
+      body
+    });
     if (request.url === '/v1/agents/issue') {
       reply(response, 200, {
         agentToken,
@@ -146,7 +152,12 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.equal(requests.filter((item) => item.url === '/v1/agents/issue').length, 1);
   assert.equal(requests[0].authorization, `Bearer ${ADMIN_TOKEN}`);
   for (const request of requests.slice(1)) assert.equal(request.authorization, `Bearer ${agentToken}`);
-  assert.deepEqual(requests[0].body, { clientId: 'codex-fixture', name: 'Codex fixture' });
+  assert.deepEqual(Object.keys(requests[0].body).sort(), ['clientId', 'connectionId', 'name']);
+  assert.equal(requests[0].body.clientId, 'codex-fixture');
+  assert.equal(requests[0].body.name, 'Codex fixture');
+  assert.match(requests[0].body.connectionId, /^mcp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+  assert.equal(requests[0].connectionId, requests[0].body.connectionId);
+  assert.equal(new Set(requests.map((request) => request.connectionId)).size, 1);
   assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['idempotencyKey', 'input', 'profileId', 'taskType']);
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
 });
@@ -208,7 +219,12 @@ test('HTTP client re-issues ETMA2 once after a 401 and Manager token rotation', 
   let connection;
   connection = await fixture(t, async (request, response) => {
     const body = await readJson(request);
-    observed.push({ url: request.url, authorization: request.headers.authorization, body });
+    observed.push({
+      url: request.url,
+      authorization: request.headers.authorization,
+      connectionId: request.headers['x-taskmaster-connection-id'],
+      body
+    });
     if (request.url === '/v1/agents/issue') {
       const rotated = request.headers.authorization === `Bearer ${rotatedAdminToken}`;
       reply(response, 201, {
@@ -242,9 +258,13 @@ test('HTTP client re-issues ETMA2 once after a 401 and Manager token rotation', 
       `Bearer ${newScoped}`
     ]
   );
+  const issued = observed.filter((request) => request.url === '/v1/agents/issue');
+  assert.equal(issued.length, 2);
+  assert.equal(issued[0].body.connectionId, issued[1].body.connectionId);
+  assert.equal(new Set(observed.map((request) => request.connectionId)).size, 1);
 });
 
-test('Profile open and close keep operation deadlines beyond the generic MCP request timeout', async (t) => {
+test('Profile operations keep long deadlines and reject removed ownership fields locally', async (t) => {
   const profile = { id: 'profile_slow', name: 'Slow Profile', state: 'idle', kind: 'persistent' };
   const connection = await fixture(t, async (request, response) => {
     const body = await readJson(request);
@@ -277,10 +297,12 @@ test('Profile open and close keep operation deadlines beyond the generic MCP req
 
   assert.equal((await client.openProfile(profile.id)).id, profile.id);
   assert.equal((await client.closeProfile(profile.id)).id, profile.id);
-  assert.equal((await client.updateProfile(profile.id, { access: 'shared' })).access, 'shared');
+  assert.equal((await client.updateProfile(profile.id, { name: 'Renamed Profile' })).name, 'Renamed Profile');
+  await assert.rejects(client.updateProfile(profile.id, { access: 'shared' }), { code: 'UNKNOWN_ARGUMENT' });
+  await assert.rejects(client.createProfile({ name: 'Legacy Profile', access: 'private' }), { code: 'UNKNOWN_ARGUMENT' });
 });
 
-test('HTTP client treats authorization denial as a Profile choice error, not a credential retry', async (t) => {
+test('HTTP client treats authorization denial as terminal instead of retrying credentials', async (t) => {
   const connection = await fixture(t, async (request, response) => {
     if (request.url === '/v1/agents/issue') {
       await readJson(request);
@@ -299,7 +321,7 @@ test('HTTP client treats authorization denial as a Profile choice error, not a c
     assert.equal(error.code, 'PROFILE_ACCESS_DENIED');
     assert.equal(error.statusCode, 403);
     assert.equal(error.retryable, false);
-    assert.match(error.nextAction, /Profile owned|share/u);
+    assert.match(error.nextAction, /Refresh Manager status and Profile state/u);
     return true;
   });
 });

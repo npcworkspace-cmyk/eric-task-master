@@ -63,6 +63,7 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
   const stateDir = path.join(root, 'manager-state');
   const registrationState = path.join(root, 'registration-state');
   const codexHome = path.join(home, '.codex');
+  const claudeDesktopConfig = path.join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json');
   const port = await freePort();
   await mkdir(codexHome, { recursive: true });
   await writeFile(path.join(codexHome, 'config.toml'), 'model = "fixture"\n', 'utf8');
@@ -101,6 +102,8 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
   assert.match(first.nextAction, /mcpRegistration\.results/u);
   assert.match(first.nextAction, /needs_adapter/u);
   assert.match(first.nextAction, /--agent-id STABLE_ID/u);
+  assert.match(first.nextAction, /cannot reload during the current run/u);
+  assert.match(first.nextAction, /Never mix MCP and CLI identities/u);
   assert.match(first.acceptance.nextAction, /top-level nextAction/u);
   assert.match(first.acceptance.nextAction, /stable Agent identity/u);
 
@@ -121,6 +124,36 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
     '--json', '--port', String(port), '--state-dir', stateDir
   ], env));
   assert.deepEqual(profiles.profiles, []);
+
+  const changedConfig = (await readFile(path.join(codexHome, 'config.toml'), 'utf8'))
+    .replace('stdio.mjs', 'foreign.mjs');
+  assert.notEqual(changedConfig, config);
+  await writeFile(path.join(codexHome, 'config.toml'), changedConfig, 'utf8');
+  const failedRegistration = await runCli(['connect', ...common], env);
+  assert.equal(failedRegistration.code, 1);
+  const failedPayload = JSON.parse(failedRegistration.stderr.trim());
+  assert.equal(failedPayload.error.code, 'MCP_REGISTRATION_FAILED');
+  assert.match(failedPayload.nextAction, /mcp status --json/u);
+  assert.ok(Array.isArray(failedPayload.error.details?.mcpRegistration?.results));
+  assert.ok(failedPayload.error.details.mcpRegistration.results.some((item) => (
+    item.hostKey === 'codex' && item.configPath && typeof item.reason === 'string' && item.reason &&
+    ['conflict', 'failed'].includes(item.status)
+  )));
+
+  await mkdir(path.dirname(claudeDesktopConfig), { recursive: true });
+  await writeFile(claudeDesktopConfig, '{"serviceCredential":LEAK42}\n', 'utf8');
+  const malformedRegistration = await runCli(['connect', ...common], env);
+  assert.equal(malformedRegistration.code, 1);
+  assert.equal(malformedRegistration.stderr.includes('LEAK42'), false);
+  const malformedPayload = JSON.parse(malformedRegistration.stderr.trim());
+  const malformedHost = malformedPayload.error.details?.mcpRegistration?.results
+    ?.find((item) => item.hostKey === 'claude-desktop');
+  assert.equal(malformedHost?.error?.code, 'INVALID_HOST_CONFIG');
+  assert.equal(malformedHost?.reason, 'The host configuration is not valid and was not modified.');
+  assert.deepEqual(
+    Object.keys(malformedPayload.error.details.mcpRegistration).sort(),
+    ['changed', 'command', 'ok', 'results']
+  );
 
   const stopped = parseSingleJson(await runCli([
     'manager', 'stop', '--json', '--port', String(port), '--state-dir', stateDir

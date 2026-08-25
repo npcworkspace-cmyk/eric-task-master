@@ -12,10 +12,11 @@ npm run check
 
 `npm run check` performs:
 
-1. static version, dependency, pure-Playwright, Web Dashboard, launcher, and Skill-boundary checks;
+1. static version, dependency, pure-Playwright, Owner Console, launcher, and Skill-boundary checks;
 2. serial unit, integration, security, registration, protocol, recovery, and real-browser tests;
 3. real Chromium feature acceptance across Profile-owned fast/human/adaptive behavior, immutable engine policy, removed task overrides, persistent Profile open/close, click/input/select, upload/download, storage, screenshot, progress, checkpoint, artifacts, ephemeral isolation, user handoff, and cleanup;
-4. a commercial acceptance workload with persistent Cookie/localStorage retention across task execution, manual Profile open-close, and Manager restart; bounded concurrency; same-Profile FIFO pressure; queued cancellation; browser timeout diagnostics; ephemeral zero-state verification; quiescence; and terminal history recovery.
+4. a real-browser Owner Console acceptance that clicks every navigation and task-control surface, creates/opens/closes Profiles, manages Agent state, sends revision-checked commands, exercises pause/resume/terminate and queued revision, verifies report-first rendering, checks 401 versus 403 handling, survives Manager restart, and validates responsive/keyboard/reduced-motion behavior;
+5. a commercial acceptance workload with persistent Cookie/localStorage retention across task execution, manual Profile open-close, and Manager restart; bounded concurrency; same-Profile FIFO pressure; queued cancellation; browser timeout diagnostics; ephemeral zero-state verification; quiescence; and terminal history recovery.
 
 Any failed assertion blocks release. The commercial workload report can be persisted with:
 
@@ -39,6 +40,17 @@ Remove-Item Env:TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE
 ```
 
 The local command records the actual engine in its report. CI repeats this commercial workload on every advertised platform with the stable Chrome channel, while all ephemeral Profile checks continue to use the lockfile-pinned Chromium.
+
+For a clean-Agent challenge that must not touch the user's normal `19946` Manager, isolate all state and choose a free loopback port. This is a release-maintainer path, not the normal onboarding protocol:
+
+```powershell
+$env:ERIC_TASK_MASTER_HOME = Join-Path $env:TEMP 'eric-task-master-isolated'
+$env:ERIC_TASK_MASTER_HOST = '127.0.0.1'
+$env:ERIC_TASK_MASTER_PORT = '29946'
+node scripts/taskmaster.mjs connect --skip-mcp-registration --json
+```
+
+Verify the selected port is free first, use a fresh directory for every challenge, run only local fixtures, stop that isolated Manager through `manager stop`, and confirm its browser processes and listener are gone. Never reuse the production state directory or silently redirect normal users away from `19946`.
 
 ## Cross-platform boundary
 
@@ -73,7 +85,9 @@ Before dispatch, enable Release immutability and configure `RELEASE_ADMIN_TOKEN`
 - missing, changed, hard-linked, or unstable artifacts;
 - wrong/replayed Manager identity, role violations, and credential redaction;
 - task-module inspection timeout/exit/error and transactional Task Pack conflicts;
-- one-time Dashboard authorization and legacy session-import lease fail-closed migration.
+- persistent Owner session bootstrap/restart/logout, exact-origin mutation protection, and Agent revoke/restore;
+- task command idempotency/revision races, cooperative pause, report publication, and cleanup-proved termination;
+- legacy session-import lease fail-closed migration.
 
 ## Honest boundary
 

@@ -2,6 +2,8 @@
 
 Read this reference only when an installed high-level task type does not cover the requested work.
 
+Before writing from scratch, scaffold the closest production recipe with `task-packs scaffold --recipe single-page|paginated-list|list-detail|resumable-batch|form-workflow`, then run `task-packs validate`. The recipes already encode result persistence, progress, checkpoint, evidence, and lifecycle conventions. Customize site and business logic only; do not fork the runtime contract into a one-off controller.
+
 ## Trusted local task-type authoring path
 
 This is not the ordinary `needs_adapter` Agent loop. Use the registered-only

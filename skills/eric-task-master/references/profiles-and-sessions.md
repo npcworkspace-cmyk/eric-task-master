@@ -9,16 +9,16 @@ Task Master has two Profile kinds. Profile names are user-facing; immutable IDs 
 
 One live lease is allowed per Profile. Same-Profile tasks wait in FIFO order; different Profiles may run concurrently within the Manager budget. “Ephemeral / 隐身临时” means no local browser state survives the task. It does not claim fingerprint spoofing, anti-detection, CAPTCHA bypass, or immunity from platform controls.
 
-One registered MCP client ID or one required stable CLI `--agent-id` is one trusted-local Agent principal. Private Profiles and task ledgers are scoped to that ID; reusing it intentionally shares them, while independent Agents must use different stable IDs. A missing CLI ID fails closed. A shared Profile permits another principal to use that browser state but never shares the owner's task records or artifacts. This prevents accidental crossover between trusted local processes, not hostile tenants under the same operating-system account. Use separate operating-system users, sandboxes, or machines for mutually untrusted Agents.
+Every Profile is a shared resource for all trusted local Agents connected to this Manager. There is no creator or per-Profile access list. One registered MCP client ID or one required stable CLI `--agent-id` remains a task principal: it attributes work and scopes that Agent's task records, artifacts, reports, and Owner-command inbox. A missing CLI ID fails closed. Profile leases, not creator identity, prevent browser-state collisions. This is coordination between trusted local processes, not a hostile tenant boundary; use separate operating-system users, sandboxes, or machines for mutually untrusted Agents.
 
 ## Login workflow
 
 This workflow applies only to a `persistent` Profile.
 
-1. Open the Task Master Dashboard URL returned by `connect`.
+1. Open the Owner Console URL returned by `connect` once. It silently establishes the persistent local Owner session; bookmark `http://127.0.0.1:19946/dashboard` for later use.
 2. Create or select a persistent Profile and click **Open**.
 3. Let the user complete login, OAuth, MFA, passkey, or account selection directly in that visible Playwright window. Manual open is always visible; `headless` applies only to task launches.
-4. Close the Profile from the Dashboard and wait until it returns to `idle`, proving the browser closed and the lease was released.
+4. Close the Profile from the Owner Console and wait until it returns to `idle`, proving the browser closed and the lease was released.
 5. Submit the task only after the Profile is ready.
 
 The persistent Profile's native Playwright `userDataDir` retains Cookie, LocalStorage, IndexedDB, service-worker, and other browser-managed state. Task Master does not copy credentials from another browser, expose them to an Agent, or maintain a parallel login-state vault. If a site logs out or rejects the state, reopen the same Profile and let the user sign in again there.
