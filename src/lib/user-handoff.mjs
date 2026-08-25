@@ -63,14 +63,17 @@ export function createUserHandoff({
     const requestId = `handoff_${randomUUID().replaceAll('-', '')}`;
     const requestedAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
-    const screenshot = await capture('waiting-user');
+    const diagnostics = await capture('waiting-user');
+    const screenshotAvailable = typeof diagnostics === 'string'
+      ? Boolean(diagnostics)
+      : diagnostics === true || Boolean(diagnostics?.screenshotPath);
     const requestRecord = {
       id: requestId,
       reason,
       ...(instructions ? { instructions } : {}),
       requestedAt,
       expiresAt,
-      ...(screenshot ? { screenshotAvailable: true } : {})
+      ...(screenshotAvailable ? { screenshotAvailable: true } : {})
     };
     let resolveWait;
     let rejectWait;
@@ -95,10 +98,11 @@ export function createUserHandoff({
 
     try {
       if (signal?.aborted) throw signal.reason || new UserHandoffError('TASK_CANCELLED', 'Task was cancelled');
-      // Publish the complete request before the generic state event. The
-      // Manager handles this message atomically as state + request metadata,
-      // so readers can never observe waiting_user without a request ID.
-      await onRequest(requestRecord);
+      // Publish the complete request and its capture result before the generic
+      // state event. The Manager handles this message atomically as state,
+      // request metadata, and diagnostic pointers, so readers never observe a
+      // partially prepared waiting_user handoff.
+      await onRequest(requestRecord, diagnostics);
       if (!pending) return waitPromise;
       await onState('waiting_user');
       if (!pending) return waitPromise;

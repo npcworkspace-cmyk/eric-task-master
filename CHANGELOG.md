@@ -7,6 +7,7 @@
 - Added authenticated, fail-closed migration from an idle older Manager; busy or unverifiable Managers remain untouched and return an actionable error instead of prompting Agents to invent another controller.
 - Added integration coverage for successful idle migration and refusal to interrupt an older Manager with active work.
 - Published the project under the MIT License so independent Skills, Task Packs, and commercial integrations can build on the core runtime.
+- Made human-handoff state and its captured screenshot/semantic pointers one atomic Manager update, eliminating a slow-Windows observation race without weakening task deadlines.
 
 ## 1.0.3 - 2026-08-25
 

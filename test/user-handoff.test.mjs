@@ -7,11 +7,13 @@ test('user handoff reports one bounded request and resumes only with its matchin
   const progress = [];
   const published = [];
   let request;
+  let publishedDiagnostics;
   let handoff;
   handoff = createUserHandoff({
     capture: async () => 'fixture.png',
-    onRequest: async (value) => {
+    onRequest: async (value, diagnostics) => {
       request = value;
+      publishedDiagnostics = diagnostics;
       assert.equal(handoff.pending?.id, value.id);
       published.push('request');
     },
@@ -33,6 +35,7 @@ test('user handoff reports one bounded request and resumes only with its matchin
   await new Promise((resolve) => setImmediate(resolve));
   assert.match(request.id, /^handoff_[a-f0-9]{32}$/u);
   assert.equal(request.screenshotAvailable, true);
+  assert.equal(publishedDiagnostics, 'fixture.png');
   assert.equal(await handoff.continue({ requestId: 'handoff_wrong', note: '' }), false);
   assert.equal(await handoff.continue({ requestId: request.id, note: 'Accepted in the live page' }), true);
   assert.equal((await waiting).note, 'Accepted in the live page');

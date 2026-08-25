@@ -1174,6 +1174,10 @@ test('waiting_user keeps the same live task and continues only through its match
                 requestedAt: new Date().toISOString(),
                 expiresAt: new Date(Date.now() + 60_000).toISOString(),
                 screenshotAvailable: true
+              },
+              diagnostics: {
+                screenshot: { path: path.join(root, 'waiting-user.jpg'), reason: 'waiting-user' },
+                observation: { path: path.join(root, 'waiting-user.json'), reason: 'waiting-user' }
               }
             });
             child.emit('message', { type: 'state', state: 'waiting_user' });
@@ -1214,6 +1218,8 @@ test('waiting_user keeps the same live task and continues only through its match
   assert.equal(waiting.userRequest.id, requestId);
   assert.equal(waiting.userRequest.status, 'pending');
   assert.equal(waiting.health.status, 'waiting_user');
+  assert.match(waiting.lastScreenshot.ref, /\/screenshot$/u);
+  assert.match(waiting.lastObservation.ref, /\/observation$/u);
   await assert.rejects(
     service.continueTask(created.id, { requestId: `handoff_${'b'.repeat(32)}` }, ADMIN),
     { code: 'USER_HANDOFF_MISMATCH', statusCode: 409 }

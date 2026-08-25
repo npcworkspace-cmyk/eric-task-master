@@ -198,13 +198,19 @@ async function captureFailure(
   outputBudget = activeOutputBudget,
   semantic = activeSemantic
 ) {
-  if (!page || page.isClosed?.()) return null;
+  const unavailable = Object.freeze({
+    screenshotPath: null,
+    observationPath: null,
+    reason: String(reason || 'failure')
+  });
+  if (!page || page.isClosed?.()) return unavailable;
   const screenshotsDir = path.join(outputDir, 'screenshots');
   const safeReason = String(reason || 'failure').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 48);
   const screenshotPath = path.join(screenshotsDir, `${Date.now()}-${safeReason}.jpg`);
   let releaseReservation = () => {};
   let captured = false;
   let result = null;
+  let observationResult = null;
   try {
     await outputBudget?.assertSafeRoot?.();
     await mkdir(screenshotsDir, { recursive: true });
@@ -264,13 +270,18 @@ async function captureFailure(
       observationCaptured = true;
       await recordDiagnostic('observation', observationPath, outputDir, safeReason);
       safeSend({ type: 'observation', path: observationPath, reason: safeReason });
+      observationResult = observationPath;
     } catch {
       // A semantic diagnostic is best-effort and never hides the browser error.
     } finally {
       if (!observationCaptured) releaseObservation();
     }
   }
-  return result;
+  return Object.freeze({
+    screenshotPath: result,
+    observationPath: observationResult,
+    reason: safeReason
+  });
 }
 
 function normalizeResult(result) {
@@ -538,7 +549,8 @@ export async function runTaskWorker(config, {
         }
       }),
       onFailure: async ({ operation }) => {
-        lastScreenshot = await captureFailure(page, config.outputDir, `action-${operation}`, outputBudget);
+        const diagnostics = await captureFailure(page, config.outputDir, `action-${operation}`, outputBudget);
+        lastScreenshot = diagnostics.screenshotPath;
       }
     });
     const guardResumeAction = (method) => (...args) => {
@@ -571,7 +583,18 @@ export async function runTaskWorker(config, {
     const handoff = createUserHandoff({
       signal: executionSignal,
       capture: (reason) => captureFailure(page, config.outputDir, reason, outputBudget, semantic),
-      onRequest: async (request) => safeSend({ type: 'waiting_user', request }),
+      onRequest: async (request, diagnostics) => safeSend({
+        type: 'waiting_user',
+        request,
+        diagnostics: {
+          ...(diagnostics?.screenshotPath ? {
+            screenshot: { path: diagnostics.screenshotPath, reason: diagnostics.reason }
+          } : {}),
+          ...(diagnostics?.observationPath ? {
+            observation: { path: diagnostics.observationPath, reason: diagnostics.reason }
+          } : {})
+        }
+      }),
       onState: async (state) => safeSend({ type: 'state', state }),
       onProgress: async (message) => progress({
         current: activeProgress.current,
@@ -639,12 +662,13 @@ export async function runTaskWorker(config, {
     if (!executionSignal.aborted) executionController.abort(error);
     const cancelled = error instanceof TaskCancelledError || error?.code === 'TASK_CANCELLED';
     if (!cancelled && !lastScreenshot) {
-      lastScreenshot = await captureFailure(
+      const diagnostics = await captureFailure(
         activePage,
         config.outputDir,
         error?.code || 'task-failure',
         outputBudget
       );
+      lastScreenshot = diagnostics.screenshotPath;
     }
     const state = cancelled ? 'cancelled' : 'failed';
     safeSend({ type: 'error', state, error: errorPayload(error, lastScreenshot) });

@@ -1432,8 +1432,29 @@ export function createTaskService({
           typeof request.id !== 'string' || !HANDOFF_ID_PATTERN.test(request.id) ||
           typeof request.reason !== 'string' || !request.reason.trim()
         ) return;
+        const diagnostics = message.diagnostics && typeof message.diagnostics === 'object'
+          ? message.diagnostics
+          : {};
+        const screenshot = diagnostics.screenshot;
+        const observation = diagnostics.observation;
         void update(task, {
           state: 'waiting_user',
+          ...(typeof screenshot?.path === 'string' && screenshot.path ? {
+            lastScreenshot: {
+              path: screenshot.path,
+              reason: typeof screenshot.reason === 'string' ? screenshot.reason : 'waiting-user',
+              at: nowIso(),
+              attempt: task.attempt
+            }
+          } : {}),
+          ...(typeof observation?.path === 'string' && observation.path ? {
+            lastObservation: {
+              path: observation.path,
+              reason: typeof observation.reason === 'string' ? observation.reason : 'waiting-user',
+              at: nowIso(),
+              attempt: task.attempt
+            }
+          } : {}),
           userRequest: {
             id: request.id,
             reason: redactSensitiveText(request.reason).slice(0, 500),

@@ -98,8 +98,11 @@ async function waitForTaskState(
   }
   const lastState = task?.state || 'unobserved';
   const lastError = task?.error?.code ? `, error=${task.error.code}` : '';
+  const diagnosticState = expectedState === 'waiting_user'
+    ? `, screenshot=${task?.lastScreenshot?.ref ? 'ready' : 'missing'}, observation=${task?.lastObservation?.ref ? 'ready' : 'missing'}, requestScreenshot=${task?.userRequest?.screenshotAvailable === true ? 'ready' : 'missing'}`
+    : '';
   throw Object.assign(new Error(
-    `Task ${id} did not reach ${expectedState} (lastState=${lastState}${lastError})`
+    `Task ${id} did not reach ${expectedState} (lastState=${lastState}${lastError}${diagnosticState})`
   ), {
     code: 'ACCEPTANCE_TASK_STATE_TIMEOUT',
     task
