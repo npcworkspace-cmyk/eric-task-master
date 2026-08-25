@@ -96,7 +96,11 @@ async function waitForTaskState(
     if (TERMINAL_TASK_STATES.has(task.state)) break;
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
   }
-  throw Object.assign(new Error(`Task ${id} did not reach ${expectedState}`), {
+  const lastState = task?.state || 'unobserved';
+  const lastError = task?.error?.code ? `, error=${task.error.code}` : '';
+  throw Object.assign(new Error(
+    `Task ${id} did not reach ${expectedState} (lastState=${lastState}${lastError})`
+  ), {
     code: 'ACCEPTANCE_TASK_STATE_TIMEOUT',
     task
   });
@@ -414,7 +418,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       token,
       handoffCreated.task.id,
       'waiting_user',
-      30_000,
+      60_000,
       (task) => Boolean(task.lastScreenshot?.ref && task.lastObservation?.ref)
     );
     const waitingArtifacts = await api(

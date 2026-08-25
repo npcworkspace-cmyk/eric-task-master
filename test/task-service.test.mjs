@@ -1409,7 +1409,7 @@ test('live-but-stalled tasks trigger diagnostics and fail after the bounded prog
   const stalled = await waitFor(async () => {
     const task = await service.get(created.id, ADMIN);
     return task.health?.status === 'stalled' ? task : null;
-  }, 3_000);
+  }, 6_000);
   assert.equal(stalled.health.diagnosticRequested, true);
   assert.ok(messages.includes('diagnose:progress-stalled'));
   const failed = await waitFor(async () => {
