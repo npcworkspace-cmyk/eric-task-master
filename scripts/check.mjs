@@ -74,13 +74,15 @@ async function staticChecks() {
     releaseWorkflow.includes('workflow_dispatch:') &&
       !releaseWorkflow.includes('workflow_run:') &&
       releaseWorkflow.includes('release_sha:') &&
-      releaseWorkflow.includes('confirm_version:'),
+      releaseWorkflow.includes('confirm_version:') &&
+      releaseWorkflow.includes('confirm_immutable:'),
     'release workflow must require an explicit manual version and commit'
   );
   invariant(
     releaseWorkflow.includes('ref: ${{ inputs.release_sha }}') &&
       releaseWorkflow.includes('RELEASE_SHA: ${{ inputs.release_sha }}') &&
-      releaseWorkflow.includes('CONFIRM_VERSION: ${{ inputs.confirm_version }}'),
+      releaseWorkflow.includes('CONFIRM_VERSION: ${{ inputs.confirm_version }}') &&
+      releaseWorkflow.includes('CONFIRM_IMMUTABLE: ${{ inputs.confirm_immutable }}'),
     'release workflow must package the exact verified commit'
   );
   invariant(
@@ -94,10 +96,10 @@ async function staticChecks() {
     releaseWorkflow.includes('actions: read') && releaseWorkflow.includes('contents: write') &&
       releaseWorkflow.includes('/git/ref/heads/main') &&
       releaseWorkflow.includes('/actions/workflows/ci.yml/runs?') &&
-      releaseWorkflow.includes('/immutable-releases') &&
       releaseWorkflow.includes('gh release create') &&
       releaseWorkflow.includes('--draft') && releaseWorkflow.includes('gh release edit') &&
       releaseWorkflow.includes('--draft=false') && releaseWorkflow.includes('TAG_SHA') &&
+      releaseWorkflow.includes('--jq .immutable') &&
       !releaseWorkflow.includes('--clobber'),
     'release publication must be scoped and immutable'
   );

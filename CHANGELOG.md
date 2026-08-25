@@ -4,7 +4,7 @@
 
 - Replaced automatic post-CI publication with an explicitly authorized manual Release that accepts an exact `main` SHA and confirmed version.
 - Added candidate-branch CI for `upgrade/**` Playwright migrations without allowing candidates or pull requests to publish.
-- Required a successful same-SHA `main` push CI, the current `main` head, enabled GitHub Release immutability, and a previously unused tag/version before packaging.
+- Required a successful same-SHA `main` push CI, the current `main` head, administrator confirmation plus post-publication verification of GitHub Release immutability, and a previously unused tag/version.
 - Removed Release asset replacement; new archives are attached to a draft and published once after all assets are present.
 
 ## 1.0.2 - 2026-08-24

@@ -11,6 +11,10 @@ on:
         description: Exact package version to publish, without the v prefix
         required: true
         type: string
+      confirm_immutable:
+        description: Confirm an administrator verified Release immutability is enabled
+        required: true
+        type: boolean
 
 permissions:
   actions: read
@@ -28,6 +32,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_SHA: ${{ inputs.release_sha }}
       CONFIRM_VERSION: ${{ inputs.confirm_version }}
+      CONFIRM_IMMUTABLE: ${{ inputs.confirm_immutable }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -43,6 +48,7 @@ jobs:
           set -euo pipefail
           [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
           [[ "${CONFIRM_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          test "${CONFIRM_IMMUTABLE}" = true
           test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
 
           MAIN_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
@@ -66,14 +72,6 @@ jobs:
             echo "Release ${TAG} already exists. Published assets are never overwritten." >&2
             exit 1
           fi
-
-          IMMUTABLE="$(gh api \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)"
-          test "${IMMUTABLE}" = true || {
-            echo "Repository release immutability must be enabled before publishing." >&2
-            exit 1
-          }
 
           CI_RUN="$(gh api \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&head_sha=${RELEASE_SHA}&per_page=20" \

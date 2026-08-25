@@ -42,10 +42,11 @@ Publishing is a separate manual action. Dispatch `.github/workflows/release.yml`
 gh workflow run release.yml \
   --repo npcworkspace-cmyk/eric-task-master \
   -f release_sha=<verified-main-sha> \
-  -f confirm_version=<package-version>
+  -f confirm_version=<package-version> \
+  -f confirm_immutable=true
 ```
 
-The workflow rejects a non-current `main` commit, a commit without a successful same-SHA `main` push CI, a mismatched package version, disabled Release immutability, and any existing tag or Release. It creates a complete draft with the source, unpacked extension, base Skill, and `SHA256SUMS`, then publishes it once. Published versions and assets are never replaced. Pull requests, candidate branches, forks, manual CI runs, failed gates, and non-`main` commits cannot publish.
+Before dispatch, an authenticated repository administrator must verify Release immutability through the repository setting or its Administration API; the Actions token intentionally does not receive that administrator permission. The workflow requires that explicit confirmation, rejects a non-current `main` commit, a commit without a successful same-SHA `main` push CI, a mismatched package version, and any existing tag or Release. It creates a complete draft with the source, unpacked extension, base Skill, and `SHA256SUMS`, publishes it once, and then verifies that GitHub reports the published Release as immutable. Published versions and assets are never replaced. Pull requests, candidate branches, forks, manual CI runs, failed gates, and non-`main` commits cannot publish.
 
 ## Faults covered
 
