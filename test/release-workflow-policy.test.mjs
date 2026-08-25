@@ -15,6 +15,18 @@ function moveFinalImmutableStepBeforeBuild(source) {
   return `${source.slice(0, buildStep)}${step}${source.slice(buildStep, stepStart)}${source.slice(nextStep)}`;
 }
 
+function moveLineAfterChecksums(source, line) {
+  const lineWithIndent = `          ${line}`;
+  const lineStart = source.indexOf(lineWithIndent);
+  const lineEnd = source.indexOf('\n', lineStart) + 1;
+  const checksum = '(cd dist && sha256sum ./*.zip > SHA256SUMS)';
+  const withoutLine = `${source.slice(0, lineStart)}${source.slice(lineEnd)}`;
+  const checksumStart = withoutLine.indexOf(checksum);
+  const checksumEnd = withoutLine.indexOf('\n', checksumStart) + 1;
+  assert.ok(lineStart >= 0 && lineEnd > lineStart && checksumStart >= 0 && checksumEnd > checksumStart);
+  return `${withoutLine.slice(0, checksumEnd)}${lineWithIndent}\n${withoutLine.slice(checksumEnd)}`;
+}
+
 test('release workflow policy accepts the audited publication path', async () => {
   const source = await readFile(workflowPath, 'utf8');
   assert.equal(assertReleaseWorkflowPolicy(source), true);
@@ -31,6 +43,17 @@ test('release workflow policy rejects publication and permission regressions', a
     ['non-Git source archive', source.replace(
       'git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-v${VERSION}/"',
       'echo source-archive'
+    )],
+    ['source archive uses the Skill subtree', source
+      .replace('--output="dist/eric-task-master-v${VERSION}.zip" HEAD', '--output="dist/eric-task-master-v${VERSION}.zip" HEAD:skills/eric-task-master')
+      .replace('--output="dist/eric-task-master-v${VERSION}.repro.zip" HEAD', '--output="dist/eric-task-master-v${VERSION}.repro.zip" HEAD:skills/eric-task-master')],
+    ['source reproducibility file survives checksums', moveLineAfterChecksums(
+      source,
+      'rm "dist/eric-task-master-v${VERSION}.repro.zip"'
+    )],
+    ['Skill reproducibility file survives checksums', moveLineAfterChecksums(
+      source,
+      'rm "dist/eric-task-master-skill-v${VERSION}.repro.zip"'
     )],
     ['persisted checkout credential', source.replace('persist-credentials: false', 'persist-credentials: true')],
     ['expanded workflow permissions', source.replace('  contents: write', '  contents: write\n  issues: write')]

@@ -104,21 +104,56 @@ export function assertReleaseWorkflowPolicy(source) {
   );
   const archiveCommands = matchingShellLines(source, 'git archive --format=zip');
   const expectedArchives = [
-    ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-v${VERSION}/"', '--output="dist/eric-task-master-v${VERSION}.zip"', ' HEAD'],
-    ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-v${VERSION}/"', '--output="dist/eric-task-master-v${VERSION}.repro.zip"', ' HEAD'],
-    ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-skill-v${VERSION}/"', '--output="dist/eric-task-master-skill-v${VERSION}.zip"', ' HEAD:skills/eric-task-master'],
-    ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-skill-v${VERSION}/"', '--output="dist/eric-task-master-skill-v${VERSION}.repro.zip"', ' HEAD:skills/eric-task-master']
+    {
+      tokens: ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-v${VERSION}/"', '--output="dist/eric-task-master-v${VERSION}.zip"'],
+      tree: 'HEAD'
+    },
+    {
+      tokens: ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-v${VERSION}/"', '--output="dist/eric-task-master-v${VERSION}.repro.zip"'],
+      tree: 'HEAD'
+    },
+    {
+      tokens: ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-skill-v${VERSION}/"', '--output="dist/eric-task-master-skill-v${VERSION}.zip"'],
+      tree: 'HEAD:skills/eric-task-master'
+    },
+    {
+      tokens: ['--mtime="${ARCHIVE_MTIME}"', '--prefix="eric-task-master-skill-v${VERSION}/"', '--output="dist/eric-task-master-skill-v${VERSION}.repro.zip"'],
+      tree: 'HEAD:skills/eric-task-master'
+    }
   ];
   invariant(
     archiveCommands.length === expectedArchives.length &&
-      expectedArchives.every((tokens) => archiveCommands.some((command) => includesTokens(command, tokens))),
+      expectedArchives.every(({ tokens, tree }) => archiveCommands.some((command) => (
+        includesTokens(command, tokens) && command.endsWith(` ${tree}`)
+      ))),
     'source and Skill archives must each be built twice from Git with the fixed Release timestamp'
   );
+  const reproducibilityProofs = [
+    {
+      archives: [
+        '--output="dist/eric-task-master-v${VERSION}.zip"',
+        '--output="dist/eric-task-master-v${VERSION}.repro.zip"'
+      ],
+      compare: 'cmp "dist/eric-task-master-v${VERSION}.zip" "dist/eric-task-master-v${VERSION}.repro.zip"',
+      remove: 'rm "dist/eric-task-master-v${VERSION}.repro.zip"'
+    },
+    {
+      archives: [
+        '--output="dist/eric-task-master-skill-v${VERSION}.zip"',
+        '--output="dist/eric-task-master-skill-v${VERSION}.repro.zip"'
+      ],
+      compare: 'cmp "dist/eric-task-master-skill-v${VERSION}.zip" "dist/eric-task-master-skill-v${VERSION}.repro.zip"',
+      remove: 'rm "dist/eric-task-master-skill-v${VERSION}.repro.zip"'
+    }
+  ];
   invariant(
-    source.includes('cmp "dist/eric-task-master-v${VERSION}.zip" "dist/eric-task-master-v${VERSION}.repro.zip"') &&
-      source.includes('rm "dist/eric-task-master-v${VERSION}.repro.zip"') &&
-      source.includes('cmp "dist/eric-task-master-skill-v${VERSION}.zip" "dist/eric-task-master-skill-v${VERSION}.repro.zip"') &&
-      source.includes('rm "dist/eric-task-master-skill-v${VERSION}.repro.zip"'),
+    reproducibilityProofs.every((proof) => {
+      const archiveIndices = proof.archives.map((needle) => source.indexOf(needle));
+      const compareIndex = source.indexOf(proof.compare);
+      const removeIndex = source.indexOf(proof.remove);
+      return archiveIndices.every((index) => index >= 0) &&
+        Math.max(...archiveIndices) < compareIndex && compareIndex < removeIndex && removeIndex < checksumIndex;
+    }),
     'both reproducibility proofs must compare and remove their temporary archives before checksums'
   );
 
