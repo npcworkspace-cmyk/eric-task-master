@@ -2,7 +2,7 @@ name: cross-platform-release-gate
 
 on:
   push:
-    branches: [main]
+    branches: [main, "upgrade/**"]
   pull_request:
   workflow_dispatch:
 

@@ -58,7 +58,8 @@ async function staticChecks() {
   );
   invariant(
     workflow.includes('windows-latest') && workflow.includes('macos-latest') &&
-      workflow.includes('ubuntu-24.04') && workflow.includes('node: [20, 22]'),
+      workflow.includes('ubuntu-24.04') && workflow.includes('node: [20, 22]') &&
+      workflow.includes('branches: [main, "upgrade/**"]') && workflow.includes('pull_request:'),
     'cross-platform release matrix drift'
   );
   invariant(
@@ -70,17 +71,16 @@ async function staticChecks() {
     'workflows must use the audited pinned Node 24 Actions runtime'
   );
   invariant(
-    releaseWorkflow.includes('workflow_run:') &&
-      releaseWorkflow.includes('workflows: [cross-platform-release-gate]') &&
-      releaseWorkflow.includes("github.event.workflow_run.conclusion == 'success'") &&
-      releaseWorkflow.includes("github.event.workflow_run.event == 'push'") &&
-      releaseWorkflow.includes("github.event.workflow_run.head_branch == 'main'") &&
-      releaseWorkflow.includes('github.event.workflow_run.head_repository.full_name == github.repository'),
-    'release workflow can bypass the trusted cross-platform gate'
+    releaseWorkflow.includes('workflow_dispatch:') &&
+      !releaseWorkflow.includes('workflow_run:') &&
+      releaseWorkflow.includes('release_sha:') &&
+      releaseWorkflow.includes('confirm_version:'),
+    'release workflow must require an explicit manual version and commit'
   );
   invariant(
-    releaseWorkflow.includes('ref: ${{ github.event.workflow_run.head_sha }}') &&
-      releaseWorkflow.includes('RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}'),
+    releaseWorkflow.includes('ref: ${{ inputs.release_sha }}') &&
+      releaseWorkflow.includes('RELEASE_SHA: ${{ inputs.release_sha }}') &&
+      releaseWorkflow.includes('CONFIRM_VERSION: ${{ inputs.confirm_version }}'),
     'release workflow must package the exact verified commit'
   );
   invariant(
@@ -91,9 +91,14 @@ async function staticChecks() {
     'release archive or checksum boundary drift'
   );
   invariant(
-    releaseWorkflow.includes('contents: write') &&
+    releaseWorkflow.includes('actions: read') && releaseWorkflow.includes('contents: write') &&
+      releaseWorkflow.includes('/git/ref/heads/main') &&
+      releaseWorkflow.includes('/actions/workflows/ci.yml/runs?') &&
+      releaseWorkflow.includes('/immutable-releases') &&
       releaseWorkflow.includes('gh release create') &&
-      releaseWorkflow.includes('TAG_SHA') && releaseWorkflow.includes('RELEASE_SHA'),
+      releaseWorkflow.includes('--draft') && releaseWorkflow.includes('gh release edit') &&
+      releaseWorkflow.includes('--draft=false') && releaseWorkflow.includes('TAG_SHA') &&
+      !releaseWorkflow.includes('--clobber'),
     'release publication must be scoped and immutable'
   );
   await Promise.all([

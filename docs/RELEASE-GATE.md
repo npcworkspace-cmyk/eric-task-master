@@ -1,4 +1,4 @@
-# 1.0.2 release gate
+# Release gate
 
 Task Master uses evidence gates rather than a blanket “commercial-grade” claim. A release is deliverable only when every local mandatory gate passes from a clean checkout and platform CI passes on each platform advertised as verified.
 
@@ -34,7 +34,18 @@ npm run acceptance:commercial
 
 The GitHub Actions matrix runs the same gate on Windows, macOS, and Linux. Local Windows success does not prove macOS. A platform becomes release-verified only after its own matrix job passes on the release commit. Until then it is “implementation audited / CI pending,” not “tested.”
 
-After all six operating-system and Node.js matrix jobs pass for a same-repository `main` push, the separate CD workflow checks out that exact verified commit and publishes three zip archives: the complete source, the unpacked extension, and the base Skill. `SHA256SUMS` is attached to the same GitHub Release. Pull requests, forks, manual CI runs, failed gates, and non-`main` branches cannot publish a release.
+Pushes to `upgrade/**` branches and pull requests run the same six-job matrix without publishing. After the candidate is reviewed and merged, the exact same-repository `main` push commit must pass all six jobs again.
+
+Publishing is a separate manual action. Dispatch `.github/workflows/release.yml` with the exact 40-character `main` SHA and the package version only after local real-machine acceptance and explicit release approval:
+
+```bash
+gh workflow run release.yml \
+  --repo npcworkspace-cmyk/eric-task-master \
+  -f release_sha=<verified-main-sha> \
+  -f confirm_version=<package-version>
+```
+
+The workflow rejects a non-current `main` commit, a commit without a successful same-SHA `main` push CI, a mismatched package version, disabled Release immutability, and any existing tag or Release. It creates a complete draft with the source, unpacked extension, base Skill, and `SHA256SUMS`, then publishes it once. Published versions and assets are never replaced. Pull requests, candidate branches, forks, manual CI runs, failed gates, and non-`main` commits cannot publish.
 
 ## Faults covered
 

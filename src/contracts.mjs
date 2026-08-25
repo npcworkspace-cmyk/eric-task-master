@@ -1,6 +1,6 @@
 import { isSensitiveKey, redactSensitiveText } from './lib/redaction.mjs';
 
-export const VERSION = '1.0.2';
+export const VERSION = '1.0.3';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
