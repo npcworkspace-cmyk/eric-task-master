@@ -72,7 +72,7 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
     name: 'CLI Profile',
     kind: 'ephemeral',
     browserEngine: 'chromium',
-    defaultBehavior: 'adaptive',
+    defaultBehavior: 'auto',
     headless: true,
     state: 'idle'
   };

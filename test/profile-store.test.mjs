@@ -35,17 +35,17 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   assert.match(created.id, /^profile_[a-f0-9]{32}$/);
   assert.equal(created.userDataDir, join(config.profilesRoot, created.id));
 
-  const updated = await store.update(created.id, {
+  let updated = await store.update(created.id, {
     name: 'Research primary',
     headless: false
   });
   assert.equal(updated.name, 'Research primary');
   assert.equal(updated.defaultBehavior, 'human');
 
-  await assert.rejects(
-    store.update(created.id, { defaultBehavior: 'human' }),
-    { code: 'PERSISTENT_BEHAVIOR_FIXED' }
-  );
+  updated = await store.update(created.id, { defaultBehavior: 'fast' });
+  assert.equal(updated.defaultBehavior, 'fast');
+  updated = await store.update(created.id, { defaultBehavior: 'auto' });
+  assert.equal(updated.defaultBehavior, 'auto');
 
   await assert.rejects(
     store.create({ name: 'research PRIMARY' }),
@@ -86,7 +86,7 @@ test('ProfileStore creates ephemeral templates and migrates pre-kind records to 
   const temporary = await store.create({ name: 'Anonymous work', kind: 'ephemeral' });
   assert.equal(temporary.kind, 'ephemeral');
   assert.equal(temporary.browserEngine, 'chromium');
-  assert.equal(temporary.defaultBehavior, 'adaptive');
+  assert.equal(temporary.defaultBehavior, 'auto');
   assert.equal(
     (await store.update(temporary.id, { defaultBehavior: 'fast' })).defaultBehavior,
     'fast'
@@ -99,7 +99,7 @@ test('ProfileStore creates ephemeral templates and migrates pre-kind records to 
   await reopened.init();
   const migrated = await reopened.get(temporary.id);
   assert.equal(migrated.kind, 'persistent');
-  assert.equal(migrated.defaultBehavior, 'human');
+  assert.equal(migrated.defaultBehavior, 'fast');
 
   await assert.rejects(
     reopened.create({ name: 'Invalid kind', kind: 'private' }),
@@ -118,10 +118,10 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   assert.equal(persistent.browserEngine, 'chrome');
   assert.equal(ephemeral.browserEngine, 'chromium');
   assert.equal(persistent.defaultBehavior, 'human');
-  assert.equal(ephemeral.defaultBehavior, 'adaptive');
-  await assert.rejects(
-    store.create({ name: 'Unsafe persistent', defaultBehavior: 'adaptive' }),
-    { code: 'PERSISTENT_BEHAVIOR_FIXED' }
+  assert.equal(ephemeral.defaultBehavior, 'auto');
+  assert.equal(
+    (await store.create({ name: 'Fast persistent', defaultBehavior: 'fast' })).defaultBehavior,
+    'fast'
   );
 
   const data = JSON.parse(await readFile(config.filePath, 'utf8'));
@@ -137,7 +137,7 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   assert.equal((await migrated.get(persistent.id)).browserEngine, 'chrome');
   assert.equal((await migrated.get(ephemeral.id)).browserEngine, 'chromium');
   const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
-  assert.equal(persisted.version, 4);
+  assert.equal(persisted.version, 5);
   assert.equal(persisted.profiles.some((profile) => Object.hasOwn(profile, 'browserChannel')), false);
 
   persisted.version = 1;
@@ -148,6 +148,23 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   const rejected = new ProfileStore(config);
   await assert.rejects(rejected.init(), { code: 'PROFILE_ENGINE_MIGRATION_REQUIRED' });
   assert.equal(await readFile(config.filePath, 'utf8'), before);
+});
+
+test('ProfileStore migrates legacy adaptive behavior to auto without moving Profile data', async (t) => {
+  const { config, store } = await fixture(t);
+  const profile = await store.create({ name: 'Legacy auto', kind: 'ephemeral' });
+  const before = JSON.parse(await readFile(config.filePath, 'utf8'));
+  before.version = 4;
+  before.profiles[0].defaultBehavior = 'adaptive';
+  const originalPath = before.profiles[0].userDataDir;
+  await writeFile(config.filePath, `${JSON.stringify(before)}\n`);
+
+  const migrated = new ProfileStore(config);
+  await migrated.init();
+  const current = await migrated.get(profile.id);
+  assert.equal(current.defaultBehavior, 'auto');
+  assert.equal(current.userDataDir, originalPath);
+  assert.equal(JSON.parse(await readFile(config.filePath, 'utf8')).version, 5);
 });
 
 test('ProfileStore rejects incomplete v2/v3 engine metadata without rewriting the store', async (t) => {
@@ -280,7 +297,7 @@ test('ProfileStore migrates private ownership metadata in place and keeps global
   assert.equal(Object.hasOwn(migratedProfile, 'createdBy'), false);
   assert.equal(Object.hasOwn(migratedProfile, 'access'), false);
   const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
-  assert.equal(persisted.version, 4);
+  assert.equal(persisted.version, 5);
 
   await migrated.acquireLease(profile.id, 'task:agent-b', {
     pid: 701,

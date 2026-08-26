@@ -70,8 +70,7 @@ export async function run({ page, context, input, outputDir, journey, progress, 
       ? behaviorTrace.pointerMoves >= 4 && behaviorTrace.inputEvents >= 16 &&
         behaviorTrace.wheelEvents >= 2 && readingDelay > 0 && readingDelay <= 8_000
       : readingDelay === 0,
-    mode: 'human',
-    effectiveMode: 'human',
+    mode: 'profile-controlled',
     pointerMoves: behaviorTrace.pointerMoves,
     inputEvents: behaviorTrace.inputEvents,
     wheelEvents: behaviorTrace.wheelEvents,
@@ -115,7 +114,7 @@ export async function run({ page, context, input, outputDir, journey, progress, 
   const passed = evidence.every((item) => item.ok);
   const report = {
     passed,
-    behavior: 'human',
+    interactionContract: journey.contract,
     checkedAt: new Date().toISOString(),
     evidence
   };

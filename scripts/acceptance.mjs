@@ -180,17 +180,20 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       profile.browserEngine === 'chromium' && profile.defaultBehavior === 'human'
     );
 
-    let persistentBehaviorFixed = false;
-    try {
-      await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, {
-        method: 'PATCH',
-        token,
-        body: { defaultBehavior: 'human' }
-      });
-    } catch (error) {
-      persistentBehaviorFixed = error.code === 'PERSISTENT_BEHAVIOR_FIXED';
-    }
-    add('persistent Profile behavior is immutable', persistentBehaviorFixed);
+    const persistentFast = await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, {
+      method: 'PATCH',
+      token,
+      body: { defaultBehavior: 'fast' }
+    });
+    const persistentHuman = await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, {
+      method: 'PATCH',
+      token,
+      body: { defaultBehavior: 'human' }
+    });
+    add(
+      'persistent Profile behavior is adjustable',
+      persistentFast.profile.defaultBehavior === 'fast' && persistentHuman.profile.defaultBehavior === 'human'
+    );
 
     const dashboardAuthorization = await api(baseUrl, '/v1/dashboard/authorize', {
       method: 'POST',
@@ -250,7 +253,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       body: {
         name: `Ephemeral acceptance ${Date.now()}`,
         kind: 'ephemeral',
-        defaultBehavior: 'adaptive',
+        defaultBehavior: 'auto',
         headless: true
       }
     }));
@@ -258,7 +261,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       'ephemeral Profile policy',
       ephemeralProfile?.id && ephemeralProfile.kind === 'ephemeral' &&
       ephemeralProfile.state === 'idle' && ephemeralProfile.browserEngine === 'chromium' &&
-      ephemeralProfile.defaultBehavior === 'adaptive'
+      ephemeralProfile.defaultBehavior === 'auto'
     );
 
     let taskBehaviorRejected = false;
@@ -279,7 +282,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     }
     add('task behavior override removed', taskBehaviorRejected);
 
-    for (const behavior of ['fast', 'human', 'adaptive']) {
+    for (const behavior of ['fast', 'human', 'auto']) {
       await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}`, {
         method: 'PATCH',
         token,
@@ -301,11 +304,52 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       add(
         `${behavior} Profile policy with full-human task`,
         task.state === 'completed' &&
-          task.behavior === 'human' &&
+          task.behavior === behavior &&
           task.interactionContract === 'full-human-v1',
         task.error ? `${task.error.code}: ${task.error.message}` : undefined
       );
     }
+
+    const liveCreated = await api(baseUrl, '/v1/tasks', {
+      method: 'POST',
+      token,
+      body: {
+        profileId: ephemeralProfile.id,
+        taskType: 'durable-delay',
+        idempotencyKey: `acceptance-${acceptanceRunId}-live-behavior`,
+        timeoutMs: 30_000,
+        input: { steps: 40, delayMs: 100 }
+      }
+    });
+    await waitForTaskState(baseUrl, token, liveCreated.task.id, 'running', 15_000);
+    const liveStates = [];
+    for (const behavior of ['fast', 'auto', 'human']) {
+      await api(baseUrl, `/v1/profiles/${encodeURIComponent(ephemeralProfile.id)}`, {
+        method: 'PATCH',
+        token,
+        body: { defaultBehavior: behavior }
+      });
+      const state = await waitForTaskState(
+        baseUrl,
+        token,
+        liveCreated.task.id,
+        'running',
+        10_000,
+        (task) => task.behavior === behavior && task.behaviorState?.configured === behavior
+      );
+      liveStates.push({
+        behavior: state.behavior,
+        effective: state.behaviorState?.effective,
+        attempts: state.history?.length
+      });
+    }
+    const liveCompleted = await waitForTask(baseUrl, token, liveCreated.task.id, 30_000);
+    add(
+      'running task behavior switches live without Worker restart',
+      liveCompleted.state === 'completed' && liveStates.length === 3 &&
+        liveStates.every((state) => state.attempts === 1) &&
+        liveStates.map((state) => state.behavior).join(',') === 'fast,auto,human'
+    );
 
     for (const task of tasks) {
       const { artifacts } = await api(baseUrl, `/v1/tasks/${encodeURIComponent(task.id)}/artifacts`, { token });
@@ -327,7 +371,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
         task.id,
         byName.get('acceptance.json').id
       ));
-      if (!report.passed || report.behavior !== task.behavior) {
+      if (!report.passed || report.interactionContract !== 'full-human-v1') {
         throw Object.assign(new Error(`Acceptance report does not match task ${task.id}`), {
           code: 'ACCEPTANCE_ARTIFACT_MISMATCH'
         });

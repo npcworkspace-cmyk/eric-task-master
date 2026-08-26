@@ -32,7 +32,7 @@ Usage:
   taskmaster dashboard-open [TASK_ID] [--json]
   taskmaster manager stop [--json]
   taskmaster profiles list [--json]
-  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior fast|adaptive|human] [--headless]
+  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior fast|auto|human] [--headless]
   taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE]
   taskmaster profiles open|close PROFILE_ID
   taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]

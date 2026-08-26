@@ -143,7 +143,7 @@ The supported `inputSchema` subset is deliberately small and enforced at registr
 
 ## Runtime rules
 
-- Task Packs must declare `full-human-v1` and use `journey.open/click/fill/type/hover/scroll/read/select/upload/navigate/nextPage/back`. The Pack specifies sequence, pacing limits, checkpoints, and business logic; the runtime supplies the physical interaction mechanics.
+- Task Packs must declare `full-human-v1` and use `journey.open/click/fill/type/hover/scroll/read/select/upload/navigate/nextPage/back`. The Pack specifies sequence, platform rate limits, checkpoints, and business logic; the runtime supplies the physical interaction mechanics and Profile-controlled live pacing.
 - In a contracted Pack, `page`, `context`, locators, and `semantic` remain available for deterministic reads and assertions, but their mutating methods are blocked. Direct mutation is recorded as a contract violation and causes completion to fail even if module code catches the first exception. The legacy `action` mutation surface is unavailable.
 - Use `journey.nextPage(locator)` for visible pagination and `journey.navigate(locator)` for visible drill-down. Do not replace site controls with constructed destination URLs during a normal in-page journey. `journey.open` is for initial or independent work-item entries and explicit checkpoint recovery.
 - After observing content that the workflow actually reads, call `await journey.read({ words: observedWordCount })`. Do not add custom pointer timing, typing cadence, or scroll-shape code.

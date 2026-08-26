@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.2.0**
+Version: **2.3.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -83,7 +83,7 @@ Copyable request for a new Agent:
 
 After the first bootstrap, the user should be able to ask naturally:
 
-> Use Eric Task Master with an ephemeral Profile and adaptive behavior to research these sites, report progress, save evidence, and close every task window when finished.
+> Use Eric Task Master with an ephemeral Profile and auto behavior to research these sites, report progress, save evidence, and close every task window when finished.
 
 The Agent then uses one durable loop: discover a task type, start once with an idempotency key, retain the task ID, wait or reconnect to that ID, inspect diagnostics when attention is required, and accept completion only after evidence and cleanup are verified.
 
@@ -94,16 +94,16 @@ Every task start returns a clickable Owner Console link focused on that task. Th
 - **persistent** — isolated reusable state for logged-in and recurring work; open it from the Dashboard and sign in directly in its Playwright window;
 - **ephemeral / 隐身临时** — a clean non-persistent browser for each no-login task, destroyed after cleanup.
 
-New persistent Profiles default to the local stable Chrome channel and fixed `human` behavior. New ephemeral Profiles default to the project-pinned Chromium and `adaptive` behavior, with `fast`, `adaptive`, or `human` selectable on the Profile. The engine is immutable and never falls back automatically. Manual persistent-Profile windows are always visible; `headless` affects task runs only.
+New persistent Profiles default to the local stable Chrome channel and `human`; new ephemeral Profiles default to the project-pinned Chromium and `auto`. Every Profile can select `fast`, `auto`, or `human`. A change is acknowledged by the live task Worker and takes effect at its next scheduling or movement boundary without restarting the task. The engine is immutable and never falls back automatically. Manual persistent-Profile windows are always visible; `headless` affects task runs only.
 
 ### Behavior
 
-- **fast** — an optional speed-first policy for ephemeral Profiles and deterministic, data-heavy work;
+- **fast** — compressed pacing for deterministic or data-heavy work;
 - **human** — rendered-page traversal, curved pointer movement, in-target clicks, keyboard input, segmented scrolling, reading cadence, and verified page changes;
-- **adaptive** — starts fast and temporarily becomes cautious or human-paced after dynamic-page signals, occlusion, timeout, uncertain navigation, action failure, or rate limiting.
+- **auto** — balances speed and caution, escalating after dynamic-page signals, occlusion, timeout, uncertain navigation, action failure, or rate limiting, then accelerating again after recovery.
 
 Human pacing is a reliability policy, not fingerprint spoofing, a promise to bypass website controls, or protection from platform enforcement.
-Behavior is selected on the Profile; task start does not accept a behavior override. Every versioned Task Pack uses the stricter `full-human-v1` journey contract, so the runtime—not each Pack—performs its visible actions consistently and records a 10/10 interaction audit.
+Behavior is selected on the Profile and can be changed while its task runs; task start does not accept a behavior override. Every versioned Task Pack uses the stricter `full-human-v1` journey contract in all three modes. The Pack always follows rendered controls, while the Profile mode controls how quickly and cautiously the central runtime performs that journey and records its 10/10 interaction audit.
 
 ### Multi-Agent workbench
 

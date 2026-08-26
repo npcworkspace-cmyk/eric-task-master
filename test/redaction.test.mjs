@@ -104,7 +104,7 @@ test('Manager and MCP Profile views share the same nullable public contract', ()
     name: 'Contract',
     kind: 'persistent',
     state: 'idle',
-    defaultBehavior: 'adaptive',
+    defaultBehavior: 'auto',
     headless: false,
     browserEngine: 'chromium',
     access: 'private',

@@ -189,7 +189,7 @@ export async function runCommercialAcceptance() {
     const profiles = await Promise.all(Array.from({ length: 3 }, (_, index) => client.createProfile({
       name: `Commercial ephemeral ${index + 1}`,
       kind: 'ephemeral',
-      defaultBehavior: 'adaptive',
+      defaultBehavior: 'auto',
       headless: true
     })));
     assertCheck(checks, 'three isolated ephemeral Profiles', profiles.every((profile) => profile.kind === 'ephemeral'));

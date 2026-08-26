@@ -158,7 +158,7 @@ const TaskSchema = z.strictObject({
     configured: z.string().optional(),
     effective: z.string().optional(),
     at: z.string().optional(),
-    adaptive: z.strictObject({
+    auto: z.strictObject({
       level: z.number().optional(),
       label: z.string().optional(),
       actionsRemaining: z.number().optional(),
@@ -455,7 +455,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   register(server, taskMaster, {
     name: 'taskmaster_profiles_update',
     title: 'Update browser profile',
-    description: 'Update one globally shared local Profile. Same-Profile browser execution remains exclusive and queued.',
+    description: 'Update one globally shared local Profile. Behavior changes are confirmed live by any running task Worker without restarting the task.',
     inputSchema: z.strictObject({
       profileId: IdentifierSchema,
       name: z.string().trim().min(1).max(80).optional(),

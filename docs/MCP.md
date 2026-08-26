@@ -73,9 +73,9 @@ Every tool publishes an input schema, output schema, and MCP annotations. Generi
 
 The MCP surface never accepts arbitrary module paths, JavaScript evaluation, cookie/session transfer, authorization headers, filesystem paths, or raw Playwright handles.
 
-Profile creation accepts an immutable `browserEngine` of `chrome` or `chromium`. Persistent Profiles default to `chrome` with fixed `human` behavior; ephemeral Profiles default to `chromium` with Profile-owned `adaptive` behavior. `taskmaster_tasks_start` accepts no task-level behavior override.
+Profile creation accepts an immutable `browserEngine` of `chrome` or `chromium`. Persistent Profiles default to `chrome` with `human`; ephemeral Profiles default to `chromium` with Profile-owned `auto`. Both Profile kinds expose `fast`, `auto`, and `human`. `taskmaster_tasks_start` accepts no task-level behavior override.
 
-`taskmaster_profiles_update` changes only mutable Profile fields. Profiles have no creator or access-list field and are available to every trusted local Agent. It cannot change the browser engine, and persistent Profile behavior remains fixed to `human`.
+`taskmaster_profiles_update` changes only mutable Profile fields. Profiles have no creator or access-list field and are available to every trusted local Agent. It cannot change the browser engine. A behavior change for an active Profile is successful only after the running Worker confirms it; the task, browser, attempt, and lease remain intact.
 
 ## Long tasks, progress, and cancellation
 

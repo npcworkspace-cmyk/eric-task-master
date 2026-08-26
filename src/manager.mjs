@@ -717,10 +717,15 @@ export async function createManager({
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const profileId = decodeURIComponent(profileMatch[1]);
       requireProfileAccess(await profileStore.get(profileId), auth, { manage: true });
+      const patch = validateProfilePatch(await readJson(request, { maxBytes: 32 * 1024 }));
+      const applyProfileBehavior = Object.hasOwn(patch, 'defaultBehavior')
+        ? requireTaskMethod(taskService, 'applyProfileBehavior')
+        : null;
       const profile = await profileStore.update(
         profileId,
-        validateProfilePatch(await readJson(request, { maxBytes: 32 * 1024 }))
+        patch
       );
+      if (applyProfileBehavior) await applyProfileBehavior(profileId, profile.defaultBehavior);
       sendJson(response, 200, { profile: publicProfile(profile) }, cors);
       return;
     }

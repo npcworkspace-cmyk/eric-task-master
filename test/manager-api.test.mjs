@@ -29,7 +29,7 @@ async function managerFixture(t) {
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Task Master</title>');
 
   const tasks = new Map();
-  const calls = { open: [], close: [], resumes: [], deletes: [], lifecycle: [] };
+  const calls = { open: [], close: [], behavior: [], resumes: [], deletes: [], lifecycle: [] };
   let taskService;
   const buildTaskService = ({ profileStore }) => taskService = {
     async list() {
@@ -98,6 +98,10 @@ async function managerFixture(t) {
       if (profile.lease?.ownerId === `profile-open:${id}`) {
         await profileStore.releaseLease(id, `profile-open:${id}`);
       }
+    },
+    async applyProfileBehavior(id, behavior) {
+      calls.behavior.push({ id, behavior });
+      return { profileId: id, behavior, activeApplied: 0, taskIds: [] };
     },
     async close() {
       for (const profile of await profileStore.list()) {
@@ -381,10 +385,10 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   const patchResult = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
     method: 'PATCH',
     headers: headers(manager.token),
-    body: JSON.stringify({ defaultBehavior: 'adaptive' })
+    body: JSON.stringify({ defaultBehavior: 'auto' })
   }));
   assert.equal(patchResult.response.status, 200);
-  assert.equal(patchResult.body.profile.defaultBehavior, 'adaptive');
+  assert.equal(patchResult.body.profile.defaultBehavior, 'auto');
 
   const persistentResult = await json(await fetch(`${baseUrl}/v1/profiles`, {
     method: 'POST',
@@ -394,16 +398,20 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   assert.equal(persistentResult.response.status, 201);
   assert.equal(persistentResult.body.profile.browserEngine, 'chrome');
   assert.equal(persistentResult.body.profile.defaultBehavior, 'human');
-  const fixedBehavior = await json(await fetch(
+  const liveBehavior = await json(await fetch(
     `${baseUrl}/v1/profiles/${persistentResult.body.profile.id}`,
     {
       method: 'PATCH',
       headers: headers(manager.token),
-      body: JSON.stringify({ defaultBehavior: 'human' })
+      body: JSON.stringify({ defaultBehavior: 'fast' })
     }
   ));
-  assert.equal(fixedBehavior.response.status, 400);
-  assert.equal(fixedBehavior.body.error.code, 'PERSISTENT_BEHAVIOR_FIXED');
+  assert.equal(liveBehavior.response.status, 200);
+  assert.equal(liveBehavior.body.profile.defaultBehavior, 'fast');
+  assert.deepEqual(calls.behavior, [
+    { id: profileId, behavior: 'auto' },
+    { id: persistentResult.body.profile.id, behavior: 'fast' }
+  ]);
 
   const invalidPatch = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
     method: 'PATCH',

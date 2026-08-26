@@ -73,13 +73,13 @@ Profile creation and mutable settings use the same identity:
 
 ```text
 node scripts/taskmaster.mjs profiles create --name NAME --kind persistent --engine chrome --behavior human --agent-id STABLE_ID --agent-name AGENT_NAME --json
-node scripts/taskmaster.mjs profiles create --name NAME --kind ephemeral --engine chromium --behavior adaptive --agent-id STABLE_ID --agent-name AGENT_NAME --json
-node scripts/taskmaster.mjs profiles update PROFILE_ID --name NAME --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs profiles create --name NAME --kind ephemeral --engine chromium --behavior auto --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs profiles update PROFILE_ID --behavior fast|auto|human --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs profiles open PROFILE_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs profiles close PROFILE_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 ```
 
-Persistent behavior is fixed to `human`; an ephemeral Profile may be updated to `fast`, `adaptive`, or `human` with `profiles update PROFILE_ID --behavior MODE ...`. The browser engine is immutable. `task-types install` and `task-packs install` are local authoring commands, not the standard no-adapter Agent task loop.
+Persistent Profiles default to `human`; ephemeral Profiles default to `auto`. Either kind may be updated to `fast`, `auto`, or `human`. A running task applies the change through a Worker-confirmed live control without restarting; the browser engine remains immutable. `task-types install` and `task-packs install` are local authoring commands, not the standard no-adapter Agent task loop.
 
 CLI identities provide the same trusted-local task attribution as registered MCP client IDs. Profiles are intentionally global, while task records, artifacts, reports, and command inboxes remain scoped. This is not a hostile tenant boundary. Do not mix MCP and CLI identities inside one task. Mutually untrusted Agents require separate operating-system users, sandboxes, or machines.
 

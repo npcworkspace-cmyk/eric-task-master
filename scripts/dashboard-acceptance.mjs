@@ -80,6 +80,10 @@ function createTaskHarness(profileStore, tasks, control) {
       if (ownerId) await profileStore.releaseLease(id, ownerId);
       openOwners.delete(id);
     },
+    async applyProfileBehavior(id, behavior) {
+      control.behaviorChanges.push({ id, behavior });
+      return { profileId: id, behavior, activeApplied: 0, taskIds: [] };
+    },
     async pauseTask(id, body) {
       control.taskActions.push({ id, action: 'pause' });
       const value = task(id);
@@ -164,7 +168,8 @@ const control = {
   listFailures: 0,
   conflictNextPause: false,
   taskActions: [],
-  deleteRequests: 0
+  deleteRequests: 0,
+  behaviorChanges: []
 };
 const checks = [];
 let manager;
@@ -197,7 +202,7 @@ try {
     name: '验收临时',
     kind: 'ephemeral',
     browserEngine: 'chromium',
-    defaultBehavior: 'adaptive',
+    defaultBehavior: 'auto',
     headless: true
   });
 
@@ -342,12 +347,14 @@ try {
   await page.getByRole('button', { name: 'Profiles', exact: true }).click();
   assert.equal(await page.evaluate(() => document.activeElement?.id), 'profiles-title');
   await page.getByRole('button', { name: '新建 Profile' }).click();
+  assert.equal(await page.locator('#profile-mode').inputValue(), 'human');
   await page.locator('#profile-name').fill('UI 临时');
   await page.locator('#profile-kind').selectOption('ephemeral');
-  await page.locator('#profile-mode').selectOption('adaptive');
+  assert.equal(await page.locator('#profile-mode').inputValue(), 'auto');
   await page.getByRole('button', { name: '创建 Profile' }).click();
   const temporaryCard = page.locator('.profile-card').filter({ hasText: 'UI 临时' });
   await temporaryCard.waitFor();
+  assert.equal(await temporaryCard.locator('select').inputValue(), 'auto');
   await temporaryCard.locator('select').selectOption('human');
   await temporaryCard.getByText('深度拟人', { exact: true }).first().waitFor();
   await temporaryCard.locator('input[type="checkbox"]').check();
@@ -357,6 +364,13 @@ try {
   await accountCard.getByRole('button', { name: '改名' }).click();
   const renamedCard = page.locator('.profile-card').filter({ hasText: '主账号' });
   await renamedCard.waitFor();
+  assert.deepEqual(
+    await renamedCard.locator('select option').evaluateAll((options) => options.map((option) => option.value)),
+    ['fast', 'auto', 'human']
+  );
+  await renamedCard.locator('select').selectOption('fast');
+  await renamedCard.getByText('快速', { exact: true }).first().waitFor();
+  assert.deepEqual(control.behaviorChanges.at(-1), { id: persistent.id, behavior: 'fast' });
   await renamedCard.getByRole('button', { name: '打开登录窗口' }).click();
   await renamedCard.getByRole('button', { name: '关闭窗口' }).waitFor();
   await renamedCard.getByRole('button', { name: '关闭窗口' }).click();
@@ -365,7 +379,7 @@ try {
   page.once('dialog', (dialog) => dialog.accept());
   await temporaryCard.getByRole('button', { name: '删除' }).click();
   await temporaryCard.waitFor({ state: 'detached' });
-  checks.push('Profile create, edit, rename, open, close, and delete');
+  checks.push('Profile defaults, fast/auto/human live control, create, edit, rename, open, close, and delete');
 
   if (screenshotPath) {
     await page.getByRole('button', { name: '任务', exact: true }).click();

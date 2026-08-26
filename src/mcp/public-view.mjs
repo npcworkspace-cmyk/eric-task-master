@@ -237,12 +237,12 @@ export function publicTask(task, { includeResult = true } = {}) {
       ['configured', stringValue(task.behaviorState.configured, 32)],
       ['effective', stringValue(task.behaviorState.effective, 32)],
       ['at', stringValue(task.behaviorState.at, 64)],
-      ['adaptive', task.behaviorState.adaptive && typeof task.behaviorState.adaptive === 'object'
+      ['auto', task.behaviorState.auto && typeof task.behaviorState.auto === 'object'
         ? definedEntries([
-          ['level', numberValue(task.behaviorState.adaptive.level)],
-          ['label', stringValue(task.behaviorState.adaptive.label, 32)],
-          ['actionsRemaining', numberValue(task.behaviorState.adaptive.actionsRemaining)],
-          ['signal', stringValue(task.behaviorState.adaptive.signal, 64)]
+          ['level', numberValue(task.behaviorState.auto.level)],
+          ['label', stringValue(task.behaviorState.auto.label, 32)],
+          ['actionsRemaining', numberValue(task.behaviorState.auto.actionsRemaining)],
+          ['signal', stringValue(task.behaviorState.auto.signal, 64)]
         ])
         : undefined]
     ])

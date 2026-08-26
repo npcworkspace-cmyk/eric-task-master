@@ -1,6 +1,6 @@
 ---
 name: eric-task-master
-description: Install, connect, and use Eric Task Master for durable Playwright browser jobs with persistent or ephemeral Profiles, adaptive behavior, task queues, progress health, semantic diagnostics, recovery, artifacts, and composable Task Packs.
+description: Install, connect, and use Eric Task Master for durable Playwright browser jobs with persistent or ephemeral Profiles, live fast-auto-human behavior control, task queues, progress health, semantic diagnostics, recovery, artifacts, and composable Task Packs.
 ---
 
 # Eric Task Master
@@ -31,7 +31,7 @@ When status and Profile discovery succeed, ask what browser task to run. Create 
 - choose `persistent` for login state or recurring account work. Open it from the Dashboard and let the user sign in directly in that Playwright window;
 - choose `ephemeral` for no-login temporary work. It starts clean for every task, retains no browser state after cleanup, and cannot be opened manually.
 
-Persistent Profiles default to stable local Chrome and fixed `human` behavior. Ephemeral Profiles default to pinned Chromium and Profile-owned `adaptive` behavior, with all three modes selectable. Choose the engine and behavior when creating the Profile; the engine is immutable, persistent behavior cannot be patched, and task start has no behavior override. A registered Task Pack with `full-human-v1` always executes through the central Human Journey engine even on an ephemeral Profile whose ordinary policy is fast or adaptive. A manual persistent-Profile window is always visible even when its task `headless` setting is enabled.
+Persistent Profiles default to stable local Chrome and `human`. Ephemeral Profiles default to pinned Chromium and `auto`. Both Profile kinds expose `fast`, `auto`, and `human`; the engine is immutable, while behavior remains editable and task start has no behavior override. `taskmaster_profiles_update` applies a behavior change to a running task through a Worker-confirmed live control message, without restarting the task. A registered Task Pack with `full-human-v1` always keeps rendered traversal, pointer movement, in-target clicks, keyboard cadence, segmented scrolling, and transition verification; the Profile mode controls the speed and caution of those mechanics. A manual persistent-Profile window is always visible even when its task `headless` setting is enabled.
 
 Every Profile is shared by all trusted local Agents connected to this Manager. Choose a Profile by purpose and availability, not creator identity. The same Profile still runs only one browser task at a time, so concurrent work queues safely. Task histories, results, artifacts, commands, and reports remain scoped to the Agent that started the task.
 
@@ -65,11 +65,11 @@ Profile administration on this path uses `profiles create`, `profiles update`, `
 
 ## Profile behavior choice
 
-- `fast`: optional speed-first Playwright policy for an ephemeral Profile and deterministic, data-heavy work.
+- `fast`: compressed pacing for deterministic or data-heavy work.
 - `human`: rendered-page traversal, bounded pointer curves and corrections, in-target clicks, keyboard input and selection rhythm, segmented eased scrolling, explicit reading dwell, and verified visible navigation.
-- `adaptive`: starts fast, uses a brief cautious tier for ordinary dynamic content, and temporarily uses guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. It returns to fast after successful actions and never auto-replays an unknown effect.
+- `auto`: balances speed and caution, uses a brief cautious tier for ordinary dynamic content, and temporarily deepens human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. It returns toward fast after successful actions and never auto-replays an unknown effect.
 
-Set behavior on an ephemeral Profile before submitting work. Persistent Profiles always use `human`. The task status exposes configured/effective behavior and active cooldown timing. Human-like pacing is a reliability option, not fingerprint spoofing, a promise to evade website controls, or protection from platform enforcement.
+Set behavior on either Profile kind. A running change is successful only after the active Worker acknowledges it; it interrupts an existing pacing delay and applies at the next JavaScript scheduling, pointer, key, or scroll boundary. It does not cancel a site-required cooldown or replay an unknown effect. The task status exposes configured/effective behavior, the `auto` guard state, and active cooldown timing. Human-like pacing is a reliability option, not fingerprint spoofing, a promise to evade website controls, or protection from platform enforcement.
 
 ## Diagnostics and handoff
 

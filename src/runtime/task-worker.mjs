@@ -15,6 +15,7 @@ import { writeCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 import { createJourneyHelper } from '../lib/journey.mjs';
 import { createObservationFacade } from '../lib/observation-facade.mjs';
 import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
+import { isBehaviorMode } from '../contracts.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 20_000;
 const DEFAULT_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
@@ -356,6 +357,8 @@ let activeSemantic = null;
 let activeHandoff = null;
 let activePauseControl = null;
 let pendingPauseControls = [];
+let activeActionHelper = null;
+let pendingBehavior = null;
 let activeDiagnosticsPath = null;
 let activeDiagnostics = null;
 let activeDiagnosticsWrite = Promise.resolve();
@@ -511,6 +514,7 @@ function restrictedPackAction(action) {
   return Object.freeze({
     get mode() { return action.mode; },
     get effectiveMode() { return action.effectiveMode; },
+    get autoState() { return action.autoState; },
     get adaptiveState() { return action.adaptiveState; },
     get audit() { return action.audit; },
     signal: () => fail('signal'),
@@ -536,6 +540,11 @@ export async function runTaskWorker(config, {
   ) {
     const error = new TypeError(`Unsupported interaction contract: ${config.interactionContract}`);
     error.code = 'TASK_INTERACTION_CONTRACT_UNSUPPORTED';
+    throw error;
+  }
+  if (!isBehaviorMode(config.behavior)) {
+    const error = new TypeError(`Unsupported behavior mode: ${config.behavior}`);
+    error.code = 'TASK_BEHAVIOR_UNSUPPORTED';
     throw error;
   }
   activePage = null;
@@ -822,7 +831,7 @@ export async function runTaskWorker(config, {
     const fullHumanJourney = config.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT;
     const rawAction = createActionHelper({
       page,
-      mode: fullHumanJourney ? 'human' : config.behavior,
+      mode: pendingBehavior ?? config.behavior,
       abortSignal: executionSignal,
       strictVisibleTraversal: fullHumanJourney,
       onEffect: async (event) => {
@@ -830,12 +839,10 @@ export async function runTaskWorker(config, {
         safeSend({ type: 'activity', activity: browserEffectActivity(event) });
         return sequence;
       },
-      onAdaptiveState: (state) => safeSend({
+      onBehaviorState: (state) => safeSend({
         type: 'behavior',
         behavior: {
-          configured: config.behavior,
-          effective: state.level >= 2 ? 'human' : state.level === 1 ? 'cautious' : 'fast',
-          adaptive: state,
+          ...state,
           at: new Date().toISOString()
         }
       }),
@@ -846,6 +853,16 @@ export async function runTaskWorker(config, {
         });
         const diagnostics = await captureFailure(page, config.outputDir, `action-${operation}`, outputBudget);
         lastScreenshot = diagnostics.screenshotPath;
+      }
+    });
+    activeActionHelper = rawAction;
+    safeSend({
+      type: 'behavior',
+      behavior: {
+        configured: rawAction.mode,
+        effective: rawAction.effectiveMode,
+        ...(rawAction.mode === 'auto' ? { auto: rawAction.autoState } : {}),
+        at: new Date().toISOString()
       }
     });
     const guardedAction = (method) => (...args) => pauseGate.run(() => {
@@ -859,6 +876,7 @@ export async function runTaskWorker(config, {
     const action = Object.freeze({
       get mode() { return rawAction.mode; },
       get effectiveMode() { return rawAction.effectiveMode; },
+      get autoState() { return rawAction.autoState; },
       get adaptiveState() { return rawAction.adaptiveState; },
       get audit() { return rawAction.audit; },
       signal: (...args) => rawAction.signal(...args),
@@ -1060,6 +1078,8 @@ export async function runTaskWorker(config, {
     activeHandoff = null;
     activePauseControl = null;
     pendingPauseControls = [];
+    activeActionHelper = null;
+    pendingBehavior = null;
     activeDiagnosticsPath = null;
     activeDiagnostics = null;
     safeSend({
@@ -1088,6 +1108,37 @@ if (typeof process.send === 'function') {
       return;
     }
     if (message?.type === 'cancel') controller.abort();
+    if (message?.type === 'set_behavior') {
+      const requestId = typeof message.requestId === 'string' ? message.requestId : null;
+      try {
+        if (!isBehaviorMode(message.behavior)) {
+          const error = new TypeError(`Unsupported behavior mode: ${message.behavior}`);
+          error.code = 'TASK_BEHAVIOR_UNSUPPORTED';
+          throw error;
+        }
+        pendingBehavior = message.behavior;
+        const state = activeActionHelper
+          ? activeActionHelper.setMode(message.behavior)
+          : {
+              configured: message.behavior,
+              effective: message.behavior === 'auto' ? 'fast' : message.behavior,
+              ...(message.behavior === 'auto'
+                ? { auto: { level: 0, label: 'fast', actionsRemaining: 0, signal: null } }
+                : {})
+            };
+        safeSend({
+          type: 'behavior_applied',
+          requestId,
+          behavior: { ...state, at: new Date().toISOString() }
+        });
+      } catch (error) {
+        safeSend({
+          type: 'behavior_control_error',
+          requestId,
+          error: errorPayload(error)
+        });
+      }
+    }
     if (message?.type === 'pause' || message?.type === 'resume_pause') {
       const operation = message.type === 'pause' ? 'requestPause' : 'requestResume';
       if (!activePauseControl) {

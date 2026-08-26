@@ -56,6 +56,7 @@ async function staticChecks() {
     taskPack,
     interactionContract,
     journey,
+    behavior,
     observationFacade,
     acceptance,
     mcpStdio,
@@ -77,6 +78,7 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'src', 'lib', 'task-pack.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'interaction-contract.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'journey.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'behavior.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'observation-facade.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'acceptance.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
@@ -126,6 +128,14 @@ async function staticChecks() {
     taskService.includes('pauseTask') && taskService.includes('terminateTask') &&
       taskService.includes('publishTaskReport') && taskService.includes('claimAgentInbox'),
     'durable task control, report, or Agent inbox boundary drift'
+  );
+  invariant(
+    taskService.includes('applyProfileBehavior') && taskService.includes("type: 'set_behavior'") &&
+      taskService.includes('BEHAVIOR_LIVE_APPLY_TIMEOUT') &&
+      taskWorker.includes("message?.type === 'set_behavior'") && taskWorker.includes('activeActionHelper.setMode') &&
+      behavior.includes('wakePacingWaiters') && behavior.includes('strictVisibleTraversal || effectiveMode()') &&
+      dashboard.includes("['fast', 'auto', 'human']"),
+    'live Profile behavior control or mandatory journey mechanics drift'
   );
   invariant(
     ['single-page', 'paginated-list', 'list-detail', 'resumable-batch', 'form-workflow']
@@ -312,7 +322,7 @@ async function staticChecks() {
       releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
     'release preflight, monotonic version, or standalone Skill archive proof drift'
   );
-  return { passed: 46, total: 46 };
+  return { passed: 47, total: 47 };
 }
 
 function run(command, args, env = {}) {

@@ -21,7 +21,7 @@ const DEFAULT_HUMAN_TIMING = Object.freeze({
   readingMaximum: 12_000
 });
 
-const ADAPTIVE_SIGNALS = Object.freeze({
+const AUTO_SIGNALS = Object.freeze({
   dynamic: Object.freeze({ level: 1, actions: 2 }),
   action_failure: Object.freeze({ level: 2, actions: 4 }),
   occluded: Object.freeze({ level: 2, actions: 4 }),
@@ -30,7 +30,8 @@ const ADAPTIVE_SIGNALS = Object.freeze({
   rate_limit: Object.freeze({ level: 3, actions: 6 })
 });
 
-const ADAPTIVE_LABELS = Object.freeze(['fast', 'cautious', 'guarded', 'cooldown']);
+const AUTO_LABELS = Object.freeze(['fast', 'cautious', 'guarded', 'cooldown']);
+const PACING_SCALE = Object.freeze({ fast: 0.18, cautious: 0.52, human: 1 });
 
 export class BehaviorActionError extends Error {
   constructor(operation, cause) {
@@ -70,7 +71,7 @@ function easedSegments(total, steps, random) {
   });
 }
 
-function adaptiveFailureSignal(error) {
+function autoFailureSignal(error) {
   const text = `${error?.name || ''} ${error?.code || ''} ${error?.message || ''}`.toLowerCase();
   if (text.includes('occlud') || text.includes('intercept')) return 'occluded';
   if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
@@ -81,7 +82,7 @@ function adaptiveFailureSignal(error) {
 }
 
 /**
- * Creates the task-scoped action facade used by task modules. Adaptive mode
+ * Creates the task-scoped action facade used by task modules. Auto mode
  * keeps deterministic work fast, adds only short settling pauses for ordinary
  * dynamic-page signals, and uses full human pacing after stronger ambiguity or
  * rate-limit signals. It never retries an unknown action outcome automatically.
@@ -94,18 +95,23 @@ export function createActionHelper({
   abortSignal,
   onFailure = async () => {},
   onEffect = async () => undefined,
+  onAutoState = null,
   onAdaptiveState = () => {},
+  onBehaviorState = () => {},
   timing = DEFAULT_HUMAN_TIMING,
   strictVisibleTraversal = false
 } = {}) {
   if (!page) throw new TypeError('page is required');
   if (!isBehaviorMode(mode)) throw new TypeError(`Unsupported behavior mode: ${mode}`);
 
-  let adaptiveLevel = 0;
-  let adaptiveActionsRemaining = 0;
-  let adaptiveSignal = null;
-  let adaptiveGeneration = 0;
+  let currentMode = mode;
+  let autoLevel = 0;
+  let autoActionsRemaining = 0;
+  let autoSignal = null;
+  let autoGeneration = 0;
   let cursor = null;
+  const pacingWaiters = new Set();
+  const autoStateListener = typeof onAutoState === 'function' ? onAutoState : onAdaptiveState;
   const metrics = {
     navigations: 0,
     clicks: 0,
@@ -127,18 +133,51 @@ export function createActionHelper({
     throw abortSignal.reason instanceof Error ? abortSignal.reason : new Error('Task execution was aborted');
   };
 
-  const usesHumanTiming = () => mode === 'human' || (mode === 'adaptive' && adaptiveLevel >= 2);
-  const usesCautiousTiming = () => mode === 'adaptive' && adaptiveLevel === 1;
+  const effectiveMode = () => {
+    if (currentMode === 'human') return 'human';
+    if (currentMode === 'auto' && autoLevel >= 2) return 'human';
+    if (currentMode === 'auto' && autoLevel === 1) return 'cautious';
+    return 'fast';
+  };
+  const usesHumanMechanics = () => strictVisibleTraversal || effectiveMode() === 'human';
+
+  function scaledRange(range, { minimum = 0 } = {}) {
+    const scale = PACING_SCALE[effectiveMode()];
+    return [
+      Math.max(minimum, Math.round(range[0] * scale)),
+      Math.max(minimum, Math.round(range[1] * scale))
+    ];
+  }
+
+  function pacingNumber(range, options) {
+    return numberBetween(scaledRange(range, options), random);
+  }
+
+  async function pacingSleep(milliseconds) {
+    if (milliseconds <= 0) return false;
+    let wake;
+    const modeChanged = new Promise((resolve) => {
+      wake = () => resolve(true);
+      pacingWaiters.add(wake);
+    });
+    try {
+      return await Promise.race([
+        Promise.resolve(sleep(milliseconds)).then(() => false),
+        modeChanged
+      ]);
+    } finally {
+      pacingWaiters.delete(wake);
+    }
+  }
+
+  function wakePacingWaiters() {
+    for (const wake of pacingWaiters) wake();
+    pacingWaiters.clear();
+  }
 
   async function pause(range) {
-    if (usesHumanTiming()) {
-      await sleep(numberBetween(range, random));
-    } else if (usesCautiousTiming()) {
-      const cautiousRange = range === timing.beforeAction
-        ? timing.cautiousBeforeAction
-        : timing.cautiousAfterAction;
-      await sleep(numberBetween(cautiousRange, random));
-    }
+    if (!usesHumanMechanics() && effectiveMode() === 'fast') return;
+    await pacingSleep(pacingNumber(range));
   }
 
   function viewportSize() {
@@ -148,7 +187,11 @@ export function createActionHelper({
   }
 
   async function humanWheel(deltaX, deltaY, requestedSteps) {
-    const steps = Math.max(3, Math.min(12, Number(requestedSteps) || numberBetween([5, 9], random)));
+    const defaultSteps = pacingNumber([5, 9], { minimum: 3 });
+    const steps = Math.max(
+      3,
+      Math.min(12, strictVisibleTraversal ? defaultSteps : Number(requestedSteps) || defaultSteps)
+    );
     const xSegments = easedSegments(deltaX, steps, random);
     const ySegments = easedSegments(deltaY, steps, random);
     metrics.scrollGestures += 1;
@@ -156,7 +199,7 @@ export function createActionHelper({
       throwIfAborted();
       await page.mouse.wheel(xSegments[index], ySegments[index]);
       metrics.wheelEvents += 1;
-      if (index !== steps - 1) await sleep(numberBetween(timing.scrollPause, random));
+      if (index !== steps - 1) await pacingSleep(pacingNumber(timing.scrollPause));
     }
   }
 
@@ -185,12 +228,12 @@ export function createActionHelper({
       if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 8) break;
       await humanWheel(0, deltaY);
       metrics.targetTraversals += 1;
-      await sleep(numberBetween(timing.scrollGesturePause, random));
+      await pacingSleep(pacingNumber(timing.scrollGesturePause));
       if (Math.abs(deltaY) > viewport.height * 0.35 && random() < 0.22) {
         const correction = -Math.sign(deltaY) * numberBetween([18, 54], random);
-        await humanWheel(0, correction, numberBetween([3, 5], random));
+        await humanWheel(0, correction, pacingNumber([3, 5], { minimum: 3 }));
         metrics.pointerCorrections += 1;
-        await sleep(numberBetween(timing.scrollPause, random));
+        await pacingSleep(pacingNumber(timing.scrollPause));
       }
       const next = await locator.boundingBox?.();
       if (!next) break;
@@ -236,7 +279,7 @@ export function createActionHelper({
       );
       metrics.pointerMoves += 1;
       if (correction) metrics.pointerCorrections += 1;
-      if (index !== steps) await sleep(numberBetween(timing.mouseStepPause, random));
+      if (index !== steps) await pacingSleep(pacingNumber(timing.mouseStepPause));
     }
   }
 
@@ -256,7 +299,7 @@ export function createActionHelper({
         throw error;
       }
       await locator.hover({ ...(requestedPosition ? { position: requestedPosition } : {}) });
-      await sleep(numberBetween(timing.hoverPause, random));
+      await pacingSleep(pacingNumber(timing.hoverPause));
       return requestedPosition || null;
     }
 
@@ -275,7 +318,10 @@ export function createActionHelper({
     const dx = target.x - cursor.x;
     const dy = target.y - cursor.y;
     const distance = Math.hypot(dx, dy);
-    const steps = Math.max(numberBetween(timing.mouseSteps, random), Math.min(36, Math.round(distance / 28)));
+    const steps = Math.max(
+      pacingNumber(timing.mouseSteps, { minimum: 6 }),
+      Math.min(36, Math.round(distance / 28))
+    );
     const start = cursor;
     if (distance > 140 && random() < 0.52) {
       const overshootDistance = Math.min(14, Math.max(4, distance * 0.025));
@@ -284,24 +330,32 @@ export function createActionHelper({
         y: target.y + dy / distance * overshootDistance
       };
       await pointerPath(start, overshoot, steps);
-      await pointerPath(overshoot, target, numberBetween(timing.mouseCorrectionSteps, random), { correction: true });
+      await pointerPath(
+        overshoot,
+        target,
+        pacingNumber(timing.mouseCorrectionSteps, { minimum: 2 }),
+        { correction: true }
+      );
     } else {
       await pointerPath(start, target, steps);
     }
     cursor = target;
-    await sleep(numberBetween(timing.hoverPause, random));
+    await pacingSleep(pacingNumber(timing.hoverPause));
     if (traversedBox && (Math.abs(traversedBox.x - box.x) > 2 || Math.abs(traversedBox.y - box.y) > 2)) {
-      await sleep(numberBetween(timing.hoverPause, random));
+      await pacingSleep(pacingNumber(timing.hoverPause));
     }
     return position;
   }
 
   async function humanClick(locator, options = {}) {
     const position = await moveToLocator(locator, options.position);
+    const { delay: requestedDelay, ...clickOptions } = options;
     const result = await locator.click({
-      ...options,
+      ...clickOptions,
       ...(position && options.position === undefined ? { position } : {}),
-      ...(options.delay === undefined ? { delay: numberBetween(timing.clickDelay, random) } : {})
+      delay: strictVisibleTraversal || requestedDelay === undefined
+        ? pacingNumber(timing.clickDelay)
+        : requestedDelay
     });
     metrics.clicks += 1;
     return result;
@@ -309,28 +363,30 @@ export function createActionHelper({
 
   async function enterText(locator, value, options) {
     const { delay: requestedDelay, ...fillOptions } = options;
-    if (!usesHumanTiming()) return locator.fill(String(value), fillOptions);
+    if (!usesHumanMechanics()) return locator.fill(String(value), fillOptions);
     await humanClick(locator);
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
     await page.keyboard.press('Backspace');
     let result;
     for (const character of Array.from(String(value))) {
       throwIfAborted();
-      const delay = requestedDelay ?? numberBetween(timing.keyDelay, random);
+      const delay = strictVisibleTraversal || requestedDelay === undefined
+        ? pacingNumber(timing.keyDelay)
+        : requestedDelay;
       if (typeof locator.pressSequentially === 'function') {
         result = await locator.pressSequentially(character, { delay });
       } else {
         result = await locator.type(character, { delay });
       }
       metrics.typedCharacters += 1;
-      if (/[,.;:!?，。！？；：、]/u.test(character)) await sleep(numberBetween(timing.punctuationPause, random));
-      else if (/\s/u.test(character)) await sleep(numberBetween(timing.wordPause, random));
+      if (/[,.;:!?，。！？；：、]/u.test(character)) await pacingSleep(pacingNumber(timing.punctuationPause));
+      else if (/\s/u.test(character)) await pacingSleep(pacingNumber(timing.wordPause));
     }
     return result;
   }
 
   async function chooseSelectOption(locator, value, options) {
-    if (!usesHumanTiming()) return locator.selectOption(value, options);
+    if (!usesHumanMechanics()) return locator.selectOption(value, options);
     const selection = await locator.evaluate((select, requested) => {
       const first = Array.isArray(requested) ? requested[0] : requested;
       const requestedIndex = typeof first === 'object' && first !== null ? first.index : undefined;
@@ -360,16 +416,16 @@ export function createActionHelper({
     const direction = selection.targetIndex >= selection.currentIndex ? 'ArrowDown' : 'ArrowUp';
     const distance = Math.abs(selection.targetIndex - selection.currentIndex);
     for (let index = 0; index < distance; index += 1) {
-      await sleep(numberBetween(timing.selectionKeyPause, random));
+      await pacingSleep(pacingNumber(timing.selectionKeyPause));
       // Do not refocus the locator here: on macOS the native picker owns the
       // active keyboard surface, and refocusing the DOM element closes it.
       await page.keyboard.press(direction);
       metrics.selectionKeyEvents += 1;
     }
-    await sleep(numberBetween(timing.selectionKeyPause, random));
+    await pacingSleep(pacingNumber(timing.selectionKeyPause));
     await page.keyboard.press('Enter');
     metrics.selectionKeyEvents += 1;
-    await sleep(numberBetween(timing.selectionKeyPause, random));
+    await pacingSleep(pacingNumber(timing.selectionKeyPause));
     await page.keyboard.press('Tab');
     metrics.selectionKeyEvents += 1;
     let actual = await locator.inputValue?.();
@@ -391,40 +447,72 @@ export function createActionHelper({
   }
 
   function signal(kind) {
-    if (mode !== 'adaptive') return null;
-    const policy = ADAPTIVE_SIGNALS[kind];
-    if (!policy) return adaptiveState();
-    if (policy.level >= adaptiveLevel) adaptiveSignal = kind;
-    adaptiveLevel = Math.max(adaptiveLevel, policy.level);
-    adaptiveActionsRemaining = Math.max(adaptiveActionsRemaining, policy.actions);
-    adaptiveGeneration += 1;
-    const state = adaptiveState();
-    Promise.resolve(onAdaptiveState(state)).catch(() => {});
+    if (currentMode !== 'auto') return null;
+    const policy = AUTO_SIGNALS[kind];
+    if (!policy) return autoState();
+    if (policy.level >= autoLevel) autoSignal = kind;
+    autoLevel = Math.max(autoLevel, policy.level);
+    autoActionsRemaining = Math.max(autoActionsRemaining, policy.actions);
+    autoGeneration += 1;
+    const state = autoState();
+    emitAutoState(state);
     return state;
   }
 
-  function adaptiveState() {
+  function autoState() {
     return Object.freeze({
-      level: adaptiveLevel,
-      label: ADAPTIVE_LABELS[adaptiveLevel],
-      actionsRemaining: adaptiveActionsRemaining,
-      signal: adaptiveSignal
+      level: autoLevel,
+      label: AUTO_LABELS[autoLevel],
+      actionsRemaining: autoActionsRemaining,
+      signal: autoSignal
     });
   }
 
-  function decayAdaptiveState(generationAtStart) {
-    if (mode !== 'adaptive' || generationAtStart !== adaptiveGeneration || adaptiveActionsRemaining <= 0) return;
-    adaptiveActionsRemaining -= 1;
-    if (adaptiveActionsRemaining === 0) {
-      adaptiveLevel = 0;
-      adaptiveSignal = null;
+  function behaviorState() {
+    return Object.freeze({
+      configured: currentMode,
+      effective: effectiveMode(),
+      ...(currentMode === 'auto' ? { auto: autoState() } : {})
+    });
+  }
+
+  function emitBehaviorState() {
+    Promise.resolve().then(() => onBehaviorState(behaviorState())).catch(() => {});
+  }
+
+  function emitAutoState(state) {
+    Promise.resolve().then(() => autoStateListener(state)).catch(() => {});
+    emitBehaviorState();
+  }
+
+  function setMode(nextMode) {
+    if (!isBehaviorMode(nextMode)) throw new TypeError(`Unsupported behavior mode: ${nextMode}`);
+    if (nextMode !== currentMode) {
+      currentMode = nextMode;
+      autoLevel = 0;
+      autoActionsRemaining = 0;
+      autoSignal = null;
+      autoGeneration += 1;
+      wakePacingWaiters();
     }
-    Promise.resolve(onAdaptiveState(adaptiveState())).catch(() => {});
+    const state = behaviorState();
+    Promise.resolve().then(() => onBehaviorState(state)).catch(() => {});
+    return state;
+  }
+
+  function decayAutoState(generationAtStart) {
+    if (currentMode !== 'auto' || generationAtStart !== autoGeneration || autoActionsRemaining <= 0) return;
+    autoActionsRemaining -= 1;
+    if (autoActionsRemaining === 0) {
+      autoLevel = 0;
+      autoSignal = null;
+    }
+    emitAutoState(autoState());
   }
 
   async function execute(operation, callback, effectOperation = operation) {
     throwIfAborted();
-    const generationAtStart = adaptiveGeneration;
+    const generationAtStart = autoGeneration;
     const sequence = await onEffect({ state: 'started', operation: effectOperation });
     let result;
     try {
@@ -434,13 +522,13 @@ export function createActionHelper({
       throwIfAborted();
       await pause(timing.afterAction);
       throwIfAborted();
-      decayAdaptiveState(generationAtStart);
+      decayAutoState(generationAtStart);
     } catch (cause) {
       // Playwright cannot prove that a failed click/navigation did not reach the
       // website. Keep the started record pending; a later attempt must inspect
       // real state and resolve the unknown outcome explicitly.
-      if (mode === 'adaptive') {
-        signal(adaptiveFailureSignal(cause));
+      if (currentMode === 'auto') {
+        signal(autoFailureSignal(cause));
       }
       if (!abortSignal?.aborted) {
         try {
@@ -460,17 +548,19 @@ export function createActionHelper({
 
   return Object.freeze({
     get mode() {
-      return mode;
+      return currentMode;
     },
 
     get effectiveMode() {
-      if (usesHumanTiming()) return 'human';
-      if (usesCautiousTiming()) return 'cautious';
-      return 'fast';
+      return effectiveMode();
+    },
+
+    get autoState() {
+      return autoState();
     },
 
     get adaptiveState() {
-      return adaptiveState();
+      return autoState();
     },
 
     get audit() {
@@ -478,6 +568,7 @@ export function createActionHelper({
     },
 
     signal,
+    setMode,
 
     async run(name, callback) {
       if (typeof callback !== 'function') throw new TypeError('action.run callback is required');
@@ -497,7 +588,7 @@ export function createActionHelper({
     async click(target, options = {}) {
       return execute('click', async () => {
         const locator = asLocator(page, target);
-        if (usesHumanTiming()) return humanClick(locator, options);
+        if (usesHumanMechanics()) return humanClick(locator, options);
         return locator.click(options);
       });
     },
@@ -513,7 +604,7 @@ export function createActionHelper({
     async hover(target, options = {}) {
       return execute('hover', async () => {
         const locator = asLocator(page, target);
-        if (usesHumanTiming()) return moveToLocator(locator, options.position);
+        if (usesHumanMechanics()) return moveToLocator(locator, options.position);
         return locator.hover(options);
       });
     },
@@ -531,7 +622,7 @@ export function createActionHelper({
       }
 
       return execute('scroll', async () => {
-        if (!usesHumanTiming()) return page.mouse.wheel(deltaX, deltaY);
+        if (!usesHumanMechanics()) return page.mouse.wheel(deltaX, deltaY);
         await humanWheel(deltaX, deltaY, normalized.steps);
       });
     },
@@ -539,17 +630,18 @@ export function createActionHelper({
     async read(input = {}) {
       const words = Number(typeof input === 'number' ? input : input.words ?? 0);
       if (!Number.isFinite(words) || words < 0) throw new TypeError('read words must be non-negative');
-      if (!usesHumanTiming()) return 0;
+      if (!usesHumanMechanics()) return 0;
       throwIfAborted();
       const duration = Math.min(
-        timing.readingMaximum,
-        numberBetween(timing.readingBase, random) + Math.round(words * numberBetween(timing.readingPerWord, random))
+        Math.max(1, Math.round(timing.readingMaximum * PACING_SCALE[effectiveMode()])),
+        pacingNumber(timing.readingBase) + Math.round(words * pacingNumber(timing.readingPerWord))
       );
-      await sleep(duration);
+      const interrupted = await pacingSleep(duration);
       throwIfAborted();
-      metrics.readingDwells += 1;
-      metrics.readingDurationMs += duration;
-      return duration;
+      const appliedDuration = interrupted ? 0 : duration;
+      if (appliedDuration > 0) metrics.readingDwells += 1;
+      metrics.readingDurationMs += appliedDuration;
+      return appliedDuration;
     },
 
     async wait(milliseconds) {

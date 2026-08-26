@@ -38,7 +38,7 @@ The manifest is named `taskpack.json`:
 
 ## Mandatory Human Journey contract
 
-Every Task Pack declares `"interactionContract": "full-human-v1"`, and every Pack module declares `meta.interactionContract: 'full-human-v1'`. The Pack defines **what** to do, in what order, how fast, when to checkpoint, and how to prove completion. The base runtime owns **how each visible browser action is physically performed**.
+Every Task Pack declares `"interactionContract": "full-human-v1"`, and every Pack module declares `meta.interactionContract: 'full-human-v1'`. The Pack defines **what** to do, in what order, platform rate limits, when to checkpoint, and how to prove completion. The base runtime owns **how each visible browser action is physically performed and paced by the Profile's live mode**.
 
 - Use `journey.open` for an entry URL or an explicit recovery entry.
 - Use `journey.navigate` and `journey.nextPage` for links, detail pages, and pagination controls. Do not construct the next-page URL when the page exposes a usable Next control.
@@ -46,7 +46,7 @@ Every Task Pack declares `"interactionContract": "full-human-v1"`, and every Pac
 - Use `page`, `context`, locators, `evaluate`, and `semantic` only for reads, assertions, extraction, and observation. Contracted Packs receive read-only wrappers; direct mutation fails at runtime even if task code catches the first error.
 - Do not accept behavior mode, pointer timing, scroll shape, or typing cadence in Pack input. Those mechanics are centrally owned and versioned.
 
-The runtime traverses rendered content with bounded wheel gestures before an offscreen target, uses curved pointer movement and in-target clicks, types through keyboard cadence, adds bounded reading dwell, verifies visible page transitions, and appends an Agent-visible `interaction-audit.json`. Completion fails unless all ten journey checks pass. This is a reliability and consistency contract, not fingerprint spoofing, CAPTCHA bypass, or a guarantee that a website cannot identify automation.
+In `fast`, `auto`, and `human`, the runtime still traverses rendered content with bounded wheel gestures before an offscreen target, uses curved pointer movement and in-target clicks, types through keyboard cadence, adds bounded reading dwell, verifies visible page transitions, and appends an Agent-visible `interaction-audit.json`. The selected Profile mode changes speed and caution, not the required journey. Completion fails unless all ten journey checks pass. This is a reliability and consistency contract, not fingerprint spoofing, CAPTCHA bypass, or a guarantee that a website cannot identify automation.
 
 For independent items in a batch, opening each supplied URL is a valid new entry. Within one item, use visible site controls for pagination and drill-down. A direct URL may be used as a checkpoint-recovery entry when the previous rendered page no longer exists; record that recovery in task progress or coverage.
 

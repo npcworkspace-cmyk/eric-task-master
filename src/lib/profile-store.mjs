@@ -2,7 +2,7 @@ import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { isBehaviorMode, isBrowserEngine, isProfileKind } from '../contracts.mjs';
+import { isBehaviorMode, isBrowserEngine, isProfileKind, normalizeBehaviorMode } from '../contracts.mjs';
 import { JsonStore } from './json-store.mjs';
 
 const DEFAULT_LEASE_TTL_MS = 60_000;
@@ -47,7 +47,7 @@ function ensureBehaviorMode(value) {
   if (!isBehaviorMode(value)) {
     throw new ProfileStoreError(
       'INVALID_BEHAVIOR_MODE',
-      'Behavior mode must be fast, human, or adaptive'
+      'Behavior mode must be fast, auto, or human'
     );
   }
   return value;
@@ -120,16 +120,13 @@ function migrateBrowserEngine(profile, { allowLegacyChannel }) {
   delete profile.browserChannel;
 }
 
-function migrateProfileBehavior(profile) {
-  if (profile.kind === 'persistent') {
-    profile.defaultBehavior = 'human';
-    return;
-  }
+function migrateProfileBehavior(profile, { allowLegacy }) {
   if (profile.defaultBehavior === undefined || profile.defaultBehavior === null || profile.defaultBehavior === '') {
-    profile.defaultBehavior = 'adaptive';
+    profile.defaultBehavior = profile.kind === 'persistent' ? 'human' : 'auto';
     return;
   }
-  profile.defaultBehavior = ensureBehaviorMode(profile.defaultBehavior);
+  const normalized = normalizeBehaviorMode(profile.defaultBehavior, { allowLegacy });
+  profile.defaultBehavior = ensureBehaviorMode(normalized);
 }
 
 function ensureOwnerClientId(value) {
@@ -165,7 +162,7 @@ export class ProfileStore {
     removePath = rm
   }) {
     if (!profilesRoot) throw new TypeError('profilesRoot is required');
-    this.#store = new JsonStore(filePath, { version: 4, profiles: [] });
+    this.#store = new JsonStore(filePath, { version: 5, profiles: [] });
     this.#profilesRoot = profilesRoot;
     this.#now = now;
     this.#processAlive = processAlive;
@@ -179,7 +176,7 @@ export class ProfileStore {
     // v0.x Profile records predate explicit persistence semantics. Preserve
     // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
-      if (data.version !== undefined && ![1, 2, 3, 4].includes(data.version)) {
+      if (data.version !== undefined && ![1, 2, 3, 4, 5].includes(data.version)) {
         throw new ProfileStoreError(
           'PROFILE_STORE_VERSION_UNSUPPORTED',
           `Profile store version ${String(data.version)} is unsupported`,
@@ -187,11 +184,12 @@ export class ProfileStore {
         );
       }
       const allowLegacyChannel = data.version === undefined || data.version === 1;
+      const allowLegacyBehavior = data.version === undefined || data.version <= 4;
       for (const profile of data.profiles) {
         profile.kind ||= 'persistent';
         ensureProfileKind(profile.kind);
         migrateBrowserEngine(profile, { allowLegacyChannel });
-        migrateProfileBehavior(profile);
+        migrateProfileBehavior(profile, { allowLegacy: allowLegacyBehavior });
         // v4 makes Profiles machine-local shared resources. Remove only the
         // obsolete authorization metadata; userDataDir and browser state stay
         // byte-for-byte in their existing location.
@@ -206,7 +204,7 @@ export class ProfileStore {
           profile.lease.cleanupRequired = true;
         }
       }
-      data.version = 4;
+      data.version = 5;
     });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
@@ -244,14 +242,8 @@ export class ProfileStore {
     const normalizedName = normalizeName(name);
     ensureProfileKind(kind);
     const defaultBehavior = ensureBehaviorMode(
-      requestedBehavior ?? (kind === 'persistent' ? 'human' : 'adaptive')
+      requestedBehavior ?? (kind === 'persistent' ? 'human' : 'auto')
     );
-    if (kind === 'persistent' && defaultBehavior !== 'human') {
-      throw new ProfileStoreError(
-        'PERSISTENT_BEHAVIOR_FIXED',
-        'Persistent Profiles always use human behavior'
-      );
-    }
     ensureHeadless(headless);
     const browserEngine = ensureBrowserEngine(
       requestedBrowserEngine ?? (kind === 'persistent' ? 'chrome' : 'chromium')
@@ -320,12 +312,6 @@ export class ProfileStore {
     let updated;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
-      if (profile.kind === 'persistent' && 'defaultBehavior' in patch) {
-        throw new ProfileStoreError(
-          'PERSISTENT_BEHAVIOR_FIXED',
-          'Persistent Profile behavior cannot be changed'
-        );
-      }
       if (
         patch.name &&
         data.profiles.some(

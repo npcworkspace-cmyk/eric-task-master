@@ -5,7 +5,7 @@ Task Master has two Profile kinds. Profile names are user-facing; immutable IDs 
 - `persistent` owns a separate Playwright `userDataDir` and is intended for login state or recurring work.
 - `ephemeral` is a reusable task template, not a browser-data directory. Every task launches a fresh browser plus non-persistent context, blocks service workers, and destroys both during cleanup. It cannot be opened manually.
 
-`browserEngine` is chosen once at creation and is never changed or automatically replaced after a launch error. Persistent defaults are stable local Chrome plus fixed `human`; ephemeral defaults are pinned Chromium plus Profile-owned `adaptive` behavior.
+`browserEngine` is chosen once at creation and is never changed or automatically replaced after a launch error. Persistent defaults are stable local Chrome plus `human`; ephemeral defaults are pinned Chromium plus Profile-owned `auto` behavior.
 
 One live lease is allowed per Profile. Same-Profile tasks wait in FIFO order; different Profiles may run concurrently within the Manager budget. “Ephemeral / 隐身临时” means no local browser state survives the task. It does not claim fingerprint spoofing, anti-detection, CAPTCHA bypass, or immunity from platform controls.
 
@@ -27,8 +27,8 @@ Only one live lease is allowed. The Dashboard cannot open a Profile while a task
 
 ## Behavior defaults
 
-- `fast`: optional speed-first policy for an ephemeral Profile and deterministic, data-heavy work.
+- `fast`: compressed pacing for deterministic or data-heavy work.
 - `human`: bounded hover, mouse, typing, reading, and scrolling cadence.
-- `adaptive`: begins fast, briefly becomes `cautious` for ordinary dynamic-page signals, and becomes guarded human-paced after occlusion, timeout, uncertain navigation, action failure, or rate limiting. Its effective mode and remaining guarded-action budget are visible in task status. Successful actions decay the temporary guard back to fast.
+- `auto`: balances speed and caution, briefly becomes `cautious` for ordinary dynamic-page signals, and becomes guarded human-paced after occlusion, timeout, uncertain navigation, action failure, or rate limiting. Its effective mode and remaining guarded-action budget are visible in task status. Successful actions decay the temporary guard back toward fast.
 
-Behavior is selected on the Profile. Persistent behavior cannot be patched, and task start accepts no override.
+Behavior is selected on either Profile kind, and task start accepts no override. Updating it while a task owns the Profile uses a confirmed Manager-to-Worker control message: the current pacing delay is released and the new mode applies at the next scheduling or physical-action boundary, without a new Worker, browser, attempt, or task ID. A failed acknowledgement stops the task rather than letting it silently continue under the stale mode. Site-required cooldowns remain authoritative.

@@ -1,11 +1,11 @@
 import { isSensitiveKey, redactPublicText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
-export const VERSION = '2.2.0';
+export const VERSION = '2.3.0';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
-export const BEHAVIOR_MODES = Object.freeze(['fast', 'human', 'adaptive']);
+export const BEHAVIOR_MODES = Object.freeze(['fast', 'auto', 'human']);
 export const BROWSER_ENGINES = Object.freeze(['chrome', 'chromium']);
 export const PROFILE_KINDS = Object.freeze(['persistent', 'ephemeral']);
 export const PROFILE_STATES = Object.freeze(['idle', 'starting', 'open', 'leased', 'deleting', 'error']);
@@ -33,6 +33,11 @@ export function isSettledTerminalTask(task) {
 
 export function isBehaviorMode(value) {
   return BEHAVIOR_MODES.includes(value);
+}
+
+export function normalizeBehaviorMode(value, { allowLegacy = false } = {}) {
+  if (allowLegacy && value === 'adaptive') return 'auto';
+  return isBehaviorMode(value) ? value : null;
 }
 
 export function isBrowserEngine(value) {

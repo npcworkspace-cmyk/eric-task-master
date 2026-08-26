@@ -148,6 +148,7 @@ test('task service isolates work in a child, tracks progress, and releases its l
   await writeFile(modulePath, 'export const meta = { supportsResume: true }; export async function run() {}\n');
   const store = fakeProfileStore(root);
   store.profile.kind = 'persistent';
+  store.profile.defaultBehavior = 'human';
   let workerKind;
   let workerBehavior;
   const service = createTaskService({
@@ -525,6 +526,217 @@ test('Profile behavior changes do not break idempotency and queued attempts use 
   assert.equal(completed.behavior, 'human');
   assert.equal(completed.history[0].behavior, 'human');
   await service.close();
+});
+
+test('running tasks apply Profile behavior changes live without restarting their Worker', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-live-profile-behavior-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  store.profile.kind = 'persistent';
+  store.profile.defaultBehavior = 'human';
+  const starts = [];
+  const changes = [];
+  let worker;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    behaviorApplyTimeoutMs: 500,
+    workerFactory() {
+      worker = new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          starts.push(message.config.behavior);
+          setImmediate(() => child.emit('message', { type: 'state', state: 'running' }));
+        }
+        if (message.type === 'set_behavior') {
+          changes.push({ behavior: message.behavior, requestId: message.requestId });
+          setImmediate(() => child.emit('message', {
+            type: 'behavior_applied',
+            requestId: message.requestId,
+            behavior: {
+              configured: message.behavior,
+              effective: message.behavior === 'auto' ? 'fast' : message.behavior,
+              ...(message.behavior === 'auto'
+                ? { auto: { level: 0, label: 'fast', actionsRemaining: 0, signal: null } }
+                : {})
+            }
+          }));
+        }
+      });
+      return worker;
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'live-profile-behavior',
+    input: {}
+  }, ADMIN);
+  await waitFor(async () => (await service.get(created.id, ADMIN)).state === 'running');
+  const workerPid = worker.pid;
+
+  for (const behavior of ['fast', 'auto', 'human']) {
+    store.profile.defaultBehavior = behavior;
+    const applied = await service.applyProfileBehavior('profile_test', behavior);
+    const task = await service.get(created.id, ADMIN);
+    assert.equal(applied.activeApplied, 1);
+    assert.equal(task.behavior, behavior);
+    assert.equal(task.behaviorState.configured, behavior);
+    assert.equal(task.behaviorState.effective, behavior === 'auto' ? 'fast' : behavior);
+    assert.equal(worker.pid, workerPid);
+    assert.equal(starts.length, 1);
+  }
+  assert.deepEqual(changes.map((change) => change.behavior), ['fast', 'auto', 'human']);
+
+  worker.emit('message', {
+    type: 'result',
+    result: { summary: 'Done', evidence: [{ kind: 'message', value: 'live behavior verified' }] }
+  });
+  worker.emit('message', { type: 'state', state: 'completed' });
+  worker.emit('message', { type: 'cleanup', browserClosed: true });
+  worker.finish();
+  await waitFor(async () => (await service.get(created.id, ADMIN)).cleanup.settled === true);
+  await service.close();
+});
+
+test('rapid live behavior changes are serialized and the last Profile choice wins', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-live-profile-behavior-race-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  store.profile.kind = 'ephemeral';
+  store.profile.defaultBehavior = 'auto';
+  const starts = [];
+  const changes = [];
+  let worker;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    behaviorApplyTimeoutMs: 500,
+    workerFactory() {
+      worker = new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          starts.push(message.config.behavior);
+          setImmediate(() => child.emit('message', { type: 'state', state: 'running' }));
+        }
+        if (message.type === 'set_behavior') {
+          changes.push(message.behavior);
+          setTimeout(() => child.emit('message', {
+            type: 'behavior_applied',
+            requestId: message.requestId,
+            behavior: {
+              configured: message.behavior,
+              effective: message.behavior === 'auto' ? 'fast' : message.behavior
+            }
+          }), message.behavior === 'fast' ? 35 : 0);
+        }
+        if (message.type === 'cancel') {
+          setImmediate(() => {
+            child.emit('message', { type: 'cleanup', browserClosed: true });
+            child.finish();
+          });
+        }
+      });
+      return worker;
+    }
+  });
+  t.after(() => service.close());
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'live-profile-behavior-race',
+    input: {}
+  }, ADMIN);
+  await waitFor(async () => (await service.get(created.id, ADMIN)).state === 'running');
+  const workerPid = worker.pid;
+
+  store.profile.defaultBehavior = 'fast';
+  const first = service.applyProfileBehavior('profile_test', 'fast');
+  await waitFor(() => changes.length === 1);
+  store.profile.defaultBehavior = 'human';
+  const second = service.applyProfileBehavior('profile_test', 'human');
+  await Promise.all([first, second]);
+
+  const task = await service.get(created.id, ADMIN);
+  assert.deepEqual(changes, ['fast', 'human']);
+  assert.equal(task.behavior, 'human');
+  assert.equal(task.behaviorState.configured, 'human');
+  assert.equal(worker.pid, workerPid);
+  assert.deepEqual(starts, ['auto']);
+
+  worker.emit('message', {
+    type: 'result',
+    result: { summary: 'Done', evidence: [{ kind: 'message', value: 'race serialized' }] }
+  });
+  worker.emit('message', { type: 'state', state: 'completed' });
+  worker.emit('message', { type: 'cleanup', browserClosed: true });
+  worker.finish();
+  await waitFor(async () => (await service.get(created.id, ADMIN)).cleanup.settled === true);
+});
+
+test('an unconfirmed live behavior change fails closed instead of continuing in the old mode', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-live-profile-behavior-timeout-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  store.profile.kind = 'persistent';
+  store.profile.defaultBehavior = 'human';
+  let worker;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    behaviorApplyTimeoutMs: 100,
+    workerCleanupGraceMs: 100,
+    workerHardKillGraceMs: 100,
+    workerFactory() {
+      worker = new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          setImmediate(() => child.emit('message', { type: 'state', state: 'running' }));
+        }
+        if (message.type === 'cancel') {
+          setImmediate(() => {
+            child.emit('message', { type: 'cleanup', browserClosed: true });
+            child.finish();
+          });
+        }
+      });
+      return worker;
+    }
+  });
+  t.after(() => service.close());
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'live-profile-behavior-timeout',
+    input: {}
+  }, ADMIN);
+  await waitFor(async () => (await service.get(created.id, ADMIN)).state === 'running');
+
+  store.profile.defaultBehavior = 'fast';
+  await assert.rejects(
+    service.applyProfileBehavior('profile_test', 'fast'),
+    { code: 'BEHAVIOR_LIVE_APPLY_TIMEOUT' }
+  );
+  const failed = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.state === 'failed' ? task : null;
+  });
+  assert.equal(failed.error.code, 'BEHAVIOR_LIVE_APPLY_TIMEOUT');
+  assert.equal(failed.behavior, 'human');
+  assert.equal(failed.behaviorState.configured, 'human');
+  await waitFor(async () => (await service.get(created.id, ADMIN)).cleanup.settled === true);
 });
 
 test('worker launch uses the atomic Profile snapshot returned by lease acquisition', async (t) => {

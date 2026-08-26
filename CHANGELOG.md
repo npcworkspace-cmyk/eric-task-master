@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.3.0 - 2026-08-27
+
+- Exposed `fast`, `auto`, and `human` on both persistent and ephemeral Profiles. New persistent Profiles default to `human`; new ephemeral Profiles default to `auto`; legacy `adaptive` settings migrate in place without moving browser data.
+- Added Worker-confirmed live behavior control. Changing a Profile during an active task releases the current pacing wait and applies at the next scheduling, pointer, key, or scroll boundary without replacing the task, attempt, browser, Worker, or Profile lease.
+- Made live changes fail closed: Manager requests are serialized per Profile, rapid changes preserve the latest selection, stalled IPC is bounded, and a missing or invalid Worker acknowledgement stops the task instead of silently retaining an old mode.
+- Separated journey mechanics from pacing. Every versioned Task Pack keeps rendered traversal, curved pointer movement, in-target clicks, keyboard cadence, segmented scrolling, reading dwell, and transition verification in all three modes; the Profile controls only their speed and caution.
+- Renamed the public adaptive policy to `auto`, retained bounded migration compatibility for persisted history, and surfaced configured, effective, and automatic guard state consistently through Dashboard, CLI, MCP, task status, and documentation.
+- Expanded real-browser, API, migration, concurrent-switch, negative-acknowledgement, Owner Console, and full release-gate coverage for the new live Profile behavior contract.
+
 ## 2.2.0 - 2026-08-26
 
 - Added the central `full-human-v1` Human Journey engine: rendered-page traversal, segmented wheel gestures, curved pointer paths with correction, in-target clicks, keyboard input and native selection cadence, bounded reading dwell, and verified visible navigation.

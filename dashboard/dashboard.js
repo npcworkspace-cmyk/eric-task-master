@@ -402,7 +402,9 @@ function profileState(profile) {
 }
 
 function profileMode(profile) {
-  return profile?.defaultBehavior || profile?.behaviorMode || (profile?.kind === 'persistent' ? 'human' : 'adaptive');
+  const mode = profile?.defaultBehavior || profile?.behaviorMode;
+  if (mode === 'adaptive') return 'auto';
+  return mode || (profile?.kind === 'persistent' ? 'human' : 'auto');
 }
 
 function profileEngine(profile) {
@@ -597,22 +599,24 @@ function renderProfiles(force = false) {
       const facts = element('div', 'profile-facts');
       facts.append(
         labelledValue('浏览器', profileEngine(profile)),
-        labelledValue('任务行为', ({ human: '深度拟人', adaptive: '自适应', fast: '快速' })[profileMode(profile)] || profileMode(profile)),
+        labelledValue('操作速度', ({ human: '深度拟人', auto: '自动平衡', fast: '快速' })[profileMode(profile)] || profileMode(profile)),
         labelledValue('最近使用', formatTime(profile.lastUsedAt, { relative: true }))
       );
 
       const settings = element('div', 'profile-settings');
       const modeLabel = element('label');
-      modeLabel.append(element('span', '', '任务行为'));
+      modeLabel.append(element('span', '', '操作速度'));
       const mode = focusKey(element('select', 'npc-field compact-field'), `profile:${id}:mode`);
-      for (const value of ['fast', 'adaptive', 'human']) {
-        const option = element('option', '', ({ fast: '快速', adaptive: '自适应', human: '深度拟人' })[value]);
+      for (const value of ['fast', 'auto', 'human']) {
+        const option = element('option', '', ({ fast: '快速', auto: '自动平衡', human: '深度拟人' })[value]);
         option.value = value;
         mode.append(option);
       }
       mode.value = profileMode(profile);
-      mode.disabled = persistent || pending;
-      mode.title = persistent ? '持久 Profile 固定使用深度拟人行为' : '临时 Profile 的任务行为';
+      mode.disabled = pending;
+      mode.title = busy
+        ? '运行中切换会立即应用到当前任务，无需重启'
+        : '为这个 Profile 选择快速、自动平衡或深度拟人';
       mode.addEventListener('change', () => void updateProfile(profile, { defaultBehavior: mode.value }));
       modeLabel.append(mode);
       const headlessLabel = element('label', 'switch-field');
@@ -761,11 +765,11 @@ function profileCreateVisible(visible) {
 function syncCreatePolicy() {
   const persistent = ui.profileKind.value === 'persistent';
   ui.profileEngine.value = persistent ? 'chrome' : 'chromium';
-  ui.profileMode.value = persistent ? 'human' : 'adaptive';
+  ui.profileMode.value = persistent ? 'human' : 'auto';
   ui.profileEngine.disabled = persistent;
-  ui.profileMode.disabled = persistent;
+  ui.profileMode.disabled = false;
   ui.profileEngine.title = persistent ? '持久 Profile 固定使用本机稳定版 Chrome' : '临时 Profile 使用项目锁定 Chromium';
-  ui.profileMode.title = persistent ? '持久 Profile 固定使用深度拟人行为' : '选择临时 Profile 的任务行为';
+  ui.profileMode.title = persistent ? '默认深度拟人，可创建后随时切换' : '默认自动平衡，可创建后随时切换';
 }
 
 function mutationSection(key) {
@@ -838,7 +842,9 @@ async function createProfile(event) {
 async function updateProfile(profile, patch) {
   await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
     method: 'PATCH', body: patch
-  }), 'Profile 设置已保存');
+  }), Object.hasOwn(patch, 'defaultBehavior')
+    ? '操作速度已生效，运行中的任务无需重启'
+    : 'Profile 设置已保存');
 }
 
 async function renameProfile(profile) {

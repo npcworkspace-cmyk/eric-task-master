@@ -49,7 +49,7 @@ test('a real long browser task survives MCP client replacement and exposes bound
   const profile = await firstClient.createProfile({
     name: 'Long task fixture',
     kind: 'ephemeral',
-    defaultBehavior: 'adaptive',
+    defaultBehavior: 'auto',
     headless: true
   });
   const started = await firstClient.startTask({
@@ -110,14 +110,14 @@ test('different Profiles run concurrently while same-Profile work queues safely'
       name: 'Parallel left',
       kind: 'ephemeral',
       browserEngine: 'chromium',
-      defaultBehavior: 'adaptive',
+      defaultBehavior: 'auto',
       headless: true
     }),
     client.createProfile({
       name: 'Parallel right',
       kind: 'ephemeral',
       browserEngine: 'chromium',
-      defaultBehavior: 'adaptive',
+      defaultBehavior: 'auto',
       headless: true
     })
   ]);

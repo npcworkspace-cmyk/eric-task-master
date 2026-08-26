@@ -182,23 +182,60 @@ test('human select uses one audited stable fallback only when native keyboard st
   assert.equal(action.audit.selectionFallbacks, 1);
 });
 
-test('adaptive mode grades ordinary dynamic signals separately from ambiguous failures', async () => {
+test('full journey keeps visible human mechanics in fast mode and applies a live switch mid-action', async () => {
+  const { calls, page } = fixture();
+  let announceFirstSleep;
+  const firstSleepStarted = new Promise((resolve) => { announceFirstSleep = resolve; });
+  let sleeps = 0;
+  const states = [];
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    strictVisibleTraversal: true,
+    random: () => 0.5,
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        announceFirstSleep();
+        return new Promise(() => {});
+      }
+    },
+    onBehaviorState: (state) => states.push(state)
+  });
+
+  const clicking = action.click('#submit');
+  await firstSleepStarted;
+  const applied = action.setMode('fast');
+  await clicking;
+
+  assert.equal(applied.configured, 'fast');
+  assert.equal(action.mode, 'fast');
+  assert.equal(action.effectiveMode, 'fast');
+  assert.ok(calls.some((item) => item[0] === 'move'));
+  const click = calls.find((item) => item[0] === 'click');
+  assert.ok(click[1].position.x > 0 && click[1].position.x < 120);
+  assert.ok(click[1].delay >= 8 && click[1].delay <= 22);
+  assert.ok(action.audit.visibleTargetAcquisitions >= 1);
+  assert.equal(states.at(-1).configured, 'fast');
+});
+
+test('auto mode grades ordinary dynamic signals separately from ambiguous failures', async () => {
   const { locator, page } = fixture();
   const sleeps = [];
   const failures = [];
   const states = [];
   const action = createActionHelper({
     page,
-    mode: 'adaptive',
+    mode: 'auto',
     random: () => 0,
     sleep: async (ms) => sleeps.push(ms),
     onFailure: async (failure) => failures.push(failure.operation),
-    onAdaptiveState: (state) => states.push(state)
+    onAutoState: (state) => states.push(state)
   });
 
   action.signal('dynamic');
   assert.equal(action.effectiveMode, 'cautious');
-  assert.deepEqual(action.adaptiveState, {
+  assert.deepEqual(action.autoState, {
     level: 1,
     label: 'cautious',
     actionsRemaining: 2,
@@ -207,7 +244,7 @@ test('adaptive mode grades ordinary dynamic signals separately from ambiguous fa
   await action.hover('#submit');
   assert.equal(action.effectiveMode, 'cautious');
   assert.equal(sleeps.every((ms) => ms <= 75), true);
-  assert.equal(action.adaptiveState.actionsRemaining, 1);
+  assert.equal(action.autoState.actionsRemaining, 1);
   await action.hover('#submit');
   assert.equal(action.effectiveMode, 'fast');
 
@@ -220,21 +257,21 @@ test('adaptive mode grades ordinary dynamic signals separately from ambiguous fa
   assert.equal(clickCount, 1);
   assert.deepEqual(failures, ['click']);
   assert.equal(action.effectiveMode, 'human');
-  assert.equal(action.adaptiveState.label, 'guarded');
+  assert.equal(action.autoState.label, 'guarded');
   assert.ok(sleeps.length > 0);
   assert.deepEqual(states.map((state) => state.label), ['cautious', 'cautious', 'fast', 'guarded']);
 });
 
-test('adaptive rate-limit signals preserve a full guarded action budget', async () => {
+test('auto rate-limit signals preserve a full guarded action budget', async () => {
   const { page } = fixture();
   page.goto = async () => ({
     status: () => 429,
     headers: () => ({ 'retry-after': '10' })
   });
-  const action = createActionHelper({ page, mode: 'adaptive', sleep: async () => {} });
+  const action = createActionHelper({ page, mode: 'auto', sleep: async () => {} });
 
   await action.goto('https://example.test');
-  assert.deepEqual(action.adaptiveState, {
+  assert.deepEqual(action.autoState, {
     level: 3,
     label: 'cooldown',
     actionsRemaining: 6,

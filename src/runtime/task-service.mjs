@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isBehaviorMode, publicTask, TERMINAL_TASK_STATES } from '../contracts.mjs';
+import { isBehaviorMode, normalizeBehaviorMode, publicTask, TERMINAL_TASK_STATES } from '../contracts.mjs';
 import { normalizeAgentName } from '../lib/agent-token.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
 import { isReservedAgentClientId } from '../lib/principal.mjs';
@@ -25,6 +25,7 @@ const DIAGNOSTIC_GRACE_MS = 15_000;
 const PROGRESS_STALL_MS = 2 * 60_000;
 const PROGRESS_FAILURE_MS = 10 * 60_000;
 const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const BEHAVIOR_APPLY_TIMEOUT_MS = 5_000;
 const MAX_ARTIFACTS = 100;
 const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
@@ -66,16 +67,15 @@ const LIFECYCLE_ACTIVITY_STATUS = Object.freeze({
   cancelled: 'cancelled'
 });
 
-function resolveProfileBehavior(profile, interactionContract = null) {
-  const behavior = interactionContract === FULL_HUMAN_INTERACTION_CONTRACT
-    ? 'human'
-    : profile.kind === 'persistent'
-    ? 'human'
-    : (profile.defaultBehavior ?? 'adaptive');
+function resolveProfileBehavior(profile) {
+  const behavior = normalizeBehaviorMode(
+    profile.defaultBehavior ?? (profile.kind === 'persistent' ? 'human' : 'auto'),
+    { allowLegacy: true }
+  );
   if (!isBehaviorMode(behavior)) {
     throw new TaskServiceError(
       'INVALID_PROFILE_BEHAVIOR',
-      'Profile behavior must be fast, human, or adaptive'
+      'Profile behavior must be fast, auto, or human'
     );
   }
   return behavior;
@@ -117,6 +117,42 @@ export class TaskServiceError extends Error {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function initialBehaviorState(behavior, at = nowIso()) {
+  return {
+    configured: behavior,
+    effective: behavior === 'auto' ? 'fast' : behavior,
+    ...(behavior === 'auto'
+      ? { auto: { level: 0, label: 'fast', actionsRemaining: 0, signal: null } }
+      : {}),
+    at
+  };
+}
+
+function workerBehaviorState(value, expectedBehavior) {
+  const configured = normalizeBehaviorMode(value?.configured, { allowLegacy: true });
+  if (configured !== expectedBehavior) return null;
+  const effective = ['fast', 'cautious', 'human'].includes(value?.effective)
+    ? value.effective
+    : expectedBehavior === 'auto' ? 'fast' : expectedBehavior;
+  const rawAuto = value?.auto ?? value?.adaptive;
+  const auto = configured === 'auto' && rawAuto && typeof rawAuto === 'object'
+    ? {
+        level: Number.isInteger(rawAuto.level) && rawAuto.level >= 0 && rawAuto.level <= 3 ? rawAuto.level : 0,
+        label: ['fast', 'cautious', 'guarded', 'cooldown'].includes(rawAuto.label) ? rawAuto.label : 'fast',
+        actionsRemaining: Number.isInteger(rawAuto.actionsRemaining) && rawAuto.actionsRemaining >= 0
+          ? Math.min(rawAuto.actionsRemaining, 1_000)
+          : 0,
+        signal: typeof rawAuto.signal === 'string' ? rawAuto.signal.slice(0, 64) : null
+      }
+    : null;
+  return {
+    configured,
+    effective,
+    ...(auto ? { auto } : {}),
+    at: nowIso()
+  };
 }
 
 function lifecycleActivity(phase, at = nowIso()) {
@@ -641,6 +677,7 @@ export function createTaskService({
   workerHardKillGraceMs = TASK_SERVICE_DEADLINES.workerHardKillGraceMs,
   progressStallMs = PROGRESS_STALL_MS,
   progressFailureMs = PROGRESS_FAILURE_MS,
+  behaviorApplyTimeoutMs = BEHAVIOR_APPLY_TIMEOUT_MS,
   maxConcurrentTasks = 4,
   maxQueuedTasks = 100,
   cleanupReconcileIntervalMs = CLEANUP_RECONCILE_INTERVAL_MS,
@@ -682,6 +719,9 @@ export function createTaskService({
   if (!Number.isFinite(progressFailureMs) || progressFailureMs <= progressStallMs) {
     throw new TypeError('progressFailureMs must be greater than progressStallMs');
   }
+  if (!Number.isFinite(behaviorApplyTimeoutMs) || behaviorApplyTimeoutMs < 100 || behaviorApplyTimeoutMs > 30_000) {
+    throw new TypeError('behaviorApplyTimeoutMs must be between 100 and 30000');
+  }
   if (!Number.isSafeInteger(maxConcurrentTasks) || maxConcurrentTasks < 1 || maxConcurrentTasks > 32) {
     throw new TypeError('maxConcurrentTasks must be an integer from 1 to 32');
   }
@@ -703,6 +743,7 @@ export function createTaskService({
   const openingProfiles = new Map();
   const persistChains = new Map();
   const controlChains = new Map();
+  const behaviorApplyChains = new Map();
   const cleanupReconcileTails = new Map();
   const artifactDigestCache = new Map();
   const finalizationFailures = new Map();
@@ -858,7 +899,9 @@ export function createTaskService({
         Number.isSafeInteger(entry.attempt) && entry.attempt >= 1 && entry.attempt <= MAX_ATTEMPTS
       )).slice(-MAX_ATTEMPTS).map((entry) => {
         const normalized = { ...entry };
-        if (!isBehaviorMode(normalized.behavior)) delete normalized.behavior;
+        const behavior = normalizeBehaviorMode(normalized.behavior, { allowLegacy: true });
+        if (behavior) normalized.behavior = behavior;
+        else delete normalized.behavior;
         return normalized;
       })
       : [];
@@ -1028,6 +1071,12 @@ export function createTaskService({
       normalizeAttemptHistory(task);
       normalizeDiagnosticHistory(task);
       normalizeTaskCoordination(task);
+      task.behavior = normalizeBehaviorMode(task.behavior, { allowLegacy: true }) || 'human';
+      const configuredBehavior = normalizeBehaviorMode(task.behaviorState?.configured, { allowLegacy: true });
+      task.behaviorState = workerBehaviorState(
+        task.behaviorState,
+        configuredBehavior || task.behavior
+      ) || initialBehaviorState(task.behavior);
       task.interactionContract = task.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT
         ? FULL_HUMAN_INTERACTION_CONTRACT
         : null;
@@ -1610,6 +1659,14 @@ export function createTaskService({
       clearInterval(entry.watchdog);
       clearTimeout(entry.forceKillTimer);
       clearTimeout(entry.hardKillTimer);
+      for (const request of entry.behaviorRequests.values()) {
+        request.reject(new TaskServiceError(
+          'BEHAVIOR_LIVE_APPLY_UNCONFIRMED',
+          'Task Worker exited before confirming the live behavior change',
+          503
+        ));
+      }
+      entry.behaviorRequests.clear();
     }
     children.delete(task.id);
     task.cleanup.workerExited = true;
@@ -1765,6 +1822,7 @@ export function createTaskService({
       exitPromise,
       resolveExit,
       leaseRenewalTail: Promise.resolve(),
+      behaviorRequests: new Map(),
       attached: false
     };
 
@@ -2020,7 +2078,34 @@ export function createTaskService({
         return;
       }
       if (message.type === 'behavior' && message.behavior) {
-        void update(task, { behaviorState: clone(message.behavior) }).catch(() => {});
+        const state = workerBehaviorState(message.behavior, task.behavior);
+        if (state) void update(task, { behaviorState: state }).catch(() => {});
+        return;
+      }
+      if (message.type === 'behavior_applied' && typeof message.requestId === 'string') {
+        const request = entry.behaviorRequests.get(message.requestId);
+        if (!request) return;
+        entry.behaviorRequests.delete(message.requestId);
+        clearTimeout(request.timer);
+        const state = workerBehaviorState(message.behavior, request.behavior);
+        if (state) request.resolve(state);
+        else request.reject(new TaskServiceError(
+          'BEHAVIOR_LIVE_APPLY_INVALID',
+          'Task Worker returned an invalid behavior application receipt',
+          502
+        ));
+        return;
+      }
+      if (message.type === 'behavior_control_error' && typeof message.requestId === 'string') {
+        const request = entry.behaviorRequests.get(message.requestId);
+        if (!request) return;
+        entry.behaviorRequests.delete(message.requestId);
+        clearTimeout(request.timer);
+        request.reject(new TaskServiceError(
+          'BEHAVIOR_LIVE_APPLY_REJECTED',
+          redactSensitiveText(message.error?.message || 'Task Worker rejected the live behavior change').slice(0, 500),
+          409
+        ));
         return;
       }
       if (message.type === 'cooldown' && message.cooldown) {
@@ -2254,7 +2339,7 @@ export function createTaskService({
       }
       failureCode = 'TASK_WORKER_START_FAILED';
       const startingAt = nowIso();
-      const behavior = resolveProfileBehavior(leasedProfile, task.interactionContract);
+      const behavior = resolveProfileBehavior(leasedProfile);
       setAttemptHistoryBehavior(task, behavior);
       markAttemptWorkerStarted(task, startingAt);
       const pausePending = task.state === 'pause_requested' && Boolean(task.pauseContext?.commandId);
@@ -2263,11 +2348,7 @@ export function createTaskService({
         startedAt: startingAt,
         workerPid: child.pid,
         behavior,
-        behaviorState: {
-          configured: behavior,
-          effective: behavior === 'adaptive' ? 'fast' : behavior,
-          at: startingAt
-        },
+        behaviorState: initialBehaviorState(behavior, startingAt),
         history: task.history,
         progress: {
           current: 0,
@@ -2385,7 +2466,7 @@ export function createTaskService({
     const interactionContract = taskType.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT
       ? FULL_HUMAN_INTERACTION_CONTRACT
       : null;
-    const behavior = resolveProfileBehavior(profile, interactionContract);
+    const behavior = resolveProfileBehavior(profile);
     if (
       body.timeoutMs !== undefined &&
       (!Number.isSafeInteger(body.timeoutMs) || body.timeoutMs < 1_000 || body.timeoutMs > MAX_TASK_TIMEOUT_MS)
@@ -2480,11 +2561,7 @@ export function createTaskService({
       progressAt: nowIso(),
       heartbeatAt: nowIso(),
       health: { status: 'healthy', checkedAt: nowIso() },
-      behaviorState: {
-        configured: behavior,
-        effective: behavior === 'adaptive' ? 'fast' : behavior,
-        at: nowIso()
-      },
+      behaviorState: initialBehaviorState(behavior),
       cooldown: null,
       timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
       outputDir,
@@ -2833,7 +2910,7 @@ export function createTaskService({
     const checkpoint = await verifyResumeCheckpoint(task);
     const resumeInput = await createResumeInput(task, checkpoint);
     const profile = requireProfileUse(await profileStore.get(task.profileId), caller);
-    const behavior = resolveProfileBehavior(profile, task.interactionContract);
+    const behavior = resolveProfileBehavior(profile);
 
     archiveAttemptDiagnostics(task);
     task.attempt += 1;
@@ -2864,11 +2941,7 @@ export function createTaskService({
     task.progressAt = nowIso();
     task.health = { status: 'healthy', checkedAt: nowIso() };
     task.behavior = behavior;
-    task.behaviorState = {
-      configured: behavior,
-      effective: behavior === 'adaptive' ? 'fast' : behavior,
-      at: nowIso()
-    };
+    task.behaviorState = initialBehaviorState(behavior);
     task.cooldown = null;
     beginAttemptHistory(task, { resumed: true, checkpointSavedAt: checkpoint.savedAt });
     await persist(task);
@@ -4041,6 +4114,121 @@ export function createTaskService({
     return registry.restore(name);
   }
 
+  async function sendLiveBehavior(task, entry, behavior) {
+    const requestId = `behavior_${randomUUID().replaceAll('-', '')}`;
+    let resolveReceipt;
+    let rejectReceipt;
+    const receipt = new Promise((resolve, reject) => {
+      resolveReceipt = resolve;
+      rejectReceipt = reject;
+    });
+    // The caller always awaits this promise, but keep the rejection observed
+    // while child.send confirmation is still pending.
+    receipt.catch(() => {});
+    const timer = setTimeout(() => {
+      entry.behaviorRequests.delete(requestId);
+      rejectReceipt(new TaskServiceError(
+        'BEHAVIOR_LIVE_APPLY_TIMEOUT',
+        'Task Worker did not confirm the live behavior change in time',
+        504
+      ));
+    }, behaviorApplyTimeoutMs);
+    entry.behaviorRequests.set(requestId, {
+      behavior,
+      timer,
+      resolve: resolveReceipt,
+      reject: rejectReceipt
+    });
+    // A Worker receipt is stronger evidence than the child.send callback and
+    // may arrive first. Start delivery confirmation without blocking the
+    // bounded receipt deadline; a wedged IPC callback must not hang this API.
+    void sendChildMessageConfirmed(entry.child, {
+      type: 'set_behavior',
+      requestId,
+      behavior
+    }).then((delivered) => {
+      if (delivered) return;
+      entry.behaviorRequests.delete(requestId);
+      clearTimeout(timer);
+      rejectReceipt(new TaskServiceError(
+        'BEHAVIOR_LIVE_APPLY_UNCONFIRMED',
+        'Task Worker did not accept the live behavior command',
+        503
+      ));
+    });
+    return receipt;
+  }
+
+  async function applyProfileBehavior(profileId, requestedBehavior) {
+    await ready;
+    requireServiceOpen();
+    if (!isBehaviorMode(requestedBehavior)) {
+      throw new TaskServiceError(
+        'INVALID_PROFILE_BEHAVIOR',
+        'Profile behavior must be fast, auto, or human'
+      );
+    }
+    const previous = behaviorApplyChains.get(profileId) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(async () => {
+      // Re-read after entering the per-Profile lane. Concurrent callers are
+      // last-write-wins and can never apply an older mode after a newer one.
+      const profile = await profileStore.get(profileId);
+      const behavior = resolveProfileBehavior(profile);
+      const affected = [...tasks.values()].filter((task) => (
+        !task.deletedAt && task.profileId === profileId && !TERMINAL_TASK_STATES.has(task.state)
+      ));
+      const appliedTaskIds = [];
+      let activeApplied = 0;
+      for (const task of affected) {
+        const entry = children.get(task.id);
+        let state = initialBehaviorState(behavior);
+        if (entry?.attached && !entry.finalized) {
+          try {
+            state = await sendLiveBehavior(task, entry, behavior);
+            activeApplied += 1;
+          } catch (error) {
+            if (!TERMINAL_TASK_STATES.has(task.state)) {
+              await update(task, {
+                state: 'failed',
+                error: sanitizeError(error, 'BEHAVIOR_LIVE_APPLY_UNCONFIRMED'),
+                finishedAt: nowIso(),
+                progress: terminalProgress(task, 'failed'),
+                health: { status: 'failed', checkedAt: nowIso() }
+              });
+              send(entry.child, { type: 'cancel' });
+              scheduleForcedStop(task, entry);
+            }
+            throw error;
+          }
+        }
+        task.behavior = behavior;
+        task.behaviorState = state;
+        appendTimeline(task, 'profile.behavior.changed', {
+          message: `Profile behavior changed live to ${behavior}`
+        });
+        await update(task, {
+          behavior,
+          behaviorState: state,
+          timeline: task.timeline,
+          timelineSequence: task.timelineSequence
+        });
+        appliedTaskIds.push(task.id);
+      }
+      return {
+        profileId,
+        behavior,
+        activeApplied,
+        taskIds: appliedTaskIds
+      };
+    });
+    behaviorApplyChains.set(profileId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (behaviorApplyChains.get(profileId) === operation) behaviorApplyChains.delete(profileId);
+    }
+  }
+
   async function openProfile(
     profileId,
     suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
@@ -4422,6 +4610,7 @@ export function createTaskService({
       // `closing` prevents any subsequent drain from launching more work.
       await queueTail.catch(() => {});
       await Promise.allSettled([...controlChains.values()]);
+      await Promise.allSettled([...behaviorApplyChains.values()]);
       const exitingWorkers = [...children.values()].map((entry) => entry.exitPromise);
       const shutdownResults = await Promise.allSettled([
         ...[...tasks.values()]
@@ -4536,6 +4725,7 @@ export function createTaskService({
     describeTaskType,
     deprecateTaskType,
     restoreTaskType,
+    applyProfileBehavior,
     openProfile,
     closeProfile,
     close
