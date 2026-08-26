@@ -353,13 +353,9 @@ export function createActionHelper({
       throw error;
     }
     await humanClick(locator);
-    // Native select popups differ across Chromium platforms. Close the popup
-    // while retaining focus, move from the current option with real arrow-key
-    // events, commit the highlighted option, then blur with Tab so input/change
-    // handlers settle consistently. macOS Chromium requires the explicit Enter
-    // commit while Windows and Linux preserve the already-selected option.
-    await locator.press('Escape');
-    metrics.selectionKeyEvents += 1;
+    // Keep the popup opened by the real click. On macOS, the first arrow key on
+    // a closed select only opens the popup and does not advance the highlight;
+    // moving while it is already open keeps the relative index consistent.
     const direction = selection.targetIndex >= selection.currentIndex ? 'ArrowDown' : 'ArrowUp';
     const distance = Math.abs(selection.targetIndex - selection.currentIndex);
     for (let index = 0; index < distance; index += 1) {

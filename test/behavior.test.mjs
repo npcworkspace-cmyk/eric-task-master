@@ -121,7 +121,7 @@ test('human click reaches an offscreen target through bounded wheel gestures ins
   assert.ok(action.audit.pointerMoves >= 14);
 });
 
-test('human select closes the native popup, moves relative to the current option, and verifies the result', async () => {
+test('human select keeps the native popup open, moves relative to the current option, and verifies the result', async () => {
   const { calls, locator, page } = fixture();
   let selectedIndex = 2;
   const values = ['alpha', 'beta', 'gamma'];
@@ -146,9 +146,9 @@ test('human select closes the native popup, moves relative to the current option
 
   assert.equal(selected, 'alpha');
   assert.deepEqual(calls.filter((item) => item[0] === 'locatorKey').map((item) => item[1]), [
-    'Escape', 'ArrowUp', 'ArrowUp', 'Enter', 'Tab'
+    'ArrowUp', 'ArrowUp', 'Enter', 'Tab'
   ]);
-  assert.equal(action.audit.selectionKeyEvents, 5);
+  assert.equal(action.audit.selectionKeyEvents, 4);
 });
 
 test('adaptive mode grades ordinary dynamic signals separately from ambiguous failures', async () => {
