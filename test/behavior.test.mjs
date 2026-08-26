@@ -149,6 +149,37 @@ test('human select keeps the native popup open, moves relative to the current op
     'ArrowUp', 'ArrowUp', 'Enter', 'Tab'
   ]);
   assert.equal(action.audit.selectionKeyEvents, 4);
+  assert.equal(action.audit.selectionFallbacks, 0);
+});
+
+test('human select uses one audited stable fallback only when native keyboard state is unchanged', async () => {
+  const { calls, locator, page } = fixture();
+  let selectedIndex = 0;
+  const values = ['alpha', 'beta', 'gamma'];
+  locator.evaluate = async (_callback, requested) => {
+    const targetIndex = values.indexOf(String(requested));
+    return { currentIndex: selectedIndex, targetIndex, targetValue: values[targetIndex] ?? null };
+  };
+  locator.inputValue = async () => values[selectedIndex];
+  locator.selectOption = async (requested, options) => {
+    calls.push(['selectOption', requested, options]);
+    selectedIndex = values.indexOf(String(requested));
+  };
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    random: () => 0.5,
+    sleep: async () => {}
+  });
+
+  const selected = await action.select('#choice', 'gamma');
+
+  assert.equal(selected, 'gamma');
+  assert.deepEqual(calls.filter((item) => item[0] === 'selectOption'), [
+    ['selectOption', 'gamma', {}]
+  ]);
+  assert.equal(action.audit.selectionKeyEvents, 4);
+  assert.equal(action.audit.selectionFallbacks, 1);
 });
 
 test('adaptive mode grades ordinary dynamic signals separately from ambiguous failures', async () => {

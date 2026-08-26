@@ -114,6 +114,7 @@ export function createActionHelper({
     visibleTargetAcquisitions: 0,
     typedCharacters: 0,
     selectionKeyEvents: 0,
+    selectionFallbacks: 0,
     scrollGestures: 0,
     wheelEvents: 0,
     targetTraversals: 0,
@@ -371,9 +372,18 @@ export function createActionHelper({
     await sleep(numberBetween(timing.selectionKeyPause, random));
     await page.keyboard.press('Tab');
     metrics.selectionKeyEvents += 1;
-    const actual = await locator.inputValue?.();
+    let actual = await locator.inputValue?.();
     if (actual !== selection.targetValue) {
-      const error = new Error('Requested select option was not applied by keyboard interaction');
+      // Native select popups are owned by the host OS. Some headless macOS
+      // Chromium builds accept the keyboard events without committing the DOM
+      // value, so fall back once to Playwright's stable select primitive after
+      // preserving the visible human journey above. Keep this observable.
+      await locator.selectOption(value, options);
+      metrics.selectionFallbacks += 1;
+      actual = await locator.inputValue?.();
+    }
+    if (actual !== selection.targetValue) {
+      const error = new Error('Requested select option was not applied by keyboard interaction or stable fallback');
       error.code = 'JOURNEY_SELECT_OPTION_UNCHANGED';
       throw error;
     }
