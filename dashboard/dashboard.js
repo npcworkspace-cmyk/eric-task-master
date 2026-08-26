@@ -407,6 +407,29 @@ function profileMode(profile) {
   return mode || (profile?.kind === 'persistent' ? 'human' : 'auto');
 }
 
+function taskBehaviorValue(task) {
+  const configured = ['fast', 'auto', 'human'].includes(task?.behaviorState?.configured)
+    ? task.behaviorState.configured
+    : ['fast', 'auto', 'human'].includes(task?.behavior)
+      ? task.behavior
+      : null;
+  const effective = ['fast', 'cautious', 'human'].includes(task?.behaviorState?.effective)
+    ? task.behaviorState.effective
+    : configured === 'auto' ? 'fast' : configured;
+  const configuredLabel = ({ fast: '快速', auto: '自动', human: '深度拟人' })[configured] || '待分配';
+  const effectiveLabel = ({ fast: '快速节奏', cautious: '谨慎节奏', human: '深度拟人节奏' })[effective] || '待应用';
+  const confirmed = task?.behaviorState?.source === 'worker' && task?.behaviorState?.confirmed === true;
+  return {
+    configured,
+    effective,
+    confirmed,
+    label: configured === 'auto' ? `${configuredLabel} · ${effectiveLabel}` : configuredLabel,
+    receipt: confirmed
+      ? `Worker 已确认 · ${formatTime(task.behaviorState.at, { relative: true })}`
+      : '等待 Worker 应用'
+  };
+}
+
 function profileEngine(profile) {
   return profile?.browserEngine === 'chromium' ? 'Chromium' : 'Chrome';
 }
@@ -472,6 +495,16 @@ function durationValue(task, kind, label) {
   value.dataset.taskDuration = kind;
   value.dataset.taskId = task.id;
   value.textContent = formatDuration(taskDurations(task)[kind]);
+  return group;
+}
+
+function behaviorValue(task) {
+  const behavior = taskBehaviorValue(task);
+  const group = labelledValue('实际行为', behavior.label, 'behavior-value');
+  group.dataset.taskBehavior = behavior.configured || '';
+  group.dataset.taskBehaviorEffective = behavior.effective || '';
+  group.dataset.taskBehaviorConfirmed = String(behavior.confirmed);
+  group.append(element('small', 'behavior-receipt', behavior.receipt));
   return group;
 }
 
@@ -557,6 +590,7 @@ function renderTasks(force = false) {
       const metadata = element('div', 'task-meta-row');
       metadata.append(
         labelledValue('Profile', profileNameFor(task)),
+        behaviorValue(task),
         durationValue(task, 'run', '运行时间'),
         durationValue(task, 'cooldown', '冷却时间'),
         durationValue(task, 'total', '总时间')

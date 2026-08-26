@@ -236,6 +236,8 @@ export function publicTask(task, { includeResult = true } = {}) {
     ? definedEntries([
       ['configured', stringValue(task.behaviorState.configured, 32)],
       ['effective', stringValue(task.behaviorState.effective, 32)],
+      ['source', stringValue(task.behaviorState.source, 32)],
+      ['confirmed', booleanValue(task.behaviorState.confirmed)],
       ['at', stringValue(task.behaviorState.at, 64)],
       ['auto', task.behaviorState.auto && typeof task.behaviorState.auto === 'object'
         ? definedEntries([

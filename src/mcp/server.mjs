@@ -157,6 +157,8 @@ const TaskSchema = z.strictObject({
   behaviorState: z.strictObject({
     configured: z.string().optional(),
     effective: z.string().optional(),
+    source: z.enum(['profile', 'worker']).optional(),
+    confirmed: z.boolean().optional(),
     at: z.string().optional(),
     auto: z.strictObject({
       level: z.number().optional(),

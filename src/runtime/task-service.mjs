@@ -126,6 +126,8 @@ function initialBehaviorState(behavior, at = nowIso()) {
     ...(behavior === 'auto'
       ? { auto: { level: 0, label: 'fast', actionsRemaining: 0, signal: null } }
       : {}),
+    source: 'profile',
+    confirmed: false,
     at
   };
 }
@@ -151,7 +153,21 @@ function workerBehaviorState(value, expectedBehavior) {
     configured,
     effective,
     ...(auto ? { auto } : {}),
+    source: 'worker',
+    confirmed: true,
     at: nowIso()
+  };
+}
+
+function restoredBehaviorState(value, expectedBehavior) {
+  const state = workerBehaviorState(value, expectedBehavior);
+  if (!state) return null;
+  const confirmed = value?.source === 'worker' && value?.confirmed === true;
+  return {
+    ...state,
+    source: confirmed ? 'worker' : 'profile',
+    confirmed,
+    at: typeof value?.at === 'string' && value.at.length <= 64 ? value.at : nowIso()
   };
 }
 
@@ -1073,7 +1089,7 @@ export function createTaskService({
       normalizeTaskCoordination(task);
       task.behavior = normalizeBehaviorMode(task.behavior, { allowLegacy: true }) || 'human';
       const configuredBehavior = normalizeBehaviorMode(task.behaviorState?.configured, { allowLegacy: true });
-      task.behaviorState = workerBehaviorState(
+      task.behaviorState = restoredBehaviorState(
         task.behaviorState,
         configuredBehavior || task.behavior
       ) || initialBehaviorState(task.behavior);

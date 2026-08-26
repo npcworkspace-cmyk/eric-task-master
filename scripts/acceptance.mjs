@@ -340,6 +340,8 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       liveStates.push({
         behavior: state.behavior,
         effective: state.behaviorState?.effective,
+        source: state.behaviorState?.source,
+        confirmed: state.behaviorState?.confirmed,
         attempts: state.history?.length
       });
     }
@@ -348,6 +350,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       'running task behavior switches live without Worker restart',
       liveCompleted.state === 'completed' && liveStates.length === 3 &&
         liveStates.every((state) => state.attempts === 1) &&
+        liveStates.every((state) => state.source === 'worker' && state.confirmed === true) &&
         liveStates.map((state) => state.behavior).join(',') === 'fast,auto,human'
     );
 

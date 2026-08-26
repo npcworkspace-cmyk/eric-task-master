@@ -75,7 +75,7 @@ The MCP surface never accepts arbitrary module paths, JavaScript evaluation, coo
 
 Profile creation accepts an immutable `browserEngine` of `chrome` or `chromium`. Persistent Profiles default to `chrome` with `human`; ephemeral Profiles default to `chromium` with Profile-owned `auto`. Both Profile kinds expose `fast`, `auto`, and `human`. `taskmaster_tasks_start` accepts no task-level behavior override.
 
-`taskmaster_profiles_update` changes only mutable Profile fields. Profiles have no creator or access-list field and are available to every trusted local Agent. It cannot change the browser engine. A behavior change for an active Profile is successful only after the running Worker confirms it; the task, browser, attempt, and lease remain intact.
+`taskmaster_profiles_update` changes only mutable Profile fields. Profiles have no creator or access-list field and are available to every trusted local Agent. It cannot change the browser engine. All three modes retain the same complete visible action mechanics and differ only in central pacing and guard depth. A behavior change for an active Profile is successful only after the running Worker confirms it; the task, browser, attempt, and lease remain intact.
 
 ## Long tasks, progress, and cancellation
 
@@ -86,7 +86,7 @@ Task status separates liveness from advancement:
 - `heartbeatAt` proves the Worker is still reporting;
 - `progressAt` records the last meaningful module progress;
 - `health.status` reports `healthy`, `stalled`, `waiting_user`, `cooling_down`, or a terminal state;
-- `behaviorState` exposes configured and currently effective behavior;
+- `behaviorState` exposes configured/effective behavior plus `source`, `confirmed`, and Manager receipt time so callers can distinguish a Profile selection from actual Worker runtime state;
 - `cooldown.resumeAt` exposes an active rate-limit deadline;
 - `queuePosition` and `queueReason` explain bounded scheduler waiting.
 

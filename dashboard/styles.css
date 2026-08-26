@@ -241,11 +241,12 @@ button { color: inherit; }
 .progress-copy span { flex: 0 0 auto; color: var(--npc-muted); font-size: 10px; }
 .progress-track { position: relative; height: 8px; overflow: hidden; border-radius: 999px; background: var(--npc-paper-deep); }
 .progress-bar { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--npc-signal), var(--npc-pink)); transition: width 240ms var(--npc-ease); }
-.task-meta-row { display: grid; grid-template-columns: minmax(150px, 1.4fr) repeat(3, minmax(105px, .7fr)); gap: 8px; margin-top: 18px; }
+.task-meta-row { display: grid; grid-template-columns: minmax(145px, 1.3fr) minmax(150px, 1.15fr) repeat(3, minmax(105px, .7fr)); gap: 8px; margin-top: 18px; }
 .labelled-value { min-width: 0; padding: 10px 11px; border-radius: 12px; background: var(--npc-paper); }
 .labelled-value small, .labelled-value strong { display: block; }
 .labelled-value small { color: var(--npc-muted); font-size: 9px; }
 .labelled-value strong { overflow: hidden; margin-top: 5px; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.labelled-value .behavior-receipt { overflow: hidden; margin-top: 4px; color: var(--npc-text-soft); text-overflow: ellipsis; white-space: nowrap; }
 .duration-value strong { font-family: var(--npc-font-mono); font-variant-numeric: tabular-nums; }
 .task-card-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--npc-line); }
 .task-updated { color: var(--npc-muted); font-size: 9px; }

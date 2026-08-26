@@ -587,6 +587,8 @@ test('running tasks apply Profile behavior changes live without restarting their
     assert.equal(task.behavior, behavior);
     assert.equal(task.behaviorState.configured, behavior);
     assert.equal(task.behaviorState.effective, behavior === 'auto' ? 'fast' : behavior);
+    assert.equal(task.behaviorState.source, 'worker');
+    assert.equal(task.behaviorState.confirmed, true);
     assert.equal(worker.pid, workerPid);
     assert.equal(starts.length, 1);
   }
@@ -669,6 +671,8 @@ test('rapid live behavior changes are serialized and the last Profile choice win
   assert.deepEqual(changes, ['fast', 'human']);
   assert.equal(task.behavior, 'human');
   assert.equal(task.behaviorState.configured, 'human');
+  assert.equal(task.behaviorState.source, 'worker');
+  assert.equal(task.behaviorState.confirmed, true);
   assert.equal(worker.pid, workerPid);
   assert.deepEqual(starts, ['auto']);
 

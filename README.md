@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.3.0**
+Version: **2.4.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -98,18 +98,18 @@ New persistent Profiles default to the local stable Chrome channel and `human`; 
 
 ### Behavior
 
-- **fast** — compressed pacing for deterministic or data-heavy work;
-- **human** — rendered-page traversal, curved pointer movement, in-target clicks, keyboard input, segmented scrolling, reading cadence, and verified page changes;
+- **fast** — the complete humanized action path with shorter pointer, key, scroll, and between-action timing for deterministic or data-heavy work;
+- **human** — the same complete action path at natural pacing;
 - **auto** — balances speed and caution, escalating after dynamic-page signals, occlusion, timeout, uncertain navigation, action failure, or rate limiting, then accelerating again after recovery.
 
 Human pacing is a reliability policy, not fingerprint spoofing, a promise to bypass website controls, or protection from platform enforcement.
-Behavior is selected on the Profile and can be changed while its task runs; task start does not accept a behavior override. Every versioned Task Pack uses the stricter `full-human-v1` journey contract in all three modes. The Pack always follows rendered controls, while the Profile mode controls how quickly and cautiously the central runtime performs that journey and records its 10/10 interaction audit.
+All three modes use the same curved pointer motion, in-target clicks, per-character keyboard input, keyboard selection, segmented scrolling, and reading dwell. A mode changes central timing and guard depth only; `fast` never removes humanized actions. Behavior is selected on the Profile and can be changed while its task runs; task start does not accept an override. Task cards show the actual Worker-confirmed configured/effective mode and receipt time instead of merely echoing the Profile value. Every versioned Task Pack additionally enforces visible-transition verification through the stricter `full-human-v1` journey contract and records its 10/10 interaction audit.
 
 ### Multi-Agent workbench
 
 - Profiles are shared by all trusted local Agents; there is no meaningless “Profile creator” field. A Profile still has one live lease, so two Agents cannot corrupt the same login state.
 - The Console has only two work areas: Tasks and Profiles. It does not expose a confusing Agent registry, reports, files, or a second messaging workbench.
-- Every task gets a stable `Agent-specific task-created time` name and shows its current action, visual progress, execution time, cumulative cooldown time, and total time.
+- Every task gets a stable `Agent-specific task-created time` name and shows its current action, Worker-confirmed runtime behavior, visual progress, execution time, cumulative cooldown time, and total time.
 - Pause, resume, cancel, and record deletion are revision-checked. Deletion hides only terminal records with confirmed cleanup and never makes an executed action replayable.
 
 ## Build specialized production workers

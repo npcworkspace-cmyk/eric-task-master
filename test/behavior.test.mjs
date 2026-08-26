@@ -32,23 +32,44 @@ function fixture() {
   return { calls, locator, page };
 }
 
-test('fast mode performs native actions without artificial sleeps', async () => {
-  const { calls, page } = fixture();
-  const sleeps = [];
-  const action = createActionHelper({ page, mode: 'fast', sleep: async (ms) => sleeps.push(ms) });
+test('fast, auto, and human use identical visible mechanics while only pacing changes', async () => {
+  async function run(mode) {
+    const { calls, page } = fixture();
+    const sleeps = [];
+    const randomValues = [0.1, 0.9, 0.3, 0.7];
+    let randomIndex = 0;
+    const action = createActionHelper({
+      page,
+      mode,
+      random: () => randomValues[randomIndex++ % randomValues.length],
+      sleep: async (ms) => sleeps.push(ms)
+    });
+    await action.goto('https://example.test');
+    await action.click('#submit');
+    await action.fill('#name', 'Eric');
+    await action.scroll({ deltaY: 420, steps: 5 });
+    const readingDelay = await action.read({ words: 50 });
+    return { calls, sleeps, readingDelay, audit: action.audit };
+  }
 
-  await action.goto('https://example.test');
-  await action.click('#submit');
-  await action.fill('#name', 'Eric');
-  await action.scroll({ deltaY: 420 });
-  const readingDelay = await action.read({ words: 50 });
+  const fast = await run('fast');
+  const auto = await run('auto');
+  const human = await run('human');
+  const topology = (result) => result.calls.map((item) => item[0]);
+  const mechanicsAudit = ({ readingDurationMs: _duration, ...audit }) => audit;
 
-  assert.deepEqual(sleeps, []);
-  assert.equal(readingDelay, 0);
-  assert.ok(calls.some((item) => item[0] === 'click'));
-  assert.ok(calls.some((item) => item[0] === 'fill' && item[1] === 'Eric'));
-  assert.deepEqual(calls.find((item) => item[0] === 'wheel'), ['wheel', 0, 420]);
-  assert.equal(calls.some((item) => item[0] === 'move'), false);
+  assert.deepEqual(topology(fast), topology(auto));
+  assert.deepEqual(topology(fast), topology(human));
+  assert.deepEqual(mechanicsAudit(fast.audit), mechanicsAudit(auto.audit));
+  assert.deepEqual(mechanicsAudit(fast.audit), mechanicsAudit(human.audit));
+  assert.ok(fast.calls.some((item) => item[0] === 'move'));
+  assert.equal(fast.calls.filter((item) => item[0] === 'pressSequentially').length, 4);
+  assert.equal(fast.calls.filter((item) => item[0] === 'wheel').length, 5);
+  assert.ok(fast.readingDelay > 0);
+  assert.ok(fast.readingDelay < human.readingDelay);
+  assert.equal(fast.sleeps.length, human.sleeps.length);
+  assert.ok(fast.sleeps.every((milliseconds, index) => milliseconds <= human.sleeps[index]));
+  assert.ok(fast.calls.find((item) => item[0] === 'click')[1].delay < human.calls.find((item) => item[0] === 'click')[1].delay);
 });
 
 test('human mode uses bounded pointer motion, typing rhythm, eased scroll, and reading dwell', async () => {
@@ -119,6 +140,20 @@ test('human click reaches an offscreen target through bounded wheel gestures ins
   assert.equal(calls.some((item) => item[0] === 'scrollIntoViewIfNeeded'), false);
   assert.ok(action.audit.targetTraversals >= 1);
   assert.ok(action.audit.pointerMoves >= 14);
+});
+
+test('visible target measurement preserves the caller action timeout', async () => {
+  const { locator, page } = fixture();
+  const measurements = [];
+  locator.boundingBox = async (options) => {
+    measurements.push(options);
+    return { x: 100, y: 80, width: 120, height: 40 };
+  };
+  const action = createActionHelper({ page, mode: 'fast', random: () => 0.5, sleep: async () => {} });
+
+  await action.click('#submit', { timeout: 250 });
+
+  assert.deepEqual(measurements, [{ timeout: 250 }, { timeout: 250 }]);
 });
 
 test('human select keeps the native popup open, moves relative to the current option, and verifies the result', async () => {
@@ -217,6 +252,36 @@ test('full journey keeps visible human mechanics in fast mode and applies a live
   assert.ok(click[1].delay >= 8 && click[1].delay <= 22);
   assert.ok(action.audit.visibleTargetAcquisitions >= 1);
   assert.equal(states.at(-1).configured, 'fast');
+});
+
+test('a live mode change restarts an in-flight reading dwell under the new pacing', async () => {
+  const { page } = fixture();
+  const sleeps = [];
+  let announceFirstSleep;
+  const firstSleepStarted = new Promise((resolve) => { announceFirstSleep = resolve; });
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    random: () => 0.5,
+    sleep: async (milliseconds) => {
+      sleeps.push(milliseconds);
+      if (sleeps.length === 1) {
+        announceFirstSleep();
+        return new Promise(() => {});
+      }
+    }
+  });
+
+  const reading = action.read({ words: 20 });
+  await firstSleepStarted;
+  action.setMode('fast');
+  const appliedDuration = await reading;
+
+  assert.equal(sleeps.length, 2);
+  assert.ok(sleeps[1] < sleeps[0]);
+  assert.equal(appliedDuration, sleeps[1]);
+  assert.equal(action.audit.readingDwells, 1);
+  assert.equal(action.audit.readingDurationMs, appliedDuration);
 });
 
 test('auto mode grades ordinary dynamic signals separately from ambiguous failures', async () => {

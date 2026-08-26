@@ -82,7 +82,25 @@ function createTaskHarness(profileStore, tasks, control) {
     },
     async applyProfileBehavior(id, behavior) {
       control.behaviorChanges.push({ id, behavior });
-      return { profileId: id, behavior, activeApplied: 0, taskIds: [] };
+      const appliedAt = now();
+      const taskIds = [];
+      for (const value of tasks.values()) {
+        if (value.profileId !== id || ['completed', 'failed', 'cancelled'].includes(value.state)) continue;
+        value.behavior = behavior;
+        value.behaviorState = {
+          configured: behavior,
+          effective: behavior === 'auto' ? 'fast' : behavior,
+          ...(behavior === 'auto'
+            ? { auto: { level: 0, label: 'fast', actionsRemaining: 0, signal: null } }
+            : {}),
+          source: 'worker',
+          confirmed: true,
+          at: appliedAt
+        };
+        value.updatedAt = appliedAt;
+        taskIds.push(value.id);
+      }
+      return { profileId: id, behavior, activeApplied: taskIds.length, taskIds };
     },
     async pauseTask(id, body) {
       control.taskActions.push({ id, action: 'pause' });
@@ -215,6 +233,10 @@ try {
     taskLabel: '抓取新闻',
     displayName: 'Codex-抓取新闻-20260826-101500Z',
     state: 'running',
+    behavior: 'human',
+    behaviorState: {
+      configured: 'human', effective: 'human', source: 'worker', confirmed: true, at: now()
+    },
     createdAt: ago(92_000),
     startedAt: ago(84_000),
     updatedAt: now(),
@@ -234,6 +256,12 @@ try {
     taskLabel: '商品巡检',
     displayName: 'WorkBuddy-商品巡检-20260826-101530Z',
     state: 'cooling_down',
+    behavior: 'auto',
+    behaviorState: {
+      configured: 'auto', effective: 'human',
+      auto: { level: 3, label: 'cooldown', actionsRemaining: 6, signal: 'rate_limit' },
+      source: 'worker', confirmed: true, at: now()
+    },
     createdAt: ago(48_000),
     startedAt: ago(45_000),
     updatedAt: now(),
@@ -253,6 +281,12 @@ try {
     taskLabel: '表单验收',
     displayName: 'Claude-表单验收-20260826-101000Z',
     state: 'completed',
+    behavior: 'auto',
+    behaviorState: {
+      configured: 'auto', effective: 'fast',
+      auto: { level: 0, label: 'fast', actionsRemaining: 0, signal: null },
+      source: 'worker', confirmed: true, at: ago(20_000)
+    },
     createdAt: ago(180_000),
     startedAt: ago(170_000),
     finishedAt: ago(20_000),
@@ -300,7 +334,11 @@ try {
 
   const runningCard = page.locator('.task-card[data-task-id="task_running"]');
   await runningCard.getByText('正在提取第 3 批结果').waitFor();
-  for (const label of ['Profile', '运行时间', '冷却时间', '总时间']) await runningCard.getByText(label, { exact: true }).waitFor();
+  for (const label of ['Profile', '实际行为', '运行时间', '冷却时间', '总时间']) await runningCard.getByText(label, { exact: true }).waitFor();
+  assert.equal(await runningCard.locator('[data-task-behavior]').getAttribute('data-task-behavior'), 'human');
+  assert.equal(await runningCard.locator('[data-task-behavior]').getAttribute('data-task-behavior-effective'), 'human');
+  assert.equal(await runningCard.locator('[data-task-behavior]').getAttribute('data-task-behavior-confirmed'), 'true');
+  await runningCard.getByText(/Worker 已确认/u).waitFor();
   assert.equal((await runningCard.locator('[data-task-duration="run"]').textContent()).includes('—'), false);
   assert.equal((await runningCard.locator('[data-task-duration="cooldown"]').textContent()).includes('—'), false);
   const totalBefore = await runningCard.locator('[data-task-duration="total"]').textContent();
@@ -312,6 +350,14 @@ try {
   const coolingAfter = await page.locator('[data-task-id="task_cooling"] [data-task-duration="cooldown"]').textContent();
   assert.notEqual(coolingAfter, coolingBefore);
   checks.push('progress plus live run, cooldown, and total timers');
+
+  await page.getByRole('button', { name: 'Profiles', exact: true }).click();
+  const liveAccountCard = page.locator('.profile-card').filter({ hasText: '验收账号' });
+  await liveAccountCard.locator('select').selectOption('fast');
+  await page.getByRole('button', { name: '任务', exact: true }).click();
+  await runningCard.locator('[data-task-behavior="fast"][data-task-behavior-effective="fast"][data-task-behavior-confirmed="true"]').waitFor();
+  await runningCard.getByText('Worker 已确认', { exact: false }).waitFor();
+  checks.push('task card refreshes from a Worker-confirmed live behavior receipt');
 
   control.conflictNextPause = true;
   await runningCard.getByRole('button', { name: '暂停', exact: true }).click();
@@ -368,9 +414,9 @@ try {
     await renamedCard.locator('select option').evaluateAll((options) => options.map((option) => option.value)),
     ['fast', 'auto', 'human']
   );
-  await renamedCard.locator('select').selectOption('fast');
-  await renamedCard.getByText('快速', { exact: true }).first().waitFor();
-  assert.deepEqual(control.behaviorChanges.at(-1), { id: persistent.id, behavior: 'fast' });
+  await renamedCard.locator('select').selectOption('human');
+  await renamedCard.getByText('深度拟人', { exact: true }).first().waitFor();
+  assert.deepEqual(control.behaviorChanges.at(-1), { id: persistent.id, behavior: 'human' });
   await renamedCard.getByRole('button', { name: '打开登录窗口' }).click();
   await renamedCard.getByRole('button', { name: '关闭窗口' }).waitFor();
   await renamedCard.getByRole('button', { name: '关闭窗口' }).click();

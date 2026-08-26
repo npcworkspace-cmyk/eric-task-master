@@ -133,7 +133,8 @@ async function staticChecks() {
     taskService.includes('applyProfileBehavior') && taskService.includes("type: 'set_behavior'") &&
       taskService.includes('BEHAVIOR_LIVE_APPLY_TIMEOUT') &&
       taskWorker.includes("message?.type === 'set_behavior'") && taskWorker.includes('activeActionHelper.setMode') &&
-      behavior.includes('wakePacingWaiters') && behavior.includes('strictVisibleTraversal || effectiveMode()') &&
+      behavior.includes('wakePacingWaiters') && behavior.includes('return humanClick(locator, options)') &&
+      !behavior.includes('usesHumanMechanics') &&
       dashboard.includes("['fast', 'auto', 'human']"),
     'live Profile behavior control or mandatory journey mechanics drift'
   );

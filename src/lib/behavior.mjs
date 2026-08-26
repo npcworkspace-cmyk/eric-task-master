@@ -82,10 +82,11 @@ function autoFailureSignal(error) {
 }
 
 /**
- * Creates the task-scoped action facade used by task modules. Auto mode
- * keeps deterministic work fast, adds only short settling pauses for ordinary
- * dynamic-page signals, and uses full human pacing after stronger ambiguity or
- * rate-limit signals. It never retries an unknown action outcome automatically.
+ * Creates the task-scoped action facade used by task modules. Every mode uses
+ * the same visible action mechanics; modes change only the central pacing and
+ * guard depth. Auto adds short settling pauses for ordinary dynamic-page
+ * signals and full human pacing after stronger ambiguity or rate-limit signals.
+ * It never retries an unknown action outcome automatically.
  */
 export function createActionHelper({
   page,
@@ -139,8 +140,6 @@ export function createActionHelper({
     if (currentMode === 'auto' && autoLevel === 1) return 'cautious';
     return 'fast';
   };
-  const usesHumanMechanics = () => strictVisibleTraversal || effectiveMode() === 'human';
-
   function scaledRange(range, { minimum = 0 } = {}) {
     const scale = PACING_SCALE[effectiveMode()];
     return [
@@ -176,7 +175,6 @@ export function createActionHelper({
   }
 
   async function pause(range) {
-    if (!usesHumanMechanics() && effectiveMode() === 'fast') return;
     await pacingSleep(pacingNumber(range));
   }
 
@@ -187,7 +185,9 @@ export function createActionHelper({
   }
 
   async function humanWheel(deltaX, deltaY, requestedSteps) {
-    const defaultSteps = pacingNumber([5, 9], { minimum: 3 });
+    // Gesture topology is mode-invariant. Only the pause between its segments
+    // is scaled, so fast never deletes wheel events from the human journey.
+    const defaultSteps = numberBetween([5, 9], random);
     const steps = Math.max(
       3,
       Math.min(12, strictVisibleTraversal ? defaultSteps : Number(requestedSteps) || defaultSteps)
@@ -203,9 +203,9 @@ export function createActionHelper({
     }
   }
 
-  async function traverseToLocator(locator) {
+  async function traverseToLocator(locator, measurementOptions = {}) {
     const viewport = viewportSize();
-    let box = await locator.boundingBox?.();
+    let box = await locator.boundingBox?.(measurementOptions);
     if (!box) {
       if (strictVisibleTraversal) {
         const error = new Error('Target has no measurable box for visible traversal');
@@ -231,11 +231,11 @@ export function createActionHelper({
       await pacingSleep(pacingNumber(timing.scrollGesturePause));
       if (Math.abs(deltaY) > viewport.height * 0.35 && random() < 0.22) {
         const correction = -Math.sign(deltaY) * numberBetween([18, 54], random);
-        await humanWheel(0, correction, pacingNumber([3, 5], { minimum: 3 }));
+        await humanWheel(0, correction, numberBetween([3, 5], random));
         metrics.pointerCorrections += 1;
         await pacingSleep(pacingNumber(timing.scrollPause));
       }
-      const next = await locator.boundingBox?.();
+      const next = await locator.boundingBox?.(measurementOptions);
       if (!next) break;
       box = next;
     }
@@ -283,9 +283,12 @@ export function createActionHelper({
     }
   }
 
-  async function moveToLocator(locator, requestedPosition) {
-    const traversedBox = await traverseToLocator(locator);
-    const box = await locator.boundingBox?.();
+  async function moveToLocator(locator, requestedPosition, actionOptions = {}) {
+    const measurementOptions = Number.isFinite(actionOptions?.timeout) && actionOptions.timeout >= 0
+      ? { timeout: actionOptions.timeout }
+      : {};
+    const traversedBox = await traverseToLocator(locator, measurementOptions);
+    const box = await locator.boundingBox?.(measurementOptions);
     if (
       !box ||
       ![box.x, box.y, box.width, box.height].every(Number.isFinite) ||
@@ -298,7 +301,7 @@ export function createActionHelper({
         error.code = 'JOURNEY_TARGET_NOT_VISIBLE';
         throw error;
       }
-      await locator.hover({ ...(requestedPosition ? { position: requestedPosition } : {}) });
+      await locator.hover({ ...measurementOptions, ...(requestedPosition ? { position: requestedPosition } : {}) });
       await pacingSleep(pacingNumber(timing.hoverPause));
       return requestedPosition || null;
     }
@@ -319,7 +322,7 @@ export function createActionHelper({
     const dy = target.y - cursor.y;
     const distance = Math.hypot(dx, dy);
     const steps = Math.max(
-      pacingNumber(timing.mouseSteps, { minimum: 6 }),
+      numberBetween(timing.mouseSteps, random),
       Math.min(36, Math.round(distance / 28))
     );
     const start = cursor;
@@ -333,7 +336,7 @@ export function createActionHelper({
       await pointerPath(
         overshoot,
         target,
-        pacingNumber(timing.mouseCorrectionSteps, { minimum: 2 }),
+        numberBetween(timing.mouseCorrectionSteps, random),
         { correction: true }
       );
     } else {
@@ -348,31 +351,27 @@ export function createActionHelper({
   }
 
   async function humanClick(locator, options = {}) {
-    const position = await moveToLocator(locator, options.position);
-    const { delay: requestedDelay, ...clickOptions } = options;
+    const position = await moveToLocator(locator, options.position, options);
+    // The Profile mode is authoritative over physical pacing. A task may still
+    // provide Playwright click semantics, but cannot bypass central timing.
+    const { delay: _requestedDelay, ...clickOptions } = options;
     const result = await locator.click({
       ...clickOptions,
       ...(position && options.position === undefined ? { position } : {}),
-      delay: strictVisibleTraversal || requestedDelay === undefined
-        ? pacingNumber(timing.clickDelay)
-        : requestedDelay
+      delay: pacingNumber(timing.clickDelay)
     });
     metrics.clicks += 1;
     return result;
   }
 
   async function enterText(locator, value, options) {
-    const { delay: requestedDelay, ...fillOptions } = options;
-    if (!usesHumanMechanics()) return locator.fill(String(value), fillOptions);
-    await humanClick(locator);
+    await humanClick(locator, Number.isFinite(options?.timeout) ? { timeout: options.timeout } : {});
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
     await page.keyboard.press('Backspace');
     let result;
     for (const character of Array.from(String(value))) {
       throwIfAborted();
-      const delay = strictVisibleTraversal || requestedDelay === undefined
-        ? pacingNumber(timing.keyDelay)
-        : requestedDelay;
+      const delay = pacingNumber(timing.keyDelay);
       if (typeof locator.pressSequentially === 'function') {
         result = await locator.pressSequentially(character, { delay });
       } else {
@@ -386,7 +385,6 @@ export function createActionHelper({
   }
 
   async function chooseSelectOption(locator, value, options) {
-    if (!usesHumanMechanics()) return locator.selectOption(value, options);
     const selection = await locator.evaluate((select, requested) => {
       const first = Array.isArray(requested) ? requested[0] : requested;
       const requestedIndex = typeof first === 'object' && first !== null ? first.index : undefined;
@@ -409,7 +407,7 @@ export function createActionHelper({
       error.code = 'JOURNEY_SELECT_OPTION_NOT_FOUND';
       throw error;
     }
-    await humanClick(locator);
+    await humanClick(locator, Number.isFinite(options?.timeout) ? { timeout: options.timeout } : {});
     // Keep the popup opened by the real click. On macOS, the first arrow key on
     // a closed select only opens the popup and does not advance the highlight;
     // moving while it is already open keeps the relative index consistent.
@@ -588,8 +586,7 @@ export function createActionHelper({
     async click(target, options = {}) {
       return execute('click', async () => {
         const locator = asLocator(page, target);
-        if (usesHumanMechanics()) return humanClick(locator, options);
-        return locator.click(options);
+        return humanClick(locator, options);
       });
     },
 
@@ -604,8 +601,7 @@ export function createActionHelper({
     async hover(target, options = {}) {
       return execute('hover', async () => {
         const locator = asLocator(page, target);
-        if (usesHumanMechanics()) return moveToLocator(locator, options.position);
-        return locator.hover(options);
+        return moveToLocator(locator, options.position, options);
       });
     },
 
@@ -622,7 +618,6 @@ export function createActionHelper({
       }
 
       return execute('scroll', async () => {
-        if (!usesHumanMechanics()) return page.mouse.wheel(deltaX, deltaY);
         await humanWheel(deltaX, deltaY, normalized.steps);
       });
     },
@@ -630,18 +625,20 @@ export function createActionHelper({
     async read(input = {}) {
       const words = Number(typeof input === 'number' ? input : input.words ?? 0);
       if (!Number.isFinite(words) || words < 0) throw new TypeError('read words must be non-negative');
-      if (!usesHumanMechanics()) return 0;
       throwIfAborted();
-      const duration = Math.min(
-        Math.max(1, Math.round(timing.readingMaximum * PACING_SCALE[effectiveMode()])),
-        pacingNumber(timing.readingBase) + Math.round(words * pacingNumber(timing.readingPerWord))
-      );
-      const interrupted = await pacingSleep(duration);
-      throwIfAborted();
-      const appliedDuration = interrupted ? 0 : duration;
-      if (appliedDuration > 0) metrics.readingDwells += 1;
-      metrics.readingDurationMs += appliedDuration;
-      return appliedDuration;
+      let duration;
+      let interrupted;
+      do {
+        duration = Math.min(
+          Math.max(1, Math.round(timing.readingMaximum * PACING_SCALE[effectiveMode()])),
+          pacingNumber(timing.readingBase) + Math.round(words * pacingNumber(timing.readingPerWord))
+        );
+        interrupted = await pacingSleep(duration);
+        throwIfAborted();
+      } while (interrupted);
+      metrics.readingDwells += 1;
+      metrics.readingDurationMs += duration;
+      return duration;
     },
 
     async wait(milliseconds) {

@@ -45,7 +45,8 @@ function fakeBrowser() {
         async click() {}, async fill() {}, async hover() {}, async pressSequentially() {}
       };
     },
-    mouse: { async wheel() {} }
+    mouse: { async wheel() {} },
+    keyboard: { async press() {} }
   };
   const context = {
     pages: () => [page],

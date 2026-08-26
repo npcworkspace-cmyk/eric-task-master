@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.4.0 - 2026-08-27
+
+- Made `fast`, `auto`, and `human` mechanically identical across the base action facade as well as Task Packs: every mode keeps rendered traversal, curved pointer paths and corrections, in-target clicks, per-character input, keyboard selection, segmented scrolling, and reading dwell. Task Pack journeys continue to add mandatory visible-transition verification.
+- Restricted behavior differences to central timing and guard depth. Pointer and wheel topology no longer shrink in `fast`, and task-supplied click or typing delays cannot override the live Profile policy.
+- Extended live switching through in-flight pacing boundaries, including recalculating an interrupted reading dwell under the newly Worker-applied mode without replacing the task, attempt, browser, Worker, or lease.
+- Added explicit `profile` versus Worker-confirmed behavior state. Task cards now show the actual configured/effective runtime mode and Manager receipt time, and show a pending state until a Worker receipt exists.
+- Expanded action-isomorphism, live Worker receipt, negative acknowledgement, real-browser acceptance, and Owner Console UI coverage for both Profile kinds and all three behavior modes.
+
 ## 2.3.0 - 2026-08-27
 
 - Exposed `fast`, `auto`, and `human` on both persistent and ephemeral Profiles. New persistent Profiles default to `human`; new ephemeral Profiles default to `auto`; legacy `adaptive` settings migrate in place without moving browser data.

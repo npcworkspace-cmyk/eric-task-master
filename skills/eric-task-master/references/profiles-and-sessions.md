@@ -27,8 +27,8 @@ Only one live lease is allowed. The Dashboard cannot open a Profile while a task
 
 ## Behavior defaults
 
-- `fast`: compressed pacing for deterministic or data-heavy work.
-- `human`: bounded hover, mouse, typing, reading, and scrolling cadence.
+- `fast`: the complete humanized action path with compressed central pacing.
+- `human`: the same complete humanized action path at natural central pacing.
 - `auto`: balances speed and caution, briefly becomes `cautious` for ordinary dynamic-page signals, and becomes guarded human-paced after occlusion, timeout, uncertain navigation, action failure, or rate limiting. Its effective mode and remaining guarded-action budget are visible in task status. Successful actions decay the temporary guard back toward fast.
 
-Behavior is selected on either Profile kind, and task start accepts no override. Updating it while a task owns the Profile uses a confirmed Manager-to-Worker control message: the current pacing delay is released and the new mode applies at the next scheduling or physical-action boundary, without a new Worker, browser, attempt, or task ID. A failed acknowledgement stops the task rather than letting it silently continue under the stale mode. Site-required cooldowns remain authoritative.
+Every mode keeps rendered traversal, curved pointer movement, target-safe clicks, per-character input, keyboard selection, segmented scrolling, and reading dwell; modes change only timing and guard depth. Behavior is selected on either Profile kind, and task start accepts no override. Updating it while a task owns the Profile uses a confirmed Manager-to-Worker control message: the current pacing delay is released and the new mode applies at the next scheduling or physical-action boundary, without a new Worker, browser, attempt, or task ID. A failed acknowledgement stops the task rather than letting it silently continue under the stale mode. Task status records `source: worker`, `confirmed: true`, and the Manager receipt time only after that acknowledgement. Site-required cooldowns remain authoritative.
