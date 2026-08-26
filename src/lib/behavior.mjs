@@ -355,7 +355,9 @@ export function createActionHelper({
     await humanClick(locator);
     // Native select popups differ across Chromium platforms. Close the popup
     // while retaining focus, move from the current option with real arrow-key
-    // events, then blur with Tab so input/change handlers settle consistently.
+    // events, commit the highlighted option, then blur with Tab so input/change
+    // handlers settle consistently. macOS Chromium requires the explicit Enter
+    // commit while Windows and Linux preserve the already-selected option.
     await locator.press('Escape');
     metrics.selectionKeyEvents += 1;
     const direction = selection.targetIndex >= selection.currentIndex ? 'ArrowDown' : 'ArrowUp';
@@ -365,6 +367,9 @@ export function createActionHelper({
       await locator.press(direction);
       metrics.selectionKeyEvents += 1;
     }
+    await sleep(numberBetween(timing.selectionKeyPause, random));
+    await locator.press('Enter');
+    metrics.selectionKeyEvents += 1;
     await sleep(numberBetween(timing.selectionKeyPause, random));
     await locator.press('Tab');
     metrics.selectionKeyEvents += 1;

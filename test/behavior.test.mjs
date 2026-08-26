@@ -146,9 +146,9 @@ test('human select closes the native popup, moves relative to the current option
 
   assert.equal(selected, 'alpha');
   assert.deepEqual(calls.filter((item) => item[0] === 'locatorKey').map((item) => item[1]), [
-    'Escape', 'ArrowUp', 'ArrowUp', 'Tab'
+    'Escape', 'ArrowUp', 'ArrowUp', 'Enter', 'Tab'
   ]);
-  assert.equal(action.audit.selectionKeyEvents, 4);
+  assert.equal(action.audit.selectionKeyEvents, 5);
 });
 
 test('adaptive mode grades ordinary dynamic signals separately from ambiguous failures', async () => {
