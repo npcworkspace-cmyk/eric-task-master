@@ -9,6 +9,7 @@ export const meta = Object.freeze({
   tags: ['acceptance', 'builtin'],
   outputs: ['json', 'png', 'download'],
   risk: 'mixed',
+  interactionContract: 'full-human-v1',
   supportsResume: false,
   inputSchema: {
     type: 'object',
@@ -23,7 +24,7 @@ export const meta = Object.freeze({
   }
 });
 
-export async function run({ page, context, input, outputDir, action, progress, checkpoint }) {
+export async function run({ page, context, input, outputDir, journey, progress, checkpoint }) {
   if (!input?.url || !input?.uploadPath) {
     throw new TypeError('acceptance task requires input.url and input.uploadPath');
   }
@@ -33,7 +34,7 @@ export async function run({ page, context, input, outputDir, action, progress, c
   await mkdir(outputDir, { recursive: true });
   const evidence = [];
 
-  await action.goto(input.url, { waitUntil: 'domcontentloaded' });
+  await journey.open(input.url, { waitUntil: 'domcontentloaded' });
   evidence.push({ kind: 'navigation', ok: page.url().startsWith(new URL(input.url).origin) });
   if (input.expectCleanStart || input.expectExistingState) {
     const initialCookies = await context.cookies(input.url);
@@ -54,40 +55,40 @@ export async function run({ page, context, input, outputDir, action, progress, c
   }
   await progress({ current: 1, total: 9, message: 'Fixture loaded' });
 
-  await action.fill('#name', 'Eric Task Master');
+  await journey.fill('#name', 'Eric Task Master');
   evidence.push({ kind: 'input', ok: await page.locator('#name').inputValue() === 'Eric Task Master' });
   await progress({ current: 2, total: 9, message: 'Text input verified' });
 
-  await action.hover('#submit');
-  await action.scroll({ deltaY: 120, steps: 4 });
-  const readingDelay = await action.read({ words: 20 });
+  await journey.hover('#submit');
+  await journey.scroll({ deltaY: 120, steps: 4 });
+  const readingDelay = await journey.read({ words: 20 });
   const behaviorTrace = await page.evaluate(() => window.__taskmasterTrace);
-  const humanBehavior = action.effectiveMode === 'human';
+  const humanBehavior = journey.contract === 'full-human-v1';
   evidence.push({
     kind: 'behavior',
     ok: humanBehavior
       ? behaviorTrace.pointerMoves >= 4 && behaviorTrace.inputEvents >= 16 &&
         behaviorTrace.wheelEvents >= 2 && readingDelay > 0 && readingDelay <= 8_000
       : readingDelay === 0,
-    mode: action.mode,
-    effectiveMode: action.effectiveMode,
+    mode: 'human',
+    effectiveMode: 'human',
     pointerMoves: behaviorTrace.pointerMoves,
     inputEvents: behaviorTrace.inputEvents,
     wheelEvents: behaviorTrace.wheelEvents,
     readingDelay
   });
 
-  await action.click('#agree');
+  await journey.click('#agree');
   evidence.push({ kind: 'checkbox', ok: await page.locator('#agree').isChecked() });
-  await action.run('select', () => page.locator('#choice').selectOption('beta'));
+  await journey.select('#choice', 'beta');
   evidence.push({ kind: 'select', ok: await page.locator('#choice').inputValue() === 'beta' });
   await progress({ current: 3, total: 9, message: 'Click and selection verified' });
 
-  await action.run('upload', () => page.locator('#upload').setInputFiles(input.uploadPath));
+  await journey.upload('#upload', input.uploadPath);
   evidence.push({ kind: 'upload', ok: await page.locator('#upload').evaluate((node) => node.files?.length === 1) });
   await progress({ current: 4, total: 9, message: 'Upload verified' });
 
-  await action.click('#submit');
+  await journey.click('#submit');
   const resultText = await page.locator('#result').innerText();
   evidence.push({ kind: 'submit', ok: resultText.includes('Eric Task Master|true|beta|') });
   await progress({ current: 5, total: 9, message: 'Submit result verified' });
@@ -99,7 +100,7 @@ export async function run({ page, context, input, outputDir, action, progress, c
   await progress({ current: 6, total: 9, message: 'Browser storage verified' });
 
   const downloadPromise = page.waitForEvent('download');
-  await action.click('#download');
+  await journey.click('#download');
   const download = await downloadPromise;
   const downloadPath = path.join(outputDir, 'taskmaster-fixture.txt');
   await download.saveAs(downloadPath);
@@ -114,7 +115,7 @@ export async function run({ page, context, input, outputDir, action, progress, c
   const passed = evidence.every((item) => item.ok);
   const report = {
     passed,
-    behavior: action.mode,
+    behavior: 'human',
     checkedAt: new Date().toISOString(),
     evidence
   };

@@ -53,6 +53,11 @@ async function staticChecks() {
     agentRegistry,
     dashboardSessions,
     taskRecipes,
+    taskPack,
+    interactionContract,
+    journey,
+    observationFacade,
+    acceptance,
     mcpStdio,
     mcpServer,
     mcpHostsDocument
@@ -69,6 +74,11 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'src', 'lib', 'agent-registry.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'dashboard-session-store.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'task-recipes.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'task-pack.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'interaction-contract.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'journey.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'observation-facade.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'scripts', 'acceptance.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'server.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'docs', 'MCP-HOSTS.md'), 'utf8')
@@ -121,6 +131,20 @@ async function staticChecks() {
     ['single-page', 'paginated-list', 'list-detail', 'resumable-batch', 'form-workflow']
       .every((recipe) => taskRecipes.includes(`'${recipe}'`)),
     'task authoring recipe boundary drift'
+  );
+  invariant(
+    taskPack.includes('FULL_HUMAN_INTERACTION_CONTRACT') &&
+      taskPack.includes('validateFullHumanPackSource') &&
+      taskRecipes.includes("interactionContract: 'full-human-v1'") &&
+      taskRecipes.includes('journey.nextPage') &&
+      interactionContract.includes("FULL_HUMAN_INTERACTION_CONTRACT = 'full-human-v1'") &&
+      journey.includes('TASK_INTERACTION_CONTRACT_FAILED') &&
+      observationFacade.includes('TASK_UI_ACTION_REQUIRES_JOURNEY') &&
+      taskWorker.includes('createObservationFacade') &&
+      taskWorker.includes('journey.assertComplete()') &&
+      acceptance.includes('interaction-audit.json') &&
+      acceptance.includes('audit.score === 10'),
+    'mandatory Human Journey, read-only observation, or interaction-audit boundary drift'
   );
   invariant(
     !manager.includes('/v1/pair/extension') &&
@@ -288,7 +312,7 @@ async function staticChecks() {
       releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
     'release preflight, monotonic version, or standalone Skill archive proof drift'
   );
-  return { passed: 45, total: 45 };
+  return { passed: 46, total: 46 };
 }
 
 function run(command, args, env = {}) {

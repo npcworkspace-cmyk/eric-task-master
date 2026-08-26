@@ -132,6 +132,7 @@ const TaskSchema = z.strictObject({
   createdBy: z.string().optional(),
   agent: AgentSchema.optional(),
   behavior: z.string().optional(),
+  interactionContract: z.literal('full-human-v1').optional(),
   attempt: z.number().int().optional(),
   history: z.array(AttemptHistorySchema).optional(),
   state: z.string().optional(),
@@ -215,6 +216,7 @@ const TaskTypeSchema = z.strictObject({
   deprecatedAt: z.string().optional(),
   replacedBy: z.string().optional(),
   pack: z.strictObject({ name: z.string(), version: z.string() }).optional(),
+  interactionContract: z.literal('full-human-v1').optional(),
   supportsResume: z.boolean().optional(),
   inputSchema: z.record(z.string(), z.json()).optional()
 });

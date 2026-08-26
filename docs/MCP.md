@@ -102,7 +102,7 @@ If a failed task exposes a preserved checkpoint and settled cleanup, `taskmaster
 
 A Worker completion claim is provisional. Manager publishes `completed` only after validating the bounded result shape, all declared Agent-visible artifacts, browser closure, Worker exit, and Profile lease release. Otherwise the task is `failed` with `TASK_COMPLETION_GATE_FAILED`.
 
-Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow.
+Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow. Pack-backed types expose `interactionContract: "full-human-v1"`; Manager forces those tasks through Human Journey and publishes `interaction-audit.json` only after its ten checks pass.
 
 Every successful `taskmaster_tasks_start` result begins with a clickable Owner Console link focused on that task. The first authorized link silently creates a persistent local `HttpOnly` Owner cookie; after that the fixed bookmarked Dashboard URL works across Manager restarts. When the user says “启动任务面板”, call `taskmaster_dashboard_open` and return its clickable link; the tool does not launch an operating-system browser.
 

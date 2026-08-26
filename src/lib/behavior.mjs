@@ -5,16 +5,20 @@ const DEFAULT_HUMAN_TIMING = Object.freeze({
   cautiousAfterAction: [25, 75],
   beforeAction: [45, 140],
   afterAction: [55, 180],
-  hoverPause: [70, 180],
-  clickDelay: [35, 95],
-  mouseSteps: [8, 16],
+  hoverPause: [90, 260],
+  clickDelay: [45, 120],
+  mouseSteps: [14, 30],
+  mouseStepPause: [3, 11],
+  mouseCorrectionSteps: [4, 8],
   keyDelay: [25, 85],
+  selectionKeyPause: [35, 95],
   wordPause: [30, 90],
   punctuationPause: [120, 320],
-  scrollPause: [70, 180],
-  readingBase: [350, 700],
-  readingPerWord: [90, 160],
-  readingMaximum: 8_000
+  scrollPause: [45, 135],
+  scrollGesturePause: [180, 620],
+  readingBase: [450, 900],
+  readingPerWord: [85, 145],
+  readingMaximum: 12_000
 });
 
 const ADAPTIVE_SIGNALS = Object.freeze({
@@ -91,7 +95,8 @@ export function createActionHelper({
   onFailure = async () => {},
   onEffect = async () => undefined,
   onAdaptiveState = () => {},
-  timing = DEFAULT_HUMAN_TIMING
+  timing = DEFAULT_HUMAN_TIMING,
+  strictVisibleTraversal = false
 } = {}) {
   if (!page) throw new TypeError('page is required');
   if (!isBehaviorMode(mode)) throw new TypeError(`Unsupported behavior mode: ${mode}`);
@@ -100,7 +105,21 @@ export function createActionHelper({
   let adaptiveActionsRemaining = 0;
   let adaptiveSignal = null;
   let adaptiveGeneration = 0;
-  let cursor = { x: 0, y: 0 };
+  let cursor = null;
+  const metrics = {
+    navigations: 0,
+    clicks: 0,
+    pointerMoves: 0,
+    pointerCorrections: 0,
+    visibleTargetAcquisitions: 0,
+    typedCharacters: 0,
+    selectionKeyEvents: 0,
+    scrollGestures: 0,
+    wheelEvents: 0,
+    targetTraversals: 0,
+    readingDwells: 0,
+    readingDurationMs: 0
+  };
 
   const throwIfAborted = () => {
     if (!abortSignal?.aborted) return;
@@ -121,8 +140,107 @@ export function createActionHelper({
     }
   }
 
+  function viewportSize() {
+    const configured = page.viewportSize?.();
+    if (configured?.width > 0 && configured?.height > 0) return configured;
+    return { width: 1280, height: 720 };
+  }
+
+  async function humanWheel(deltaX, deltaY, requestedSteps) {
+    const steps = Math.max(3, Math.min(12, Number(requestedSteps) || numberBetween([5, 9], random)));
+    const xSegments = easedSegments(deltaX, steps, random);
+    const ySegments = easedSegments(deltaY, steps, random);
+    metrics.scrollGestures += 1;
+    for (let index = 0; index < steps; index += 1) {
+      throwIfAborted();
+      await page.mouse.wheel(xSegments[index], ySegments[index]);
+      metrics.wheelEvents += 1;
+      if (index !== steps - 1) await sleep(numberBetween(timing.scrollPause, random));
+    }
+  }
+
+  async function traverseToLocator(locator) {
+    const viewport = viewportSize();
+    let box = await locator.boundingBox?.();
+    if (!box) {
+      if (strictVisibleTraversal) {
+        const error = new Error('Target has no measurable box for visible traversal');
+        error.code = 'JOURNEY_TARGET_NOT_MEASURABLE';
+        throw error;
+      }
+      return null;
+    }
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      throwIfAborted();
+      const centerY = box.y + box.height / 2;
+      if (centerY >= 0 && centerY <= viewport.height) {
+        metrics.visibleTargetAcquisitions += 1;
+        return box;
+      }
+      const desiredY = viewport.height * (0.48 + (random() - 0.5) * 0.12);
+      const rawDelta = centerY - desiredY;
+      const maximumGesture = viewport.height * (0.56 + random() * 0.18);
+      const deltaY = Math.sign(rawDelta) * Math.min(Math.abs(rawDelta), maximumGesture);
+      if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 8) break;
+      await humanWheel(0, deltaY);
+      metrics.targetTraversals += 1;
+      await sleep(numberBetween(timing.scrollGesturePause, random));
+      if (Math.abs(deltaY) > viewport.height * 0.35 && random() < 0.22) {
+        const correction = -Math.sign(deltaY) * numberBetween([18, 54], random);
+        await humanWheel(0, correction, numberBetween([3, 5], random));
+        metrics.pointerCorrections += 1;
+        await sleep(numberBetween(timing.scrollPause, random));
+      }
+      const next = await locator.boundingBox?.();
+      if (!next) break;
+      box = next;
+    }
+    const centerY = box.y + box.height / 2;
+    if (centerY >= 0 && centerY <= viewport.height) {
+      metrics.visibleTargetAcquisitions += 1;
+      return box;
+    }
+    const error = new Error('Target could not be reached through bounded visible scrolling');
+    error.code = 'JOURNEY_TARGET_NOT_VISIBLE';
+    throw error;
+  }
+
+  async function pointerPath(start, target, steps, { correction = false } = {}) {
+    const dx = target.x - start.x;
+    const dy = target.y - start.y;
+    const distance = Math.hypot(dx, dy);
+    const normal = distance > 0 ? { x: -dy / distance, y: dx / distance } : { x: 0, y: 0 };
+    const curve = Math.min(100, Math.max(8, distance * 0.15)) * (random() * 2 - 1);
+    const control1 = {
+      x: start.x + dx * (0.28 + random() * 0.12) + normal.x * curve,
+      y: start.y + dy * (0.28 + random() * 0.12) + normal.y * curve
+    };
+    const control2 = {
+      x: start.x + dx * (0.68 + random() * 0.12) - normal.x * curve * 0.45,
+      y: start.y + dy * (0.68 + random() * 0.12) - normal.y * curve * 0.45
+    };
+    const viewport = viewportSize();
+    for (let index = 1; index <= steps; index += 1) {
+      throwIfAborted();
+      const linear = index / steps;
+      const progress = linear * linear * (3 - 2 * linear);
+      const inverse = 1 - progress;
+      const x = inverse ** 3 * start.x + 3 * inverse ** 2 * progress * control1.x +
+        3 * inverse * progress ** 2 * control2.x + progress ** 3 * target.x;
+      const y = inverse ** 3 * start.y + 3 * inverse ** 2 * progress * control1.y +
+        3 * inverse * progress ** 2 * control2.y + progress ** 3 * target.y;
+      await page.mouse.move(
+        Math.max(0, Math.min(viewport.width - 1, x)),
+        Math.max(0, Math.min(viewport.height - 1, y))
+      );
+      metrics.pointerMoves += 1;
+      if (correction) metrics.pointerCorrections += 1;
+      if (index !== steps) await sleep(numberBetween(timing.mouseStepPause, random));
+    }
+  }
+
   async function moveToLocator(locator, requestedPosition) {
-    await locator.scrollIntoViewIfNeeded?.();
+    const traversedBox = await traverseToLocator(locator);
     const box = await locator.boundingBox?.();
     if (
       !box ||
@@ -131,6 +249,11 @@ export function createActionHelper({
       box.height <= 0 ||
       typeof page.mouse?.move !== 'function'
     ) {
+      if (strictVisibleTraversal) {
+        const error = new Error('Target became unavailable after visible traversal');
+        error.code = 'JOURNEY_TARGET_NOT_VISIBLE';
+        throw error;
+      }
       await locator.hover({ ...(requestedPosition ? { position: requestedPosition } : {}) });
       await sleep(numberBetween(timing.hoverPause, random));
       return requestedPosition || null;
@@ -141,49 +264,54 @@ export function createActionHelper({
       y: box.height * (0.3 + random() * 0.4)
     };
     const target = { x: box.x + position.x, y: box.y + position.y };
+    if (!cursor) {
+      const viewport = viewportSize();
+      cursor = {
+        x: viewport.width * (0.42 + random() * 0.16),
+        y: viewport.height * (0.36 + random() * 0.18)
+      };
+    }
     const dx = target.x - cursor.x;
     const dy = target.y - cursor.y;
     const distance = Math.hypot(dx, dy);
-    const curve = Math.min(80, Math.max(6, distance * 0.12)) * (random() * 2 - 1);
-    const control = distance > 0 ? {
-      x: cursor.x + dx / 2 - dy / distance * curve,
-      y: cursor.y + dy / 2 + dx / distance * curve
-    } : cursor;
-    const steps = numberBetween(timing.mouseSteps, random);
+    const steps = Math.max(numberBetween(timing.mouseSteps, random), Math.min(36, Math.round(distance / 28)));
     const start = cursor;
-    const viewport = page.viewportSize?.();
-    const maximumX = viewport?.width ? viewport.width - 1 : Number.POSITIVE_INFINITY;
-    const maximumY = viewport?.height ? viewport.height - 1 : Number.POSITIVE_INFINITY;
-    for (let index = 1; index <= steps; index += 1) {
-      throwIfAborted();
-      const progress = index / steps;
-      const inverse = 1 - progress;
-      await page.mouse.move(
-        Math.max(0, Math.min(maximumX,
-          inverse * inverse * start.x + 2 * inverse * progress * control.x + progress * progress * target.x)),
-        Math.max(0, Math.min(maximumY,
-          inverse * inverse * start.y + 2 * inverse * progress * control.y + progress * progress * target.y))
-      );
+    if (distance > 140 && random() < 0.52) {
+      const overshootDistance = Math.min(14, Math.max(4, distance * 0.025));
+      const overshoot = {
+        x: target.x + dx / distance * overshootDistance,
+        y: target.y + dy / distance * overshootDistance
+      };
+      await pointerPath(start, overshoot, steps);
+      await pointerPath(overshoot, target, numberBetween(timing.mouseCorrectionSteps, random), { correction: true });
+    } else {
+      await pointerPath(start, target, steps);
     }
     cursor = target;
     await sleep(numberBetween(timing.hoverPause, random));
+    if (traversedBox && (Math.abs(traversedBox.x - box.x) > 2 || Math.abs(traversedBox.y - box.y) > 2)) {
+      await sleep(numberBetween(timing.hoverPause, random));
+    }
     return position;
   }
 
   async function humanClick(locator, options = {}) {
     const position = await moveToLocator(locator, options.position);
-    return locator.click({
+    const result = await locator.click({
       ...options,
       ...(position && options.position === undefined ? { position } : {}),
       ...(options.delay === undefined ? { delay: numberBetween(timing.clickDelay, random) } : {})
     });
+    metrics.clicks += 1;
+    return result;
   }
 
   async function enterText(locator, value, options) {
     const { delay: requestedDelay, ...fillOptions } = options;
     if (!usesHumanTiming()) return locator.fill(String(value), fillOptions);
     await humanClick(locator);
-    await locator.fill('');
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+    await page.keyboard.press('Backspace');
     let result;
     for (const character of Array.from(String(value))) {
       throwIfAborted();
@@ -193,10 +321,41 @@ export function createActionHelper({
       } else {
         result = await locator.type(character, { delay });
       }
+      metrics.typedCharacters += 1;
       if (/[,.;:!?，。！？；：、]/u.test(character)) await sleep(numberBetween(timing.punctuationPause, random));
       else if (/\s/u.test(character)) await sleep(numberBetween(timing.wordPause, random));
     }
     return result;
+  }
+
+  async function chooseSelectOption(locator, value, options) {
+    if (!usesHumanTiming()) return locator.selectOption(value, options);
+    const targetIndex = await locator.evaluate((select, requested) => {
+      const first = Array.isArray(requested) ? requested[0] : requested;
+      const requestedValue = typeof first === 'object' && first !== null
+        ? first.value ?? first.label
+        : first;
+      return [...select.options].findIndex((option) => (
+        option.value === String(requestedValue) || option.label === String(requestedValue)
+      ));
+    }, value);
+    if (!Number.isSafeInteger(targetIndex) || targetIndex < 0) {
+      const error = new Error('Requested select option is unavailable');
+      error.code = 'JOURNEY_SELECT_OPTION_NOT_FOUND';
+      throw error;
+    }
+    await humanClick(locator);
+    await page.keyboard.press('Home');
+    metrics.selectionKeyEvents += 1;
+    for (let index = 0; index < targetIndex; index += 1) {
+      await sleep(numberBetween(timing.selectionKeyPause, random));
+      await page.keyboard.press('ArrowDown');
+      metrics.selectionKeyEvents += 1;
+    }
+    await sleep(numberBetween(timing.selectionKeyPause, random));
+    await page.keyboard.press('Enter');
+    metrics.selectionKeyEvents += 1;
+    return locator.inputValue?.();
   }
 
   function signal(kind) {
@@ -282,6 +441,10 @@ export function createActionHelper({
       return adaptiveState();
     },
 
+    get audit() {
+      return Object.freeze({ ...metrics });
+    },
+
     signal,
 
     async run(name, callback) {
@@ -292,6 +455,7 @@ export function createActionHelper({
     async goto(url, options = {}) {
       return execute('goto', async () => {
         const response = await page.goto(url, options);
+        metrics.navigations += 1;
         const status = response?.status?.();
         if (status === 429 || (status === 503 && response?.headers?.()['retry-after'])) signal('rate_limit');
         return response;
@@ -322,6 +486,10 @@ export function createActionHelper({
       });
     },
 
+    async select(target, value, options = {}) {
+      return execute('select', () => chooseSelectOption(asLocator(page, target), value, options));
+    },
+
     async scroll(input = {}) {
       const normalized = typeof input === 'number' ? { deltaY: input } : input;
       const deltaX = Number(normalized.deltaX ?? 0);
@@ -332,14 +500,7 @@ export function createActionHelper({
 
       return execute('scroll', async () => {
         if (!usesHumanTiming()) return page.mouse.wheel(deltaX, deltaY);
-        const steps = Math.max(2, Math.min(8, Number(normalized.steps) || numberBetween([3, 6], random)));
-        const xSegments = easedSegments(deltaX, steps, random);
-        const ySegments = easedSegments(deltaY, steps, random);
-        for (let index = 0; index < steps; index += 1) {
-          throwIfAborted();
-          await page.mouse.wheel(xSegments[index], ySegments[index]);
-          if (index !== steps - 1) await sleep(numberBetween(timing.scrollPause, random));
-        }
+        await humanWheel(deltaX, deltaY, normalized.steps);
       });
     },
 
@@ -354,6 +515,8 @@ export function createActionHelper({
       );
       await sleep(duration);
       throwIfAborted();
+      metrics.readingDwells += 1;
+      metrics.readingDurationMs += duration;
       return duration;
     },
 

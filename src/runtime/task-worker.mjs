@@ -12,6 +12,9 @@ import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs'
 import { createSemanticObserver } from '../lib/semantic-observer.mjs';
 import { createUserHandoff } from '../lib/user-handoff.mjs';
 import { writeCleanupReceipt } from '../lib/cleanup-receipt.mjs';
+import { createJourneyHelper } from '../lib/journey.mjs';
+import { createObservationFacade } from '../lib/observation-facade.mjs';
+import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 20_000;
 const DEFAULT_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
@@ -499,10 +502,42 @@ function normalizeResult(result) {
   return normalized;
 }
 
+function restrictedPackAction(action) {
+  const fail = (operation) => {
+    const error = new Error(`Task Packs must use journey.${operation} instead of the legacy action facade`);
+    error.code = 'TASK_PACK_JOURNEY_REQUIRED';
+    throw error;
+  };
+  return Object.freeze({
+    get mode() { return action.mode; },
+    get effectiveMode() { return action.effectiveMode; },
+    get adaptiveState() { return action.adaptiveState; },
+    get audit() { return action.audit; },
+    signal: () => fail('signal'),
+    run: () => fail('run'),
+    goto: () => fail('open'),
+    click: () => fail('click'),
+    fill: () => fail('fill'),
+    type: () => fail('type'),
+    hover: () => fail('hover'),
+    scroll: () => fail('scroll'),
+    read: () => fail('read'),
+    wait: () => fail('wait')
+  });
+}
+
 export async function runTaskWorker(config, {
   loadPlaywright = () => import('playwright'),
   signal
 } = {}) {
+  if (
+    config.interactionContract !== undefined &&
+    config.interactionContract !== FULL_HUMAN_INTERACTION_CONTRACT
+  ) {
+    const error = new TypeError(`Unsupported interaction contract: ${config.interactionContract}`);
+    error.code = 'TASK_INTERACTION_CONTRACT_UNSUPPORTED';
+    throw error;
+  }
   activePage = null;
   activeProgress = { current: 0, total: null, message: 'Starting browser' };
   activeOutputBudget = null;
@@ -784,10 +819,12 @@ export async function runTaskWorker(config, {
     };
 
     let semantic;
+    const fullHumanJourney = config.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT;
     const rawAction = createActionHelper({
       page,
-      mode: config.behavior,
+      mode: fullHumanJourney ? 'human' : config.behavior,
       abortSignal: executionSignal,
+      strictVisibleTraversal: fullHumanJourney,
       onEffect: async (event) => {
         const sequence = await effectJournal.record(event);
         safeSend({ type: 'activity', activity: browserEffectActivity(event) });
@@ -823,6 +860,7 @@ export async function runTaskWorker(config, {
       get mode() { return rawAction.mode; },
       get effectiveMode() { return rawAction.effectiveMode; },
       get adaptiveState() { return rawAction.adaptiveState; },
+      get audit() { return rawAction.audit; },
       signal: (...args) => rawAction.signal(...args),
       run: guardedAction('run'),
       goto: guardedAction('goto'),
@@ -830,11 +868,44 @@ export async function runTaskWorker(config, {
       fill: guardedAction('fill'),
       type: guardedAction('type'),
       hover: guardedAction('hover'),
+      select: guardedAction('select'),
       scroll: guardedAction('scroll'),
       read: guardedAction('read'),
       wait: guardedAction('wait')
     });
-    semantic = createSemanticObserver({ page, action });
+    let journey = null;
+    let taskPage = page;
+    let taskContext = context;
+    let taskAction = action;
+    if (fullHumanJourney) {
+      journey = createJourneyHelper({
+        page,
+        action,
+        contract: FULL_HUMAN_INTERACTION_CONTRACT,
+        onState: ({ phase, operation, at }) => safeSend({
+          type: 'activity',
+          activity: {
+            phase: operation.includes('scroll') ? 'scrolling'
+              : operation.includes('fill') || operation.includes('type') ? 'typing'
+                : operation.includes('click') || operation.includes('page') || operation.includes('navigate') ? 'clicking'
+                  : operation === 'open' ? 'navigating' : 'working',
+            status: phase === 'started' ? 'active' : phase === 'succeeded' ? 'succeeded' : 'unknown',
+            updatedAt: at
+          }
+        })
+      });
+      const observation = createObservationFacade({
+        page,
+        context,
+        onViolation: (event) => journey.violation(event)
+      });
+      taskPage = observation.page;
+      taskContext = observation.context;
+      taskAction = restrictedPackAction(action);
+      semantic = createSemanticObserver({ page, action: journey, locatorTransform: observation.locator });
+    } else {
+      semantic = createSemanticObserver({ page, action });
+    }
     activeSemantic = semantic;
     const handoff = createUserHandoff({
       signal: executionSignal,
@@ -883,11 +954,12 @@ export async function runTaskWorker(config, {
     await progress({ current: 0, total: null, message: 'Task started' });
 
     const taskPromise = Promise.resolve().then(() => taskModule.run({
-      page,
-      context,
+      page: taskPage,
+      context: taskContext,
       input: config.input,
       outputDir: config.outputDir,
-      action,
+      action: taskAction,
+      ...(journey ? { journey } : {}),
       cooldown,
       effects,
       semantic,
@@ -905,9 +977,33 @@ export async function runTaskWorker(config, {
       error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
       throw error;
     }
+    let interactionAudit = null;
+    if (journey) {
+      interactionAudit = journey.assertComplete();
+      await writeJsonAtomic(path.join(config.outputDir, 'interaction-audit.json'), interactionAudit);
+    }
     await outputBudget.assertWithinBudget();
     await effectJournal.assertSettled();
-    const result = normalizeResult(rawResult);
+    const resultInput = interactionAudit
+      ? {
+          ...rawResult,
+          evidence: [
+            ...rawResult.evidence,
+            {
+              kind: 'artifact',
+              file: 'interaction-audit.json',
+              agentVisible: true,
+              label: 'full-human-v1 interaction audit'
+            }
+          ]
+        }
+      : rawResult;
+    if (interactionAudit && rawResult.evidence.length >= 32) {
+      const error = new Error('full-human-v1 Task Pack results must leave one evidence slot for the interaction audit');
+      error.code = 'TASK_INTERACTION_AUDIT_EVIDENCE_LIMIT';
+      throw error;
+    }
+    const result = normalizeResult(resultInput);
     safeSend({ type: 'state', state: 'verifying' });
     safeSend({ type: 'result', result });
     safeSend({ type: 'state', state: 'completed' });

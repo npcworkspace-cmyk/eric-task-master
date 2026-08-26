@@ -21,6 +21,9 @@ function fixture() {
       async move(x, y) { calls.push(['move', x, y]); },
       async wheel(x, y) { calls.push(['wheel', x, y]); }
     },
+    keyboard: {
+      async press(key) { calls.push(['key', key]); }
+    },
     async goto(url, options) {
       calls.push(['goto', url, options]);
       return { ok: true };
@@ -74,7 +77,7 @@ test('human mode uses bounded pointer motion, typing rhythm, eased scroll, and r
   const click = calls.find((item) => item[0] === 'click');
   assert.ok(click[1].position.x > 0 && click[1].position.x < 120);
   assert.ok(click[1].position.y > 0 && click[1].position.y < 40);
-  assert.ok(click[1].delay >= 35 && click[1].delay <= 95);
+  assert.ok(click[1].delay >= 45 && click[1].delay <= 120);
 
   const keystrokes = calls.filter((item) => item[0] === 'pressSequentially');
   assert.equal(keystrokes.length, 5);
@@ -88,6 +91,34 @@ test('human mode uses bounded pointer motion, typing rhythm, eased scroll, and r
   assert.ok(Math.abs(wheels[2][2]) > Math.abs(wheels[0][2]));
   assert.ok(readingDelay >= 2_150 && readingDelay <= 3_900);
   assert.ok(sleeps.includes(readingDelay));
+  assert.equal(calls.some((item) => item[0] === 'scrollIntoViewIfNeeded'), false);
+  assert.ok(action.audit.pointerMoves >= 14);
+  assert.equal(action.audit.wheelEvents, 5);
+});
+
+test('human click reaches an offscreen target through bounded wheel gestures instead of instant positioning', async () => {
+  const { calls, locator, page } = fixture();
+  let y = 2_400;
+  locator.boundingBox = async () => ({ x: 100, y, width: 120, height: 40 });
+  page.mouse.wheel = async (x, deltaY) => {
+    calls.push(['wheel', x, deltaY]);
+    y -= deltaY;
+  };
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    strictVisibleTraversal: true,
+    random: () => 0.5,
+    sleep: async () => {}
+  });
+
+  await action.click('#submit');
+
+  assert.ok(calls.filter((item) => item[0] === 'wheel').length >= 6);
+  assert.ok(y >= 0 && y <= 720);
+  assert.equal(calls.some((item) => item[0] === 'scrollIntoViewIfNeeded'), false);
+  assert.ok(action.audit.targetTraversals >= 1);
+  assert.ok(action.audit.pointerMoves >= 14);
 });
 
 test('adaptive mode grades ordinary dynamic signals separately from ambiguous failures', async () => {

@@ -44,6 +44,7 @@ export const meta = {
   name: 'example-read',
   version: '1.0.0',
   description: 'Read one bounded page.',
+  interactionContract: 'full-human-v1',
   supportsResume: false,
   inputSchema: {
     type: 'object',
@@ -57,14 +58,14 @@ export const meta = {
 
 export async function run({
   page, context, input, outputDir,
-  action, cooldown, effects, semantic, handoff,
+  journey, cooldown, effects, semantic, handoff,
   progress, checkpoint, signal
 }) {
   const target = new URL(input.url);
   if (!['http:', 'https:'].includes(target.protocol)) throw new TypeError('url must use HTTP(S)');
   await mkdir(outputDir, { recursive: true });
 
-  await action.goto(target.href, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await journey.open(target.href, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await progress({ current: 1, total: 2, message: 'Target loaded' });
   const data = await page.locator('body').evaluate((body) => ({
     title: document.title.slice(0, 500),
@@ -88,7 +89,7 @@ export async function run({
 
 The module return value is not streamed. Persist large or durable data below `outputDir`, declare each safe relative file as an Agent-visible artifact, and return only a compact summary/evidence object. Unlisted files remain internal.
 
-The completion claim must contain a non-empty `summary` of at most 4,000 characters and 1-32 evidence items. Supported evidence shapes are:
+The completion claim must contain a non-empty `summary` of at most 4,000 characters and 1-32 evidence items. A `full-human-v1` module may return at most 31 because the runtime reserves one item for its generated interaction audit. Supported evidence shapes are:
 
 - `{ kind: 'url', value: 'https://...' }` for one HTTP(S) URL;
 - `{ kind: 'count', value: 123 }` for a non-negative finite count;
@@ -142,8 +143,11 @@ The supported `inputSchema` subset is deliberately small and enforced at registr
 
 ## Runtime rules
 
-- Use `action.goto/click/fill/type/hover/scroll/read/run` so the selected `fast`, `human`, or `adaptive` policy applies. Direct Playwright locators remain available for deterministic reads and assertions.
-- After observing content that a human-paced workflow actually reads, call `await action.read({ words: observedWordCount })`. The delay is bounded to eight seconds, returns its duration, and is zero in effective fast mode. Do not use it for deterministic bulk extraction.
+- Task Packs must declare `full-human-v1` and use `journey.open/click/fill/type/hover/scroll/read/select/upload/navigate/nextPage/back`. The Pack specifies sequence, pacing limits, checkpoints, and business logic; the runtime supplies the physical interaction mechanics.
+- In a contracted Pack, `page`, `context`, locators, and `semantic` remain available for deterministic reads and assertions, but their mutating methods are blocked. Direct mutation is recorded as a contract violation and causes completion to fail even if module code catches the first exception. The legacy `action` mutation surface is unavailable.
+- Use `journey.nextPage(locator)` for visible pagination and `journey.navigate(locator)` for visible drill-down. Do not replace site controls with constructed destination URLs during a normal in-page journey. `journey.open` is for initial or independent work-item entries and explicit checkpoint recovery.
+- After observing content that the workflow actually reads, call `await journey.read({ words: observedWordCount })`. Do not add custom pointer timing, typing cadence, or scroll-shape code.
+- Successful contracted tasks publish `interaction-audit.json` automatically. Its ten checks cover entry, viewport observation, visible target acquisition, pointer/click mechanics, typing cadence when used, segmented scrolling, verified pagination, bypass absence, and settled journey steps. A failed audit rejects completion.
 - Report progress after each meaningful, externally verifiable unit. Automatic heartbeat does not replace task progress. By default, two minutes without meaningful progress marks the task `stalled` and captures diagnostics; ten minutes of continued silence fails and cleans it up. `waiting_user` and an explicit `cooling_down` period are not treated as stalls.
 - Within one attempt, `current` cannot decrease and a declared finite `total` cannot shrink or disappear. If a finite total was declared, completion requires `current === total`.
 - Checkpoint after a recoverable unit. `await checkpoint(data)` stores that bounded data; `await checkpoint.read()` returns exactly the previously stored `data` object, or `null` when no checkpoint exists. It does not return an internal `{ savedAt, data }` wrapper. The complete checkpoint envelope is capped at 8 MiB; store bulk rows/files under `outputDir` and checkpoint only cursors, stable keys, counts, and file references.
@@ -155,7 +159,7 @@ The supported `inputSchema` subset is deliberately small and enforced at registr
 - Persist large results below `outputDir`, but expose only explicit relative files as `{ kind: 'artifact', file, agentVisible: true }`.
 - Agent-visible artifact chunks are returned byte-for-byte so JSON/JSONL/CSV and SHA-256 verification remain valid. Treat `agentVisible: true` as an explicit disclosure decision: never declare a credential-bearing file.
 - Keep output bounded. The Worker enforces a default 512 MiB / 10,000-file task budget and preserves existing files on `TASK_OUTPUT_BUDGET_EXCEEDED`; split genuinely larger jobs into checkpointed tasks instead of bypassing the limit.
-- Put every state-changing browser operation through `action`; direct `page` access is for observation. Browser effects made through `action` are journaled without selectors, values, or URLs. A Playwright exception is treated as an unknown outcome, never proof that the website did nothing. At the start of a resumed attempt, call `effects.pending()`. If it is non-empty, inspect current page/server state without issuing another external action. Only after verification may the module call `await effects.resolveUnknown(sequence, 'observed_succeeded')` or `await effects.resolveUnknown(sequence, 'observed_not_applied')`. Until then every new `action` is rejected with `TASK_EFFECT_OUTCOME_UNKNOWN`; the journal is evidence, never permission to replay an action.
+- Put every state-changing browser operation through `journey` in a Task Pack. Browser effects are journaled without selectors, values, or URLs. A Playwright exception is treated as an unknown outcome, never proof that the website did nothing. At the start of a resumed attempt, call `effects.pending()`. If it is non-empty, inspect current page/server state without issuing another external action. Only after verification may the module call `await effects.resolveUnknown(sequence, 'observed_succeeded')` or `await effects.resolveUnknown(sequence, 'observed_not_applied')`. Until then every new journey action is rejected with `TASK_EFFECT_OUTCOME_UNKNOWN`; the journal is evidence, never permission to replay an action.
 - Keep returned `summary` and `evidence` compact; returned business arrays are not persisted automatically.
 - Do not launch a second browser, reuse another Profile directory, close the supplied context, create another daemon, or implement a parallel task-follow loop.
 - Never log credentials or include them in evidence, checkpoints, artifacts, filenames, URLs, or errors.

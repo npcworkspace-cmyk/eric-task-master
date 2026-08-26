@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.2.0 - 2026-08-26
+
+- Added the central `full-human-v1` Human Journey engine: rendered-page traversal, segmented wheel gestures, curved pointer paths with correction, in-target clicks, keyboard input and native selection cadence, bounded reading dwell, and verified visible navigation.
+- Made `full-human-v1` mandatory for every versioned Task Pack. Pack modules now define workflow intent, selectors, pacing limits, extraction, checkpoints, outputs, and evidence while the runtime owns physical browser behavior.
+- Added read-only Page, Context, Frame, FrameLocator, and Locator observation facades plus Pack source preflight so direct Playwright mutation and legacy action bypasses fail closed.
+- Added a ten-check `interaction-audit.json` completion gate. A contracted task cannot publish success unless visible target acquisition, pointer/click mechanics, input cadence where applicable, segmented scrolling, transition verification, bypass absence, and step settlement all pass.
+- Migrated all five Task Pack recipes and the real Chromium acceptance task to Human Journey, added an offscreen pagination browser test, and expanded acceptance to validate the generated 10/10 audit and cleanup.
+- Kept the boundary explicit: Human Journey improves reliability and consistency but does not spoof fingerprints, bypass CAPTCHA, or promise that websites cannot identify automation.
+
 ## 2.1.3 - 2026-08-26
 
 - Made MCP the default multi-Agent integration: every host owns a scoped STDIO bridge while all bridges reuse one local Manager, shared Profiles, scheduling, and durable task state; CLI remains an emergency fallback only.

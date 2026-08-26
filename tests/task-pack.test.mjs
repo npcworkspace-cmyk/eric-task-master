@@ -27,6 +27,7 @@ test('Task Pack scaffold is portable, bounded, and path-safe', async (t) => {
   const destination = path.join(root, 'sample');
   const created = await scaffoldTaskPack(destination, { name: 'sample-pack' });
   assert.equal(created.pack.name, 'sample-pack');
+  assert.equal(created.pack.interactionContract, 'full-human-v1');
   assert.deepEqual(created.pack.tasks[0], {
     name: 'sample-pack.single-page.v1',
     module: 'tasks/single-page-v1.mjs'
@@ -43,9 +44,7 @@ test('Task Pack scaffold is portable, bounded, and path-safe', async (t) => {
     version: '1.0.0',
     tasks: [{ name: 'legacy-pack.collect', module: 'tasks/collect.mjs' }]
   }));
-  assert.deepEqual((await readTaskPack(legacy)).pack.tasks, [
-    { name: 'legacy-pack.collect', module: 'tasks/collect.mjs' }
-  ]);
+  await assert.rejects(readTaskPack(legacy), { code: 'INVALID_TASK_PACK' });
 
   const outside = path.join(root, 'outside.mjs');
   await writeFile(outside, 'export async function run() {}\n');
@@ -67,7 +66,7 @@ test('Task Pack batch install is all-or-nothing and exposes progressive discover
     "  risk: 'read', readOnly: true, supportsResume: true,",
     "  inputSchema: { type: 'object', properties: { url: { type: 'string' } } }",
     '};',
-    'export async function run() { return { summary: "ok", evidence: [] }; }',
+    'export async function run({ journey }) { await journey.open("https://example.test"); return { summary: "ok", evidence: [] }; }',
     ''
   ].join('\n');
   const first = path.join(allowed, 'first.mjs');
@@ -78,11 +77,12 @@ test('Task Pack batch install is all-or-nothing and exposes progressive discover
   const installed = await registry.installBatch([
     { name: 'pack.first', modulePath: first },
     { name: 'pack.second', modulePath: second }
-  ], { pack: { name: 'sample-pack', version: '1.0.0' } });
+  ], { pack: { name: 'sample-pack', version: '1.0.0', interactionContract: 'full-human-v1' } });
   assert.equal(installed.length, 2);
   const summaries = await registry.listSummaries();
   assert.equal('inputSchema' in summaries[0], false);
   assert.deepEqual(summaries[0].pack, { name: 'sample-pack', version: '1.0.0' });
+  assert.equal(summaries[0].interactionContract, 'full-human-v1');
   assert.equal(summaries[0].supportsResume, true);
   const described = await registry.describe('pack.first');
   assert.equal(described.inputSchema.properties.url.type, 'string');
@@ -95,7 +95,7 @@ test('Task Pack batch install is all-or-nothing and exposes progressive discover
     registry.installBatch([
       { name: 'pack.third', modulePath: third },
       { name: 'pack.second', modulePath: conflict }
-    ], { pack: { name: 'broken-pack', version: '1.0.0' } }),
+    ], { pack: { name: 'broken-pack', version: '1.0.0', interactionContract: 'full-human-v1' } }),
     { code: 'TASK_TYPE_CONFLICT', statusCode: 409 }
   );
   assert.equal((await registry.list()).some((item) => item.name === 'pack.third'), false);
@@ -106,7 +106,7 @@ test('Task Pack install attaches provenance to an identical standalone type with
   const modulePath = path.join(allowed, 'shared.mjs');
   await writeFile(modulePath, [
     "export const meta = { version: '1.0.0', risk: 'read', readOnly: true };",
-    "export async function run() { return { summary: 'ok', evidence: [{ kind: 'message', value: 'ok' }] }; }",
+    "export async function run({ journey }) { await journey.open('https://example.test'); return { summary: 'ok', evidence: [{ kind: 'message', value: 'ok' }] }; }",
     ''
   ].join('\n'));
 
@@ -115,7 +115,7 @@ test('Task Pack install attaches provenance to an identical standalone type with
 
   const [attached] = await registry.installBatch([
     { name: 'pack.shared', modulePath }
-  ], { pack: { name: 'sample-pack', version: '1.0.0' } });
+  ], { pack: { name: 'sample-pack', version: '1.0.0', interactionContract: 'full-human-v1' } });
   assert.deepEqual(attached.pack, { name: 'sample-pack', version: '1.0.0' });
   assert.deepEqual((await registry.describe('pack.shared')).pack, {
     name: 'sample-pack',
@@ -125,11 +125,35 @@ test('Task Pack install attaches provenance to an identical standalone type with
   await assert.rejects(
     registry.installBatch([
       { name: 'pack.shared', modulePath }
-    ], { pack: { name: 'other-pack', version: '1.0.0' } }),
+    ], { pack: { name: 'other-pack', version: '1.0.0', interactionContract: 'full-human-v1' } }),
     { code: 'TASK_TYPE_PACK_CONFLICT', statusCode: 409 }
   );
   assert.deepEqual((await registry.describe('pack.shared')).pack, {
     name: 'sample-pack',
     version: '1.0.0'
   });
+});
+
+test('Task Pack preflight rejects legacy action and direct Page mutation bypasses', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-pack-bypass-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, 'tasks'), { recursive: true });
+  await writeFile(path.join(root, 'taskpack.json'), JSON.stringify({
+    name: 'unsafe-pack',
+    version: '1.0.0',
+    interactionContract: 'full-human-v1',
+    tasks: [{ name: 'unsafe-pack.collect.v1', module: 'tasks/collect.mjs' }]
+  }));
+  await writeFile(path.join(root, 'tasks', 'collect.mjs'), [
+    'export async function run({ page, action, journey }) {',
+    "  await action.goto('https://example.test');",
+    "  await page.goto('https://example.test/next');",
+    '  return { summary: journey.contract, evidence: [] };',
+    '}',
+    ''
+  ].join('\n'));
+
+  const result = await preflightTaskPack(root);
+  assert.equal(result.ok, false);
+  assert.equal(result.checks[0].code, 'TASK_PACK_JOURNEY_BYPASS');
 });

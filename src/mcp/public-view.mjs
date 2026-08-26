@@ -288,6 +288,7 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['createdBy', stringValue(task?.createdBy, 128)],
     ['agent', agent?.clientId && agent?.name ? agent : undefined],
     ['behavior', stringValue(task?.behavior, 32)],
+    ['interactionContract', stringValue(task?.interactionContract, 32)],
     ['attempt', Number.isSafeInteger(task?.attempt) ? task.attempt : undefined],
     ['history', publicAttemptHistory(task?.history)],
     ['state', stringValue(task?.state, 64)],
@@ -345,6 +346,7 @@ export function publicTaskType(taskType, { includeSchema = true } = {}) {
       ['name', stringValue(taskType.pack.name, 80)],
       ['version', stringValue(taskType.pack.version, 64)]
     ]) : undefined],
+    ['interactionContract', stringValue(taskType?.interactionContract, 32)],
     ['supportsResume', booleanValue(taskType?.supportsResume)],
     ['inputSchema', schema && typeof schema === 'object' && !Array.isArray(schema) ? schema : undefined]
   ]);

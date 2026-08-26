@@ -166,7 +166,7 @@ async function inspectFrame(frame, { scope, maxNodes, maxTextChars }) {
   }, { requestedScope: scope, requestedNodes: maxNodes, requestedText: maxTextChars });
 }
 
-export function createSemanticObserver({ page, action } = {}) {
+export function createSemanticObserver({ page, action, locatorTransform = (locator) => locator } = {}) {
   if (!page) throw new TypeError('page is required');
   let current = null;
 
@@ -264,7 +264,7 @@ export function createSemanticObserver({ page, action } = {}) {
     return found;
   }
 
-  async function resolve(ref, { snapshotId } = {}) {
+  async function resolveRaw(ref, { snapshotId } = {}) {
     const found = descriptor(ref, snapshotId);
     const frame = found.frame;
     const candidates = [];
@@ -283,8 +283,12 @@ export function createSemanticObserver({ page, action } = {}) {
     throw new SemanticObserverError('SEMANTIC_REF_UNSTABLE', 'Semantic ref no longer resolves to exactly one element');
   }
 
+  async function resolve(ref, options = {}) {
+    return locatorTransform(await resolveRaw(ref, options));
+  }
+
   async function href(ref, options = {}) {
-    const locator = await resolve(ref, options);
+    const locator = await resolveRaw(ref, options);
     const value = await locator.evaluate((element) => element.href || element.getAttribute('href'));
     if (!value) throw new SemanticObserverError('SEMANTIC_REF_HAS_NO_HREF', 'Semantic ref is not a navigable link');
     const absolute = new URL(value, page.url());
@@ -300,14 +304,17 @@ export function createSemanticObserver({ page, action } = {}) {
     href,
     async click(ref, options = {}) {
       if (!action) throw new SemanticObserverError('SEMANTIC_ACTION_UNAVAILABLE', 'Semantic action helper is unavailable');
-      return action.click(await resolve(ref, options), options.actionOptions || {});
+      return action.click(await resolveRaw(ref, options), options.actionOptions || {});
     },
     async fill(ref, value, options = {}) {
       if (!action) throw new SemanticObserverError('SEMANTIC_ACTION_UNAVAILABLE', 'Semantic action helper is unavailable');
-      return action.fill(await resolve(ref, options), value, options.actionOptions || {});
+      return action.fill(await resolveRaw(ref, options), value, options.actionOptions || {});
     },
     async navigate(ref, options = {}) {
       if (!action) throw new SemanticObserverError('SEMANTIC_ACTION_UNAVAILABLE', 'Semantic action helper is unavailable');
+      if (typeof action.navigate === 'function') {
+        return action.navigate(await resolveRaw(ref, options), options.navigationOptions || {});
+      }
       return action.goto(await href(ref, options), options.navigationOptions || { waitUntil: 'domcontentloaded' });
     }
   });

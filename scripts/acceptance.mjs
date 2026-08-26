@@ -143,6 +143,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
   let ephemeralProfile;
   const tasks = [];
   const acceptanceReports = [];
+  const interactionAudits = [];
   try {
     const health = await api(baseUrl, '/v1/health');
     add('manager health', health.ok && health.service === 'eric-task-master');
@@ -298,15 +299,22 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       const task = await waitForTask(baseUrl, token, created.task.id);
       tasks.push(task);
       add(
-        `${behavior} behavior task`,
-        task.state === 'completed',
+        `${behavior} Profile policy with full-human task`,
+        task.state === 'completed' &&
+          task.behavior === 'human' &&
+          task.interactionContract === 'full-human-v1',
         task.error ? `${task.error.code}: ${task.error.message}` : undefined
       );
     }
 
     for (const task of tasks) {
       const { artifacts } = await api(baseUrl, `/v1/tasks/${encodeURIComponent(task.id)}/artifacts`, { token });
-      const expected = new Set(['acceptance.json', 'acceptance.png', 'taskmaster-fixture.txt']);
+      const expected = new Set([
+        'acceptance.json',
+        'acceptance.png',
+        'interaction-audit.json',
+        'taskmaster-fixture.txt'
+      ]);
       const byName = new Map(artifacts.map((artifact) => [artifact.name, artifact]));
       if ([...expected].some((name) => !byName.has(name) || byName.get(name).sizeBytes <= 0)) {
         throw Object.assign(new Error(`Acceptance artifacts are incomplete for ${task.id}`), {
@@ -325,6 +333,12 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
         });
       }
       acceptanceReports.push(report);
+      interactionAudits.push(JSON.parse(await readArtifactText(
+        baseUrl,
+        token,
+        task.id,
+        byName.get('interaction-audit.json').id
+      )));
     }
     add('bounded artifact API', true);
 
@@ -333,6 +347,12 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     add('navigation', allTrue('navigation'));
     add('text input', allTrue('input'));
     add('human behavior mechanics', allTrue('behavior'));
+    add(
+      'full-human interaction contract',
+      interactionAudits.length === tasks.length && interactionAudits.every((audit) => (
+        audit.contract === 'full-human-v1' && audit.passed === true && audit.score === 10
+      ))
+    );
     add('click and select', allTrue('checkbox') && allTrue('select'));
     add('file upload', allTrue('upload'));
     add('cookie and local storage', allTrue('cookie') && allTrue('localStorage'));
@@ -344,7 +364,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     );
     add(
       'checkpoint and compact evidence',
-      tasks.every((task) => task.checkpoint?.ref && task.result?.evidence?.length === 4) &&
+      tasks.every((task) => task.checkpoint?.ref && task.result?.evidence?.length === 5) &&
       acceptanceReports.every((report) => Array.isArray(report.evidence) && report.evidence.length >= 10)
     );
 

@@ -957,6 +957,7 @@ function publicPack(pack) {
   return {
     name: pack.name,
     version: pack.version,
+    interactionContract: pack.interactionContract,
     ...(pack.title ? { title: pack.title } : {}),
     ...(pack.description ? { description: pack.description } : {}),
     tasks: pack.tasks
@@ -991,6 +992,7 @@ async function taskPackCommand(action, args, options, json) {
       body: {
         name: loaded.pack.name,
         version: loaded.pack.version,
+        interactionContract: loaded.pack.interactionContract,
         ...(loaded.pack.title ? { title: loaded.pack.title } : {}),
         ...(loaded.pack.description ? { description: loaded.pack.description } : {}),
         modules

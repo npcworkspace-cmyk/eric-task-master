@@ -495,7 +495,7 @@ test('Profile behavior changes do not break idempotency and queued attempts use 
   const queued = await service.create(request, ADMIN);
   assert.equal(queued.state, 'queued');
   assert.equal(queued.behavior, 'fast');
-  assert.equal((await service.getInternal(queued.id)).requestHashVersion, 3);
+  assert.equal((await service.getInternal(queued.id)).requestHashVersion, 4);
 
   store.profile.defaultBehavior = 'human';
   assert.equal((await service.create(request, ADMIN)).id, queued.id);

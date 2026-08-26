@@ -94,8 +94,8 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
   const first = parseSingleJson(await runCli(['connect', ...common], env));
   assert.equal(first.ok, true);
   assert.equal(first.manager.startedNow, true);
-  assert.equal(first.acceptance.passed, 30);
-  assert.equal(first.acceptance.total, 30);
+  assert.equal(first.acceptance.passed, 31);
+  assert.equal(first.acceptance.total, 31);
   assert.equal(first.acceptance.cached, undefined);
   assert.match(first.dashboard, new RegExp(`^http://127\\.0\\.0\\.1:${port}/dashboard#code=`));
   assert.equal(first.dashboard.toLowerCase().includes('token'), false);

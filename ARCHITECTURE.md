@@ -132,11 +132,11 @@ A failed task with a stable checkpoint can be resumed only by its original role/
 ## Behavior policies
 
 - `fast`: deterministic native Playwright operations with minimum necessary waits.
-- `human`: bounded curved pointer motion, safe in-target click offsets and press duration, per-character typing rhythm, eased scrolling, and explicit reading dwell.
+- `human`: rendered-page traversal, bounded curved pointer motion and corrections, safe in-target click offsets and press duration, per-character keyboard rhythm, keyboard-driven native selection, segmented eased scrolling, explicit reading dwell, and verified visible navigation.
 - `adaptive`: starts fast, uses a short cautious tier for ordinary dynamic signals, and uses bounded guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. Stronger signals retain a larger guarded-action budget; successful actions decay back to fast. No tier retries an unknown effect automatically.
 
-Behavior is owned by the Profile and task creation accepts no override. Persistent Profiles always execute in `human`; ephemeral Profiles execute the currently selected Profile policy.
-Pacing applies to visible interaction primitives such as pointer movement, clicking, typing, scrolling, navigation, and explicit reading dwell. Direct DOM extraction and file I/O remain unpaced. Only task logic knows when content is actually being read, so it requests bounded dwell with `action.read({ words })`; the runtime does not guess from page size or silently slow deterministic collection.
+Behavior is owned by the Profile and task creation accepts no override. Persistent Profiles always execute in `human`; ephemeral Profiles execute the currently selected Profile policy except that a `full-human-v1` task type is forced through the Human Journey engine.
+Pacing applies to visible interaction primitives such as pointer movement, clicking, typing, scrolling, navigation, and explicit reading dwell. Direct DOM extraction and file I/O remain unpaced. Task logic identifies the content and sequence; Human Journey centrally owns the physical action mechanics. It observes the rendered viewport after entries, traverses toward offscreen controls through bounded wheel gestures instead of instant locator positioning, and verifies page-changing clicks before continuing.
 
 Each task output is bounded by a worker-enforced default budget of 512 MiB and 10,000 files. The worker checks it periodically and before progress, checkpoint, and completion; exceeding it fails the task without deleting existing output. A separate small reserve remains available for controlled diagnostic screenshots. Each automatic diagnostic screenshot is a complete, viewport-wide JPEG capped at 48 KiB, so MCP can return it as one valid image instead of mislabeled image fragments. The scanner never follows links and has independent entry/depth bounds. Checkpoint envelopes have an independent 8 MiB cap and are atomically rejected before replacing the last valid checkpoint; bulk records belong under `outputDir`.
 
@@ -149,24 +149,32 @@ A task module is a trusted, bounded single-file `.mjs` that exports `run(runtime
 Manager never imports a task module while installing it. A short-lived inspector child loads the snapshot, returns bounded JSON metadata, and is force-stopped on exit, error, or timeout; Manager hashes the snapshot again before registering it. This protects Manager availability from accidental top-level exits or waits, but it is not a sandbox for untrusted code. External installation is idempotent for the same SHA and returns `409 TASK_TYPE_CONFLICT` for a same-name different SHA. Only the internal seed path may explicitly replace a built-in task during an application upgrade.
 
 ```js
-export const meta = { name: 'example', version: '1.0.0' };
+export const meta = {
+  name: 'example',
+  version: '1.0.0',
+  interactionContract: 'full-human-v1'
+};
 
 export async function run({
   page, context, input, outputDir,
-  action, cooldown, effects, semantic, handoff,
+  journey, cooldown, effects, semantic, handoff,
   progress, checkpoint, signal
 }) {
-  await action.goto(input.url, { waitUntil: 'domcontentloaded' });
+  await journey.open(input.url, { waitUntil: 'domcontentloaded' });
   await progress({ current: 1, total: 1, message: 'Loaded target' });
   return { summary: 'Done', evidence: [{ kind: 'url', value: page.url() }] };
 }
 ```
 
-Each attempt replays the same internal effect journal. State-changing operations must use `action`; direct `page` access is observational and trusted Task Packs must not mutate through it. A `started` record without a durable terminal record is carried into the next attempt and blocks every new action until trusted task logic consumes its frozen checkpoint, inspects external state, and explicitly resolves that exact sequence as observed succeeded or observed not applied. Resume never clears an unknown outcome implicitly. Timeout covers setup, Playwright/browser/module startup, and task execution. Timeout, cancellation, and output-budget failure abort the task signal before bounded screenshot diagnostics, so the action facade rejects late operations before cleanup.
+Every Task Pack manifest and module declares `full-human-v1`. Contracted modules use `journey` for visible state changes; their `page`, `context`, Locator, Frame, and FrameLocator surfaces are observation-only proxies, and the legacy mutation facade is unavailable. Pack preflight also rejects common direct-action bypasses. This is defense in depth for trusted local modules, not an adversarial JavaScript sandbox: observation expressions remain trusted code.
+
+Journey completion emits `interaction-audit.json` and reserves one evidence slot. Ten checks cover entry establishment, viewport observation, measurable visible target acquisition, pointer/click mechanics, keyboard cadence when input exists, segmented scrolling, verified pagination, absence of bypass violations, and settled steps. A failed audit rejects the task's completion claim. The contract improves repeatability and reviewability; it does not spoof fingerprints, bypass CAPTCHA, or guarantee that sites cannot identify automation.
+
+Each attempt replays the same internal effect journal. State-changing operations flow through `journey` for contracted modules or `action` for legacy standalone modules. A `started` record without a durable terminal record is carried into the next attempt and blocks every new action until trusted task logic consumes its frozen checkpoint, inspects external state, and explicitly resolves that exact sequence as observed succeeded or observed not applied. Resume never clears an unknown outcome implicitly. Timeout covers setup, Playwright/browser/module startup, and task execution. Timeout, cancellation, and output-budget failure abort the task signal before bounded screenshot diagnostics, so the action facade rejects late operations before cleanup.
 
 `semantic.snapshot()` builds one bounded, redacted ref/text view across up to sixteen Playwright Frames. A ref resolves only while its snapshot and page URL are current; navigation invalidates it. `semantic.click/fill/navigate` route through the same action/effect policy. Diagnostics persist the semantic view beside the viewport screenshot, allowing an Agent to inspect structure first and use pixels only where structure is ambiguous.
 
-Task-type list responses contain compact metadata (`domains`, `intents`, `tags`, outputs, risk, resume support, Pack provenance, and lifecycle) without the input schema. The full schema is returned only by describe. Deprecated task types disappear from ordinary discovery, reject new execution, and may point to one active replacement; their immutable snapshots remain auditable. A Task Pack validates and inspects every candidate before one registry commit; conflicts cannot partially install a Pack. Five built-in scaffolds cover `single-page`, `paginated-list`, `list-detail`, `resumable-batch`, and `form-workflow`, and preflight validates modules in isolation without installing them.
+Task-type list responses contain compact metadata (`domains`, `intents`, `tags`, outputs, risk, resume support, interaction contract, Pack provenance, and lifecycle) without the input schema. The full schema is returned only by describe. Deprecated task types disappear from ordinary discovery, reject new execution, and may point to one active replacement; their immutable snapshots remain auditable. A Task Pack validates the Human Journey contract and inspects every candidate before one registry commit; conflicts cannot partially install a Pack. Five built-in scaffolds cover `single-page`, `paginated-list`, `list-detail`, `resumable-batch`, and `form-workflow`, and preflight validates modules in isolation without installing them.
 
 `checkpoint(data)` persists an internal task/attempt/timestamp envelope capped at 8 MiB, while task code sees only the exact prior `data` from `checkpoint.read()`. Output and checkpoint are not one filesystem transaction; resumable modules therefore use deterministic per-unit outputs or stable-key deduplication instead of blind append-only writes. Diagnostic manifests are also attempt-bound so a recovered screenshot from an earlier failure cannot replace the current attempt's result artifact.
 

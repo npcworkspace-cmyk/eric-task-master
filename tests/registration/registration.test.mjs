@@ -13,6 +13,7 @@ import {
 import { createRegistrar } from '../../src/registration/index.mjs';
 import { RegistrationLock } from '../../src/registration/lock.mjs';
 import { createOfficialCliAdapter, runHostCommand } from '../../src/registration/official-cli.mjs';
+import { VERSION } from '../../src/contracts.mjs';
 
 async function write(path, text) {
   await mkdir(dirname(path), { recursive: true });
@@ -250,7 +251,7 @@ test('registration runtime marker is backward compatible and requires one full-i
   assert.equal(first.ok, true);
   assert.equal(first.agentHostReloadRequired, false);
   let state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
-  assert.equal(state.runtimeVersion, '2.1.3');
+  assert.equal(state.runtimeVersion, VERSION);
 
   delete state.runtimeVersion;
   await writeFile(setup.registrar.statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
@@ -260,7 +261,7 @@ test('registration runtime marker is backward compatible and requires one full-i
   assert.equal(legacyStateUpgrade.previousRuntimeVersion, null);
   assert.equal(legacyStateUpgrade.agentHostReloadRequired, true);
   state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
-  assert.equal(state.runtimeVersion, '2.1.3');
+  assert.equal(state.runtimeVersion, VERSION);
 
   const repeated = await setup.registrar.install();
   assert.equal(repeated.ok, true);

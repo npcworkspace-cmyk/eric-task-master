@@ -10,7 +10,7 @@ node scripts/taskmaster.mjs task-packs validate ./reddit-comments --json
 node scripts/taskmaster.mjs task-packs install ./reddit-comments --json
 ```
 
-Choose exactly one built-in recipe: `single-page`, `paginated-list`, `list-detail`, `resumable-batch`, or `form-workflow`. Each recipe already contains the approved lifecycle, bounded progress, output persistence, completion evidence, cleanup-compatible control flow, and the checkpoint pattern appropriate to that shape. Start from the closest recipe instead of rewriting infrastructure. `task-packs validate` performs isolated module preflight without registering anything and reports every detected module error in one pass.
+Choose exactly one built-in recipe: `single-page`, `paginated-list`, `list-detail`, `resumable-batch`, or `form-workflow`. Each recipe already contains the approved lifecycle, bounded progress, output persistence, completion evidence, cleanup-compatible control flow, checkpoint pattern, and mandatory `full-human-v1` journey contract. Start from the closest recipe instead of rewriting infrastructure. `task-packs validate` performs isolated module preflight without registering anything and reports every detected module error in one pass.
 
 The manifest is named `taskpack.json`:
 
@@ -20,6 +20,7 @@ The manifest is named `taskpack.json`:
   "version": "1.0.0",
   "title": "Reddit Comments",
   "description": "One bounded workflow family.",
+  "interactionContract": "full-human-v1",
   "tasks": [
     { "name": "reddit-comments.collect.v1", "module": "tasks/collect-v1.mjs" }
   ]
@@ -35,11 +36,25 @@ The manifest is named `taskpack.json`:
 - Use bounded `camelCase` input fields that describe only business intent. Do not put runtime controls, Profile IDs, behavior modes, Agent IDs, cookies, tokens, or other credentials in task input.
 - Keep applicable output names stable within one task type, preferring `result.json`, `records.jsonl`, `summary.json`, and `manifest.json`. A Pack need not emit every file, but it must not rename equivalent outputs between runs.
 
+## Mandatory Human Journey contract
+
+Every Task Pack declares `"interactionContract": "full-human-v1"`, and every Pack module declares `meta.interactionContract: 'full-human-v1'`. The Pack defines **what** to do, in what order, how fast, when to checkpoint, and how to prove completion. The base runtime owns **how each visible browser action is physically performed**.
+
+- Use `journey.open` for an entry URL or an explicit recovery entry.
+- Use `journey.navigate` and `journey.nextPage` for links, detail pages, and pagination controls. Do not construct the next-page URL when the page exposes a usable Next control.
+- Use `journey.click/fill/type/hover/scroll/read/select/upload` for visible actions.
+- Use `page`, `context`, locators, `evaluate`, and `semantic` only for reads, assertions, extraction, and observation. Contracted Packs receive read-only wrappers; direct mutation fails at runtime even if task code catches the first error.
+- Do not accept behavior mode, pointer timing, scroll shape, or typing cadence in Pack input. Those mechanics are centrally owned and versioned.
+
+The runtime traverses rendered content with bounded wheel gestures before an offscreen target, uses curved pointer movement and in-target clicks, types through keyboard cadence, adds bounded reading dwell, verifies visible page transitions, and appends an Agent-visible `interaction-audit.json`. Completion fails unless all ten journey checks pass. This is a reliability and consistency contract, not fingerprint spoofing, CAPTCHA bypass, or a guarantee that a website cannot identify automation.
+
+For independent items in a batch, opening each supplied URL is a valid new entry. Within one item, use visible site controls for pagination and drill-down. A direct URL may be used as a checkpoint-recovery entry when the previous rendered page no longer exists; record that recovery in task progress or coverage.
+
 Compatibility and installation rules:
 
-- one Pack contains 1–64 regular `.mjs` files below its own directory;
+- one Pack contains 1–64 regular `.mjs` files below its own directory and must declare `full-human-v1`;
 - names are unique lowercase identifiers and Pack versions use semantic versioning;
-- modules are snapshotted and inspected in short-lived child processes before registration;
+- modules are statically checked for direct browser-action bypasses, then snapshotted and inspected in short-lived child processes before registration;
 - the complete batch is validated before the registry changes; any conflict rejects all modules;
 - reinstallation of the same name and source hash is idempotent, and installing that identical standalone type through a Pack safely attaches its Pack provenance;
 - Pack provenance appears in task-type discovery.

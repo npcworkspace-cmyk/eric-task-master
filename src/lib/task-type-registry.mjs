@@ -4,6 +4,10 @@ import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore } from './json-store.mjs';
+import {
+  FULL_HUMAN_INTERACTION_CONTRACT,
+  validateFullHumanPackSource
+} from './interaction-contract.mjs';
 
 const MAX_TASK_MODULE_BYTES = 2 * 1024 * 1024;
 const MAX_INSPECTOR_RESULT_BYTES = 96 * 1024;
@@ -62,6 +66,7 @@ function publicType(record, { includeSchema = true, includeIntegrity = true } = 
     ...(record.outputs?.length ? { outputs: [...record.outputs] } : {}),
     ...(record.risk ? { risk: record.risk } : {}),
     ...(record.pack ? { pack: { name: record.pack.name, version: record.pack.version } } : {}),
+    ...(record.interactionContract ? { interactionContract: record.interactionContract } : {}),
     lifecycle: record.deprecatedAt ? 'deprecated' : 'active',
     ...(record.deprecatedAt ? { deprecatedAt: record.deprecatedAt } : {}),
     ...(record.replacedBy ? { replacedBy: record.replacedBy } : {}),
@@ -215,6 +220,15 @@ function safeMetadata(meta, expectedName) {
   if (source.supportsResume !== undefined && typeof source.supportsResume !== 'boolean') {
     throw new TaskTypeRegistryError('INVALID_TASK_METADATA', 'meta.supportsResume must be a boolean');
   }
+  if (
+    source.interactionContract !== undefined &&
+    source.interactionContract !== FULL_HUMAN_INTERACTION_CONTRACT
+  ) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_METADATA',
+      `meta.interactionContract must be ${FULL_HUMAN_INTERACTION_CONTRACT}`
+    );
+  }
   return {
     title,
     ...(description ? { description } : {}),
@@ -226,6 +240,7 @@ function safeMetadata(meta, expectedName) {
     ...(tags ? { tags } : {}),
     ...(outputs ? { outputs } : {}),
     ...(source.risk ? { risk: source.risk } : {}),
+    ...(source.interactionContract ? { interactionContract: source.interactionContract } : {}),
     supportsResume: source.supportsResume === true
   };
 }
@@ -462,12 +477,20 @@ export class TaskTypeRegistry {
       : (
           pack &&
           typeof pack.name === 'string' && DISCOVERY_TOKEN.test(pack.name) &&
-          typeof pack.version === 'string' && PACK_VERSION_PATTERN.test(pack.version) && pack.version.length <= 64
-            ? { name: pack.name, version: pack.version }
+          typeof pack.version === 'string' && PACK_VERSION_PATTERN.test(pack.version) && pack.version.length <= 64 &&
+          pack.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT
+            ? {
+                name: pack.name,
+                version: pack.version,
+                interactionContract: FULL_HUMAN_INTERACTION_CONTRACT
+              }
             : null
         );
     if (pack !== undefined && !packReference) {
-      throw new TaskTypeRegistryError('INVALID_TASK_PACK', 'Task Pack name or version is invalid');
+      throw new TaskTypeRegistryError(
+        'INVALID_TASK_PACK',
+        `Task Pack name, version, or ${FULL_HUMAN_INTERACTION_CONTRACT} interaction contract is invalid`
+      );
     }
     const snapshot = await this.#store.read();
     const prepared = [];
@@ -475,6 +498,10 @@ export class TaskTypeRegistry {
       const candidate = await this.#prepareInstall(input, { currentTypes: snapshot.types });
       if (candidate.changed && packReference) {
         candidate.record.pack = { ...packReference };
+        candidate.record.interactionContract = FULL_HUMAN_INTERACTION_CONTRACT;
+      }
+      if (packReference) {
+        validateFullHumanPackSource(await readFile(path.join(this.#snapshotRoot, candidate.record.snapshotName)));
       }
       prepared.push(candidate);
     }
@@ -503,7 +530,10 @@ export class TaskTypeRegistry {
       for (const candidate of prepared) {
         const current = data.types.find((item) => item.name === candidate.record.name);
         if (current) {
-          if (packReference) current.pack = { ...packReference };
+          if (packReference) {
+            current.pack = { ...packReference };
+            current.interactionContract = FULL_HUMAN_INTERACTION_CONTRACT;
+          }
           installed.push(current);
         }
         else {
@@ -658,6 +688,13 @@ export class TaskTypeRegistry {
         record.replacedBy
           ? `Task type ${name} is deprecated; use ${record.replacedBy}`
           : `Task type ${name} is deprecated and has no replacement`,
+        409
+      );
+    }
+    if (record.pack && record.interactionContract !== FULL_HUMAN_INTERACTION_CONTRACT) {
+      throw new TaskTypeRegistryError(
+        'TASK_PACK_INTERACTION_CONTRACT_REQUIRED',
+        `Task Pack ${record.pack.name} must be reinstalled with ${FULL_HUMAN_INTERACTION_CONTRACT}`,
         409
       );
     }

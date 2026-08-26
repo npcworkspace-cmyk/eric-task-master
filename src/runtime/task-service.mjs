@@ -9,6 +9,7 @@ import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs'
 import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
 import { removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
+import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
 const PROFILE_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
@@ -65,8 +66,10 @@ const LIFECYCLE_ACTIVITY_STATUS = Object.freeze({
   cancelled: 'cancelled'
 });
 
-function resolveProfileBehavior(profile) {
-  const behavior = profile.kind === 'persistent'
+function resolveProfileBehavior(profile, interactionContract = null) {
+  const behavior = interactionContract === FULL_HUMAN_INTERACTION_CONTRACT
+    ? 'human'
+    : profile.kind === 'persistent'
     ? 'human'
     : (profile.defaultBehavior ?? 'adaptive');
   if (!isBehaviorMode(behavior)) {
@@ -1025,6 +1028,9 @@ export function createTaskService({
       normalizeAttemptHistory(task);
       normalizeDiagnosticHistory(task);
       normalizeTaskCoordination(task);
+      task.interactionContract = task.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT
+        ? FULL_HUMAN_INTERACTION_CONTRACT
+        : null;
       if (!task.taskLabel) task.taskLabel = normalizeTaskLabel(undefined, task.taskType);
       if (!task.displayName) task.displayName = buildTaskDisplayName(task);
       normalizeTaskTiming(task);
@@ -2248,7 +2254,7 @@ export function createTaskService({
       }
       failureCode = 'TASK_WORKER_START_FAILED';
       const startingAt = nowIso();
-      const behavior = resolveProfileBehavior(leasedProfile);
+      const behavior = resolveProfileBehavior(leasedProfile, task.interactionContract);
       setAttemptHistoryBehavior(task, behavior);
       markAttemptWorkerStarted(task, startingAt);
       const pausePending = task.state === 'pause_requested' && Boolean(task.pauseContext?.commandId);
@@ -2283,6 +2289,7 @@ export function createTaskService({
           modulePath: task.modulePath,
           input: clone(task.input),
           behavior,
+          ...(task.interactionContract ? { interactionContract: task.interactionContract } : {}),
           outputDir: task.outputDir,
           checkpointPath: path.join(root, task.id, 'checkpoint.json'),
           ...(task.resumeInput ? { resumeCheckpoint: clone(task.resumeInput) } : {}),
@@ -2375,7 +2382,10 @@ export function createTaskService({
     const profile = requireProfileUse(await profileStore.get(body.profileId), caller);
     const taskType = await registry.resolve(body.taskType);
     const taskLabel = normalizeTaskLabel(body.taskLabel, taskType.title || taskType.name);
-    const behavior = resolveProfileBehavior(profile);
+    const interactionContract = taskType.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT
+      ? FULL_HUMAN_INTERACTION_CONTRACT
+      : null;
+    const behavior = resolveProfileBehavior(profile, interactionContract);
     if (
       body.timeoutMs !== undefined &&
       (!Number.isSafeInteger(body.timeoutMs) || body.timeoutMs < 1_000 || body.timeoutMs > MAX_TASK_TIMEOUT_MS)
@@ -2390,6 +2400,7 @@ export function createTaskService({
       taskLabel,
       taskTypeSha256: taskType.sha256,
       supportsResume: taskType.supportsResume === true,
+      interactionContract,
       timeoutMs: body.timeoutMs ?? null,
       input
     };
@@ -2399,11 +2410,15 @@ export function createTaskService({
     ));
     if (existing) {
       const { taskLabel: _taskLabel, ...legacyHashInput } = hashInput;
+      const { interactionContract: _interactionContract, ...versionThreeHashInput } = hashInput;
+      const { interactionContract: _legacyInteractionContract, ...versionTwoHashInput } = legacyHashInput;
       const legacyHash = existing.requestHashVersion === undefined
-        ? requestHash({ ...legacyHashInput, behavior: existing.behavior })
+        ? requestHash({ ...versionTwoHashInput, behavior: existing.behavior })
         : existing.requestHashVersion === 2
-          ? requestHash(legacyHashInput)
-          : null;
+          ? requestHash(versionTwoHashInput)
+          : existing.requestHashVersion === 3
+            ? requestHash(versionThreeHashInput)
+            : null;
       if (existing.requestHash !== hash && existing.requestHash !== legacyHash) {
         throw new TaskServiceError(
           'IDEMPOTENCY_CONFLICT',
@@ -2443,13 +2458,14 @@ export function createTaskService({
       taskLabel,
       taskTypeSha256: taskType.sha256,
       supportsResume: taskType.supportsResume === true,
+      ...(interactionContract ? { interactionContract } : {}),
       modulePath: taskType.modulePath,
       ownerRole: caller.role,
       ownerClientId: caller.clientId,
       ...(caller.role === 'agent' ? { ownerAgentName: caller.agentName } : {}),
       idempotencyKey: body.idempotencyKey,
       requestHash: hash,
-      requestHashVersion: 3,
+      requestHashVersion: 4,
       inputRevisionHash: requestHash(input),
       behavior,
       input: clone(input),
@@ -2817,7 +2833,7 @@ export function createTaskService({
     const checkpoint = await verifyResumeCheckpoint(task);
     const resumeInput = await createResumeInput(task, checkpoint);
     const profile = requireProfileUse(await profileStore.get(task.profileId), caller);
-    const behavior = resolveProfileBehavior(profile);
+    const behavior = resolveProfileBehavior(profile, task.interactionContract);
 
     archiveAttemptDiagnostics(task);
     task.attempt += 1;
@@ -3941,16 +3957,20 @@ export function createTaskService({
     if (caller.role !== 'manager-admin') {
       throw new TaskServiceError('TASK_PACK_INSTALL_FORBIDDEN', 'Only Manager admin can install Task Packs', 403);
     }
-    const allowed = new Set(['name', 'version', 'title', 'description', 'modules']);
+    const allowed = new Set(['name', 'version', 'title', 'description', 'interactionContract', 'modules']);
     const unknown = Object.keys(input).filter((key) => !allowed.has(key));
     if (unknown.length) {
       throw new TaskServiceError('INVALID_TASK_PACK', `Unsupported Task Pack fields: ${unknown.join(', ')}`);
     }
     if (
       typeof input.name !== 'string' || !/^[a-z][a-z0-9._-]{0,79}$/.test(input.name) ||
-      typeof input.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(input.version)
+      typeof input.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(input.version) ||
+      input.interactionContract !== FULL_HUMAN_INTERACTION_CONTRACT
     ) {
-      throw new TaskServiceError('INVALID_TASK_PACK', 'Task Pack name or semantic version is invalid');
+      throw new TaskServiceError(
+        'INVALID_TASK_PACK',
+        `Task Pack name, semantic version, or ${FULL_HUMAN_INTERACTION_CONTRACT} interaction contract is invalid`
+      );
     }
     if (!Array.isArray(input.modules) || input.modules.length < 1 || input.modules.length > 64) {
       throw new TaskServiceError('INVALID_TASK_PACK', 'Task Pack must contain 1 to 64 modules');
@@ -3966,11 +3986,16 @@ export function createTaskService({
       return { name: item.name, modulePath: item.modulePath };
     });
     const taskTypes = await registry.installBatch(modules, {
-      pack: { name: input.name, version: input.version }
+      pack: {
+        name: input.name,
+        version: input.version,
+        interactionContract: FULL_HUMAN_INTERACTION_CONTRACT
+      }
     });
     return {
       name: input.name,
       version: input.version,
+      interactionContract: FULL_HUMAN_INTERACTION_CONTRACT,
       ...(typeof input.title === 'string' ? { title: input.title.slice(0, 120) } : {}),
       ...(typeof input.description === 'string' ? { description: input.description.slice(0, 2_000) } : {}),
       taskTypes

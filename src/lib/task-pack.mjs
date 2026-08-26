@@ -2,6 +2,10 @@ import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { validateTaskModule } from './task-type-registry.mjs';
 import { createTaskRecipeSource, TASK_RECIPES } from './task-recipes.mjs';
+import {
+  FULL_HUMAN_INTERACTION_CONTRACT,
+  validateFullHumanPackSource
+} from './interaction-contract.mjs';
 
 const PACK_NAME = /^[a-z][a-z0-9._-]{0,79}$/;
 const TASK_NAME = /^[a-z][a-z0-9._-]{0,79}$/;
@@ -72,7 +76,7 @@ export async function readTaskPack(location) {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
     throw new TaskPackError('INVALID_TASK_PACK', 'taskpack.json must contain one object');
   }
-  exactKeys(manifest, new Set(['name', 'version', 'title', 'description', 'tasks']), 'taskpack.json');
+  exactKeys(manifest, new Set(['name', 'version', 'title', 'description', 'interactionContract', 'tasks']), 'taskpack.json');
   const name = boundedText(manifest.name, 'Task Pack name', 80, { required: true });
   const version = boundedText(manifest.version, 'Task Pack version', 64, { required: true });
   if (!PACK_NAME.test(name)) {
@@ -80,6 +84,12 @@ export async function readTaskPack(location) {
   }
   if (!VERSION.test(version)) {
     throw new TaskPackError('INVALID_TASK_PACK', 'Task Pack version must use semantic versioning');
+  }
+  if (manifest.interactionContract !== FULL_HUMAN_INTERACTION_CONTRACT) {
+    throw new TaskPackError(
+      'INVALID_TASK_PACK',
+      `Task Pack interactionContract must be ${FULL_HUMAN_INTERACTION_CONTRACT}`
+    );
   }
   const title = boundedText(manifest.title, 'Task Pack title', 120);
   const description = boundedText(manifest.description, 'Task Pack description', 2_000);
@@ -124,6 +134,7 @@ export async function readTaskPack(location) {
     pack: {
       name,
       version,
+      interactionContract: FULL_HUMAN_INTERACTION_CONTRACT,
       ...(title ? { title } : {}),
       ...(description ? { description } : {}),
       tasks: modules.map(({ name: taskName, module }) => ({ name: taskName, module }))
@@ -134,11 +145,14 @@ export async function readTaskPack(location) {
 
 export async function preflightTaskPack(location) {
   const loaded = await readTaskPack(location);
-  const results = await Promise.allSettled(loaded.modules.map((module) => validateTaskModule({
-    name: module.name,
-    modulePath: module.modulePath,
-    allowedRoots: [loaded.root]
-  })));
+  const results = await Promise.allSettled(loaded.modules.map(async (module) => {
+    validateFullHumanPackSource(await readFile(module.modulePath));
+    return validateTaskModule({
+      name: module.name,
+      modulePath: module.modulePath,
+      allowedRoots: [loaded.root]
+    });
+  }));
   const checks = results.map((result, index) => {
     const name = loaded.modules[index].name;
     if (result.status === 'fulfilled') {
@@ -179,6 +193,7 @@ export async function scaffoldTaskPack(directory, { name, recipe = 'single-page'
     version: '1.0.0',
     title: packName,
     description: 'Reusable Task Master task pack.',
+    interactionContract: FULL_HUMAN_INTERACTION_CONTRACT,
     tasks: [{ name: taskName, module: `tasks/${moduleName}` }]
   };
   const moduleSource = createTaskRecipeSource(taskName, recipe);

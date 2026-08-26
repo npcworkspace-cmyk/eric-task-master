@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.1.3**
+Version: **2.2.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -39,7 +39,7 @@ Task Master does not replace Agent reasoning. It gives that reasoning a dependab
 
 ## The three-layer model
 
-1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, and cleanup.
+1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, cleanup, and a central Human Journey engine for visible browser interaction.
 2. **Owner Console** — one fixed local web address does only shared Profile management, task progress, pause, resume, cancel, and safe record deletion. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
@@ -99,11 +99,11 @@ New persistent Profiles default to the local stable Chrome channel and fixed `hu
 ### Behavior
 
 - **fast** — an optional speed-first policy for ephemeral Profiles and deterministic, data-heavy work;
-- **human** — bounded mouse, typing, scrolling, and reading cadence;
+- **human** — rendered-page traversal, curved pointer movement, in-target clicks, keyboard input, segmented scrolling, reading cadence, and verified page changes;
 - **adaptive** — starts fast and temporarily becomes cautious or human-paced after dynamic-page signals, occlusion, timeout, uncertain navigation, action failure, or rate limiting.
 
-Human pacing is a reliability policy, not a promise to bypass website controls or protect an account from platform enforcement.
-Behavior is selected on the Profile; task start does not accept a behavior override.
+Human pacing is a reliability policy, not fingerprint spoofing, a promise to bypass website controls, or protection from platform enforcement.
+Behavior is selected on the Profile; task start does not accept a behavior override. Every versioned Task Pack uses the stricter `full-human-v1` journey contract, so the runtime—not each Pack—performs its visible actions consistently and records a 10/10 interaction audit.
 
 ### Multi-Agent workbench
 
@@ -122,7 +122,7 @@ node scripts/taskmaster.mjs task-packs validate ./my-pack --json
 node scripts/taskmaster.mjs task-packs install ./my-pack --json
 ```
 
-A Task Pack defines reusable task types. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. A specialized Skill teaches the Agent when to use them, how to interpret results, and which platform rules apply. Neither should rebuild Manager startup, browser lifecycle, task tracking, diagnostics, or cleanup. Publish a new task-type name, verify it, then deprecate the old type with a replacement pointer; do not overwrite divergent production logic in place.
+A Task Pack defines reusable task types. It specifies the target, sequence, selectors, platform rate limits, extraction, checkpoints, outputs, and proof—not custom mouse or scrolling code. The central Human Journey engine handles rendered-page traversal, pointer movement, input, reading pauses, visible pagination, and transition verification; direct browser-action bypasses are rejected. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. A specialized Skill teaches the Agent when to use them, how to interpret results, and which platform rules apply. Publish a new task-type name, verify it, then deprecate the old type with a replacement pointer.
 
 ## Host integration
 

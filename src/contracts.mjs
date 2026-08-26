@@ -1,7 +1,7 @@
 import { isSensitiveKey, redactPublicText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
-export const VERSION = '2.1.3';
+export const VERSION = '2.2.0';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -129,6 +129,7 @@ export function publicTask(task) {
     'taskLabel',
     'displayName',
     'supportsResume',
+    'interactionContract',
     'behavior',
     'attempt',
     'history',

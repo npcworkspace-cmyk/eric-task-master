@@ -31,7 +31,7 @@ When status and Profile discovery succeed, ask what browser task to run. Create 
 - choose `persistent` for login state or recurring account work. Open it from the Dashboard and let the user sign in directly in that Playwright window;
 - choose `ephemeral` for no-login temporary work. It starts clean for every task, retains no browser state after cleanup, and cannot be opened manually.
 
-Persistent Profiles default to stable local Chrome and fixed `human` behavior. Ephemeral Profiles default to pinned Chromium and Profile-owned `adaptive` behavior, with all three modes selectable. Choose the engine and behavior when creating the Profile; the engine is immutable, persistent behavior cannot be patched, and task start has no behavior override. A manual persistent-Profile window is always visible even when its task `headless` setting is enabled.
+Persistent Profiles default to stable local Chrome and fixed `human` behavior. Ephemeral Profiles default to pinned Chromium and Profile-owned `adaptive` behavior, with all three modes selectable. Choose the engine and behavior when creating the Profile; the engine is immutable, persistent behavior cannot be patched, and task start has no behavior override. A registered Task Pack with `full-human-v1` always executes through the central Human Journey engine even on an ephemeral Profile whose ordinary policy is fast or adaptive. A manual persistent-Profile window is always visible even when its task `headless` setting is enabled.
 
 Every Profile is shared by all trusted local Agents connected to this Manager. Choose a Profile by purpose and availability, not creator identity. The same Profile still runs only one browser task at a time, so concurrent work queues safely. Task histories, results, artifacts, commands, and reports remain scoped to the Agent that started the task.
 
@@ -66,10 +66,10 @@ Profile administration on this path uses `profiles create`, `profiles update`, `
 ## Profile behavior choice
 
 - `fast`: optional speed-first Playwright policy for an ephemeral Profile and deterministic, data-heavy work.
-- `human`: bounded pointer curves, in-target clicks, typing rhythm, eased scrolling, and explicit reading dwell.
+- `human`: rendered-page traversal, bounded pointer curves and corrections, in-target clicks, keyboard input and selection rhythm, segmented eased scrolling, explicit reading dwell, and verified visible navigation.
 - `adaptive`: starts fast, uses a brief cautious tier for ordinary dynamic content, and temporarily uses guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. It returns to fast after successful actions and never auto-replays an unknown effect.
 
-Set behavior on an ephemeral Profile before submitting work. Persistent Profiles always use `human`. The task status exposes configured/effective behavior and active cooldown timing. Human-like pacing is a reliability option, not a promise to evade website controls or protect an account from platform enforcement.
+Set behavior on an ephemeral Profile before submitting work. Persistent Profiles always use `human`. The task status exposes configured/effective behavior and active cooldown timing. Human-like pacing is a reliability option, not fingerprint spoofing, a promise to evade website controls, or protection from platform enforcement.
 
 ## Diagnostics and handoff
 
@@ -81,8 +81,8 @@ Stop Manager only through `node scripts/taskmaster.mjs manager stop --json`. If 
 
 ## Specialized Skills and Task Packs
 
-If a specialized Skill matches, use it to select the task type, map bounded inputs, apply business and coverage policy, and interpret results. Executable selectors, pagination, parsing, rate-limit handling, checkpoints, outputs, and evidence belong in its Task Pack; shared browser and task lifecycle behavior stays in Task Master.
+If a specialized Skill matches, use it to select the task type, map bounded inputs, apply business and coverage policy, and interpret results. Executable selectors, pagination intent, parsing, platform rate limits, checkpoints, outputs, and evidence belong in its Task Pack; physical scrolling, pointer movement, clicking, typing, reading dwell, navigation verification, browser lifecycle, and cleanup stay in Task Master.
 
-When no task type exists, read [references/task-runtime.md](references/task-runtime.md). For one disposable job, register one bounded `.mjs` task. For reusable capability, read [references/task-packs.md](references/task-packs.md) and ship a versioned Task Pack. Task Pack installation is transactional: a conflict rejects the whole Pack without partial registration.
+When no task type exists, read [references/task-runtime.md](references/task-runtime.md). For one disposable job, register one bounded `.mjs` task. For reusable capability, read [references/task-packs.md](references/task-packs.md) and ship a versioned Task Pack. Every new Pack must declare `full-human-v1`, use the `journey` facade for every visible action, and leave behavior mechanics out of task input and site code. Validation rejects direct Playwright mutation or legacy `action` bypasses; completed tasks include a 10/10 interaction audit. Task Pack installation is transactional: a conflict rejects the whole Pack without partial registration.
 
 For account work, read [references/profiles-and-sessions.md](references/profiles-and-sessions.md). Never request, print, persist, or return cookies, tokens, authorization headers, Manager credentials, or browser-profile files.

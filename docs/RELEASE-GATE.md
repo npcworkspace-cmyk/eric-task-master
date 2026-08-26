@@ -14,7 +14,7 @@ npm run check
 
 1. static version, dependency, pure-Playwright, Owner Console, launcher, and Skill-boundary checks;
 2. serial unit, integration, security, registration, protocol, recovery, and real-browser tests;
-3. real Chromium feature acceptance across Profile-owned fast/human/adaptive behavior, immutable engine policy, removed task overrides, persistent Profile open/close, click/input/select, upload/download, storage, screenshot, progress, checkpoint, artifacts, ephemeral isolation, user handoff, and cleanup;
+3. real Chromium feature acceptance across Profile-owned fast/human/adaptive behavior, forced `full-human-v1` Task Pack execution, immutable engine policy, removed task overrides, persistent Profile open/close, rendered-page traversal, curved pointer/click, keyboard input/select, segmented scrolling, verified visible pagination, upload/download, storage, screenshot, progress, checkpoint, 10/10 interaction audit, artifacts, ephemeral isolation, user handoff, and cleanup;
 4. a real-browser Owner Console acceptance that exercises the intentionally minimal Tasks and Profiles views, creates/updates/opens/closes/deletes Profiles, verifies stable task names and live run/cooldown/total timing, clicks revision-checked pause/resume/cancel/delete controls, confirms removed Agent/report/file/message surfaces are absent, checks 401 versus 403 handling, survives Manager restart, and validates responsive/keyboard/reduced-motion behavior;
 5. a commercial acceptance workload with persistent Cookie/localStorage retention across task execution, manual Profile open-close, and Manager restart; bounded concurrency; same-Profile FIFO pressure; queued cancellation; browser timeout diagnostics; ephemeral zero-state verification; quiescence; and terminal history recovery.
 
@@ -84,7 +84,7 @@ Before dispatch, enable Release immutability and configure `RELEASE_ADMIN_TOKEN`
 - output/file-count exhaustion and link/path replacement attempts;
 - missing, changed, hard-linked, or unstable artifacts;
 - wrong/replayed Manager identity, role violations, and credential redaction;
-- task-module inspection timeout/exit/error and transactional Task Pack conflicts;
+- task-module inspection timeout/exit/error, direct-action bypass rejection, mandatory Task Pack Human Journey contracts, and transactional Task Pack conflicts;
 - persistent Owner session bootstrap/restart/logout, exact-origin mutation protection, and Agent revoke/restore;
 - task command idempotency/revision races, cooperative pause, cleanup-proved termination, cumulative cooldown timing, and tombstoned record deletion without idempotency replay;
 - legacy session-import lease fail-closed migration.
