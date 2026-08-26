@@ -360,14 +360,16 @@ export function createActionHelper({
     const distance = Math.abs(selection.targetIndex - selection.currentIndex);
     for (let index = 0; index < distance; index += 1) {
       await sleep(numberBetween(timing.selectionKeyPause, random));
-      await locator.press(direction);
+      // Do not refocus the locator here: on macOS the native picker owns the
+      // active keyboard surface, and refocusing the DOM element closes it.
+      await page.keyboard.press(direction);
       metrics.selectionKeyEvents += 1;
     }
     await sleep(numberBetween(timing.selectionKeyPause, random));
-    await locator.press('Enter');
+    await page.keyboard.press('Enter');
     metrics.selectionKeyEvents += 1;
     await sleep(numberBetween(timing.selectionKeyPause, random));
-    await locator.press('Tab');
+    await page.keyboard.press('Tab');
     metrics.selectionKeyEvents += 1;
     const actual = await locator.inputValue?.();
     if (actual !== selection.targetValue) {
