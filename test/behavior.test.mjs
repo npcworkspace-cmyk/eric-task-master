@@ -130,8 +130,8 @@ test('human select closes the native popup, moves relative to the current option
     return { currentIndex: selectedIndex, targetIndex, targetValue: values[targetIndex] ?? null };
   };
   locator.inputValue = async () => values[selectedIndex];
-  page.keyboard.press = async (key) => {
-    calls.push(['key', key]);
+  locator.press = async (key) => {
+    calls.push(['locatorKey', key]);
     if (key === 'ArrowUp') selectedIndex -= 1;
     if (key === 'ArrowDown') selectedIndex += 1;
   };
@@ -145,7 +145,7 @@ test('human select closes the native popup, moves relative to the current option
   const selected = await action.select('#choice', 'alpha');
 
   assert.equal(selected, 'alpha');
-  assert.deepEqual(calls.filter((item) => item[0] === 'key').map((item) => item[1]), [
+  assert.deepEqual(calls.filter((item) => item[0] === 'locatorKey').map((item) => item[1]), [
     'Escape', 'ArrowUp', 'ArrowUp', 'Tab'
   ]);
   assert.equal(action.audit.selectionKeyEvents, 4);

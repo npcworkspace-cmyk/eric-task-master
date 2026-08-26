@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { pathExists } from './files.mjs';
 
 export const MCP_CAPABILITIES = Object.freeze({
@@ -16,7 +16,9 @@ export const REGISTRATION_MODES = Object.freeze({
 });
 
 function executableCandidates(name, env, platform) {
-  const pathEntries = String(env.PATH || '').split(platform === 'win32' ? ';' : ':').filter(Boolean);
+  // PATH belongs to the process doing the registration, even when a test or
+  // compatibility probe asks us to evaluate another platform's host layout.
+  const pathEntries = String(env.PATH || '').split(delimiter).filter(Boolean);
   const extensions = platform === 'win32'
     ? String(env.PATHEXT || '.EXE;.CMD;.BAT').split(';').filter(Boolean)
     : [''];

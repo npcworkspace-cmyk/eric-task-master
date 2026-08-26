@@ -356,17 +356,17 @@ export function createActionHelper({
     // Native select popups differ across Chromium platforms. Close the popup
     // while retaining focus, move from the current option with real arrow-key
     // events, then blur with Tab so input/change handlers settle consistently.
-    await page.keyboard.press('Escape');
+    await locator.press('Escape');
     metrics.selectionKeyEvents += 1;
     const direction = selection.targetIndex >= selection.currentIndex ? 'ArrowDown' : 'ArrowUp';
     const distance = Math.abs(selection.targetIndex - selection.currentIndex);
     for (let index = 0; index < distance; index += 1) {
       await sleep(numberBetween(timing.selectionKeyPause, random));
-      await page.keyboard.press(direction);
+      await locator.press(direction);
       metrics.selectionKeyEvents += 1;
     }
     await sleep(numberBetween(timing.selectionKeyPause, random));
-    await page.keyboard.press('Tab');
+    await locator.press('Tab');
     metrics.selectionKeyEvents += 1;
     const actual = await locator.inputValue?.();
     if (actual !== selection.targetValue) {
