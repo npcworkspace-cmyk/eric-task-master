@@ -4,7 +4,7 @@
 
 **为 AI Agent 打造的持久化浏览器自动化任务系统。**
 
-版本：**2.1.1**
+版本：**2.1.3**
 
 AI Agent 已经能够理解需求、制定计划和编写代码，但浏览器执行往往仍是最薄弱的一环。Agent 内置浏览器适合短时交互，却很难稳定保留登录态、任务上下文和恢复现场；简单的 CDP 控制器虽然能快速操作真实浏览器，却会迫使每个 Agent 为每次任务重新编写控制器、进度跟踪、异常恢复和清理逻辑。
 
@@ -40,7 +40,7 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 ## 三层模型
 
 1. **Task Master 运行时**：纯 Playwright 执行、持久化与临时 Profile、任务队列、进度、恢复、证据和清理。
-2. **Owner Console 人类工作台**：一个固定本地网址统一管理共享 Profile、已接入 Agent、实时任务、进度、指令和最终报告；用户直接在隔离的 Playwright 持久 Profile 中登录。
+2. **Owner Console 人类工作台**：一个固定本地网址，只做共享 Profile 管理、任务进度查看，以及暂停、恢复、取消和删除记录；用户直接在隔离的 Playwright 持久 Profile 中登录。
 3. **MCP + Skills + Task Packs**：Agent 只接触精简的高级任务接口，行业和网站能力独立叠加，不污染核心。
 
 这样可以用一个稳定的万能基座，持续定义不同的专属批量行动助手。
@@ -60,13 +60,13 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
    node scripts/taskmaster.mjs connect --json
    ```
 
-5. `connect` 会安装锁定依赖和匹配的 Playwright Chromium；在旧 Manager 空闲时完成可信的优雅升级；启动本地 Manager；执行真实浏览器验收；并注册已支持的 MCP 宿主。如果旧 Manager 还有任务，升级会停止且不会打断原任务。
+5. `connect` 会安装锁定依赖和匹配的 Playwright Chromium；在旧 Manager 空闲时完成可信的优雅升级；启动本地 Manager；执行真实浏览器验收；并注册已支持的 MCP 宿主。如果旧 Manager 还有任务，升级会停止且不会打断原任务。如果返回 `manager.agentHostReloadRequired: true`，先重载当前 Agent 宿主一次再验证 MCP；已经升级的 Manager 应继续运行。
 6. 严格执行返回的 `nextAction`。修复明确前置条件后，最多原样重试同一条命令一次；不要发散成另一套临时控制器。
 7. 首次打开返回的 Owner Console 链接。页面会静默建立持久本机会话，不需要输入授权码，也没有 Agent 绑定流程；以后直接收藏 `http://127.0.0.1:19946/dashboard`。
-8. 如果宿主返回 `registered_pending_restart`，让用户只重启或重新加载该 Agent 宿主一次；若当前进程本轮无法重载，只允许整项任务使用同一个稳定 Agent ID 走固定 CLI，下一次宿主重启后的新任务再切回 MCP。
+8. MCP 是默认 Agent 路径。任何 `registered_pending_*` 结果都只完成一次返回中指定的审批或重载，然后用 `taskmaster_status` 与 `taskmaster_profiles_list` 验证真实宿主连接。
 9. 二选一并在本次任务中保持同一路径：
    - 宿主已经加载 MCP 时，依次调用 `taskmaster_status`、`taskmaster_profiles_list`；
-   - 宿主返回 `needs_adapter`，或本轮无法重载待生效的 MCP 时，在完整项目根目录使用固定 CLI，并在所有作用域命令中保持同一个、与其他 Agent 不同的身份：
+   - 仅当返回 `adapter_pending`、`extension_required`，或本轮无法重载宿主时，在完整项目根目录使用固定 CLI 兜底，并在所有作用域命令中保持同一个、与其他 Agent 不同的身份：
 
      ```bash
      node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json
@@ -77,7 +77,7 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 
 可以直接复制给新 Agent：
 
-> 安装并启动 `https://github.com/npcworkspace-cmyk/eric-task-master`。拉取完整仓库，阅读或安装 `skills/eric-task-master`，只运行 `node scripts/taskmaster.mjs connect --json`，不要发明其他控制器或端口。宿主支持时走已加载的 MCP；返回 `needs_adapter` 时，严格按 Skill 的固定 CLI 路径并保持一个稳定、独立的 Agent ID。返回 Owner Console 链接；状态和 Profile 检查成功后，询问我要执行什么任务。
+> 安装并启动 `https://github.com/npcworkspace-cmyk/eric-task-master`。拉取完整仓库，阅读或安装 `skills/eric-task-master`，只运行 `node scripts/taskmaster.mjs connect --json`，不要发明其他控制器或端口。默认走 MCP；仅在 `adapter_pending`、`extension_required` 或本轮宿主无法重载时，严格按 Skill 使用稳定身份的 CLI 兜底。返回 Owner Console 链接；真实状态和 Profile 检查成功后，询问我要执行什么任务。
 
 ## 日常使用
 
@@ -108,10 +108,10 @@ Agent 随后只走一条持久任务路径：发现任务类型、使用幂等�
 ### 多 Agent 工作台
 
 - 所有可信本机 Agent 共享 Profile，不再定义没有实际意义的“Profile 创建者”；单 Profile 的排他租约仍会保护登录态不被并发破坏。
-- Owner Console 展示 Agent 的已注册、在线、离线、工作中和已撤销状态，以及当前任务、所用 Profile 和排队深度。
-- 任务工作台展示 Playwright 当前在打开、滚动、提取、等待还是恢复，并提供暂停、继续、终止、修改排队输入和发送询问/修改指令。
-- 指令会持久化并校验任务版本。在线 Agent 可在 wait/inbox 循环中立即收到；离线 Agent 重连后收到。系统不会虚假承诺唤醒一个已经完全关闭的宿主进程。
-- 任务详情优先展示 Agent 生成的用户报告；代码、日志、截图、产物和诊断只作为可展开的次级证据。
+- 面板只保留两个区域：任务与 Profile，不再展示容易混淆的 Agent 名录、报告、文件或消息工作台。
+- 每个任务使用 `Agent-具体任务-创建时间` 的稳定名称，显示当前动作、可视化进度、运行时间、累计冷却时间和总时间。
+- 暂停、恢复、取消和删除记录都会校验任务最新状态；删除只隐藏已经完成清理的终态记录，不会把已执行动作变成可重放任务。
+- 面板只承担轻量任务管理；结果解释与专项交付继续由发起任务的 Agent 完成。
 
 ## 定义专属生产任务
 
@@ -129,10 +129,18 @@ Task Pack 提供可复用任务类型。内置单页、分页列表、列表详�
 
 | 宿主 | 本地 MCP 自动注册 |
 | --- | --- |
-| Codex、Claude Desktop、Claude Code、Hermes | 已支持 |
-| WorkBuddy、DeepSeek Harness、Pi、OpenClaw | 仍需适配器，当前版本不会自动修改其配置 |
+| Codex | 自动注册；本机已验证真实工具发现与 Task Master 工具调用 |
+| WorkBuddy Desktop | 自动注册；已验证真实宿主拉起 bridge，运行时升级后需要重载宿主 |
+| Hermes | 自动注册；本机已验证发现 21 个工具，并真实调用 `taskmaster_status` 与 `taskmaster_profiles_list` |
+| Claude Desktop、Claude Code | 自动注册；仍需对应宿主加载配置并完成一次真实工具调用，才能证明已激活 |
+| CodeBuddy CLI、Gemini CLI | 已有自动注册适配器，真实宿主矩阵待补 |
+| OpenClaw | 已有官方 CLI 注册适配器，真实宿主矩阵待补 |
+| DeepSeek Harness、VS Code/Copilot、OpenCode | 宿主支持 MCP，安全自动适配器待完成 |
+| Pi | 按宿主设计需要 MCP 扩展 |
 
-没有宿主专用 MCP 适配器时，仍可通过固定且带 Agent 作用域的 CLI 使用浏览器运行时。每条作用域 CLI 命令都要求每个独立 Agent 保持一个稳定且不同的 `--agent-id`；所有 Agent 共享 Profile 目录，复用同一 ID 则会有意共享该身份的任务记录和 Owner 收件箱。完整的非 MCP 命令路径和可信本机边界见 [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md)。
+每个 Agent 宿主独立启动一个 STDIO MCP bridge，所有 bridge 共同复用一个 Manager、Profile 目录、调度器和持久任务运行时。CLI 只保留为应急兼容路径；每个独立 CLI Agent 必须保持一个稳定且不同的 `--agent-id`，复用同一 ID 会有意共享该身份的任务记录和 Owner 收件箱。完整宿主矩阵和可信本机边界见 [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md)。
+
+发布门槛使用 4 个独立、分别携带 Codex、WorkBuddy 与 Hermes 身份的真实 STDIO MCP 协议客户端接入同一个隔离 Manager，验证共享 Profile、按 Agent 隔离任务与产物、同 Profile 排队、不同 Profile 并行，以及 Agent 重连时任务不中断。真实宿主加载和工具调用另行在已安装宿主上验收。
 
 ## 验收与停止
 

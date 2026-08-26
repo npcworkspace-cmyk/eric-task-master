@@ -172,16 +172,17 @@ export async function scaffoldTaskPack(directory, { name, recipe = 'single-page'
   }
   const root = path.resolve(directory);
   await mkdir(path.join(root, 'tasks'), { recursive: true, mode: 0o700 });
-  const taskName = `${packName}.${recipe}`;
+  const taskName = `${packName}.${recipe}.v1`;
+  const moduleName = `${recipe}-v1.mjs`;
   const manifest = {
     name: packName,
     version: '1.0.0',
     title: packName,
     description: 'Reusable Task Master task pack.',
-    tasks: [{ name: taskName, module: `tasks/${recipe}.mjs` }]
+    tasks: [{ name: taskName, module: `tasks/${moduleName}` }]
   };
   const moduleSource = createTaskRecipeSource(taskName, recipe);
   await writeFile(path.join(root, 'taskpack.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-  await writeFile(path.join(root, 'tasks', `${recipe}.mjs`), moduleSource, { flag: 'wx', mode: 0o600 });
+  await writeFile(path.join(root, 'tasks', moduleName), moduleSource, { flag: 'wx', mode: 0o600 });
   return readTaskPack(root);
 }

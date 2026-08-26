@@ -9,10 +9,10 @@
 5. Unknown action outcomes are inspected before retrying.
 6. Authentication material never appears in agent-visible responses or logs.
 7. Core runtime remains site-agnostic; specialized Skills provide site behavior.
-8. Agent hosts receive scoped MCP identities; no host configuration contains Manager, browser, or account credentials.
+8. Each Agent host starts its own STDIO MCP bridge with a stable scoped identity; all bridges reuse the same Manager, and no host configuration contains Manager, browser, or account credentials.
 9. Agent-visible task results contain bounded summaries and declared artifacts only after completion verification, never local execution paths.
 10. A persistent Ed25519 Manager identity authenticates the loopback endpoint before an admin or scoped Agent credential is sent.
-11. The Owner Console is a persistent human workbench. Its report view is primary; raw diagnostics remain secondary and folded.
+11. The Owner Console is a deliberately small human workbench: Profile management plus task progress and pause, resume, cancel, or record deletion. Reports, artifacts, diagnostics, and Agent coordination remain protocol capabilities rather than Dashboard surfaces.
 12. Owner commands are durable and revision-checked. An offline Agent can receive them when it reconnects, but Manager does not claim to wake an arbitrary closed host process.
 
 ## Components
@@ -70,6 +70,7 @@ Agent authorization is scoped to one stable registered MCP client ID and role tu
 - `GET /v1/tasks`
 - `POST /v1/tasks`
 - `GET /v1/tasks/:id`
+- `DELETE /v1/tasks/:id` (terminal, cleanup-settled records; Manager/Owner only)
 - `POST /v1/tasks/:id/continue`
 - `POST /v1/tasks/:id/resume`
 - `POST /v1/tasks/:id/cancel`
@@ -94,6 +95,8 @@ Agent authorization is scoped to one stable registered MCP client ID and role tu
 
 Dashboard URLs never contain the Manager admin credential. The first authorized link creates the persistent Owner cookie; after that the fixed Dashboard URL works directly across Manager restarts until logout, expiry, or revocation. A `401` requests a new bootstrap link. A `403` is shown inline and does not discard the valid session or the last rendered state.
 
+The Dashboard has exactly two primary views: Tasks and Profiles. Task cards expose the immutable display name, state, current progress, Profile, active execution time, cumulative cooldown time, total elapsed time, and only the applicable lifecycle controls. It does not fetch or render the Agent Registry, reports, artifacts, timeline, diagnostics, or Agent inbox.
+
 ## Profile states
 
 `idle -> starting -> open -> idle`; an unconfirmed browser close becomes `error` and retains its cleanup-required lease.
@@ -112,7 +115,11 @@ Side states are `waiting_user`, `cooling_down`, `recovering`, `pause_requested`,
 
 Every task has a stable `jobId` and monotonic `revision`. Owner commands use `commandId + expectedRevision`, making retries idempotent and concurrent edits explicit. Running input is immutable; only queued input can be revised. Ask/modify messages live in a durable Agent inbox and can be acknowledged, applied, or rejected. Active waits return early when commands arrive; an offline Agent sees them after reconnecting and claiming its inbox.
 
-The Agent may publish a bounded, human-readable task report with a title, summary, and sections. The Owner Console renders this report before diagnostics, artifacts, and raw timeline data. This separates the user deliverable from execution evidence without weakening completion verification.
+Task creation accepts one bounded `taskLabel` containing only the concrete action, object, and scope. Manager combines a stable host identity, that label, and its own UTC creation timestamp into the immutable `displayName` (`Agent-task-createdAt`); the Agent display identity must never be changed per task. Timing is Manager-derived: total time spans creation to terminal completion (or now), execution time spans browser attempts with cumulative cooldown removed, and cooldown time accumulates actual elapsed cooldown periods, including interrupted ones.
+
+Dashboard deletion is a logical record deletion, never task cancellation. It is allowed only after terminal state and confirmed browser, Worker, and Profile cleanup, is serialized with other controls, and requires the current revision. Public reads immediately hide the record, while its minimal idempotency tombstone remains private so deleting history cannot make a previously executed external action replayable with the same key.
+
+The Agent may publish a bounded, human-readable task report with a title, summary, and sections. Reports remain available to Agent and API consumers, but the intentionally minimal Owner Console does not render them. This preserves delivery and audit compatibility without turning the Dashboard into a second reporting product.
 
 Heartbeat and progress are separate clocks. Heartbeat proves Worker liveness. `progressAt` proves application work advanced. The default stall detector requests screenshot plus semantic diagnostics after two minutes without progress and fails/cleans up after ten minutes of continued silence; explicit `waiting_user` and `cooling_down` states are exempt. Diagnostic capture is best-effort when the Worker or page event loop is itself unresponsive.
 

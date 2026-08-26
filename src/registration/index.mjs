@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { readdir, realpath, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VERSION } from '../contracts.mjs';
 import {
   atomicWrite,
   atomicWriteCas,
@@ -15,8 +16,9 @@ import {
   writeJsonAtomic
 } from './files.mjs';
 import { adapterFor, desiredEntry } from './formats.mjs';
-import { createHostDefinitions, DEFAULT_HOST_KEYS } from './hosts.mjs';
+import { createHostDefinitions, DEFAULT_HOST_KEYS, REGISTRATION_MODES } from './hosts.mjs';
 import { RegistrationLock } from './lock.mjs';
+import { createOfficialCliAdapter } from './official-cli.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const STATE_SCHEMA_VERSION = 1;
@@ -39,16 +41,25 @@ function errorDetail(error, fallbackCode = 'REGISTRATION_FAILED') {
   return { code: error?.code || fallbackCode, message: error?.message || String(error) };
 }
 
-function freshState(projectRoot) {
+function freshState(projectRoot, runtimeVersion) {
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
     installationId: randomUUID(),
     projectRoot,
+    runtimeVersion,
     createdAt: now(),
     updatedAt: now(),
     registrations: {},
     transactions: []
   };
+}
+
+function requiresAgentHostReload(state, runtimeVersion) {
+  return Boolean(
+    state
+    && Object.keys(state.registrations || {}).length > 0
+    && state.runtimeVersion !== runtimeVersion
+  );
 }
 
 function validateStateShape(state) {
@@ -64,6 +75,15 @@ function validateStateShape(state) {
   }
   state.registrations ||= {};
   state.transactions ||= [];
+  if (state.runtimeVersion !== undefined && (
+    typeof state.runtimeVersion !== 'string'
+    || !state.runtimeVersion.trim()
+    || state.runtimeVersion.length > 64
+  )) {
+    throw Object.assign(new Error('Registration state has an invalid runtime version'), {
+      code: 'INVALID_REGISTRATION_STATE'
+    });
+  }
   if (
     !state.registrations ||
     typeof state.registrations !== 'object' ||
@@ -106,15 +126,62 @@ function normalizeHostKeys(hostKeys) {
 }
 
 function publicHost(host, detected, status, extra = {}) {
+  const autoRegistration = (
+    host.registrationMode === REGISTRATION_MODES.FILE
+    || host.registrationMode === REGISTRATION_MODES.OFFICIAL_CLI
+  ) ? 'verified' : host.registrationMode;
+  const support = autoRegistration === 'verified' ? 'native' : 'needs_adapter';
+  const configurationStatus = {
+    registered: 'registered',
+    adoption_available: 'registered_unowned',
+    update_available: 'registered_outdated',
+    adopted: 'registered',
+    registered_pending_restart: 'registered',
+    registered_pending_reload: 'registered',
+    registered_pending_approval_or_reload: 'registered',
+    registered_disabled: 'registered',
+    would_register: 'would_register',
+    would_adopt: 'would_adopt',
+    conflict: 'conflict',
+    failed: 'failed'
+  }[status] || 'not_registered';
+  const activationStatus = extra.activationStatus || ({
+    registered_pending_restart: 'pending_host_restart',
+    registered_pending_reload: 'pending_host_reload',
+    registered_pending_approval_or_reload: 'pending_approval_or_reload',
+    registered: 'not_verified',
+    adoption_available: 'not_verified',
+    adopted: 'not_verified',
+    registered_disabled: 'disabled_by_host'
+  }[status] || 'not_configured');
   return {
     hostKey: host.key,
     displayName: host.displayName,
-    support: host.support,
+    support,
+    mcpCapability: host.mcpCapability,
+    autoRegistration,
+    registrationMode: host.registrationMode,
     detected,
     status,
+    configurationStatus,
+    activationStatus,
     ...(host.configPath ? { configPath: host.configPath } : {}),
     ...extra
   };
+}
+
+function isAutoRegistrationVerified(host) {
+  return host.registrationMode === REGISTRATION_MODES.FILE
+    || host.registrationMode === REGISTRATION_MODES.OFFICIAL_CLI;
+}
+
+function unavailableAdapterResult(host, detected) {
+  const status = host.registrationMode === REGISTRATION_MODES.EXTENSION_REQUIRED
+    ? 'extension_required'
+    : 'adapter_pending';
+  return publicHost(host, detected, detected ? status : 'not_installed', {
+    reason: host.reason || 'No verified automatic registration contract is enabled for this host.'
+  });
 }
 
 export function createRegistrar(options = {}) {
@@ -134,6 +201,8 @@ export function createRegistrar(options = {}) {
     || ((path, lockOptions) => new RegistrationLock(path, lockOptions));
   const pruneBackups = options.pruneBackups;
   const onMaintenanceWarning = options.onMaintenanceWarning || (() => {});
+  const commandRunner = options.runHostCommand;
+  const runtimeVersion = options.runtimeVersion || VERSION;
   const hosts = createHostDefinitions({ home, env, platform });
   const hostMap = new Map(hosts.map((host) => [host.key, host]));
 
@@ -240,11 +309,72 @@ export function createRegistrar(options = {}) {
   }
 
   function contextFor(host, installationId) {
-    const desired = desiredEntry(host, installationId, executablePath, entrypoint);
+    const desired = desiredEntry(host, installationId, executablePath, entrypoint, runtimeVersion);
     return {
+      host,
       filePath: host.configPath,
       desired,
-      clientId: desired.env.TASKMASTER_CLIENT_ID
+      clientId: desired.env.TASKMASTER_CLIENT_ID,
+      ...(host.managedEntryKeys ? { managedEntryKeys: host.managedEntryKeys } : {}),
+      ...(host.managedEnvKeys ? { managedEnvKeys: host.managedEnvKeys } : {})
+    };
+  }
+
+  function sameResolvedPath(left, right) {
+    if (typeof left !== 'string' || typeof right !== 'string') return false;
+    const normalizedLeft = resolve(left);
+    const normalizedRight = resolve(right);
+    return platform === 'win32'
+      ? normalizedLeft.toLocaleLowerCase('en-US') === normalizedRight.toLocaleLowerCase('en-US')
+      : normalizedLeft === normalizedRight;
+  }
+
+  function isSafeWorkBuddyAdoption(inspection, context) {
+    if (context.host.key !== 'workbuddy' || inspection.state !== 'owned_outdated') return false;
+    const current = inspection.currentEntry;
+    const currentEnv = current?.env;
+    const expectedEnv = context.desired.env;
+    const acceptedNames = new Set([
+      expectedEnv.ERIC_TASK_MASTER_CLIENT_NAME,
+      'Eric Task Master / WorkBuddy'
+    ]);
+    return Boolean(
+      current
+      && typeof current.command === 'string'
+      && isAbsolute(current.command)
+      && /^node(?:\.exe)?$/iu.test(basename(current.command))
+      && Array.isArray(current.args)
+      && current.args.length === 1
+      && sameResolvedPath(current.args[0], context.desired.args[0])
+      && currentEnv?.ERIC_TASK_MASTER_CLIENT_ID === expectedEnv.ERIC_TASK_MASTER_CLIENT_ID
+      && currentEnv?.TASKMASTER_CLIENT_ID === expectedEnv.TASKMASTER_CLIENT_ID
+      && currentEnv?.ERIC_TASK_MASTER_CLIENT_NAME === currentEnv?.TASKMASTER_CLIENT_NAME
+      && acceptedNames.has(currentEnv?.ERIC_TASK_MASTER_CLIENT_NAME)
+    );
+  }
+
+  function officialCliAdapterFor(host) {
+    return createOfficialCliAdapter(host, { commandRunner, env, platform });
+  }
+
+  function contextForRecordedAction(action) {
+    const host = hostMap.get(action.hostKey);
+    if (!host) throw Object.assign(new Error(`Unknown recorded MCP host: ${action.hostKey}`), {
+      code: 'INVALID_REGISTRATION_STATE'
+    });
+    const desired = action.desiredEntry || action.registrationAfter?.entry || action.registrationBefore?.entry;
+    if (!desired || typeof desired !== 'object') {
+      throw Object.assign(new Error(`Recorded MCP entry is missing for ${action.hostKey}`), {
+        code: 'INVALID_REGISTRATION_STATE'
+      });
+    }
+    return {
+      host,
+      filePath: action.configPath,
+      desired,
+      clientId: action.registrationAfter?.clientId || action.registrationBefore?.clientId,
+      ...(host.managedEntryKeys ? { managedEntryKeys: host.managedEntryKeys } : {}),
+      ...(host.managedEnvKeys ? { managedEnvKeys: host.managedEnvKeys } : {})
     };
   }
 
@@ -273,6 +403,29 @@ export function createRegistrar(options = {}) {
   }
 
   async function inspectRollbackAction(action) {
+    if (action.kind === 'adoption') return { state: 'after', current: null };
+    if (action.kind === REGISTRATION_MODES.OFFICIAL_CLI) {
+      const host = hostMap.get(action.hostKey);
+      const context = contextForRecordedAction(action);
+      const inspection = await officialCliAdapterFor(host).inspect(context);
+      const useFullFingerprint = Object.prototype.hasOwnProperty.call(action, 'beforeFullFingerprint');
+      const currentFingerprint = useFullFingerprint
+        ? inspection.fullFingerprint
+        : inspection.currentFingerprint;
+      const beforeFingerprint = useFullFingerprint
+        ? action.beforeFullFingerprint
+        : action.beforeFingerprint;
+      const afterFingerprint = useFullFingerprint
+        ? action.afterFullFingerprint
+        : action.afterFingerprint;
+      if (currentFingerprint === beforeFingerprint) {
+        return { state: 'before', current: inspection };
+      }
+      if (currentFingerprint === afterFingerprint) {
+        return { state: 'after', current: inspection };
+      }
+      return { state: 'conflict', current: inspection };
+    }
     const current = await readOptionalFile(action.configPath);
     if (sameFileSnapshot(current, beforeSnapshot(action))) {
       return { state: 'before', current };
@@ -387,14 +540,52 @@ export function createRegistrar(options = {}) {
     for (const host of selected) {
       const registration = state?.registrations?.[host.key];
       const detected = registration ? true : await host.detect();
-      if (host.support !== 'native') {
-        results.push(publicHost(host, detected, detected ? 'needs_adapter' : 'not_installed', {
-          reason: 'No verified native registration contract is enabled for this host.'
-        }));
+      if (!isAutoRegistrationVerified(host)) {
+        results.push(unavailableAdapterResult(host, detected));
         continue;
       }
       if (!detected) {
         results.push(publicHost(host, false, 'not_installed'));
+        continue;
+      }
+      if (host.registrationMode === REGISTRATION_MODES.OFFICIAL_CLI) {
+        const context = contextFor(host, state?.installationId || 'unowned');
+        try {
+          const inspection = await officialCliAdapterFor(host).inspect(context);
+          if (!state) {
+            results.push(publicHost(host, true, inspection.state === 'absent' ? 'unregistered' : 'conflict',
+              inspection.state === 'absent' ? {} : {
+                reason: 'Named entry exists but no Task Master ownership state is available.'
+              }));
+            continue;
+          }
+          if (
+            inspection.state === 'owned_outdated'
+            && registration
+            && inspection.currentFingerprint !== registration.entryFingerprint
+          ) {
+            results.push(publicHost(host, true, 'conflict', {
+              reason: 'The owned entry changed after installation.'
+            }));
+            continue;
+          }
+          if (inspection.state === 'disabled' && !registration) {
+            results.push(publicHost(host, true, 'conflict', {
+              reason: 'A disabled named entry exists without Task Master ownership state.'
+            }));
+            continue;
+          }
+          const statusName = {
+            absent: 'unregistered',
+            registered: registration ? 'registered' : 'adoption_available',
+            owned_outdated: 'update_available',
+            disabled: 'registered_disabled',
+            conflict: 'conflict'
+          }[inspection.state];
+          results.push(publicHost(host, true, statusName));
+        } catch (error) {
+          results.push(publicHost(host, true, 'failed', { error: errorDetail(error) }));
+        }
         continue;
       }
       const configPath = registration?.configPath || host.configPath;
@@ -437,10 +628,20 @@ export function createRegistrar(options = {}) {
           }));
           continue;
         }
+        const safeWorkBuddyAdoption = isSafeWorkBuddyAdoption(inspection, context);
+        const workBuddyRuntimeCurrent = inspection.currentEntry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION
+          === context.desired.env.ERIC_TASK_MASTER_RUNTIME_VERSION
+          || Boolean(
+            registration?.runtimeVersion === runtimeVersion
+            && registration?.entry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION === undefined
+            && inspection.currentEntry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION === undefined
+          );
         const statusName = {
           absent: 'unregistered',
-          registered: 'registered',
-          owned_outdated: 'update_available',
+          registered: registration ? 'registered' : 'adoption_available',
+          owned_outdated: safeWorkBuddyAdoption && (!registration || workBuddyRuntimeCurrent)
+            ? (registration ? 'registered' : 'adoption_available')
+            : 'update_available',
           conflict: 'conflict'
         }[inspection.state];
         results.push(publicHost({ ...host, configPath }, true, statusName));
@@ -452,6 +653,9 @@ export function createRegistrar(options = {}) {
       ok: results.every((result) => result.status !== 'failed'),
       command: 'status',
       installationId: state?.installationId || null,
+      registeredRuntimeVersion: state?.runtimeVersion || null,
+      currentRuntimeVersion: runtimeVersion,
+      agentHostReloadRequired: requiresAgentHostReload(state, runtimeVersion),
       statePath,
       results
     };
@@ -460,7 +664,16 @@ export function createRegistrar(options = {}) {
   async function install({ dryRun = false, hostKeys } = {}) {
     const selected = select(hostKeys);
     const loaded = await loadState();
-    const state = loaded || freshState(projectRoot);
+    const state = loaded || freshState(projectRoot, runtimeVersion);
+    const fullInstall = hostKeys === undefined || hostKeys === null;
+    const agentHostReloadRequired = requiresAgentHostReload(loaded, runtimeVersion);
+    const previousRuntimeVersion = loaded?.runtimeVersion || null;
+    const installMetadata = (result) => ({
+      ...result,
+      previousRuntimeVersion,
+      currentRuntimeVersion: runtimeVersion,
+      agentHostReloadRequired
+    });
     const results = [];
     const actions = [];
     let preflightFailed = false;
@@ -471,10 +684,8 @@ export function createRegistrar(options = {}) {
         ? { ...selectedHost, configPath: previousRegistration.configPath, format: previousRegistration.format }
         : selectedHost;
       const detected = previousRegistration ? true : await host.detect();
-      if (host.support !== 'native') {
-        results.push(publicHost(host, detected, detected ? 'needs_adapter' : 'not_installed', {
-          reason: 'Skipped: adapter is not verified.'
-        }));
+      if (!isAutoRegistrationVerified(host)) {
+        results.push(unavailableAdapterResult(host, detected));
         continue;
       }
       if (!detected) {
@@ -482,8 +693,85 @@ export function createRegistrar(options = {}) {
         continue;
       }
       try {
-        const before = await readOptionalFile(host.configPath);
         const context = contextFor(host, state.installationId);
+        if (host.registrationMode === REGISTRATION_MODES.OFFICIAL_CLI) {
+          const adapter = officialCliAdapterFor(host);
+          const inspection = await adapter.inspect(context);
+          if (inspection.state === 'conflict') {
+            preflightFailed = true;
+            results.push(publicHost(host, true, 'conflict', {
+              error: { code: 'REGISTRATION_CONFLICT', message: `Unowned ${host.key} entry uses the name eric-task-master.` }
+            }));
+            continue;
+          }
+          if (inspection.state === 'disabled') {
+            if (previousRegistration && inspection.currentFingerprint === previousRegistration.entryFingerprint) {
+              results.push(publicHost(host, true, 'registered_disabled', {
+                changed: false,
+                reason: 'The host has explicitly disabled eric-task-master; enable it there, reload once, then verify taskmaster_status.'
+              }));
+            } else {
+              preflightFailed = true;
+              results.push(publicHost(host, true, 'conflict', {
+                error: {
+                  code: 'OWNED_ENTRY_CHANGED',
+                  message: 'A disabled entry does not match the last registered Task Master definition.'
+                }
+              }));
+            }
+            continue;
+          }
+          if (
+            inspection.state === 'owned_outdated'
+            && (!previousRegistration || inspection.currentFingerprint !== previousRegistration.entryFingerprint)
+          ) {
+            preflightFailed = true;
+            results.push(publicHost(host, true, 'conflict', {
+              error: {
+                code: 'OWNED_ENTRY_CHANGED',
+                message: 'The owned entry changed after installation; it was not overwritten.'
+              }
+            }));
+            continue;
+          }
+          if (inspection.state === 'registered') {
+            if (previousRegistration) {
+              results.push(publicHost(host, true, 'registered', { changed: false }));
+              continue;
+            }
+            actions.push({
+              kind: 'adoption',
+              host,
+              context,
+              beforeEntry: inspection.fullCurrentEntry,
+              beforeFingerprint: inspection.currentFingerprint,
+              beforeFullFingerprint: inspection.fullFingerprint,
+              afterFingerprint: inspection.currentFingerprint,
+              afterFullFingerprint: inspection.fullFingerprint,
+              entryFingerprint: inspection.currentFingerprint,
+              registrationBefore: null
+            });
+            results.push(publicHost(host, true, dryRun ? 'would_adopt' : 'pending', { changed: !dryRun }));
+            continue;
+          }
+          const afterEntry = adapter.prepareEntry(context, inspection.fullCurrentEntry);
+          actions.push({
+            kind: REGISTRATION_MODES.OFFICIAL_CLI,
+            host,
+            context,
+            beforeEntry: inspection.fullCurrentEntry,
+            beforeFingerprint: inspection.currentFingerprint,
+            beforeFullFingerprint: inspection.fullFingerprint,
+            afterEntry,
+            afterFingerprint: adapter.fingerprint(afterEntry),
+            afterFullFingerprint: adapter.fullFingerprint(afterEntry),
+            entryFingerprint: adapter.fingerprint(afterEntry),
+            registrationBefore: previousRegistration || null
+          });
+          results.push(publicHost(host, true, dryRun ? 'would_register' : 'pending', { changed: !dryRun }));
+          continue;
+        }
+        const before = await readOptionalFile(host.configPath);
         const adapter = adapterFor(host.format);
         const inspection = adapter.inspect(before.text, context);
         if (inspection.state === 'conflict') {
@@ -497,6 +785,21 @@ export function createRegistrar(options = {}) {
           inspection.state === 'owned_outdated'
           && (!previousRegistration || inspection.currentFingerprint !== previousRegistration.entryFingerprint)
         ) {
+          if (!previousRegistration && isSafeWorkBuddyAdoption(inspection, context)) {
+            actions.push({
+              kind: 'adoption',
+              host,
+              context,
+              before,
+              afterBytes: before.bytes,
+              afterHash: before.hash,
+              entryFingerprint: inspection.currentFingerprint,
+              adoptedEntry: inspection.currentEntry,
+              registrationBefore: null
+            });
+            results.push(publicHost(host, true, dryRun ? 'would_adopt' : 'pending', { changed: !dryRun }));
+            continue;
+          }
           preflightFailed = true;
           results.push(publicHost(host, true, 'conflict', {
             error: {
@@ -506,13 +809,46 @@ export function createRegistrar(options = {}) {
           }));
           continue;
         }
-        if (inspection.state === 'registered') {
+        if (
+          inspection.state === 'owned_outdated'
+          && previousRegistration
+          && inspection.currentFingerprint === previousRegistration.entryFingerprint
+          && isSafeWorkBuddyAdoption(inspection, context)
+          && (
+            inspection.currentEntry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION
+              === context.desired.env.ERIC_TASK_MASTER_RUNTIME_VERSION
+            || (
+              previousRegistration.runtimeVersion === runtimeVersion
+              && previousRegistration.entry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION === undefined
+              && inspection.currentEntry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION === undefined
+            )
+          )
+        ) {
           results.push(publicHost(host, true, 'registered', { changed: false }));
+          continue;
+        }
+        if (inspection.state === 'registered') {
+          if (previousRegistration) {
+            results.push(publicHost(host, true, 'registered', { changed: false }));
+            continue;
+          }
+          actions.push({
+            kind: 'adoption',
+            host,
+            context,
+            before,
+            afterBytes: before.bytes,
+            afterHash: before.hash,
+            entryFingerprint: inspection.currentFingerprint,
+            registrationBefore: null
+          });
+          results.push(publicHost(host, true, dryRun ? 'would_adopt' : 'pending', { changed: !dryRun }));
           continue;
         }
         const afterText = adapter.install(before.text, context);
         const afterBytes = Buffer.from(afterText, 'utf8');
         actions.push({
+          kind: REGISTRATION_MODES.FILE,
           host,
           context,
           before,
@@ -529,7 +865,7 @@ export function createRegistrar(options = {}) {
     }
 
     if (preflightFailed) {
-      return {
+      return installMetadata({
         ok: false,
         command: 'install',
         dryRun,
@@ -539,16 +875,20 @@ export function createRegistrar(options = {}) {
         results: results.map((result) => result.status === 'pending'
           ? { ...result, status: 'not_changed', changed: false }
           : result)
-      };
+      });
     }
     if (actions.length && (!isAbsolute(executablePath) || !await pathExists(executablePath))) {
-      return failedGlobal('install', dryRun, statePath, results, 'NODE_EXECUTABLE_MISSING', `Node executable not found: ${executablePath}`);
+      return installMetadata(failedGlobal('install', dryRun, statePath, results, 'NODE_EXECUTABLE_MISSING', `Node executable not found: ${executablePath}`));
     }
     if (actions.length && (!isAbsolute(entrypoint) || !await pathExists(entrypoint))) {
-      return failedGlobal('install', dryRun, statePath, results, 'MCP_ENTRYPOINT_MISSING', `MCP entrypoint not found: ${entrypoint}`);
+      return installMetadata(failedGlobal('install', dryRun, statePath, results, 'MCP_ENTRYPOINT_MISSING', `MCP entrypoint not found: ${entrypoint}`));
     }
     if (dryRun || actions.length === 0) {
-      return {
+      if (!dryRun && fullInstall && loaded && state.runtimeVersion !== runtimeVersion) {
+        state.runtimeVersion = runtimeVersion;
+        await saveState(state);
+      }
+      return installMetadata({
         ok: true,
         command: 'install',
         dryRun,
@@ -556,7 +896,7 @@ export function createRegistrar(options = {}) {
         installationId: loaded?.installationId || (actions.length ? '(created during install)' : null),
         statePath,
         results
-      };
+      });
     }
 
     const transaction = await prepareTransaction({ state, stateDir, operation: 'install', actions });
@@ -568,23 +908,39 @@ export function createRegistrar(options = {}) {
         recorded.status = 'writing';
         transaction.currentHostKey = action.host.key;
         await saveState(state);
-        await writeHostFile(action.host.configPath, action.afterBytes, {
-          mode: action.before.exists ? action.before.mode : 0o600,
-          expected: action.before
-        });
-        const written = await readOptionalFile(action.host.configPath);
-        if (written.hash !== action.afterHash) throw Object.assign(new Error(`Write verification failed for ${action.host.configPath}`), {
-          code: 'CONFIG_WRITE_VERIFY_FAILED'
-        });
+        if (action.kind === REGISTRATION_MODES.FILE) {
+          await writeHostFile(action.host.configPath, action.afterBytes, {
+            mode: action.before.exists ? action.before.mode : 0o600,
+            expected: action.before
+          });
+          const written = await readOptionalFile(action.host.configPath);
+          if (written.hash !== action.afterHash) throw Object.assign(new Error(`Write verification failed for ${action.host.configPath}`), {
+            code: 'CONFIG_WRITE_VERIFY_FAILED'
+          });
+        } else if (action.kind === REGISTRATION_MODES.OFFICIAL_CLI) {
+          const verified = await officialCliAdapterFor(action.host).install(action.context, {
+            expectedFullFingerprint: action.beforeFullFingerprint,
+            entry: action.afterEntry
+          });
+          if (
+            verified.currentFingerprint !== action.afterFingerprint
+            || verified.fullFingerprint !== action.afterFullFingerprint
+          ) {
+            throw Object.assign(new Error(`Official host registration verification failed for ${action.host.key}`), {
+              code: 'HOST_CLI_WRITE_VERIFY_FAILED'
+            });
+          }
+        }
         recorded.status = 'applied';
         transaction.currentHostKey = null;
         setRegistrationPhase(state, transaction, recorded, 'after');
         await saveState(state);
       }
+      if (fullInstall) state.runtimeVersion = runtimeVersion;
       transaction.status = 'complete';
       transaction.completedAt = now();
       await saveState(state);
-      return {
+      return installMetadata({
         ok: true,
         command: 'install',
         dryRun: false,
@@ -592,14 +948,22 @@ export function createRegistrar(options = {}) {
         installationId: state.installationId,
         transactionId: transaction.id,
         statePath,
-        results: results.map((result) => result.status === 'pending'
-          ? { ...result, status: 'registered_pending_restart', changed: true }
-          : result)
-      };
+        results: results.map((result) => {
+          if (result.status !== 'pending') return result;
+          const action = actions.find((candidate) => candidate.host.key === result.hostKey);
+          const status = action?.kind === 'adoption'
+            ? 'adopted'
+            : action?.host.installedStatus
+              || (action?.kind === REGISTRATION_MODES.OFFICIAL_CLI
+                ? 'registered_pending_reload'
+                : 'registered_pending_restart');
+          return publicHost(action.host, true, status, { changed: true });
+        })
+      });
     } catch (error) {
       const rollback = await rollbackFailedTransaction(state, transaction, { cause: error });
       const rollbackByHost = new Map(rollback.results.map((result) => [result.hostKey, result]));
-      return {
+      return installMetadata({
         ok: false,
         command: 'install',
         dryRun: false,
@@ -617,7 +981,7 @@ export function createRegistrar(options = {}) {
             error: errorDetail(error)
           }
           : result)
-      };
+      });
     }
   }
 
@@ -640,17 +1004,56 @@ export function createRegistrar(options = {}) {
     let preflightFailed = false;
     for (const host of selected) {
       const registration = state.registrations[host.key];
-      if (host.support !== 'native' && !registration) {
+      if (!isAutoRegistrationVerified(host) && !registration) {
         const detected = await host.detect();
-        results.push(publicHost(host, detected, detected ? 'needs_adapter' : 'not_installed'));
+        results.push(unavailableAdapterResult(host, detected));
         continue;
       }
       if (!registration) {
         results.push(publicHost(host, await host.detect(), 'not_registered'));
         continue;
       }
-      const registeredHost = { ...host, configPath: registration.configPath, format: registration.format };
+      const registeredHost = {
+        ...host,
+        ...(registration.configPath ? { configPath: registration.configPath } : {}),
+        ...(registration.format ? { format: registration.format } : {}),
+        ...(registration.registrationMode ? { registrationMode: registration.registrationMode } : {})
+      };
       try {
+        if (registeredHost.registrationMode === REGISTRATION_MODES.OFFICIAL_CLI) {
+          const context = contextFor(registeredHost, state.installationId);
+          const adapter = officialCliAdapterFor(registeredHost);
+          const inspection = await adapter.inspect(context);
+          if (inspection.state === 'absent') {
+            results.push(publicHost(registeredHost, true, 'already_absent', { changed: false }));
+            continue;
+          }
+          if (inspection.currentFingerprint !== registration.entryFingerprint) {
+            preflightFailed = true;
+            results.push(publicHost(registeredHost, true, 'conflict', {
+              error: {
+                code: 'OWNED_ENTRY_CHANGED',
+                message: 'The registered entry changed after installation; it was not removed.'
+              }
+            }));
+            continue;
+          }
+          actions.push({
+            kind: REGISTRATION_MODES.OFFICIAL_CLI,
+            host: registeredHost,
+            context,
+            beforeEntry: inspection.fullCurrentEntry,
+            beforeFingerprint: inspection.currentFingerprint,
+            beforeFullFingerprint: inspection.fullFingerprint,
+            afterFingerprint: null,
+            afterFullFingerprint: null,
+            entryFingerprint: null,
+            registrationBefore: registration,
+            registrationAfter: null
+          });
+          results.push(publicHost(registeredHost, true, dryRun ? 'would_unregister' : 'pending', { changed: !dryRun }));
+          continue;
+        }
         const before = await readOptionalFile(registration.configPath);
         if (!before.exists) {
           results.push(publicHost(registeredHost, true, 'already_absent', { changed: false }));
@@ -676,6 +1079,7 @@ export function createRegistrar(options = {}) {
         const afterText = adapter.remove(before.text, context);
         const afterBytes = Buffer.from(afterText, 'utf8');
         actions.push({
+          kind: REGISTRATION_MODES.FILE,
           host: registeredHost,
           context,
           before,
@@ -730,14 +1134,25 @@ export function createRegistrar(options = {}) {
         recorded.status = 'writing';
         transaction.currentHostKey = action.host.key;
         await saveState(state);
-        await writeHostFile(action.host.configPath, action.afterBytes, {
-          mode: action.before.mode,
-          expected: action.before
-        });
-        const written = await readOptionalFile(action.host.configPath);
-        if (written.hash !== action.afterHash) throw Object.assign(new Error(`Write verification failed for ${action.host.configPath}`), {
-          code: 'CONFIG_WRITE_VERIFY_FAILED'
-        });
+        if (action.kind === REGISTRATION_MODES.OFFICIAL_CLI) {
+          const verified = await officialCliAdapterFor(action.host).remove(action.context, {
+            expectedFullFingerprint: action.beforeFullFingerprint
+          });
+          if (verified.currentFingerprint !== null || verified.fullFingerprint !== null) {
+            throw Object.assign(new Error(`Official host removal verification failed for ${action.host.key}`), {
+              code: 'HOST_CLI_WRITE_VERIFY_FAILED'
+            });
+          }
+        } else {
+          await writeHostFile(action.host.configPath, action.afterBytes, {
+            mode: action.before.mode,
+            expected: action.before
+          });
+          const written = await readOptionalFile(action.host.configPath);
+          if (written.hash !== action.afterHash) throw Object.assign(new Error(`Write verification failed for ${action.host.configPath}`), {
+            code: 'CONFIG_WRITE_VERIFY_FAILED'
+          });
+        }
         recorded.status = 'applied';
         transaction.currentHostKey = null;
         setRegistrationPhase(state, transaction, recorded, 'after');
@@ -757,9 +1172,14 @@ export function createRegistrar(options = {}) {
         installationId: state.installationId,
         transactionId: transaction.id,
         statePath,
-        results: results.map((result) => result.status === 'pending'
-          ? { ...result, status: 'unregistered_pending_restart', changed: true }
-          : result)
+        results: results.map((result) => {
+          if (result.status !== 'pending') return result;
+          const action = actions.find((candidate) => candidate.host.key === result.hostKey);
+          const status = action?.kind === REGISTRATION_MODES.OFFICIAL_CLI
+            ? 'unregistered_pending_reload'
+            : 'unregistered_pending_restart';
+          return publicHost(action.host, true, status, { changed: true });
+        })
       };
     } catch (error) {
       const rollback = await rollbackFailedTransaction(state, transaction, { cause: error });
@@ -824,11 +1244,13 @@ export function createRegistrar(options = {}) {
           setRegistrationPhase(state, transaction, action, 'before');
           continue;
         }
-        const backup = await readOptionalFile(action.backupPath);
-        if (!backup.exists || backup.hash !== action.beforeHash) {
-          throw Object.assign(new Error(`Registration backup is missing or changed: ${action.backupPath}`), {
-            code: backup.exists ? 'REGISTRATION_BACKUP_CHANGED' : 'REGISTRATION_BACKUP_MISSING'
-          });
+        if (!action.kind || action.kind === REGISTRATION_MODES.FILE) {
+          const backup = await readOptionalFile(action.backupPath);
+          if (!backup.exists || backup.hash !== action.beforeHash) {
+            throw Object.assign(new Error(`Registration backup is missing or changed: ${action.backupPath}`), {
+              code: backup.exists ? 'REGISTRATION_BACKUP_CHANGED' : 'REGISTRATION_BACKUP_MISSING'
+            });
+          }
         }
       } catch (error) {
         action.rollbackStatus = 'rollback_failed';
@@ -953,43 +1375,62 @@ export function createRegistrar(options = {}) {
     const backupDir = join(targetStateDir, 'backups', id);
     const serializedActions = [];
     for (const action of actions) {
-      const backupPath = join(backupDir, `${action.host.key}.before`);
-      const metadataPath = join(backupDir, `${action.host.key}.json`);
-      await atomicWrite(backupPath, action.before.bytes, { mode: 0o600 });
-      await writeJsonAtomic(metadataPath, {
-        schemaVersion: 1,
-        hostKey: action.host.key,
-        configPath: action.host.configPath,
-        existedBefore: action.before.exists,
-        modeBefore: action.before.mode,
-        beforeIdentity: action.before.identity,
-        beforeHash: action.before.hash,
-        afterHash: action.afterHash
-      });
+      let backupPath = null;
+      let metadataPath = null;
+      if (action.kind === REGISTRATION_MODES.FILE) {
+        backupPath = join(backupDir, `${action.host.key}.before`);
+        metadataPath = join(backupDir, `${action.host.key}.json`);
+        await atomicWrite(backupPath, action.before.bytes, { mode: 0o600 });
+        await writeJsonAtomic(metadataPath, {
+          schemaVersion: 1,
+          hostKey: action.host.key,
+          configPath: action.host.configPath,
+          existedBefore: action.before.exists,
+          modeBefore: action.before.mode,
+          beforeIdentity: action.before.identity,
+          beforeHash: action.before.hash,
+          afterHash: action.afterHash
+        });
+      }
+      const registrationEntry = action.adoptedEntry || action.context.desired;
       const registrationAfter = operation === 'install'
         ? {
           hostKey: action.host.key,
-          configPath: action.host.configPath,
-          format: action.host.format,
+          registrationMode: action.host.registrationMode,
+          ...(action.host.configPath ? { configPath: action.host.configPath } : {}),
+          ...(action.host.format ? { format: action.host.format } : {}),
           clientId: action.context.clientId,
           entryFingerprint: action.entryFingerprint,
-          command: action.context.desired.command,
-          args: action.context.desired.args,
+          command: registrationEntry.command,
+          args: registrationEntry.args,
+          entry: registrationEntry,
+          runtimeVersion,
           installedAt: createdAt,
           transactionId: id
         }
         : null;
       serializedActions.push({
+        kind: action.kind,
         hostKey: action.host.key,
-        configPath: action.host.configPath,
-        backupPath,
-        metadataPath,
-        existedBefore: action.before.exists,
-        existsAfter: true,
-        modeBefore: action.before.mode,
-        beforeIdentity: action.before.identity,
-        beforeHash: action.before.hash,
-        afterHash: action.afterHash,
+        ...(action.host.configPath ? { configPath: action.host.configPath } : {}),
+        ...(backupPath ? { backupPath, metadataPath } : {}),
+        ...(action.kind === REGISTRATION_MODES.FILE ? {
+          existedBefore: action.before.exists,
+          existsAfter: true,
+          modeBefore: action.before.mode,
+          beforeIdentity: action.before.identity,
+          beforeHash: action.before.hash,
+          afterHash: action.afterHash
+        } : {}),
+        ...(action.kind === REGISTRATION_MODES.OFFICIAL_CLI ? {
+          beforeEntry: action.beforeEntry,
+          beforeFingerprint: action.beforeFingerprint,
+          beforeFullFingerprint: action.beforeFullFingerprint,
+          afterEntry: action.afterEntry,
+          afterFingerprint: action.afterFingerprint,
+          afterFullFingerprint: action.afterFullFingerprint,
+          desiredEntry: action.context.desired
+        } : {}),
         registrationBefore: action.registrationBefore,
         registrationAfter,
         status: 'pending',
@@ -1011,6 +1452,26 @@ export function createRegistrar(options = {}) {
   }
 
   async function restoreAction(action, expectedCurrent) {
+    if (action.kind === 'adoption') return;
+    if (action.kind === REGISTRATION_MODES.OFFICIAL_CLI) {
+      const host = hostMap.get(action.hostKey);
+      const context = contextForRecordedAction(action);
+      const adapter = officialCliAdapterFor(host);
+      const hasFullFingerprint = Object.prototype.hasOwnProperty.call(action, 'beforeFullFingerprint');
+      await adapter.restore(context, action.beforeEntry, hasFullFingerprint
+        ? { expectedFullFingerprint: expectedCurrent?.fullFingerprint }
+        : { expectedFingerprint: expectedCurrent?.currentFingerprint });
+      const restored = await adapter.inspect(context);
+      const restoredMatches = hasFullFingerprint
+        ? restored.fullFingerprint === action.beforeFullFingerprint
+        : restored.currentFingerprint === action.beforeFingerprint;
+      if (!restoredMatches) {
+        throw Object.assign(new Error(`Rollback verification failed for ${action.hostKey}`), {
+          code: 'ROLLBACK_VERIFY_FAILED'
+        });
+      }
+      return;
+    }
     const backup = await readOptionalFile(action.backupPath);
     if (!backup.exists) throw Object.assign(new Error(`Missing registration backup: ${action.backupPath}`), {
       code: 'REGISTRATION_BACKUP_MISSING'
@@ -1052,7 +1513,7 @@ export function createRegistrar(options = {}) {
         }
         if (inspection.state === 'conflict') {
           const knownApplied = action.status === 'applied' || transaction.appliedHostKeys.includes(action.hostKey);
-          const casRejectedBeforeWrite = cause?.code === 'CONFIG_CAS_MISMATCH' &&
+          const casRejectedBeforeWrite = ['CONFIG_CAS_MISMATCH', 'HOST_CLI_CAS_MISMATCH'].includes(cause?.code) &&
             transaction.currentHostKey === action.hostKey &&
             !knownApplied;
           if (casRejectedBeforeWrite) {

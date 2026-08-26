@@ -27,10 +27,25 @@ test('Task Pack scaffold is portable, bounded, and path-safe', async (t) => {
   const destination = path.join(root, 'sample');
   const created = await scaffoldTaskPack(destination, { name: 'sample-pack' });
   assert.equal(created.pack.name, 'sample-pack');
-  assert.equal(created.pack.tasks[0].name, 'sample-pack.single-page');
+  assert.deepEqual(created.pack.tasks[0], {
+    name: 'sample-pack.single-page.v1',
+    module: 'tasks/single-page-v1.mjs'
+  });
   assert.equal((await readTaskPack(path.join(destination, 'taskpack.json'))).modules.length, 1);
   assert.match((await preflightTaskPack(destination)).nextAction, /^Install this validated Pack/u);
-  assert.match(await readFile(path.join(destination, 'tasks', 'single-page.mjs'), 'utf8'), /supportsResume/u);
+  assert.match(await readFile(path.join(destination, 'tasks', 'single-page-v1.mjs'), 'utf8'), /supportsResume/u);
+
+  const legacy = path.join(root, 'legacy');
+  await mkdir(path.join(legacy, 'tasks'), { recursive: true });
+  await writeFile(path.join(legacy, 'tasks', 'collect.mjs'), 'export async function run() {}\n');
+  await writeFile(path.join(legacy, 'taskpack.json'), JSON.stringify({
+    name: 'legacy-pack',
+    version: '1.0.0',
+    tasks: [{ name: 'legacy-pack.collect', module: 'tasks/collect.mjs' }]
+  }));
+  assert.deepEqual((await readTaskPack(legacy)).pack.tasks, [
+    { name: 'legacy-pack.collect', module: 'tasks/collect.mjs' }
+  ]);
 
   const outside = path.join(root, 'outside.mjs');
   await writeFile(outside, 'export async function run() {}\n');

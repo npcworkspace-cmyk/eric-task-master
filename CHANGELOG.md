@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.1.3 - 2026-08-26
+
+- Made MCP the default multi-Agent integration: every host owns a scoped STDIO bridge while all bridges reuse one local Manager, shared Profiles, scheduling, and durable task state; CLI remains an emergency fallback only.
+- Replaced the ambiguous native/needs-adapter model with explicit MCP capability, automatic-registration, configuration, and activation states without breaking the legacy response field.
+- Promoted WorkBuddy Desktop to a verified adapter at `~/.workbuddy/mcp.json`, added no-write adoption for an exact existing installation, preserved host-managed metadata, and prohibited connector-proxy or approval-file changes.
+- Added automatic adapters for CodeBuddy CLI and Gemini CLI, an official-command adapter for OpenClaw, and accurate first-party-extension or extension-required states for DSH and Pi; VS Code/Copilot and OpenCode remain explicitly adapter-pending instead of being misclassified as CLI-only.
+- Expanded cross-platform registration, rollback, conflict, approval-boundary, official-command, multi-host identity, and MCP-first bootstrap checks while keeping HTTP/SSE MCP listeners out of the runtime.
+- Added a real multi-host MCP protocol gate covering four independent STDIO bridges, one shared Manager, shared Profiles, scoped task data, Profile-aware scheduling, disconnect survival, and identity-stable reconnection.
+- Hardened host registration against duplicate JSON/JSONC keys, reserved WorkBuddy path overrides, CodeBuddy registry precedence, OpenClaw process-tree leaks and unbounded output, shim indirection, metadata loss, disabled-entry misreporting, and human-text absence guesses; OpenClaw updates now preserve complete host metadata and use full-object CAS plus exact rollback.
+- Persisted the registered runtime version so Manager migration and offline upgrades both require one Agent-host reload, and corrected version-mismatch recovery so an old bridge never tells the Agent to stop a newer Manager.
+
+## 2.1.2 - 2026-08-26
+
+- Reduced the Owner Console to two focused views: task progress and Profile management, with only pause, resume, cancel, and safe task-record deletion exposed for task control.
+- Added immutable `Agent-task-createdAt` display names from stable host identity plus a bounded task label, eliminating per-task Agent-name confusion.
+- Added Manager-derived execution, cumulative actual cooldown, and total elapsed timing, including interrupted cooldown accounting and live Dashboard updates.
+- Added revision-checked logical deletion for cleanup-settled terminal task records while retaining private idempotency tombstones so completed external actions cannot be replayed after history is hidden.
+- Standardized specialized Skill and Task Pack naming, input/output, and ownership conventions; new scaffolds use `<pack>.<verb>.v1` while legacy Pack identifiers remain compatible.
+
 ## 2.1.1 - 2026-08-26
 
 - Replaced short-lived, Agent-scoped Dashboard sessions with one persistent local Owner Console at `http://127.0.0.1:19946/dashboard`; a one-time bootstrap link now establishes a hardened HttpOnly cookie that survives Manager restarts and can be explicitly revoked.

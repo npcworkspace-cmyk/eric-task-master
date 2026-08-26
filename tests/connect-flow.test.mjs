@@ -101,9 +101,11 @@ test('one fixed connect command accepts, registers, caches, and leaves no browse
   assert.equal(first.dashboard.toLowerCase().includes('token'), false);
   assert.equal(first.mcpRegistration.results.filter((item) => item.status === 'registered_pending_restart').length, 1);
   assert.match(first.nextAction, /mcpRegistration\.results/u);
-  assert.match(first.nextAction, /needs_adapter/u);
+  assert.match(first.nextAction, /MCP is the default path/u);
+  assert.match(first.nextAction, /adapter_pending/u);
+  assert.match(first.nextAction, /extension_required/u);
   assert.match(first.nextAction, /--agent-id STABLE_ID/u);
-  assert.match(first.nextAction, /cannot reload during the current run/u);
+  assert.match(first.nextAction, /cannot reload/u);
   assert.match(first.nextAction, /Never mix MCP and CLI identities/u);
   assert.match(first.acceptance.nextAction, /top-level nextAction/u);
   assert.match(first.acceptance.nextAction, /stable Agent identity/u);

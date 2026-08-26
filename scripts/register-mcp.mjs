@@ -20,11 +20,12 @@ Options:
   --dry-run          Report changes without writing host or state files
   --json             Emit compact machine-readable JSON
 
-Supported host keys:
-  codex, claude-desktop, claude-code, hermes
+Verified automatic MCP registration:
+  codex, claude-desktop, claude-code, workbuddy, codebuddy-cli,
+  hermes, gemini-cli, openclaw
 
-Reported but not modified until a verified adapter exists:
-  workbuddy, dsh, pi, openclaw
+MCP capability reported without speculative host writes:
+  dsh, pi, vscode-copilot, opencode
 `;
 
 function parseArgs(argv) {

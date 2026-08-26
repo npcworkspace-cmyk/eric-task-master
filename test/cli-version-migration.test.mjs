@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path, { dirname } from 'node:path';
@@ -14,10 +14,19 @@ import {
   generateManagerIdentity,
   MANAGER_SERVICE
 } from '../src/lib/manager-identity.mjs';
+import { createRegistrar } from '../src/registration/index.mjs';
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'src', 'cli.mjs');
+
+async function unusedPort() {
+  const server = http.createServer();
+  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+  const port = server.address().port;
+  await new Promise((resolveClose) => server.close(resolveClose));
+  return port;
+}
 
 async function readJson(request) {
   const chunks = [];
@@ -186,6 +195,8 @@ test('connect authenticates and gracefully replaces an idle older Manager', asyn
   assert.equal(result.manager.version, VERSION);
   assert.equal(result.manager.migratedFrom, '1.0.4');
   assert.equal(result.manager.startedNow, true);
+  assert.equal(result.manager.agentHostReloadRequired, true);
+  assert.match(result.nextAction, /reload this Agent host once before MCP verification/u);
   const health = await fetch(`${legacy.baseUrl}/v1/health`).then((response) => response.json());
   assert.equal(health.version, VERSION);
   const currentConfig = JSON.parse(await readFile(path.join(stateDir, 'config.json'), 'utf8'));
@@ -202,6 +213,89 @@ test('connect authenticates and gracefully replaces an idle older Manager', asyn
     headers: { Authorization: `Bearer ${newIssue.agentToken}` }
   });
   assert.equal(scopedProfiles.status, 200);
+});
+
+test('connect requires an Agent host reload after a registration runtime upgrade even when no old Manager is running', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'eric-task-master-cli-offline-upgrade-'));
+  const home = path.join(root, 'home');
+  const codexHome = path.join(home, '.codex');
+  const stateDir = path.join(root, 'manager');
+  const registrationStateDir = path.join(root, 'registration');
+  const port = await unusedPort();
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    CODEX_HOME: codexHome,
+    CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+    HERMES_HOME: path.join(home, '.hermes'),
+    WORKBUDDY_HOME: path.join(home, '.workbuddy'),
+    CODEBUDDY_HOME: path.join(home, '.codebuddy'),
+    GEMINI_CLI_HOME: path.join(home, '.gemini'),
+    DSH_HOME: path.join(home, '.dsh'),
+    PI_HOME: path.join(home, '.pi'),
+    APPDATA: path.join(home, 'AppData', 'Roaming'),
+    LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+    PATH: ''
+  };
+  let managerStarted = false;
+  t.after(async () => {
+    if (managerStarted) {
+      await execFileAsync(process.execPath, [
+        CLI, 'manager', 'stop', '--host', '127.0.0.1', '--port', String(port),
+        '--state-dir', stateDir, '--json'
+      ], { cwd: ROOT, env }).catch(() => {});
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await mkdir(codexHome, { recursive: true });
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(path.join(codexHome, 'config.toml'), 'model = "test"\n', 'utf8');
+  const oldRegistrar = createRegistrar({
+    env,
+    home,
+    projectRoot: ROOT,
+    stateDir: registrationStateDir,
+    entrypoint: path.join(ROOT, 'src', 'mcp', 'stdio.mjs'),
+    executablePath: process.execPath,
+    runtimeVersion: '2.1.2'
+  });
+  const oldRegistration = await oldRegistrar.install({ hostKeys: ['codex'] });
+  assert.equal(oldRegistration.ok, true);
+  assert.equal(oldRegistration.agentHostReloadRequired, false);
+  await writeFile(path.join(stateDir, `acceptance-${VERSION}.json`), `${JSON.stringify({
+    ok: true,
+    version: VERSION,
+    checks: []
+  })}\n`, 'utf8');
+
+  const connectArgs = [
+    CLI, 'connect', '--host', '127.0.0.1', '--port', String(port),
+    '--state-dir', stateDir, '--registration-state-dir', registrationStateDir,
+    '--home', home, '--json'
+  ];
+  const first = JSON.parse((await execFileAsync(process.execPath, connectArgs, {
+    cwd: ROOT,
+    env,
+    timeout: 30_000
+  })).stdout);
+  managerStarted = true;
+  assert.equal(first.manager.startedNow, true);
+  assert.equal(first.manager.migratedFrom, undefined);
+  assert.equal(first.mcpRegistration.previousRuntimeVersion, '2.1.2');
+  assert.equal(first.mcpRegistration.agentHostReloadRequired, true);
+  assert.equal(first.manager.agentHostReloadRequired, true);
+  assert.match(first.nextAction, /runtime changed; reload this Agent host once/u);
+
+  const second = JSON.parse((await execFileAsync(process.execPath, connectArgs, {
+    cwd: ROOT,
+    env,
+    timeout: 30_000
+  })).stdout);
+  assert.equal(second.manager.startedNow, false);
+  assert.equal(second.mcpRegistration.agentHostReloadRequired, false);
+  assert.equal(second.manager.agentHostReloadRequired, false);
 });
 
 test('connect leaves a busy older Manager running and fails closed', async (t) => {

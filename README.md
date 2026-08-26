@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.1.1**
+Version: **2.1.3**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -40,7 +40,7 @@ Task Master does not replace Agent reasoning. It gives that reasoning a dependab
 ## The three-layer model
 
 1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, and cleanup.
-2. **Owner Console** — one fixed local web address manages shared Profiles, connected Agents, live tasks, progress, commands, and human-readable reports. Users sign in directly inside isolated persistent Playwright Profiles.
+2. **Owner Console** — one fixed local web address does only shared Profile management, task progress, pause, resume, cancel, and safe record deletion. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
 This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
@@ -60,13 +60,13 @@ If a user gives you this GitHub URL, follow the steps below in order. Do not inv
    node scripts/taskmaster.mjs connect --json
    ```
 
-5. `connect` installs the lockfile-pinned runtime and matching Playwright Chromium, safely migrates an idle older Manager, starts the loopback Manager, runs real-browser acceptance, and registers supported local MCP hosts. If an older Manager still has work, migration stops without interrupting it.
+5. `connect` installs the lockfile-pinned runtime and matching Playwright Chromium, safely migrates an idle older Manager, starts the loopback Manager, runs real-browser acceptance, and registers supported local MCP hosts. If an older Manager still has work, migration stops without interrupting it. If `manager.agentHostReloadRequired` is true, reload this Agent host once before MCP verification; the upgraded Manager should remain running.
 6. Follow the returned `nextAction`. After correcting the named precondition, retry the same command at most once; do not branch into a speculative replacement controller.
 7. Open the returned Owner Console link once. It silently establishes a persistent local session; there is no code to type or Agent-binding flow. Bookmark `http://127.0.0.1:19946/dashboard` for later use.
-8. If a host reports `registered_pending_restart`, ask the user to reload that Agent host once. If it cannot reload during this run, use the scoped CLI with one stable Agent ID for this task only, then use MCP for new tasks after the next restart.
+8. MCP is the default Agent path. For any `registered_pending_*` result, complete the named one-time approval or reload, then verify the live host with `taskmaster_status` and `taskmaster_profiles_list`.
 9. Choose one operation path and keep it for the task:
    - if the host loaded the registered MCP server, call `taskmaster_status`, then `taskmaster_profiles_list`;
-   - if the host reports `needs_adapter`, or cannot reload a pending registration during this run, use the fixed CLI from the repository root. Keep one stable, distinct Agent ID on every scoped command:
+   - only for `adapter_pending`, `extension_required`, or a host that cannot reload during this run, use the fixed CLI fallback from the repository root. Keep one stable, distinct Agent ID on every scoped command:
 
      ```bash
      node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json
@@ -77,7 +77,7 @@ If a user gives you this GitHub URL, follow the steps below in order. Do not inv
 
 Copyable request for a new Agent:
 
-> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Use the loaded MCP path when supported; on `needs_adapter`, follow the Skill's fixed CLI path with one stable, distinct Agent ID. Return the Owner Console link; after status and Profile discovery succeed, ask what task I want to run.
+> Install and start `https://github.com/npcworkspace-cmyk/eric-task-master`. Clone the full repository, read or install `skills/eric-task-master`, and run only `node scripts/taskmaster.mjs connect --json`. Do not invent another controller or port. Use MCP by default; use the Skill's stable-identity CLI fallback only for `adapter_pending`, `extension_required`, or a host that cannot reload this run. Return the Owner Console link; after live status and Profile discovery succeed, ask what task I want to run.
 
 ## Everyday use
 
@@ -108,10 +108,9 @@ Behavior is selected on the Profile; task start does not accept a behavior overr
 ### Multi-Agent workbench
 
 - Profiles are shared by all trusted local Agents; there is no meaningless “Profile creator” field. A Profile still has one live lease, so two Agents cannot corrupt the same login state.
-- The Owner Console shows which Agents are registered, online, offline, working, or revoked, plus their active tasks, Profiles, and queue depth.
-- The task workbench shows what Playwright is doing now, progress, limits, recovery state, and a timeline. The Owner can pause, resume, terminate, revise queued input, or send an ask/modify instruction.
-- Commands are durable and revision-checked. An active Agent receives them immediately through its wait/inbox loop; an offline Agent receives them after reconnecting. Task Master does not pretend it can wake a completely closed host process.
-- Completed work opens on the Agent's human-readable report. Code, logs, screenshots, artifacts, and diagnostics remain available as secondary evidence instead of becoming the “result.”
+- The Console has only two work areas: Tasks and Profiles. It does not expose a confusing Agent registry, reports, files, or a second messaging workbench.
+- Every task gets a stable `Agent-specific task-created time` name and shows its current action, visual progress, execution time, cumulative cooldown time, and total time.
+- Pause, resume, cancel, and record deletion are revision-checked. Deletion hides only terminal records with confirmed cleanup and never makes an executed action replayable.
 
 ## Build specialized production workers
 
@@ -129,10 +128,18 @@ A Task Pack defines reusable task types. Five production scaffolds—single page
 
 | Host | Automatic local MCP registration |
 | --- | --- |
-| Codex, Claude Desktop, Claude Code, Hermes | supported |
-| WorkBuddy, DeepSeek Harness, Pi, OpenClaw | adapter required; current release does not modify them automatically |
+| Codex | automatic registration; live tool discovery and Task Master calls verified locally |
+| WorkBuddy Desktop | automatic registration; live host-launched bridge verified, with a host reload required after runtime upgrades |
+| Hermes | automatic registration; live discovery of 21 tools plus `taskmaster_status` and `taskmaster_profiles_list` calls verified locally |
+| Claude Desktop, Claude Code | automatic registration; activation still requires that host to load the entry and complete a live tool call |
+| CodeBuddy CLI, Gemini CLI | automatic registration adapter; real-host matrix pending |
+| OpenClaw | official-CLI registration adapter; real-host matrix pending |
+| DeepSeek Harness, VS Code/Copilot, OpenCode | MCP capable; safe automatic adapter pending |
+| Pi | MCP extension required by the host's design |
 
-The browser runtime remains usable through its fixed, Agent-scoped CLI when a host-specific MCP adapter is unavailable. Every scoped CLI command requires a stable, distinct `--agent-id` for each independent Agent; all Agents share the Profile catalog, while reusing an ID intentionally shares that identity's task ledger and Owner inbox. See [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md) for the complete non-MCP command path and its trusted-local boundary.
+Each Agent host starts its own STDIO MCP bridge, while all bridges reuse one Manager, Profile catalog, scheduler, and durable task runtime. The scoped CLI remains only an emergency compatibility path. Every independent CLI Agent keeps one stable, distinct `--agent-id`; reusing one ID intentionally shares that principal's task history and Owner-command inbox. See [`docs/MCP-HOSTS.md`](./docs/MCP-HOSTS.md) for the host matrix and trusted-local boundary.
+
+The release gate uses four independent real STDIO MCP protocol clients carrying Codex, WorkBuddy, and Hermes identities against one isolated Manager. It verifies shared Profiles, per-Agent task and artifact isolation, same-Profile FIFO, cross-Profile parallelism, and task survival across an Agent reconnect. Real host loading and tool calls are validated separately on installed hosts.
 
 ## Verification and shutdown
 

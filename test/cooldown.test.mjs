@@ -37,13 +37,17 @@ test('cooldown reports visible state and honors server timing without replaying 
 test('cooldown cancellation is immediate and does not announce a false resume', async () => {
   const controller = new AbortController();
   const states = [];
+  const cooldowns = [];
   const helper = createCooldownHelper({
     signal: controller.signal,
-    onState: async (state) => states.push(state)
+    onState: async (state) => states.push(state),
+    onCooldown: async (record) => cooldowns.push(record)
   });
   const cancellation = Object.assign(new Error('cancelled'), { code: 'TASK_CANCELLED' });
   const pending = helper({ milliseconds: 5_000 });
   setTimeout(() => controller.abort(cancellation), 10);
   await assert.rejects(pending, { code: 'TASK_CANCELLED' });
   assert.deepEqual(states, ['cooling_down']);
+  assert.deepEqual(cooldowns.map((record) => record.status), ['active', 'interrupted']);
+  assert.ok(cooldowns[1].elapsedMs >= 0 && cooldowns[1].elapsedMs < cooldowns[1].durationMs);
 });

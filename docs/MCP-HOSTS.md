@@ -1,6 +1,6 @@
 # MCP host registration
 
-Eric Task Master does **not** depend on a fictional operating-system-wide MCP registry. The MCP protocol discovers tools only after a client has already connected to a server. This project therefore detects each installed host and merges the same local STDIO server into each host's own configuration.
+Eric Task Master does **not** depend on a fictional operating-system-wide MCP registry. The MCP protocol discovers tools only after a client has connected to a server. This project therefore detects each installed host and registers one local STDIO bridge through that host's verified configuration or official CLI. Every host owns its STDIO process; all bridges reuse the same Task Master Manager, Profiles, scheduler, and durable tasks.
 
 The fixed server process is:
 
@@ -8,12 +8,14 @@ The fixed server process is:
 <absolute Node.js path> <absolute project path>/src/mcp/stdio.mjs
 ```
 
-Every native host entry receives only two non-secret identity values, mirrored
-under the current `ERIC_TASK_MASTER_*` names and the compatibility
-`TASKMASTER_*` names:
+Every native host entry receives two non-secret identity values, mirrored under
+the current `ERIC_TASK_MASTER_*` names and the compatibility `TASKMASTER_*`
+names, plus one non-secret runtime-version marker used to detect a stale Agent
+bridge after upgrades:
 
 - `ERIC_TASK_MASTER_CLIENT_ID` / `TASKMASTER_CLIENT_ID` = `<installationId>:<hostKey>`
 - `ERIC_TASK_MASTER_CLIENT_NAME` / `TASKMASTER_CLIENT_NAME` = `Eric Task Master / <host name>`
+- `ERIC_TASK_MASTER_RUNTIME_VERSION` = the registered Task Master runtime version
 
 No Manager admin token, agent token, cookie, or browser credential is written to host configuration. The STDIO adapter obtains local Manager authority at runtime and exchanges it for a scoped Agent session.
 
@@ -27,14 +29,16 @@ node scripts/register-mcp.mjs install --json
 node scripts/register-mcp.mjs status --json
 ```
 
-The result contains one record per host. Typical states are `registered_pending_restart`, `registered`, `not_installed`, `needs_adapter`, `conflict`, and `failed`. A host restart may be required; the registrar never kills or restarts an Agent, Manager, browser, or running task.
+The result contains one record per host. `mcpCapability` describes what the host can do; `autoRegistration` describes whether Task Master has a verified adapter. Typical operation states are `registered_pending_restart`, `registered_pending_reload`, `registered_pending_approval_or_reload`, `registered_disabled`, `adopted`, `registered`, `adapter_pending`, `extension_required`, `not_installed`, `conflict`, and `failed`. The legacy `support` field remains for response compatibility and must not be interpreted as the host's MCP capability. `registered_disabled` means that the host deliberately retained but disabled the entry; enable it in that host and reload once. The registrar never bypasses approvals, silently reenables a disabled entry, or kills or restarts an Agent, Manager, browser, or running task.
+
+`configurationStatus: registered` proves only that the saved entry matches. `activationStatus: not_verified` means the running host has not been proved through this registration command. Only a successful MCP `taskmaster_status` call proves the live bridge is active.
 
 ## Two fixed Agent operation paths
 
-Bootstrap is identical for every host: from the complete project root run `node scripts/taskmaster.mjs connect --json` once and follow its `nextAction`. After that, choose one path and keep it for the whole task:
+Bootstrap is identical for every host: from the complete project root run `node scripts/taskmaster.mjs connect --json` once and follow its `nextAction`. When it returns `manager.agentHostReloadRequired: true`, reload the current Agent host once because its already-running bridge may still be the previous version; the upgraded Manager remains running. After that, choose one path and keep it for the whole task:
 
-1. **Native MCP path:** for a host reported as `registered` or `registered_pending_restart`, reload it when requested and use only the `taskmaster_*` tools documented in [`MCP.md`](./MCP.md).
-2. **Scoped CLI path:** use this for `needs_adapter`, or for the current run only when a `registered_pending_restart` host cannot reload itself. Do not invent a host configuration, daemon, port, direct Manager request, or temporary controller. Use only `node scripts/taskmaster.mjs ... --json` from the complete project root. Every scoped command requires the same `--agent-id STABLE_ID`; `--agent-name AGENT_NAME` supplies its display name. Different independent Agents need different stable IDs; all trusted Agents share the Profile catalog, while the same ID intentionally shares that principal's task ledger and Owner-command inbox. A missing or misspelled Agent ID fails closed instead of silently joining a default identity. After the next host restart, use MCP for new tasks; never switch identities or mix MCP and CLI inside one task.
+1. **MCP path:** this is the default. For any `registered_pending_*` status, complete the named one-time approval or reload. For `registered_disabled`, enable `eric-task-master` in that host and reload once. For `registered` or `adopted`, configuration is already in place. In every case verify the live host with `taskmaster_status`, then use only the `taskmaster_*` tools in [`MCP.md`](./MCP.md).
+2. **Emergency scoped CLI fallback:** use this only for `adapter_pending`, `extension_required`, or for the current run when a registered host cannot reload itself. Do not invent a host configuration, daemon, port, direct Manager request, or temporary controller. Use only `node scripts/taskmaster.mjs ... --json` from the complete project root. Every scoped command requires the same `--agent-id STABLE_ID`; `--agent-name AGENT_NAME` supplies its display name. Different independent Agents need different stable IDs; all trusted Agents share the Profile catalog, while the same ID intentionally shares that principal's task ledger and Owner-command inbox. A missing or misspelled Agent ID fails closed instead of silently joining a default identity. After the prerequisite is resolved, use MCP for new tasks; never switch identities or mix MCP and CLI inside one task.
 
 The fixed no-adapter flow is:
 
@@ -44,7 +48,7 @@ node scripts/taskmaster.mjs profiles list --agent-id STABLE_ID --agent-name AGEN
 node scripts/taskmaster.mjs task inbox --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task-types list --query QUERY --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task-types describe TYPE --agent-id STABLE_ID --agent-name AGENT_NAME --json
-node scripts/taskmaster.mjs task start --profile PROFILE_ID --type TYPE --input INPUT_JSON --request-key STABLE_REQUEST_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task start --profile PROFILE_ID --type TYPE --input @INPUT_FILE.json --request-key STABLE_REQUEST_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task wait TASK_ID --wait-ms 30000 --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task status TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs artifacts list TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
@@ -108,20 +112,24 @@ that did not succeed. A later user or host edit is never overwritten.
 
 ## Host contracts
 
-| Host | Registration surface | Default path / override | Automatic status |
+| Host | MCP capability | Registration surface | Automatic status / validation |
 | --- | --- | --- | --- |
-| Codex app, CLI, IDE | `mcp_servers` TOML table | `$CODEX_HOME/config.toml` or `~/.codex/config.toml` | supported |
-| Claude Desktop | `mcpServers` JSON object | macOS `~/Library/Application Support/Claude/claude_desktop_config.json`; Windows `%APPDATA%/Claude/claude_desktop_config.json` | supported |
-| Claude Code | user-scope `mcpServers` JSON object | `$CLAUDE_CONFIG_DIR/.claude.json` when overridden, otherwise `~/.claude.json` | supported |
-| WorkBuddy Desktop | official writable user contract not yet verified for this release | installation hints only | `needs_adapter`, never modified |
-| Hermes Agent | `mcp_servers` YAML mapping | `$HERMES_HOME/config.yaml` or `~/.hermes/config.yaml` | supported |
-| DeepSeek Harness (DSH) | version-matched patch/plugin required | detected only | `needs_adapter`, never modified |
-| Pi Coding Agent | MCP is extension/package-defined, not a core global registry | detected only | `needs_adapter`, never modified |
-| OpenClaw | native CLI contract not yet accepted into this release | detected only | `needs_adapter`, never modified |
+| Codex app, CLI, IDE | native | `mcp_servers` in `$CODEX_HOME/config.toml` or `~/.codex/config.toml` | file adapter; live local tool call verified |
+| Claude Desktop | native | `mcpServers` in the platform Desktop config | file adapter; host reload still proves activation |
+| Claude Code | native | user `mcpServers` in `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json` | file adapter; live host validation requires Claude Code installed |
+| WorkBuddy Desktop | native | `mcpServers` in `~/.workbuddy/mcp.json` | file adapter; live WorkBuddy-launched STDIO verified |
+| CodeBuddy CLI | native | first existing user registry in `~/.codebuddy/.mcp.json`, `mcp.json`, then `.codebuddy.json` | JSONC file adapter; fixture and cross-platform path validation |
+| Hermes Agent | native | `mcp_servers` in `$HERMES_HOME/config.yaml` or `~/.hermes/config.yaml` | file adapter; live discovery of 21 tools plus status and Profile-list calls verified |
+| Gemini CLI | native | `mcpServers` in `~/.gemini/settings.json` | file adapter; fixture and cross-platform path validation |
+| OpenClaw | native | official `openclaw mcp list/set/unset` commands | official-CLI adapter; real-host validation pending |
+| DeepSeek Harness (DSH) | first-party MCP extension | version-matched `@deepseek-ai/dsh-mcp-client` Cordis overlay | `adapter_pending`; never rewrites Cordis blindly |
+| Pi Coding Agent | extension-defined MCP | reviewed Pi extension/package required | `extension_required`; no silent third-party install |
+| VS Code / GitHub Copilot | native | official `code --add-mcp` user-profile command or host-managed registry | `adapter_pending`; official-CLI install, inspection, and reversible removal still need versioned validation |
+| OpenCode | native | V2 `mcp.servers` registry and version-specific CLI | `adapter_pending`; versioned install, inspection, and reversible removal contract still needs validation |
 
-TaskMaster-specific path overrides are also available for controlled deployments and tests: `TASKMASTER_CODEX_CONFIG`, `TASKMASTER_CLAUDE_DESKTOP_CONFIG`, `TASKMASTER_CLAUDE_CODE_CONFIG`, `WORKBUDDY_MCP_CONFIG`, and `TASKMASTER_HERMES_CONFIG`.
+TaskMaster-specific path overrides are also available for controlled deployments and tests: `TASKMASTER_CODEX_CONFIG`, `TASKMASTER_CLAUDE_DESKTOP_CONFIG`, `TASKMASTER_CLAUDE_CODE_CONFIG`, `WORKBUDDY_MCP_CONFIG`, `CODEBUDDY_MCP_CONFIG`, `TASKMASTER_HERMES_CONFIG`, and `GEMINI_MCP_CONFIG`.
 
-The accepted adapters are based on the documented contracts for [OpenAI Codex MCP](https://learn.chatgpt.com/docs/extend/mcp), [Claude Code MCP](https://code.claude.com/docs/en/mcp), and [Hermes MCP](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/mcp.md). Documentation for [WorkBuddy/CodeBuddy MCP](https://www.workbuddy.cn/docs/cli/mcp), [DSH MCP examples](https://github.com/deepseek-ai/deepseek-harness/blob/master/examples/mcp-memory/README.md), [Pi's coding-agent](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md), and [OpenClaw MCP](https://github.com/openclaw/openclaw/blob/main/docs/cli/mcp.md) is retained as adapter research only; those hosts are not modified until their writable user contract is verified end to end. The [MCP Registry FAQ](https://modelcontextprotocol.io/registry/faq) describes a public metadata registry, not local host registration.
+The accepted adapters are based on the documented contracts for [OpenAI Codex MCP](https://developers.openai.com/codex/mcp/), [Claude Desktop local MCP](https://github.com/modelcontextprotocol/docs/blob/main/quickstart/user.mdx), [Claude Code MCP](https://code.claude.com/docs/en/mcp), [WorkBuddy MCP](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide), [CodeBuddy CLI MCP](https://www.workbuddy.cn/docs/cli/mcp), [Hermes MCP](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/mcp.md), [Gemini CLI MCP](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md), and [OpenClaw MCP](https://github.com/openclaw/openclaw/blob/main/docs/cli/mcp.md). [VS Code MCP](https://code.visualstudio.com/docs/agent-customization/mcp-servers) and [OpenCode V2 MCP](https://v2.opencode.ai/docs/mcp-servers/) confirm native support, but their automatic adapters remain pending until Task Master can inspect and reverse every change. [DSH MCP examples](https://github.com/deepseek-ai/deepseek-harness/blob/master/examples/mcp-memory/README.md) and [Pi's coding-agent design](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/usage.md#design-principles) define extension-specific boundaries rather than a generic writable registry. The [MCP Registry FAQ](https://modelcontextprotocol.io/registry/faq) describes a public metadata registry, not local host registration.
 
 ## Safety and ownership
 
@@ -161,8 +169,12 @@ owned entry whose fingerprint still matches the recorded fingerprint. A host
 configuration path that is a symbolic link, or is not a regular file, is
 rejected rather than followed or replaced.
 
-JSON files are parsed and semantically merged. Invalid JSON/JSONC is rejected
-without a write. TOML and YAML are changed only in the exact
+WorkBuddy Desktop is intentionally narrower than the generic JSON contract. Task Master writes only `~/.workbuddy/mcp.json`; it never writes WorkBuddy's internal `~/.workbuddy/.mcp.json` connector proxy or `mcp-approvals.json`. An existing WorkBuddy entry can be adopted without rewriting the file only when it uses an absolute Node executable, this installation's exact STDIO entrypoint and client IDs, and either the current or the known legacy WorkBuddy display name. WorkBuddy-managed metadata and extra environment fields are preserved, while any other change to managed launch or identity fields fails closed.
+
+JSON files are parsed and semantically merged. Invalid JSON/JSONC and duplicate
+object keys at any depth are rejected without a write. CodeBuddy's JSONC
+comments and trailing commas are accepted, then normalized on a managed write;
+other JSON hosts remain strict. TOML and YAML are changed only in the exact
 `eric-task-master` block. Bare, single-quoted, or double-quoted same-name
 entries, duplicate semantic roots/entries, and unsupported non-empty YAML flow
 mappings fail closed; unfamiliar structures are not rewritten.
@@ -188,12 +200,12 @@ Configuration presence is necessary but not the final acceptance gate. After the
 | Stage | Required evidence |
 | --- | --- |
 | Detect | Correct host and effective config path; HOME/config overrides honored |
-| Register | Result is `registered_pending_restart`; unrelated entries unchanged |
-| Restart | Only the target host is restarted manually; Manager/tasks remain alive |
+| Register | Result is the host-specific `registered_pending_*` state or safe `adopted`; unrelated entries unchanged |
+| Approve/reload | Only the target host completes its own approval or reload; Manager/tasks remain alive |
 | Discover | Host's MCP list shows `eric-task-master` |
 | Connect | MCP initialize succeeds and the server advertises its expected tools |
 | Isolate | `TASKMASTER_CLIENT_ID` differs per host and contains no secret |
-| Repeat | Second install is `registered` with no file changes |
+| Repeat | Second install is `registered` with no file or host-registry changes; activation still requires a live tool call |
 | Remove | Only this installation's entry disappears |
 | Interrupt | A `prepared`/`applying` journal is recovered on the next command, or fails closed without a write |
 | Race | An edit injected after the last content assertion survives write, create, and remove attempts |

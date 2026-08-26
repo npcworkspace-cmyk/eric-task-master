@@ -12,6 +12,7 @@ import {
 } from '../../src/registration/files.mjs';
 import { createRegistrar } from '../../src/registration/index.mjs';
 import { RegistrationLock } from '../../src/registration/lock.mjs';
+import { createOfficialCliAdapter, runHostCommand } from '../../src/registration/official-cli.mjs';
 
 async function write(path, text) {
   await mkdir(dirname(path), { recursive: true });
@@ -28,7 +29,12 @@ async function fixture(platform = 'win32') {
   const codexHome = join(home, 'Codex 自定义');
   const claudeConfigDir = join(home, 'Claude Code 自定义');
   const hermesHome = join(home, 'Hermes 自定义');
-  const workBuddyConfig = join(home, 'WorkBuddy 自定义', '.mcp.json');
+  const workBuddyHome = join(home, 'WorkBuddy 自定义');
+  const workBuddyConfig = join(workBuddyHome, 'mcp.json');
+  const protectedPaths = {
+    workbuddyProxy: join(workBuddyHome, '.mcp.json'),
+    workbuddyApprovals: join(workBuddyHome, 'mcp-approvals.json')
+  };
   const env = {
     HOME: home,
     USERPROFILE: home,
@@ -38,6 +44,7 @@ async function fixture(platform = 'win32') {
     CODEX_HOME: codexHome,
     CLAUDE_CONFIG_DIR: claudeConfigDir,
     HERMES_HOME: hermesHome,
+    WORKBUDDY_HOME: workBuddyHome,
     WORKBUDDY_MCP_CONFIG: workBuddyConfig
   };
   const entrypoint = join(projectRoot, 'src', 'mcp', 'stdio.mjs');
@@ -75,6 +82,10 @@ async function fixture(platform = 'win32') {
     mcpServers: { existing: { command: 'existing-command' } },
     preferences: { language: 'zh-CN' }
   }, null, 2)}\n`);
+  await write(protectedPaths.workbuddyProxy, `${JSON.stringify({
+    mcpServers: { 'connector-proxy': { type: 'http', url: 'http://127.0.0.1:1/mcp' } }
+  }, null, 2)}\n`);
+  await write(protectedPaths.workbuddyApprovals, '{"approval-hash::existing":1}\n');
   await write(paths.hermes, [
     'model: test-model',
     'mcp_servers:',
@@ -94,11 +105,24 @@ async function fixture(platform = 'win32') {
     entrypoint,
     executablePath: process.execPath
   });
-  return { root, home, projectRoot, stateDir, env, entrypoint, paths, registrar };
+  return { root, home, projectRoot, stateDir, env, entrypoint, paths, protectedPaths, registrar };
 }
 
 async function snapshot(paths) {
   return Object.fromEntries(await Promise.all(Object.entries(paths).map(async ([key, path]) => [key, await readFile(path, 'utf8')])));
+}
+
+function registrarFor(setup, overrides = {}) {
+  return createRegistrar({
+    env: setup.env,
+    platform: 'win32',
+    home: setup.home,
+    projectRoot: setup.projectRoot,
+    stateDir: setup.stateDir,
+    entrypoint: setup.entrypoint,
+    executablePath: process.execPath,
+    ...overrides
+  });
 }
 
 function runNode(args, env) {
@@ -122,13 +146,13 @@ function delay(milliseconds) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
-test('dry-run plans all detected native hosts without writing state or configs', async () => {
+test('dry-run plans all detected verified hosts without writing state or configs', async () => {
   const setup = await fixture();
   const before = await snapshot(setup.paths);
   const result = await setup.registrar.install({ dryRun: true });
   assert.equal(result.ok, true);
   assert.equal(result.changed, false);
-  assert.equal(result.results.filter((item) => item.status === 'would_register').length, 4);
+  assert.equal(result.results.filter((item) => item.status === 'would_register').length, 5);
   assert.deepEqual(await snapshot(setup.paths), before);
   await assert.rejects(readFile(setup.registrar.statePath, 'utf8'), { code: 'ENOENT' });
   for (const item of result.results) {
@@ -150,17 +174,19 @@ test('standalone CLI runs a machine-readable dry-run entirely inside fake HOME',
   assert.equal(run.code, 0, run.stderr || run.stdout);
   const result = JSON.parse(run.stdout);
   assert.equal(result.ok, true);
-  assert.equal(result.results.filter((item) => item.status === 'would_register').length, 4);
+  assert.equal(result.results.filter((item) => item.status === 'would_register').length, 5);
   assert.deepEqual(await snapshot(setup.paths), before);
   await assert.rejects(readFile(setup.registrar.statePath, 'utf8'), { code: 'ENOENT' });
 });
 
-test('install merges four verified host configs, skips WorkBuddy, and is idempotent', async () => {
+test('install merges five verified host configs including WorkBuddy and is idempotent', async () => {
   const setup = await fixture();
+  const protectedBefore = await Promise.all(Object.values(setup.protectedPaths).map((path) => readFile(path, 'utf8')));
   const first = await setup.registrar.install();
   assert.equal(first.ok, true);
   assert.equal(first.changed, true);
   assert.equal(first.results.filter((item) => item.status === 'registered_pending_restart').length, 4);
+  assert.equal(first.results.find((item) => item.hostKey === 'workbuddy').status, 'registered_pending_approval_or_reload');
   assert.match(first.installationId, /^[0-9a-f-]{36}$/);
 
   const codex = await readFile(setup.paths.codex, 'utf8');
@@ -172,12 +198,17 @@ test('install merges four verified host configs, skips WorkBuddy, and is idempot
   assert.equal(desktop.theme, 'dark');
   assert.equal(claudeCode.oauthAccount.displayName, 'preserve me');
   assert.equal(workbuddy.preferences.language, 'zh-CN');
-  assert.equal(workbuddy.mcpServers['eric-task-master'], undefined);
+  assert.ok(workbuddy.mcpServers['eric-task-master']);
+  assert.equal(workbuddy.mcpServers['eric-task-master'].type, undefined);
+  assert.equal(workbuddy.mcpServers['eric-task-master'].disabled, false);
+  assert.equal(workbuddy.mcpServers['eric-task-master'].description, 'Eric Task Master');
+  assert.equal(first.results.find((item) => item.hostKey === 'workbuddy').activationStatus, 'pending_approval_or_reload');
 
   const clientIds = new Set();
   for (const [hostKey, document] of [
     ['claude-desktop', desktop],
-    ['claude-code', claudeCode]
+    ['claude-code', claudeCode],
+    ['workbuddy', workbuddy]
   ]) {
     const entry = document.mcpServers['eric-task-master'];
     assert.equal(entry.command, process.execPath);
@@ -191,22 +222,70 @@ test('install merges four verified host configs, skips WorkBuddy, and is idempot
   assert.match(hermes, /model: test-model/);
   assert.match(hermes, /theme: dark/);
   assert.match(hermes, new RegExp(`${first.installationId}:hermes`));
-  assert.equal(clientIds.size, 2);
+  assert.equal(clientIds.size, 3);
 
   const afterFirst = await snapshot(setup.paths);
   const second = await setup.registrar.install();
   assert.equal(second.ok, true);
   assert.equal(second.changed, false);
-  assert.equal(second.results.filter((item) => item.status === 'registered').length, 4);
+  assert.equal(second.results.filter((item) => item.status === 'registered').length, 5);
   assert.deepEqual(await snapshot(setup.paths), afterFirst);
 
   const status = await setup.registrar.status();
   assert.equal(status.ok, true);
-  assert.equal(status.results.filter((item) => item.status === 'registered').length, 4);
+  assert.equal(status.results.filter((item) => item.status === 'registered').length, 5);
   const state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
   assert.equal(state.installationId, first.installationId);
-  assert.equal(Object.keys(state.registrations).length, 4);
+  assert.equal(Object.keys(state.registrations).length, 5);
   assert.ok(state.transactions[0].actions.every((action) => isAbsolute(action.backupPath)));
+  assert.deepEqual(
+    await Promise.all(Object.values(setup.protectedPaths).map((path) => readFile(path, 'utf8'))),
+    protectedBefore
+  );
+});
+
+test('registration runtime marker is backward compatible and requires one full-install host reload after upgrade', async () => {
+  const setup = await fixture();
+  const first = await setup.registrar.install();
+  assert.equal(first.ok, true);
+  assert.equal(first.agentHostReloadRequired, false);
+  let state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
+  assert.equal(state.runtimeVersion, '2.1.3');
+
+  delete state.runtimeVersion;
+  await writeFile(setup.registrar.statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const legacyStateUpgrade = await setup.registrar.install();
+  assert.equal(legacyStateUpgrade.ok, true);
+  assert.equal(legacyStateUpgrade.changed, false);
+  assert.equal(legacyStateUpgrade.previousRuntimeVersion, null);
+  assert.equal(legacyStateUpgrade.agentHostReloadRequired, true);
+  state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
+  assert.equal(state.runtimeVersion, '2.1.3');
+
+  const repeated = await setup.registrar.install();
+  assert.equal(repeated.ok, true);
+  assert.equal(repeated.changed, false);
+  assert.equal(repeated.agentHostReloadRequired, false);
+});
+
+test('partial registration cannot consume a pending global runtime reload marker', async () => {
+  const setup = await fixture();
+  const oldRegistrar = registrarFor(setup, { runtimeVersion: '2.1.2' });
+  const installed = await oldRegistrar.install();
+  assert.equal(installed.ok, true);
+  assert.equal(JSON.parse(await readFile(oldRegistrar.statePath, 'utf8')).runtimeVersion, '2.1.2');
+
+  const currentRegistrar = registrarFor(setup, { runtimeVersion: '2.1.3' });
+  const partial = await currentRegistrar.install({ hostKeys: ['codex'] });
+  assert.equal(partial.ok, true);
+  assert.equal(partial.agentHostReloadRequired, true);
+  assert.equal(JSON.parse(await readFile(currentRegistrar.statePath, 'utf8')).runtimeVersion, '2.1.2');
+
+  const complete = await currentRegistrar.install();
+  assert.equal(complete.ok, true);
+  assert.equal(complete.agentHostReloadRequired, true);
+  assert.equal(JSON.parse(await readFile(currentRegistrar.statePath, 'utf8')).runtimeVersion, '2.1.3');
+  assert.equal((await currentRegistrar.install()).agentHostReloadRequired, false);
 });
 
 test('uninstall preserves unrelated later edits and rollback restores the owned entries', async () => {
@@ -218,7 +297,7 @@ test('uninstall preserves unrelated later edits and rollback restores the owned 
 
   const removed = await setup.registrar.uninstall();
   assert.equal(removed.ok, true);
-  assert.equal(removed.results.filter((item) => item.status === 'unregistered_pending_restart').length, 4);
+  assert.equal(removed.results.filter((item) => item.status === 'unregistered_pending_restart').length, 5);
   const afterRemoval = JSON.parse(await readFile(setup.paths['claude-desktop'], 'utf8'));
   assert.deepEqual(afterRemoval.afterInstall, { preserve: true });
   assert.equal(afterRemoval.mcpServers['eric-task-master'], undefined);
@@ -230,7 +309,7 @@ test('uninstall preserves unrelated later edits and rollback restores the owned 
   assert.deepEqual(restored.afterInstall, { preserve: true });
   assert.ok(restored.mcpServers['eric-task-master']);
   const status = await setup.registrar.status();
-  assert.equal(status.results.filter((item) => item.status === 'registered').length, 4);
+  assert.equal(status.results.filter((item) => item.status === 'registered').length, 5);
 });
 
 test('foreign same-name entry aborts the whole multi-host install without partial writes', async () => {
@@ -330,17 +409,20 @@ test('manual changes inside an owned entry are conflicts, not silently overwritt
   assert.equal(await readFile(setup.paths['claude-desktop'], 'utf8'), changedSource);
 });
 
-test('WorkBuddy, DSH, Pi, and OpenClaw are detected but never modified without verified adapters', async () => {
+test('DSH and Pi report their real MCP capability without speculative writes', async () => {
   const setup = await fixture('linux');
-  const markerPaths = [join(setup.home, '.dsh', 'marker'), join(setup.home, '.pi', 'marker'), join(setup.home, '.openclaw', 'marker')];
+  const markerPaths = [join(setup.home, '.dsh', 'marker'), join(setup.home, '.pi', 'marker')];
   for (const marker of markerPaths) await write(marker, 'keep\n');
   const before = await Promise.all(markerPaths.map((path) => readFile(path, 'utf8')));
-  const workBuddyBefore = await readFile(setup.paths.workbuddy, 'utf8');
-  const result = await setup.registrar.install({ hostKeys: ['workbuddy', 'dsh', 'pi', 'openclaw'] });
+  const result = await setup.registrar.install({ hostKeys: ['dsh', 'pi'] });
   assert.equal(result.ok, true);
   assert.equal(result.changed, false);
-  assert.deepEqual(result.results.map((item) => item.status), ['needs_adapter', 'needs_adapter', 'needs_adapter', 'needs_adapter']);
-  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), workBuddyBefore);
+  assert.deepEqual(result.results.map((item) => item.status), ['adapter_pending', 'extension_required']);
+  assert.deepEqual(result.results.map((item) => item.mcpCapability), [
+    'mcp_first_party_extension',
+    'mcp_extension_required'
+  ]);
+  assert.ok(result.results.every((item) => item.support === 'needs_adapter'));
   assert.deepEqual(await Promise.all(markerPaths.map((path) => readFile(path, 'utf8'))), before);
   await assert.rejects(readFile(setup.registrar.statePath, 'utf8'), { code: 'ENOENT' });
 });
@@ -353,8 +435,553 @@ test('host definitions compute expected paths for simulated win32, darwin, and l
     assert.equal(hosts['claude-code'].configPath, resolve(setup.env.CLAUDE_CONFIG_DIR, '.claude.json'));
     assert.equal(hosts.workbuddy.configPath, resolve(setup.env.WORKBUDDY_MCP_CONFIG));
     assert.equal(hosts.hermes.configPath, resolve(setup.env.HERMES_HOME, 'config.yaml'));
+    assert.equal(hosts['codebuddy-cli'].configPath, resolve(setup.home, '.codebuddy', '.mcp.json'));
+    assert.equal(hosts['gemini-cli'].configPath, resolve(setup.home, '.gemini', 'settings.json'));
     assert.ok(hosts['claude-desktop'].configPath.startsWith(setup.home));
+
+    const defaultEnv = { ...setup.env };
+    delete defaultEnv.WORKBUDDY_MCP_CONFIG;
+    delete defaultEnv.WORKBUDDY_HOME;
+    const defaults = createRegistrar({
+      env: defaultEnv,
+      platform,
+      home: setup.home,
+      projectRoot: setup.projectRoot,
+      stateDir: join(setup.root, `default-paths-${platform}`),
+      entrypoint: setup.entrypoint,
+      executablePath: process.execPath
+    });
+    const defaultHosts = Object.fromEntries(defaults.hosts.map((host) => [host.key, host]));
+    assert.equal(defaultHosts.workbuddy.configPath, resolve(setup.home, '.workbuddy', 'mcp.json'));
+    assert.notEqual(defaultHosts.workbuddy.configPath, resolve(setup.home, '.workbuddy', '.mcp.json'));
   }
+});
+
+test('WorkBuddy proxy and approval paths are rejected even when an override points at them', async () => {
+  const setup = await fixture();
+  for (const reservedPath of Object.values(setup.protectedPaths)) {
+    assert.throws(() => registrarFor(setup, {
+      env: { ...setup.env, WORKBUDDY_MCP_CONFIG: reservedPath }
+    }), { code: 'WORKBUDDY_RESERVED_CONFIG_PATH' });
+  }
+});
+
+test('WorkBuddy adopts an exact same-install entry without rewriting host metadata, proxy, or approvals', async () => {
+  const setup = await fixture();
+  const installed = await setup.registrar.install({ hostKeys: ['codex'] });
+  const clientId = `${installed.installationId}:workbuddy`;
+  const clientName = 'Eric Task Master / WorkBuddy Desktop';
+  const document = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  document.mcpServers['eric-task-master'] = {
+    command: process.execPath,
+    args: [setup.entrypoint],
+    env: {
+      ERIC_TASK_MASTER_CLIENT_ID: clientId,
+      ERIC_TASK_MASTER_CLIENT_NAME: clientName,
+      TASKMASTER_CLIENT_ID: clientId,
+      TASKMASTER_CLIENT_NAME: clientName,
+      WORKBUDDY_RUNTIME_HINT: 'preserve-me'
+    },
+    description: 'User-managed description',
+    disabled: true
+  };
+  await write(setup.paths.workbuddy, `${JSON.stringify(document, null, 2)}\n`);
+  const workBuddyBefore = await readFile(setup.paths.workbuddy, 'utf8');
+  const protectedBefore = await Promise.all(Object.values(setup.protectedPaths).map((path) => readFile(path, 'utf8')));
+
+  const beforeStatus = await setup.registrar.status({ hostKeys: ['workbuddy'] });
+  assert.equal(beforeStatus.results[0].status, 'adoption_available');
+  assert.equal(beforeStatus.results[0].configurationStatus, 'registered_unowned');
+
+  const adopted = await setup.registrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(adopted.ok, true);
+  assert.equal(adopted.changed, true);
+  assert.equal(adopted.results[0].status, 'adopted');
+  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), workBuddyBefore);
+  assert.deepEqual(
+    await Promise.all(Object.values(setup.protectedPaths).map((path) => readFile(path, 'utf8'))),
+    protectedBefore
+  );
+  const state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
+  assert.equal(state.registrations.workbuddy.clientId, clientId);
+  assert.equal((await setup.registrar.status({ hostKeys: ['workbuddy'] })).results[0].status, 'registered');
+
+  const adoptionRollback = await setup.registrar.rollback({ transactionId: adopted.transactionId });
+  assert.equal(adoptionRollback.ok, true);
+  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), workBuddyBefore);
+  assert.equal((await setup.registrar.status({ hostKeys: ['workbuddy'] })).results[0].status, 'adoption_available');
+  const readopted = await setup.registrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(readopted.results[0].status, 'adopted');
+
+  const removed = await setup.registrar.uninstall({ hostKeys: ['workbuddy'] });
+  assert.equal(removed.ok, true);
+  const after = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  assert.equal(after.mcpServers['eric-task-master'], undefined);
+  assert.ok(after.mcpServers.existing);
+  assert.equal(after.preferences.language, 'zh-CN');
+});
+
+test('WorkBuddy safely adopts a live legacy entry that uses its own absolute Node runtime', async () => {
+  const setup = await fixture();
+  const installed = await setup.registrar.install({ hostKeys: ['codex'] });
+  const clientId = `${installed.installationId}:workbuddy`;
+  const workBuddyNode = join(setup.root, 'WorkBuddy Runtime', 'node.exe');
+  await write(workBuddyNode, 'fixture runtime\n');
+  const document = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  document.mcpServers['eric-task-master'] = {
+    command: workBuddyNode,
+    args: [setup.entrypoint],
+    env: {
+      ERIC_TASK_MASTER_CLIENT_ID: clientId,
+      ERIC_TASK_MASTER_CLIENT_NAME: 'Eric Task Master / WorkBuddy',
+      TASKMASTER_CLIENT_ID: clientId,
+      TASKMASTER_CLIENT_NAME: 'Eric Task Master / WorkBuddy',
+      NODE_OPTIONS: '--preserve-host-value'
+    },
+    description: 'Host-maintained metadata',
+    disabled: false
+  };
+  await write(setup.paths.workbuddy, `${JSON.stringify(document, null, 2)}\n`);
+  const before = await readFile(setup.paths.workbuddy, 'utf8');
+
+  const status = await setup.registrar.status({ hostKeys: ['workbuddy'] });
+  assert.equal(status.results[0].status, 'adoption_available');
+  const dryRun = await setup.registrar.install({ hostKeys: ['workbuddy'], dryRun: true });
+  assert.equal(dryRun.ok, true);
+  assert.equal(dryRun.results[0].status, 'would_adopt');
+  const adopted = await setup.registrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(adopted.ok, true);
+  assert.equal(adopted.results[0].status, 'adopted');
+  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), before);
+
+  const state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
+  assert.equal(state.registrations.workbuddy.command, workBuddyNode);
+  assert.deepEqual(state.registrations.workbuddy.args, [setup.entrypoint]);
+  assert.deepEqual(Object.keys(state.registrations.workbuddy.entry.env).sort(), [
+    'ERIC_TASK_MASTER_CLIENT_ID',
+    'ERIC_TASK_MASTER_CLIENT_NAME',
+    'TASKMASTER_CLIENT_ID',
+    'TASKMASTER_CLIENT_NAME'
+  ]);
+  assert.equal((await setup.registrar.status({ hostKeys: ['workbuddy'] })).results[0].status, 'registered');
+  const repeated = await setup.registrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(repeated.ok, true);
+  assert.equal(repeated.changed, false);
+  assert.equal(repeated.results[0].status, 'registered');
+  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), before);
+});
+
+test('WorkBuddy refuses same-command adoption when stable identity names do not match', async () => {
+  const setup = await fixture();
+  const installed = await setup.registrar.install({ hostKeys: ['codex'] });
+  const clientId = `${installed.installationId}:workbuddy`;
+  const document = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  document.mcpServers['eric-task-master'] = {
+    command: process.execPath,
+    args: [setup.entrypoint],
+    env: {
+      ERIC_TASK_MASTER_CLIENT_ID: clientId,
+      ERIC_TASK_MASTER_CLIENT_NAME: 'wrong-name',
+      TASKMASTER_CLIENT_ID: clientId,
+      TASKMASTER_CLIENT_NAME: 'wrong-name'
+    }
+  };
+  await write(setup.paths.workbuddy, `${JSON.stringify(document, null, 2)}\n`);
+  const before = await readFile(setup.paths.workbuddy, 'utf8');
+  const result = await setup.registrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(result.ok, false);
+  assert.equal(result.results[0].status, 'conflict');
+  assert.equal(result.results[0].error.code, 'OWNED_ENTRY_CHANGED');
+  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), before);
+});
+
+test('CodeBuddy CLI and Gemini CLI register transactionally while preserving unrelated settings', async () => {
+  const setup = await fixture('linux');
+  const codeBuddyPath = join(setup.home, '.codebuddy', '.mcp.json');
+  const geminiPath = join(setup.home, '.gemini', 'settings.json');
+  setup.env.CODEBUDDY_MCP_CONFIG = codeBuddyPath;
+  setup.env.GEMINI_MCP_CONFIG = geminiPath;
+  await write(codeBuddyPath, `${JSON.stringify({
+    locale: 'zh-CN',
+    mcpServers: { existing: { command: 'keep' } }
+  }, null, 2)}\n`);
+  await write(geminiPath, `${JSON.stringify({
+    theme: 'ANSI',
+    mcpServers: { existing: { command: 'keep' } }
+  }, null, 2)}\n`);
+  const registrar = registrarFor(setup, { platform: 'linux' });
+
+  const installed = await registrar.install({ hostKeys: ['codebuddy-cli', 'gemini-cli'] });
+  assert.equal(installed.ok, true);
+  assert.equal(installed.results.filter((item) => item.status === 'registered_pending_restart').length, 2);
+  assert.ok(installed.results.every((item) => item.mcpCapability === 'mcp_native_verified'));
+  assert.ok(installed.results.every((item) => item.autoRegistration === 'verified'));
+  const codeBuddy = JSON.parse(await readFile(codeBuddyPath, 'utf8'));
+  const gemini = JSON.parse(await readFile(geminiPath, 'utf8'));
+  assert.equal(codeBuddy.locale, 'zh-CN');
+  assert.equal(gemini.theme, 'ANSI');
+  assert.ok(codeBuddy.mcpServers['eric-task-master']);
+  assert.ok(gemini.mcpServers['eric-task-master']);
+
+  const removed = await registrar.uninstall({ hostKeys: ['codebuddy-cli', 'gemini-cli'] });
+  assert.equal(removed.ok, true);
+  assert.equal(JSON.parse(await readFile(codeBuddyPath, 'utf8')).locale, 'zh-CN');
+  assert.equal(JSON.parse(await readFile(geminiPath, 'utf8')).theme, 'ANSI');
+});
+
+test('native MCP hosts without a verified write contract are reported as adapter pending', async () => {
+  const setup = await fixture('linux');
+  const bin = join(setup.root, 'bin');
+  await write(join(bin, 'code'), 'fixture\n');
+  await write(join(bin, 'opencode'), 'fixture\n');
+  setup.env.PATH = bin;
+  const registrar = registrarFor(setup, { platform: 'linux' });
+  const result = await registrar.install({ hostKeys: ['vscode-copilot', 'opencode'] });
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.results.map((item) => item.status), ['adapter_pending', 'adapter_pending']);
+  assert.ok(result.results.every((item) => item.mcpCapability === 'mcp_native_verified'));
+  assert.ok(result.results.every((item) => item.autoRegistration === 'adapter_pending'));
+  await assert.rejects(readFile(registrar.statePath, 'utf8'), { code: 'ENOENT' });
+});
+
+test('Windows OpenClaw npm shims launch without shell interpolation and reject escaping bins', async () => {
+  const setup = await fixture('win32');
+  const bin = join(setup.root, 'openclaw-bin');
+  const packageRoot = join(bin, 'node_modules', 'openclaw');
+  const cliPath = join(packageRoot, 'cli.mjs');
+  await write(join(bin, 'openclaw.cmd'), '@rem fixture shim that must never execute\n');
+  await write(join(packageRoot, 'package.json'), `${JSON.stringify({
+    name: 'openclaw',
+    bin: { openclaw: 'cli.mjs' }
+  })}\n`);
+  await write(cliPath, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));\n');
+  const env = { ...process.env, PATH: bin, PATHEXT: '.CMD' };
+  const result = await runHostCommand('openclaw', ['mcp', 'list', '--json'], {
+    env,
+    platform: 'win32'
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(JSON.parse(result.stdout), ['mcp', 'list', '--json']);
+
+  await write(join(packageRoot, 'package.json'), `${JSON.stringify({
+    name: 'openclaw',
+    bin: { openclaw: '../escape.mjs' }
+  })}\n`);
+  await assert.rejects(
+    runHostCommand('openclaw', ['mcp', 'list'], { env, platform: 'win32' }),
+    { code: 'HOST_CLI_SHIM_UNSUPPORTED' }
+  );
+
+  const externalRoot = join(setup.root, 'external-openclaw-bin');
+  await write(join(externalRoot, 'cli.mjs'), 'process.stdout.write("escaped");\n');
+  await symlink(externalRoot, join(packageRoot, 'linked'), 'junction');
+  await write(join(packageRoot, 'package.json'), `${JSON.stringify({
+    name: 'openclaw',
+    bin: { openclaw: 'linked/cli.mjs' }
+  })}\n`);
+  await assert.rejects(
+    runHostCommand('openclaw', ['mcp', 'list'], { env, platform: 'win32' }),
+    { code: 'HOST_CLI_SHIM_UNSUPPORTED' }
+  );
+
+  await write(join(packageRoot, 'package.json'), `${JSON.stringify({
+    name: 'openclaw',
+    bin: { openclaw: 'cli.mjs' }
+  })}\n`);
+  await write(cliPath, 'process.stderr.write("x".repeat(1024 * 1024 + 1));\n');
+  await assert.rejects(
+    runHostCommand('openclaw', ['mcp', 'list'], { env, platform: 'win32' }),
+    { code: 'HOST_CLI_OUTPUT_LIMIT' }
+  );
+
+  const sentinel = join(setup.root, 'late-child-write.txt');
+  const childSource = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(sentinel)}, 'late'), 600);`;
+  await write(cliPath, [
+    "import { spawn } from 'node:child_process';",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(childSource)}], { stdio: 'ignore' });`,
+    'setTimeout(() => {}, 5000);',
+    ''
+  ].join('\n'));
+  await assert.rejects(
+    runHostCommand('openclaw', ['mcp', 'list'], { env, platform: 'win32', timeoutMs: 100 }),
+    { code: 'HOST_CLI_TIMEOUT' }
+  );
+  await delay(900);
+  await assert.rejects(readFile(sentinel, 'utf8'), { code: 'ENOENT' });
+});
+
+test('OpenClaw inspection uses the complete JSON registry and fails closed on registry load errors', async () => {
+  let mutationRan = false;
+  const runner = async (_command, args) => {
+    if (args[1] === 'list') {
+      return { exitCode: 2, signal: null, stdout: '{}' };
+    }
+    mutationRan = true;
+    return { exitCode: 0, signal: null, stdout: '{}' };
+  };
+  const adapter = createOfficialCliAdapter({ key: 'openclaw', executable: 'openclaw' }, {
+    commandRunner: runner,
+    platform: 'linux',
+    env: {}
+  });
+  const context = {
+    desired: { command: '/usr/bin/node', args: ['/runtime/stdio.mjs'], env: { TASKMASTER_CLIENT_ID: 'install:openclaw' } },
+    clientId: 'install:openclaw'
+  };
+  await assert.rejects(adapter.inspect(context), { code: 'HOST_CLI_COMMAND_FAILED' });
+  assert.equal(mutationRan, false);
+});
+
+test('OpenClaw rollback performs a final compare before any mutation', async () => {
+  const foreign = { command: 'foreign', args: [], env: {} };
+  let mutationRan = false;
+  const runner = async (_command, args) => {
+    if (args[1] === 'list') {
+      return { exitCode: 0, signal: null, stdout: JSON.stringify({ 'eric-task-master': foreign }) };
+    }
+    mutationRan = true;
+    return { exitCode: 0, signal: null, stdout: '{}' };
+  };
+  const adapter = createOfficialCliAdapter({ key: 'openclaw', executable: 'openclaw' }, {
+    commandRunner: runner,
+    platform: 'linux',
+    env: {}
+  });
+  const context = {
+    desired: { command: '/usr/bin/node', args: ['/runtime/stdio.mjs'], env: { TASKMASTER_CLIENT_ID: 'install:openclaw' } },
+    clientId: 'install:openclaw'
+  };
+  await assert.rejects(adapter.restore(context, null, { expectedFingerprint: null }), {
+    code: 'HOST_CLI_CAS_MISMATCH'
+  });
+  assert.equal(mutationRan, false);
+});
+
+test('OpenClaw official CLI adapter is idempotent, reversible, and never guesses a config path', async () => {
+  const setup = await fixture('linux');
+  const bin = join(setup.root, 'bin');
+  await write(join(bin, 'openclaw'), 'fixture\n');
+  setup.env.PATH = bin;
+  let entry = null;
+  const calls = [];
+  const commandRunner = async (command, args) => {
+    calls.push({ command, args: [...args] });
+    if (args[1] === 'list') {
+      return { exitCode: 0, signal: null, stdout: JSON.stringify(entry ? { 'eric-task-master': entry } : {}) };
+    }
+    if (args[1] === 'set') {
+      entry = JSON.parse(args[3]);
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    if (args[1] === 'unset') {
+      entry = null;
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    throw new Error(`Unexpected fixture command: ${args.join(' ')}`);
+  };
+  const registrar = registrarFor(setup, { platform: 'linux', runHostCommand: commandRunner });
+  const host = registrar.hosts.find((item) => item.key === 'openclaw');
+  assert.equal(host.configPath, undefined);
+
+  const installed = await registrar.install({ hostKeys: ['openclaw'] });
+  assert.equal(installed.ok, true);
+  assert.equal(installed.results[0].status, 'registered_pending_reload');
+  assert.equal(installed.results[0].configurationStatus, 'registered');
+  assert.equal(installed.results[0].activationStatus, 'pending_host_reload');
+  assert.equal(entry.command, process.execPath);
+  assert.deepEqual(entry.args, [setup.entrypoint]);
+  assert.equal(entry.env.TASKMASTER_CLIENT_ID, `${installed.installationId}:openclaw`);
+  assert.ok(calls.some((call) => call.args[1] === 'set'));
+
+  const second = await registrar.install({ hostKeys: ['openclaw'] });
+  assert.equal(second.ok, true);
+  assert.equal(second.changed, false);
+  assert.equal(second.results[0].status, 'registered');
+
+  const removed = await registrar.uninstall({ hostKeys: ['openclaw'] });
+  assert.equal(removed.ok, true);
+  assert.equal(removed.results[0].status, 'unregistered_pending_reload');
+  assert.equal(entry, null);
+
+  const restored = await registrar.rollback({ transactionId: removed.transactionId });
+  assert.equal(restored.ok, true);
+  assert.ok(entry);
+  assert.equal((await registrar.status({ hostKeys: ['openclaw'] })).results[0].status, 'registered');
+});
+
+test('OpenClaw disabled ownership is reported honestly, never silently enabled, and restores exactly after uninstall rollback', async () => {
+  const setup = await fixture('linux');
+  const bin = join(setup.root, 'bin');
+  await write(join(bin, 'openclaw'), 'fixture\n');
+  setup.env.PATH = bin;
+  let entry = null;
+  let setCalls = 0;
+  const commandRunner = async (_command, args) => {
+    if (args[1] === 'list') {
+      return { exitCode: 0, signal: null, stdout: JSON.stringify(entry ? { 'eric-task-master': entry } : {}) };
+    }
+    if (args[1] === 'set') {
+      entry = JSON.parse(args[3]);
+      setCalls += 1;
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    if (args[1] === 'unset') {
+      entry = null;
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    throw new Error(`Unexpected fixture command: ${args.join(' ')}`);
+  };
+  const registrar = registrarFor(setup, { platform: 'linux', runHostCommand: commandRunner });
+  assert.equal((await registrar.install({ hostKeys: ['openclaw'] })).ok, true);
+  entry = {
+    ...entry,
+    enabled: false,
+    cwd: '/disabled/work',
+    toolFilter: { include: ['taskmaster_status'] }
+  };
+  const disabledEntry = structuredClone(entry);
+  const status = (await registrar.status({ hostKeys: ['openclaw'] })).results[0];
+  assert.equal(status.status, 'registered_disabled');
+  assert.equal(status.configurationStatus, 'registered');
+  assert.equal(status.activationStatus, 'disabled_by_host');
+
+  const setCallsBeforeRepeat = setCalls;
+  const repeated = await registrar.install({ hostKeys: ['openclaw'] });
+  assert.equal(repeated.ok, true);
+  assert.equal(repeated.changed, false);
+  assert.equal(repeated.results[0].status, 'registered_disabled');
+  assert.equal(setCalls, setCallsBeforeRepeat);
+  assert.deepEqual(entry, disabledEntry);
+
+  const removed = await registrar.uninstall({ hostKeys: ['openclaw'] });
+  assert.equal(removed.ok, true);
+  assert.equal(entry, null);
+  const restored = await registrar.rollback({ transactionId: removed.transactionId });
+  assert.equal(restored.ok, true);
+  assert.deepEqual(entry, disabledEntry);
+});
+
+test('OpenClaw runtime upgrade preserves complete host metadata and transaction rollback restores it exactly', async () => {
+  const setup = await fixture('linux');
+  const bin = join(setup.root, 'bin');
+  await write(join(bin, 'openclaw'), 'fixture\n');
+  setup.env.PATH = bin;
+  let entry = null;
+  const commandRunner = async (_command, args) => {
+    if (args[1] === 'list') {
+      return { exitCode: 0, signal: null, stdout: JSON.stringify(entry ? { 'eric-task-master': entry } : {}) };
+    }
+    if (args[1] === 'set') {
+      entry = JSON.parse(args[3]);
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    if (args[1] === 'unset') {
+      entry = null;
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    throw new Error(`Unexpected fixture command: ${args.join(' ')}`);
+  };
+  const oldRegistrar = registrarFor(setup, {
+    platform: 'linux',
+    runHostCommand: commandRunner,
+    runtimeVersion: '2.1.2'
+  });
+  const first = await oldRegistrar.install({ hostKeys: ['openclaw'] });
+  assert.equal(first.ok, true);
+
+  entry = {
+    ...entry,
+    cwd: '/operator/work',
+    toolFilter: { include: ['taskmaster_*'] },
+    requestTimeoutMs: 12_000,
+    connectionTimeoutMs: 3_000,
+    supportsParallelToolCalls: true,
+    futureHostField: { preserve: true },
+    env: { ...entry.env, RETRIES: 3, FEATURE_FLAG: true }
+  };
+  const beforeUpgrade = structuredClone(entry);
+  const newRegistrar = registrarFor(setup, {
+    platform: 'linux',
+    runHostCommand: commandRunner,
+    runtimeVersion: '2.1.3'
+  });
+  const upgraded = await newRegistrar.install({ hostKeys: ['openclaw'] });
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.agentHostReloadRequired, true);
+  assert.equal(entry.env.ERIC_TASK_MASTER_RUNTIME_VERSION, '2.1.3');
+  assert.equal(entry.env.RETRIES, 3);
+  assert.equal(entry.env.FEATURE_FLAG, true);
+  for (const key of [
+    'cwd', 'toolFilter', 'requestTimeoutMs', 'connectionTimeoutMs',
+    'supportsParallelToolCalls', 'futureHostField'
+  ]) {
+    assert.deepEqual(entry[key], beforeUpgrade[key]);
+  }
+
+  const rolledBack = await newRegistrar.rollback({ transactionId: upgraded.transactionId });
+  assert.equal(rolledBack.ok, true);
+  assert.deepEqual(entry, beforeUpgrade);
+});
+
+test('a failed OpenClaw CLI write rolls back an earlier file host and any applied CLI entry', async () => {
+  const setup = await fixture('linux');
+  const bin = join(setup.root, 'bin');
+  await write(join(bin, 'openclaw'), 'fixture\n');
+  setup.env.PATH = bin;
+  const codexBefore = await readFile(setup.paths.codex, 'utf8');
+  let entry = null;
+  let failSet = true;
+  const commandRunner = async (_command, args) => {
+    if (args[1] === 'list') {
+      return { exitCode: 0, signal: null, stdout: JSON.stringify(entry ? { 'eric-task-master': entry } : {}) };
+    }
+    if (args[1] === 'set') {
+      entry = JSON.parse(args[3]);
+      if (failSet) {
+        failSet = false;
+        return { exitCode: 2, signal: null, stdout: '{}' };
+      }
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    if (args[1] === 'unset') {
+      entry = null;
+      return { exitCode: 0, signal: null, stdout: '{}' };
+    }
+    throw new Error('unexpected command');
+  };
+  const registrar = registrarFor(setup, { platform: 'linux', runHostCommand: commandRunner });
+  const result = await registrar.install({ hostKeys: ['codex', 'openclaw'] });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'HOST_CLI_COMMAND_FAILED');
+  assert.equal(result.rollback.ok, true);
+  assert.equal(await readFile(setup.paths.codex, 'utf8'), codexBefore);
+  assert.equal(entry, null);
+  assert.deepEqual(JSON.parse(await readFile(registrar.statePath, 'utf8')).registrations, {});
+});
+
+test('OpenClaw CLI compare-before-write preserves a concurrent foreign entry', async () => {
+  const setup = await fixture('linux');
+  const bin = join(setup.root, 'bin');
+  await write(join(bin, 'openclaw'), 'fixture\n');
+  setup.env.PATH = bin;
+  let entry = null;
+  let listCount = 0;
+  const commandRunner = async (_command, args) => {
+    if (args[1] === 'list') {
+      listCount += 1;
+      if (listCount === 2) entry = { command: 'foreign', args: [], env: {} };
+      return { exitCode: 0, signal: null, stdout: JSON.stringify(entry ? { 'eric-task-master': entry } : {}) };
+    }
+    throw new Error('mutation command must not run after a compare-before-write mismatch');
+  };
+  const registrar = registrarFor(setup, { platform: 'linux', runHostCommand: commandRunner });
+  const result = await registrar.install({ hostKeys: ['openclaw'] });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'HOST_CLI_CAS_MISMATCH');
+  assert.equal(result.rollback.ok, true);
+  assert.equal(entry.command, 'foreign');
+  assert.deepEqual(JSON.parse(await readFile(registrar.statePath, 'utf8')).registrations, {});
 });
 
 test('rollback refuses to overwrite a host config changed after the transaction', async () => {

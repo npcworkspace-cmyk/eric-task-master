@@ -29,7 +29,7 @@ async function managerFixture(t) {
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Task Master</title>');
 
   const tasks = new Map();
-  const calls = { open: [], close: [], resumes: [], lifecycle: [] };
+  const calls = { open: [], close: [], resumes: [], deletes: [], lifecycle: [] };
   let taskService;
   const buildTaskService = ({ profileStore }) => taskService = {
     async list() {
@@ -42,6 +42,7 @@ async function managerFixture(t) {
       if (existing) return existing;
       const task = {
         id: `task_${tasks.size + 1}`,
+        revision: 1,
         state: 'queued',
         modulePath: 'C:/secret/task.mjs',
         input,
@@ -61,6 +62,12 @@ async function managerFixture(t) {
       const task = await this.get(id);
       task.state = 'cancelled';
       return task;
+    },
+    async deleteTask(id, body, caller) {
+      const task = await this.get(id);
+      calls.deletes.push({ id, body, caller });
+      tasks.delete(id);
+      return { id, deletedAt: new Date().toISOString() };
     },
     async resume(id, body, caller) {
       const task = await this.get(id);
@@ -213,6 +220,39 @@ test('ETMA2 snapshots trusted Agent names while authorization remains client-sco
   }));
   assert.equal(forged.response.status, 400);
   assert.equal(forged.body.error.code, 'INVALID_TASK_CREATE');
+});
+
+test('task record deletion is Owner-only and forwards revision-safe intent', async (t) => {
+  const { manager, baseUrl, calls } = await managerFixture(t);
+  const agentToken = await issueAgent(baseUrl, manager.token, 'codex.delete', 'Codex');
+  const created = await json(await fetch(`${baseUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: headers(agentToken),
+    body: JSON.stringify({
+      profileId: 'profile_fixture', taskType: 'fixture', taskLabel: '删除契约测试',
+      idempotencyKey: 'task-delete-contract'
+    })
+  }));
+  assert.equal(created.response.status, 202);
+  const request = {
+    commandId: 'delete-contract-1',
+    expectedRevision: created.body.task.revision
+  };
+  const forbidden = await json(await fetch(`${baseUrl}/v1/tasks/${created.body.task.id}`, {
+    method: 'DELETE', headers: headers(agentToken), body: JSON.stringify(request)
+  }));
+  assert.equal(forbidden.response.status, 403);
+
+  const deleted = await json(await fetch(`${baseUrl}/v1/tasks/${created.body.task.id}`, {
+    method: 'DELETE', headers: headers(manager.token), body: JSON.stringify(request)
+  }));
+  assert.equal(deleted.response.status, 200);
+  assert.equal(deleted.body.deleted.id, created.body.task.id);
+  assert.deepEqual(calls.deletes[0], {
+    id: created.body.task.id,
+    body: request,
+    caller: { role: 'manager-admin', clientId: 'manager-admin' }
+  });
 });
 
 test('ETMA2 survives Manager restart and fails closed after admin token rotation', async (t) => {

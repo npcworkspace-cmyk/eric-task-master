@@ -8,27 +8,26 @@ async function text(path) {
   return readFile(new URL(path, root), 'utf8');
 }
 
-test('Owner Console exposes the four work areas and accessible task controls', async () => {
+test('task panel exposes only Tasks and Profiles with accessible retained controls', async () => {
   const [html, css] = await Promise.all([
     text('dashboard/index.html'),
     text('dashboard/styles.css')
   ]);
 
-  for (const id of ['view-overview', 'view-agents', 'view-profiles', 'view-tasks']) {
+  for (const id of ['view-tasks', 'view-profiles', 'tasks', 'profiles', 'tasks-error', 'profiles-error']) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
-  for (const id of [
-    'agents', 'profiles', 'tasks', 'task-detail-dialog', 'task-report',
-    'task-pause', 'task-resume', 'task-terminate', 'task-modify', 'task-ask',
-    'task-timeline', 'task-artifacts', 'developer-diagnostics', 'task-detail-error'
+  for (const removed of [
+    'view-overview', 'view-agents', 'agents', 'task-detail-dialog', 'task-report',
+    'task-timeline', 'task-artifacts', 'task-command-form', 'developer-diagnostics'
   ]) {
-    assert.match(html, new RegExp(`id="${id}"`));
+    assert.doesNotMatch(html, new RegExp(`id="${removed}"`));
   }
-
+  const views = [...html.matchAll(/data-view="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(views, ['tasks', 'profiles']);
+  assert.match(html, /id="view-tasks" class="view is-active"/);
   assert.match(html, /href="#main-content"/);
   assert.match(html, /<nav[^>]+aria-label="主要导航"/);
-  assert.match(html, /<dialog[^>]+aria-labelledby="task-detail-title"/);
-  assert.match(html, /<details class="developer-details">/);
   assert.match(html, /role="alert"/);
   assert.match(html, /aria-live="polite"/);
   assert.match(html, /href="\/dashboard\/styles\.css"/);
@@ -45,7 +44,7 @@ test('Owner Console exposes the four work areas and accessible task controls', a
   assert.match(css, /--npc-signal:/);
 });
 
-test('Owner Console uses cookie auth, bounded reads, durable commands, and stale-response guards', async () => {
+test('task panel keeps bounded same-origin reads, concurrency guards, task timing, and four safe mutations', async () => {
   const [html, source] = await Promise.all([
     text('dashboard/index.html'),
     text('dashboard/dashboard.js')
@@ -66,38 +65,40 @@ test('Owner Console uses cookie auth, bounded reads, durable commands, and stale
   assert.match(source, /const attempts = mayRetry \? 2 : 1/);
   assert.match(source, /Promise\.allSettled/);
   assert.match(source, /sequence !== state\.refreshSequence/);
-  assert.match(source, /sequence !== state\.detailSequence/);
   assert.match(source, /containsInteractiveFocus/);
   assert.match(source, /document\.visibilityState === 'hidden'/);
   assert.match(source, /window\.addEventListener\('pagehide'/);
   assert.match(source, /window\.addEventListener\('pageshow'/);
   assert.match(source, /window\.addEventListener\('popstate'/);
 
-  for (const path of [
-    '/v1/dashboard/summary', '/v1/agents', '/v1/profiles', '/v1/tasks',
-    '/v1/dashboard/logout'
-  ]) {
+  for (const path of ['/v1/profiles', '/v1/tasks', '/v1/dashboard/logout']) {
     assert.ok(source.includes(path), `Dashboard must call ${path}`);
   }
+  for (const removedPath of ['/v1/agents', '/v1/dashboard/summary', '/artifacts', '/timeline', '/commands', '/continue']) {
+    assert.equal(source.includes(removedPath), false, `Dashboard must not call ${removedPath}`);
+  }
+
   assert.match(source, /\/actions`/);
-  assert.match(source, /\/commands`/);
-  assert.match(source, /commandId:\s*commandId\(\)/);
-  assert.match(source, /expectedRevision:\s*task\.revision/);
+  assert.match(source, /method:\s*'DELETE'/);
+  assert.match(source, /body:\s*\{ commandId: commandId\(\), expectedRevision: task\.revision \}/);
+  assert.match(source, /body:\s*\{ action, commandId: commandId\(\), expectedRevision: task\.revision \}/);
   assert.match(source, /error\.status === 409/);
   assert.match(source, /状态已变化，已刷新最新状态/);
   assert.match(source, /error\.status === 403/);
-  assert.match(source, /setInlineError\(ui\.taskDetailError/);
-  assert.match(source, /agent\.connectionCount \?\? agent\.activeConnectionCount/);
-  assert.match(source, /isAgentActionLocked\(id\)/);
-  assert.match(source, /focusIntentSequence === state\.focusIntentSequence/u);
-  assert.match(source, /state\.pendingFocusKey === activeFocusKey/u);
-  assert.match(source, /恢复“\$\{agentName\(agent\)\}”接入 Manager 的权限/);
-  assert.match(source, /state\.tasks = \[\]/);
-  assert.match(source, /ui\.taskReport\.replaceChildren\(\)/);
-  assert.match(source, /task\.userRequest\?\.id/);
-  assert.match(source, /\/continue`/);
-  assert.match(source, /for \(const section of report\.sections\)/);
+  assert.match(source, /state\.pendingMutations\.has\(key\)/);
+  assert.match(source, /focusIntentSequence === state\.focusIntentSequence/);
+  assert.match(source, /displayName \|\| task\?\.name \|\| task\?\.taskLabel/);
+  assert.match(source, /timing\.runDurationMs/);
+  assert.match(source, /timing\.cooldownDurationMs/);
+  assert.match(source, /timing\.totalDurationMs/);
+  assert.match(source, /scheduleDurationTick/);
+  assert.match(source, /data-task-duration/);
+  assert.match(source, /cleanup\?\.settled === true/);
+  assert.match(source, /确定取消任务/);
+  assert.match(source, /确定删除任务记录/);
+  assert.match(source, /focusAfter/);
 
+  assert.doesNotMatch(source, /ownerAgentName|taskAgent\(|agentName\(/);
   assert.doesNotMatch(source, /sessionStorage|localStorage|['"]Authorization['"]/i);
   assert.doesNotMatch(source, /\.innerHTML\s*=|insertAdjacentHTML|eval\(|new Function/);
   assert.doesNotMatch(source, /fetch\(['"]https?:\/\//);

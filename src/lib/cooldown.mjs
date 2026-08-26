@@ -77,17 +77,29 @@ export function createCooldownHelper({
       nowMs: now(),
       random
     });
-    const resumeAt = new Date(now() + durationMs).toISOString();
+    const startedAtMs = now();
+    const startedAt = new Date(startedAtMs).toISOString();
+    const resumeAt = new Date(startedAtMs + durationMs).toISOString();
     const reason = String(options.reason || 'Rate limit cooldown').slice(0, 160);
     onSignal('rate_limit');
     await onState('cooling_down');
     await onProgress({ durationMs, resumeAt, reason });
-    await onCooldown({ status: 'active', durationMs, resumeAt, reason });
+    await onCooldown({ status: 'active', durationMs, startedAt, resumeAt, reason });
     try {
       await sleep(durationMs, signal);
     } finally {
+      const finishedAtMs = now();
+      const finishedAt = new Date(finishedAtMs).toISOString();
+      await onCooldown({
+        status: signal?.aborted ? 'interrupted' : 'completed',
+        durationMs,
+        startedAt,
+        finishedAt,
+        elapsedMs: Math.max(0, finishedAtMs - startedAtMs),
+        resumeAt,
+        reason
+      });
       if (!signal?.aborted) {
-        await onCooldown({ status: 'completed', durationMs, resumeAt, reason });
         await onState('running');
       }
     }

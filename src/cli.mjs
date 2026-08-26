@@ -45,8 +45,8 @@ Usage:
   taskmaster task-packs install PATH [--json]
   taskmaster task list [--json]
   taskmaster task inbox [--limit N] [--json]
-  taskmaster task start --profile ID --type TYPE --request-key KEY [--input JSON] [--json]
-  taskmaster task run --profile ID --type TYPE [--module PATH] [--input JSON] [--request-key KEY]
+  taskmaster task start --profile ID --type TYPE --request-key KEY [--label TEXT] [--input JSON_OR_@FILE] [--json]
+  taskmaster task run --profile ID --type TYPE [--module PATH] [--label TEXT] [--input JSON_OR_@FILE] [--request-key KEY]
   taskmaster task status|wait|follow|cancel TASK_ID [--json]
   taskmaster task continue TASK_ID [--request-id ID] [--note TEXT] [--json]
   taskmaster task command-respond TASK_ID --command-id ID --revision N --status acknowledged|applied|rejected [--message TEXT] [--json]
@@ -159,8 +159,13 @@ function registrationFailureDetails(registration) {
             ...(typeof result?.hostKey === 'string' ? { hostKey: result.hostKey.slice(0, 80) } : {}),
             ...(typeof result?.displayName === 'string' ? { displayName: result.displayName.slice(0, 120) } : {}),
             ...(typeof result?.support === 'string' ? { support: result.support.slice(0, 32) } : {}),
+            ...(typeof result?.mcpCapability === 'string' ? { mcpCapability: result.mcpCapability.slice(0, 64) } : {}),
+            ...(typeof result?.autoRegistration === 'string' ? { autoRegistration: result.autoRegistration.slice(0, 64) } : {}),
+            ...(typeof result?.registrationMode === 'string' ? { registrationMode: result.registrationMode.slice(0, 64) } : {}),
             ...(typeof result?.detected === 'boolean' ? { detected: result.detected } : {}),
             ...(typeof result?.status === 'string' ? { status: result.status.slice(0, 64) } : {}),
+            ...(typeof result?.configurationStatus === 'string' ? { configurationStatus: result.configurationStatus.slice(0, 64) } : {}),
+            ...(typeof result?.activationStatus === 'string' ? { activationStatus: result.activationStatus.slice(0, 64) } : {}),
             ...(typeof result?.configPath === 'string' ? { configPath: result.configPath.slice(0, 4_096) } : {}),
             ...(typeof result?.changed === 'boolean' ? { changed: result.changed } : {}),
             ...(reason ? { reason } : {}),
@@ -557,6 +562,9 @@ async function connect(options, json) {
       { mcpRegistration: registrationFailureDetails(registration) }
     );
   }
+  const agentHostReloadRequired = Boolean(
+    connection.migratedFrom || registration.agentHostReloadRequired
+  );
   const dashboardAuthorization = await requestJson(config.baseUrl, '/v1/dashboard/authorize', {
     method: 'POST', body: {}, token
   });
@@ -566,12 +574,13 @@ async function connect(options, json) {
     manager: {
       ...connection.health,
       startedNow: connection.started,
+      agentHostReloadRequired,
       ...(connection.migratedFrom ? { migratedFrom: connection.migratedFrom } : {})
     },
     acceptance,
     mcpRegistration: registration,
     dashboard: `${config.baseUrl}/dashboard#${new URLSearchParams({ code: dashboardAuthorization.code })}`,
-    nextAction: 'Match this Agent host in mcpRegistration.results. For registered_pending_restart, reload it once; if this host cannot reload during the current run, use the scoped CLI path with one stable Agent ID for this task only, then switch to MCP after the next host restart. For registered, use taskmaster_status then taskmaster_profiles_list. For needs_adapter, run node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json, then profiles list with the same identity. Never mix MCP and CLI identities inside one task. After status and Profile discovery succeed, ask for the browser task.'
+    nextAction: `${agentHostReloadRequired ? 'Task Master runtime changed; reload this Agent host once before MCP verification. ' : ''}Match this Agent host in mcpRegistration.results. MCP is the default path. For any registered_pending_* status, complete the named host approval or reload once, then verify the live connection with taskmaster_status and taskmaster_profiles_list. For registered_disabled, enable eric-task-master in that host and reload once before verification. For registered or adopted, perform the same live MCP verification. Only when this run reports adapter_pending, extension_required, or the current host cannot reload, run node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json and profiles list with the same identity; switch future tasks to MCP after that prerequisite is resolved. Never mix MCP and CLI identities inside one task. After status and Profile discovery succeed, ask for the browser task.`
   };
   emit(result, json);
   return result;
@@ -795,6 +804,7 @@ async function taskCommand(action, args, options, json) {
     const body = {
       profileId: options.profile,
       taskType: options.type,
+      ...(options.label ? { taskLabel: options.label } : {}),
       input,
       idempotencyKey,
       ...(options.timeout ? { timeoutMs: Number(options.timeout) } : {})

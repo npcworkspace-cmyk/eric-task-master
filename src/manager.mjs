@@ -113,7 +113,7 @@ function validateTaskCreate(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new HttpError(400, 'INVALID_TASK_CREATE', 'Task request must be an object');
   }
-  const allowed = new Set(['profileId', 'taskType', 'input', 'timeoutMs', 'idempotencyKey']);
+  const allowed = new Set(['profileId', 'taskType', 'taskLabel', 'input', 'timeoutMs', 'idempotencyKey']);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_TASK_CREATE', `Unsupported task fields: ${unknown.join(', ')}`);
@@ -877,6 +877,17 @@ export async function createManager({
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const task = await requireTaskMethod(taskService, 'get')(decodeURIComponent(taskMatch[1]), serviceCaller(auth));
       sendJson(response, 200, { task: publicTask(task) }, cors);
+      return;
+    }
+    if (taskMatch && request.method === 'DELETE') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const deleted = await requireTaskMethod(taskService, 'deleteTask')(
+        decodeURIComponent(taskMatch[1]),
+        await readJson(request, { maxBytes: 4 * 1024 }),
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, { deleted }, cors);
       return;
     }
     if (taskTimelineMatch && request.method === 'GET') {

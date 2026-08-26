@@ -1,7 +1,7 @@
 import { isSensitiveKey, redactPublicText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
-export const VERSION = '2.1.1';
+export const VERSION = '2.1.3';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -80,6 +80,44 @@ function redactLocalPaths(value, depth = 0) {
   return safe;
 }
 
+function publicTaskTiming(task) {
+  const createdAt = Date.parse(task?.createdAt);
+  const finishedAt = Date.parse(task?.finishedAt);
+  const endAt = Number.isFinite(finishedAt) ? finishedAt : Date.now();
+  const totalDurationMs = Number.isFinite(createdAt) ? Math.max(0, endAt - createdAt) : 0;
+  if (task?.timing?.version !== 1) {
+    return { recorded: false, runDurationMs: null, cooldownDurationMs: null, totalDurationMs };
+  }
+  let cooldownDurationMs = Number.isFinite(task.timing.cooldownDurationMs)
+    ? Math.max(0, Math.round(task.timing.cooldownDurationMs))
+    : 0;
+  const activeCooldownStartedAt = Date.parse(task.timing.activeCooldownStartedAt);
+  if (Number.isFinite(activeCooldownStartedAt)) {
+    const resumeAt = Date.parse(task.cooldown?.resumeAt);
+    const activeEndAt = Number.isFinite(resumeAt) ? Math.min(endAt, resumeAt) : endAt;
+    cooldownDurationMs += Math.max(0, activeEndAt - activeCooldownStartedAt);
+  }
+  let elapsedSinceStart = 0;
+  if (Array.isArray(task?.history)) {
+    for (const attempt of task.history) {
+      const attemptStart = Date.parse(attempt?.workerStartedAt);
+      if (!Number.isFinite(attemptStart)) continue;
+      const attemptFinish = Date.parse(attempt?.finishedAt);
+      elapsedSinceStart += Math.max(0, (Number.isFinite(attemptFinish) ? attemptFinish : endAt) - attemptStart);
+    }
+  }
+  if (elapsedSinceStart === 0) {
+    const startedAt = Date.parse(task?.startedAt);
+    elapsedSinceStart = Number.isFinite(startedAt) ? Math.max(0, endAt - startedAt) : 0;
+  }
+  return {
+    recorded: true,
+    runDurationMs: Math.max(0, elapsedSinceStart - cooldownDurationMs),
+    cooldownDurationMs,
+    totalDurationMs
+  };
+}
+
 export function publicTask(task) {
   const safe = {};
   for (const key of [
@@ -88,6 +126,8 @@ export function publicTask(task) {
     'revision',
     'profileId',
     'taskType',
+    'taskLabel',
+    'displayName',
     'supportsResume',
     'behavior',
     'attempt',
@@ -118,6 +158,7 @@ export function publicTask(task) {
     ) continue;
     if (task?.[key] !== undefined) safe[key] = redactLocalPaths(task[key]);
   }
+  safe.timing = publicTaskTiming(task);
   if (Array.isArray(task?.timeline)) {
     safe.timeline = task.timeline.slice(-200).map((event) => redactLocalPaths(event));
   }

@@ -2,7 +2,7 @@
 
 Read this reference only when an installed high-level task type does not cover the requested work.
 
-Before writing from scratch, scaffold the closest production recipe with `task-packs scaffold --recipe single-page|paginated-list|list-detail|resumable-batch|form-workflow`, then run `task-packs validate`. The recipes already encode result persistence, progress, checkpoint, evidence, and lifecycle conventions. Customize site and business logic only; do not fork the runtime contract into a one-off controller.
+Before writing from scratch, follow the concise naming, input, output, and ownership conventions in [task-packs.md](task-packs.md), scaffold the closest production recipe with `task-packs scaffold --recipe single-page|paginated-list|list-detail|resumable-batch|form-workflow`, then run `task-packs validate`. The recipes already encode result persistence, progress, checkpoint, evidence, and lifecycle conventions. Customize site and business logic only; do not fork the runtime contract into a one-off controller.
 
 ## Trusted local task-type authoring path
 
@@ -12,13 +12,14 @@ request. Continue here only when trusted local code must be authored and
 registered. Module installation is a local administrator surface, not a
 sandbox for untrusted code.
 
-Choose one stable CLI Agent identity for the task and reuse it on discovery,
-submission, status, recovery, and artifact reads:
+Choose one stable CLI Agent identity for the host and reuse it on discovery,
+submission, status, recovery, and artifact reads. The Agent identity must never
+be a task name; supply the action + object + scope separately with `--label`:
 
 ```bash
 node scripts/taskmaster.mjs task-types list --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task-types install --type TASK_TYPE --module MODULE.mjs --json
-node scripts/taskmaster.mjs task run --profile PROFILE_ID --type TASK_TYPE --module MODULE.mjs --input '{"url":"https://example.com"}' --request-key UNIQUE_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
+node scripts/taskmaster.mjs task run --profile PROFILE_ID --type TASK_TYPE --module MODULE.mjs --label TASK_LABEL --input @INPUT_FILE.json --request-key UNIQUE_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task status TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task follow TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task resume TASK_ID --resume-key STABLE_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
@@ -26,6 +27,8 @@ node scripts/taskmaster.mjs artifacts list TASK_ID --agent-id STABLE_ID --agent-
 node scripts/taskmaster.mjs artifacts read TASK_ID --artifact ARTIFACT_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task cancel TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 ```
+
+Put the bounded task input object in `INPUT_FILE.json`. The `@FILE` form is the portable default because it avoids shell-specific JSON quoting; inline JSON remains available for controlled environments.
 
 `task run` follows progress until cleanup settles unless `--detach` is set. The module may live outside the repository: the CLI accepts only a regular single-file `.mjs` of at most 2 MiB, copies it into a Manager-owned inbox, verifies its hash, and snapshots it. Imports of sibling files are therefore not portable; bundle needed logic into the one module.
 

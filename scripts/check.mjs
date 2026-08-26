@@ -52,7 +52,10 @@ async function staticChecks() {
     dashboardHtml,
     agentRegistry,
     dashboardSessions,
-    taskRecipes
+    taskRecipes,
+    mcpStdio,
+    mcpServer,
+    mcpHostsDocument
   ] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
@@ -65,7 +68,10 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'dashboard', 'index.html'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'agent-registry.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'dashboard-session-store.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'src', 'lib', 'task-recipes.mjs'), 'utf8')
+    readFile(resolve(ROOT, 'src', 'lib', 'task-recipes.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'mcp', 'server.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'docs', 'MCP-HOSTS.md'), 'utf8')
   ]);
   const releaseCreation = releaseWorkflow.indexOf('gh release create');
   const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
@@ -93,9 +99,13 @@ async function staticChecks() {
   );
   invariant(
     dashboard.includes('bootstrapOwnerSession') && dashboard.includes('markAuthorizationRequired') &&
-      dashboard.includes('expectedRevision') && dashboard.includes('submitTaskCommand') &&
-      dashboardHtml.includes('data-view-panel="overview"') && dashboardHtml.includes('data-view-panel="tasks"'),
-    'Owner Console bootstrap, revision, command, or navigation contract drift'
+      dashboard.includes('expectedRevision') && dashboard.includes('deleteTaskRecord') &&
+      dashboard.includes('taskDurations') && dashboardHtml.includes('data-view-panel="tasks"') &&
+      dashboardHtml.includes('data-view-panel="profiles"') &&
+      !dashboardHtml.includes('data-view-panel="overview"') && !dashboardHtml.includes('data-view-panel="agents"') &&
+      !dashboard.includes("request('/v1/agents") && !dashboard.includes('/artifacts') &&
+      !dashboard.includes('/timeline') && !dashboard.includes('/commands'),
+    'Minimal Owner Console bootstrap, task timing, revision, deletion, or two-view contract drift'
   );
   invariant(
     agentRegistry.includes("status = 'revoked'") && dashboardSessions.includes('tokenHash') &&
@@ -118,6 +128,13 @@ async function staticChecks() {
       !manager.includes('validatedSessionBundle') &&
       !taskService.includes('importSession'),
     'extension or session-transfer runtime must remain removed'
+  );
+  invariant(
+    mcpStdio.includes("from '@modelcontextprotocol/server/stdio'") &&
+      mcpStdio.includes('serveStdio(') &&
+      !/StreamableHTTPServerTransport|SSEServerTransport|createServer\s*\(/u.test(mcpStdio) &&
+      !/StreamableHTTPServerTransport|SSEServerTransport/u.test(mcpServer),
+    'Agent MCP must remain one per-host STDIO bridge; no HTTP/SSE MCP listener is allowed'
   );
   invariant(
     workflow.includes('windows-latest') && workflow.includes('macos-latest') &&
@@ -185,7 +202,10 @@ async function staticChecks() {
     access(resolve(ROOT, 'src', 'lib', 'semantic-observer.mjs')),
     access(resolve(ROOT, 'src', 'lib', 'task-pack.mjs')),
     access(resolve(ROOT, 'src', 'lib', 'user-handoff.mjs')),
-    access(resolve(ROOT, 'docs', 'RELEASE-GATE.md'))
+    access(resolve(ROOT, 'docs', 'RELEASE-GATE.md')),
+    access(resolve(ROOT, 'tests', 'mcp', 'multi-host-e2e.test.mjs')),
+    access(resolve(ROOT, 'tests', 'registration', 'json-host-hardening.test.mjs')),
+    access(resolve(ROOT, 'tests', 'registration', 'openclaw-metadata.test.mjs'))
   ]);
   const codeFiles = [
     'src/manager.mjs',
@@ -218,7 +238,11 @@ async function staticChecks() {
       skillRuntime.releaseTag === `v${VERSION}` && skillWrapper.includes('TASKMASTER_RUNTIME_VERSION_MISMATCH'),
     'Skill and runtime version contract drift'
   );
-  invariant(skill.includes('node scripts/taskmaster.mjs connect --json'), 'Skill lacks the fixed startup command');
+  invariant(
+    skill.includes('node scripts/taskmaster.mjs connect --json') &&
+      skill.includes('manager.agentHostReloadRequired'),
+    'Skill lacks the fixed startup or Manager-migration reload contract'
+  );
   invariant(
     skill.includes('taskmaster_task_types_describe') && skill.includes('taskmaster_tasks_continue') &&
       skill.includes('taskmaster_dashboard_open') && skill.includes('clickable Dashboard link') &&
@@ -237,6 +261,18 @@ async function staticChecks() {
     'GitHub-to-task bootstrap contract drift'
   );
   invariant(
+    !skill.includes('needs_adapter') && !readme.includes('needs_adapter') && !readmeZh.includes('needs_adapter') &&
+      skill.includes('MCP is the default Agent path') &&
+      mcpHostsDocument.includes('adapter_pending') && mcpHostsDocument.includes('extension_required') &&
+      mcpHostsDocument.includes('registered_disabled') &&
+      mcpHostsDocument.includes('ERIC_TASK_MASTER_RUNTIME_VERSION') &&
+      mcpHostsDocument.includes('~/.workbuddy/mcp.json') &&
+      mcpHostsDocument.includes('one local STDIO bridge') &&
+      mcpHostsDocument.includes('openclaw mcp list/set/unset') &&
+      mcpHostsDocument.includes('~/.codebuddy/.mcp.json`, `mcp.json`, then `.codebuddy.json'),
+    'MCP-first Skill, host capability, or WorkBuddy registration documentation drift'
+  );
+  invariant(
     workflow.includes('TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome') &&
       workflow.includes('TASKMASTER_DASHBOARD_REPORT:') &&
       workflow.includes('TASKMASTER_DASHBOARD_SCREENSHOT:'),
@@ -252,7 +288,7 @@ async function staticChecks() {
       releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
     'release preflight, monotonic version, or standalone Skill archive proof drift'
   );
-  return { passed: 42, total: 42 };
+  return { passed: 45, total: 45 };
 }
 
 function run(command, args, env = {}) {

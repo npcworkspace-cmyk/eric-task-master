@@ -238,6 +238,7 @@ test('MCP rejects low-level task fields before dispatch and redacts task interna
     arguments: {
       taskType: 'fixture.read',
       profileId: 'profile_fixture',
+      taskLabel: 'Read fixture page',
       input: {},
       idempotencyKey: 'fixture-key-0001',
       modulePath: 'C:\\attack.mjs'

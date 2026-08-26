@@ -42,6 +42,7 @@ const WORKER_ACTIVITY_PHASES = new Set(['navigating', 'clicking', 'typing', 'hov
 const WORKER_ACTIVITY_STATUSES = new Set(['active', 'succeeded', 'unknown']);
 const COMMAND_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 const REPORT_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
+const TASK_LABEL_MAX_LENGTH = 80;
 const MAX_TASK_COMMANDS = 200;
 const MAX_TASK_TIMELINE = 500;
 const COMMAND_STATUSES = new Set(['pending', 'delivered', 'acknowledged', 'applied', 'rejected']);
@@ -144,6 +145,69 @@ function boundedText(value, { field, maximum = 2_000, required = true } = {}) {
     );
   }
   return redactSensitiveText(value).slice(0, maximum);
+}
+
+function normalizeTaskLabel(value, fallback) {
+  if (value === undefined) {
+    const safeFallback = redactSensitiveText(typeof fallback === 'string' ? fallback.trim() : 'task')
+      .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+      .trim()
+      .slice(0, TASK_LABEL_MAX_LENGTH);
+    return safeFallback || 'task';
+  }
+  const candidate = value;
+  if (
+    typeof candidate !== 'string' || !candidate.trim() || candidate.length > TASK_LABEL_MAX_LENGTH ||
+    /[\u0000-\u001f\u007f]/u.test(candidate)
+  ) {
+    throw new TaskServiceError(
+      'INVALID_TASK_LABEL',
+      `taskLabel must be a non-empty string of at most ${TASK_LABEL_MAX_LENGTH} characters without control characters`
+    );
+  }
+  return redactSensitiveText(candidate.trim()).slice(0, TASK_LABEL_MAX_LENGTH);
+}
+
+const AGENT_LABELS = Object.freeze({
+  codex: 'Codex',
+  'claude-desktop': 'Claude',
+  'claude-code': 'Claude',
+  workbuddy: 'WorkBuddy',
+  hermes: 'Hermes',
+  pi: 'Pi',
+  dsh: 'DSH',
+  openclaw: 'OpenClaw'
+});
+
+function stableAgentLabel(taskOrCaller) {
+  if (taskOrCaller?.role === 'manager-admin' || taskOrCaller?.ownerRole === 'manager-admin') return 'Manager';
+  const clientId = String(taskOrCaller?.clientId ?? taskOrCaller?.ownerClientId ?? 'agent');
+  const hostKey = clientId.includes(':')
+    ? clientId.slice(clientId.lastIndexOf(':') + 1)
+    : clientId.split(/[._]/u)[0];
+  if (AGENT_LABELS[hostKey]) return AGENT_LABELS[hostKey];
+  const safe = hostKey.replace(/[^a-zA-Z0-9-]/gu, '').slice(0, 24);
+  return safe || 'Agent';
+}
+
+function compactCreatedAt(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return 'unknown-time';
+  return date.toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z').replace('T', '-');
+}
+
+function buildTaskDisplayName(task) {
+  return `${stableAgentLabel(task)}-${task.taskLabel || task.taskType || 'task'}-${compactCreatedAt(task.createdAt)}`;
+}
+
+function normalizeTaskTiming(task) {
+  if (!task.timing || typeof task.timing !== 'object' || Array.isArray(task.timing) || task.timing.version !== 1) {
+    return null;
+  }
+  task.timing.cooldownDurationMs = Number.isFinite(task.timing.cooldownDurationMs)
+    ? Math.max(0, Math.round(task.timing.cooldownDurationMs))
+    : 0;
+  return task.timing;
 }
 
 function taskActor(caller) {
@@ -855,6 +919,12 @@ export function createTaskService({
     if (record && isBehaviorMode(behavior)) record.behavior = behavior;
   }
 
+  function markAttemptWorkerStarted(task, startedAt) {
+    normalizeAttemptHistory(task);
+    const record = [...task.history].reverse().find((entry) => entry.attempt === task.attempt);
+    if (record) record.workerStartedAt ||= startedAt;
+  }
+
   function finishAttemptHistory(task) {
     normalizeAttemptHistory(task);
     let record = [...task.history].reverse().find((entry) => entry.attempt === task.attempt);
@@ -863,6 +933,22 @@ export function createTaskService({
       task.history.push(record);
     }
     record.finishedAt ||= task.finishedAt || nowIso();
+    const timing = normalizeTaskTiming(task);
+    const activeCooldownStartedAt = timing?.activeCooldownStartedAt;
+    if (timing && activeCooldownStartedAt && timing.lastCooldownStartedAt !== activeCooldownStartedAt) {
+      const startedAt = Date.parse(activeCooldownStartedAt);
+      const finishedAt = Date.parse(record.finishedAt);
+      const resumeAt = Date.parse(task.cooldown?.resumeAt);
+      const boundedFinishedAt = Number.isFinite(resumeAt) && Number.isFinite(finishedAt)
+        ? Math.min(finishedAt, resumeAt)
+        : finishedAt;
+      if (Number.isFinite(startedAt) && Number.isFinite(boundedFinishedAt)) {
+        timing.cooldownDurationMs += Math.max(0, boundedFinishedAt - startedAt);
+      }
+      timing.lastCooldownStartedAt = activeCooldownStartedAt;
+      timing.activeCooldownStartedAt = null;
+      if (task.cooldown?.status === 'active') task.cooldown.status = 'interrupted';
+    }
     record.state = task.state;
     if (typeof task.error?.code === 'string') record.errorCode = task.error.code;
   }
@@ -939,6 +1025,9 @@ export function createTaskService({
       normalizeAttemptHistory(task);
       normalizeDiagnosticHistory(task);
       normalizeTaskCoordination(task);
+      if (!task.taskLabel) task.taskLabel = normalizeTaskLabel(undefined, task.taskType);
+      if (!task.displayName) task.displayName = buildTaskDisplayName(task);
+      normalizeTaskTiming(task);
       task.supportsResume = task.supportsResume === true;
       task.cleanup = {
         browserClosed: false,
@@ -1210,7 +1299,7 @@ export function createTaskService({
 
   function requireTaskAccess(id, caller, { ownerOnly = false } = {}) {
     const task = tasks.get(id);
-    if (!task || !(ownerOnly ? isTaskOwner(task, caller) : canAccess(task, caller))) {
+    if (!task || task.deletedAt || !(ownerOnly ? isTaskOwner(task, caller) : canAccess(task, caller))) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     normalizeTaskCoordination(task);
@@ -1931,10 +2020,26 @@ export function createTaskService({
       if (message.type === 'cooldown' && message.cooldown) {
         const record = message.cooldown;
         if (
-          ['active', 'completed'].includes(record.status) &&
+          ['active', 'completed', 'interrupted'].includes(record.status) &&
           typeof record.resumeAt === 'string' &&
           typeof record.reason === 'string'
         ) {
+          const timing = normalizeTaskTiming(task);
+          if (timing) {
+            if (record.status === 'active') {
+              timing.activeCooldownStartedAt = record.startedAt || nowIso();
+            } else {
+              const startedAt = record.startedAt || timing.activeCooldownStartedAt;
+              if (startedAt && timing.lastCooldownStartedAt !== startedAt) {
+                const calculated = Math.max(0, Date.parse(record.finishedAt || nowIso()) - Date.parse(startedAt));
+                timing.cooldownDurationMs += Number.isFinite(record.elapsedMs)
+                  ? Math.max(0, Math.round(record.elapsedMs))
+                  : (Number.isFinite(calculated) ? calculated : 0);
+                timing.lastCooldownStartedAt = startedAt;
+              }
+              timing.activeCooldownStartedAt = null;
+            }
+          }
           void update(task, {
             cooldown: {
               status: record.status,
@@ -1942,7 +2047,8 @@ export function createTaskService({
               resumeAt: record.resumeAt,
               reason: redactSensitiveText(record.reason).slice(0, 160),
               updatedAt: nowIso()
-            }
+            },
+            ...(timing ? { timing } : {})
           }).catch(() => {});
         }
         return;
@@ -2144,6 +2250,7 @@ export function createTaskService({
       const startingAt = nowIso();
       const behavior = resolveProfileBehavior(leasedProfile);
       setAttemptHistoryBehavior(task, behavior);
+      markAttemptWorkerStarted(task, startingAt);
       const pausePending = task.state === 'pause_requested' && Boolean(task.pauseContext?.commandId);
       await update(task, {
         state: pausePending ? 'pause_requested' : 'starting_browser',
@@ -2240,6 +2347,7 @@ export function createTaskService({
     const allowed = new Set([
       'profileId',
       'taskType',
+      'taskLabel',
       'input',
       'timeoutMs',
       'idempotencyKey'
@@ -2266,6 +2374,7 @@ export function createTaskService({
 
     const profile = requireProfileUse(await profileStore.get(body.profileId), caller);
     const taskType = await registry.resolve(body.taskType);
+    const taskLabel = normalizeTaskLabel(body.taskLabel, taskType.title || taskType.name);
     const behavior = resolveProfileBehavior(profile);
     if (
       body.timeoutMs !== undefined &&
@@ -2278,6 +2387,7 @@ export function createTaskService({
     const hashInput = {
       profileId: body.profileId,
       taskType: body.taskType,
+      taskLabel,
       taskTypeSha256: taskType.sha256,
       supportsResume: taskType.supportsResume === true,
       timeoutMs: body.timeoutMs ?? null,
@@ -2288,13 +2398,23 @@ export function createTaskService({
       isTaskOwner(task, caller) && task.idempotencyKey === body.idempotencyKey
     ));
     if (existing) {
+      const { taskLabel: _taskLabel, ...legacyHashInput } = hashInput;
       const legacyHash = existing.requestHashVersion === undefined
-        ? requestHash({ ...hashInput, behavior: existing.behavior })
-        : null;
+        ? requestHash({ ...legacyHashInput, behavior: existing.behavior })
+        : existing.requestHashVersion === 2
+          ? requestHash(legacyHashInput)
+          : null;
       if (existing.requestHash !== hash && existing.requestHash !== legacyHash) {
         throw new TaskServiceError(
           'IDEMPOTENCY_CONFLICT',
           'The idempotency key is already bound to a different task request',
+          409
+        );
+      }
+      if (existing.deletedAt) {
+        throw new TaskServiceError(
+          'TASK_IDEMPOTENCY_RETIRED',
+          'The idempotency key belongs to a deleted task record; use a new key for a new task',
           409
         );
       }
@@ -2308,6 +2428,7 @@ export function createTaskService({
     const taskRoot = path.join(root, id);
     const outputDir = path.join(taskRoot, 'output');
     await mkdir(outputDir, { recursive: true, mode: 0o700 });
+    const createdAt = nowIso();
     const task = {
       id,
       jobId: `job_${randomUUID().replaceAll('-', '')}`,
@@ -2319,6 +2440,7 @@ export function createTaskService({
       report: null,
       profileId: body.profileId,
       taskType: taskType.name,
+      taskLabel,
       taskTypeSha256: taskType.sha256,
       supportsResume: taskType.supportsResume === true,
       modulePath: taskType.modulePath,
@@ -2327,7 +2449,7 @@ export function createTaskService({
       ...(caller.role === 'agent' ? { ownerAgentName: caller.agentName } : {}),
       idempotencyKey: body.idempotencyKey,
       requestHash: hash,
-      requestHashVersion: 2,
+      requestHashVersion: 3,
       inputRevisionHash: requestHash(input),
       behavior,
       input: clone(input),
@@ -2348,6 +2470,7 @@ export function createTaskService({
         at: nowIso()
       },
       cooldown: null,
+      timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
       outputDir,
       checkpoint: null,
       resumeInput: null,
@@ -2355,13 +2478,14 @@ export function createTaskService({
       result: null,
       error: null,
       cleanup: { browserClosed: false, leaseReleased: false, workerExited: false, settled: false },
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
+      createdAt,
+      updatedAt: createdAt,
       startedAt: null,
       finishedAt: null,
       leaseOwner: `task:${id}`,
       leaseHeld: false
     };
+    task.displayName = buildTaskDisplayName(task);
     appendTimeline(task, 'task.created', {
       actor: taskActor(caller),
       message: `Task ${task.taskType} queued`
@@ -2649,7 +2773,7 @@ export function createTaskService({
     requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task || !isTaskOwner(task, caller)) {
+    if (!task || task.deletedAt || !isTaskOwner(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'resumeKey')) {
@@ -2745,7 +2869,7 @@ export function createTaskService({
     }
     await Promise.all([...tasks.keys()].map(awaitTaskPersistence));
     const visible = [...tasks.values()]
-      .filter((task) => canAccess(task, caller))
+      .filter((task) => !task.deletedAt && canAccess(task, caller))
       .sort((left, right) => (
         right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
       ));
@@ -2768,7 +2892,7 @@ export function createTaskService({
     await ready;
     const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task || !canAccess(task, caller)) {
+    if (!task || task.deletedAt || !canAccess(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     return readPublicRecord(task);
@@ -3089,7 +3213,7 @@ export function createTaskService({
     await ready;
     const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task || !canAccess(task, caller)) {
+    if (!task || task.deletedAt || !canAccess(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     await awaitTaskPersistence(id);
@@ -3106,7 +3230,7 @@ export function createTaskService({
     await ready;
     const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task || !canAccess(task, caller)) {
+    if (!task || task.deletedAt || !canAccess(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     await awaitTaskPersistence(id);
@@ -3417,7 +3541,7 @@ export function createTaskService({
     const records = [];
     const changedTasks = new Set();
     const owned = [...tasks.values()]
-      .filter((task) => isTaskOwner(task, caller))
+      .filter((task) => !task.deletedAt && isTaskOwner(task, caller))
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
     for (const task of owned) {
       normalizeTaskCoordination(task);
@@ -3713,6 +3837,39 @@ export function createTaskService({
     });
   }
 
+  async function deleteTask(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      const caller = callerIdentity(suppliedCaller);
+      if (caller.role !== 'manager-admin') {
+        throw new TaskServiceError('TASK_DELETE_FORBIDDEN', 'Only the Owner Dashboard can delete task records', 403);
+      }
+      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision']));
+      const task = tasks.get(id);
+      if (!task || task.deletedAt) {
+        throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
+      }
+      requireTaskRevision(task, body.expectedRevision);
+      if (
+        !TERMINAL_TASK_STATES.has(task.state) || task.cleanup?.settled !== true ||
+        children.has(task.id) || task.leaseHeld === true || finalizationFailures.has(task.id)
+      ) {
+        throw new TaskServiceError(
+          'TASK_DELETE_NOT_READY',
+          'Only terminal task records with confirmed browser and Profile cleanup can be deleted',
+          409
+        );
+      }
+      task.deletedAt = nowIso();
+      task.deletedBy = { role: caller.role, clientId: caller.clientId };
+      task.revision += 1;
+      task.updatedAt = task.deletedAt;
+      await persist(task);
+      await awaitTaskPersistence(task.id);
+      return { id: task.id, deletedAt: task.deletedAt };
+    });
+  }
+
   async function cancel(id, suppliedCaller = {}) {
     return serializeControl(id, async () => {
       await ready;
@@ -3729,7 +3886,7 @@ export function createTaskService({
     requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
     const task = tasks.get(id);
-    if (!task || !canAccess(task, caller)) {
+    if (!task || task.deletedAt || !canAccess(task, caller)) {
       throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     }
     const allowed = new Set(['requestId', 'note']);
@@ -4312,14 +4469,15 @@ export function createTaskService({
 
   async function schedulerStatus() {
     await ready;
+    const visible = [...tasks.values()].filter((task) => !task.deletedAt);
     return {
       active: children.size,
       queued: queuedTasks().length,
-      paused: [...tasks.values()].filter((task) => task.state === 'paused').length,
-      pauseRequested: [...tasks.values()].filter((task) => task.state === 'pause_requested').length,
-      cancelRequested: [...tasks.values()].filter((task) => task.state === 'cancel_requested').length,
-      waitingUser: [...tasks.values()].filter((task) => task.state === 'waiting_user').length,
-      stalled: [...tasks.values()].filter((task) => task.health?.status === 'stalled').length,
+      paused: visible.filter((task) => task.state === 'paused').length,
+      pauseRequested: visible.filter((task) => task.state === 'pause_requested').length,
+      cancelRequested: visible.filter((task) => task.state === 'cancel_requested').length,
+      waitingUser: visible.filter((task) => task.state === 'waiting_user').length,
+      stalled: visible.filter((task) => task.health?.status === 'stalled').length,
       maxConcurrent: maxConcurrentTasks,
       maxQueued: maxQueuedTasks
     };
@@ -4335,6 +4493,7 @@ export function createTaskService({
     readArtifact,
     cancel,
     terminateTask,
+    deleteTask,
     pauseTask,
     resumePausedTask,
     submitTaskCommand,

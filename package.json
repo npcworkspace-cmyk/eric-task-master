@@ -1,6 +1,6 @@
 {
   "name": "eric-task-master",
-  "version": "2.1.1",
+  "version": "2.1.3",
   "description": "Playwright browser automation runtime for AI agents with MCP, persistent Profiles, durable tasks, and unattended workflows.",
   "license": "MIT",
   "type": "module",

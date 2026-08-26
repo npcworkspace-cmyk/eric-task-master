@@ -2,7 +2,7 @@
 
 Task Master exposes a local, high-level MCP surface over STDIO. The MCP process does not execute browser code itself. It submits registered task types to the loopback Task Master manager and returns durable task IDs, bounded status, progress, and explicitly agent-visible artifacts.
 
-This document defines the native MCP path. Hosts marked `needs_adapter` must not invent an MCP registration. They use the fixed, Agent-scoped CLI path documented in [`MCP-HOSTS.md`](./MCP-HOSTS.md), which issues the same kind of scoped Manager identity but is not an MCP connection.
+This document defines the MCP-first Agent path. Each host starts its own STDIO bridge and all bridges reuse the same local Manager; multiple Agents never share one STDIO pipe. A host reported as `adapter_pending` or `extension_required` must not invent a registration. It may temporarily use the fixed, Agent-scoped CLI fallback in [`MCP-HOSTS.md`](./MCP-HOSTS.md), which issues the same kind of scoped Manager identity but is not an MCP connection.
 
 ## Stable STDIO entry
 
@@ -18,6 +18,7 @@ Required environment:
 - `TASKMASTER_CLIENT_NAME`: optional human-readable host name.
 
 `ERIC_TASK_MASTER_CLIENT_ID` and `ERIC_TASK_MASTER_CLIENT_NAME` are accepted as compatibility aliases.
+Automatically registered entries also carry the non-secret `ERIC_TASK_MASTER_RUNTIME_VERSION` marker so `connect` can require an Agent-host reload after an offline upgrade. Task code must not use it as an identity or authorization value.
 
 Manager location may be overridden with `ERIC_TASK_MASTER_HOME`, `ERIC_TASK_MASTER_HOST`, and `ERIC_TASK_MASTER_PORT`. The host must remain exactly `127.0.0.1`.
 
@@ -95,7 +96,7 @@ When state is `waiting_user`, list/read the task's `diagnostic-observation` and 
 
 Cancelling or disconnecting a wait request stops only that wait. The browser task continues under Task Master. Only `taskmaster_tasks_cancel` requests task cancellation. This prevents a transient MCP host disconnect from destroying a long task.
 
-Call `taskmaster_agent_inbox_claim` after connection and whenever wait returns pending commands. Respond through `taskmaster_task_command_respond`; command IDs and expected task revisions prevent duplicate or stale application. Commands remain durable while the Agent is offline, but Manager cannot wake an arbitrary host process that is fully closed. Before final user handoff, publish a bounded report through `taskmaster_task_report_publish`. The Owner Console renders that report as the result and keeps diagnostics, logs, and artifacts secondary.
+Call `taskmaster_agent_inbox_claim` after connection and whenever wait returns pending commands. Respond through `taskmaster_task_command_respond`; command IDs and expected task revisions prevent duplicate or stale application. Commands remain durable while the Agent is offline, but Manager cannot wake an arbitrary host process that is fully closed. Before final user handoff, publish a bounded report through `taskmaster_task_report_publish`. Reports remain available to the owning Agent and API clients; the deliberately small Owner Console shows task progress and lifecycle controls but does not render reports, diagnostics, logs, or artifacts.
 
 If a failed task exposes a preserved checkpoint and settled cleanup, `taskmaster_tasks_resume` starts a new attempt on the same task ID. It requires a stable `resumeKey`; retrying the same key is idempotent, while a new key is a new explicit resume decision. Resume fails closed for the wrong owner, a non-failed task, missing checkpoint, unsettled cleanup, missing persisted context, or a changed module snapshot. The caller must inspect the checkpoint and current site state before repeating any action whose external outcome is unknown.
 

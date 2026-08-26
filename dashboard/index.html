@@ -4,345 +4,78 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
-    <title>Eric Task Master · Owner Console</title>
+    <title>Eric Task Master · 本机任务面板</title>
     <link rel="stylesheet" href="/dashboard/styles.css">
   </head>
   <body class="npc-app">
     <a class="skip-link" href="#main-content">跳到主要内容</a>
 
     <header class="app-header npc-glass-light">
-      <a class="brand" href="/dashboard" aria-label="Eric Task Master Owner Console 首页">
+      <a class="brand" href="/dashboard" aria-label="Eric Task Master 任务面板首页">
         <span class="npc-brand-mark" aria-hidden="true">NPC</span>
-        <span class="brand-copy">
-          <strong>Eric Task Master</strong>
-          <small>OWNER CONSOLE · LOCAL</small>
-        </span>
+        <span class="brand-copy"><strong>Eric Task Master</strong><small>LOCAL TASK PANEL</small></span>
       </a>
 
       <nav class="primary-nav" aria-label="主要导航">
-        <button class="nav-link is-active" type="button" data-view="overview" aria-current="page">总览</button>
-        <button class="nav-link" type="button" data-view="agents">Agents</button>
+        <button class="nav-link is-active" type="button" data-view="tasks" aria-current="page">任务</button>
         <button class="nav-link" type="button" data-view="profiles">Profiles</button>
-        <button class="nav-link" type="button" data-view="tasks">任务</button>
       </nav>
 
       <div class="header-actions">
         <div class="connection" role="status" aria-live="polite">
           <span id="connection-dot" class="npc-signal-dot is-pending" aria-hidden="true"></span>
-          <span>
-            <strong id="connection-label">正在连接本机 Manager</strong>
-            <small id="last-refresh">尚未刷新</small>
-          </span>
+          <span><strong id="connection-label">正在连接本机 Manager</strong><small id="last-refresh">尚未刷新</small></span>
         </div>
-        <button id="refresh-all" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="刷新全部数据" title="刷新全部数据">
-          <span aria-hidden="true">↻</span>
-        </button>
-        <button id="logout-button" class="npc-btn npc-btn-ghost compact-button hidden" type="button">退出控制台</button>
+        <button id="refresh-all" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="刷新任务和 Profiles" title="刷新任务和 Profiles"><span aria-hidden="true">↻</span></button>
+        <button id="logout-button" class="npc-btn npc-btn-ghost compact-button hidden" type="button">退出</button>
       </div>
     </header>
 
     <div id="auth-banner" class="system-banner auth-banner hidden" role="alert">
-      <div>
-        <strong>此浏览器尚未建立 Owner 会话</strong>
-        <p>请从部署完成页打开一次控制台。完成首次可信连接后，这个固定地址可以直接收藏使用。</p>
-      </div>
+      <div><strong>此浏览器尚未建立 Owner 会话</strong><p>请从部署完成页打开一次面板。首次可信连接后，这个固定地址可以直接收藏使用。</p></div>
       <button id="retry-auth" class="npc-btn npc-btn-dark" type="button">重新检查连接</button>
     </div>
 
     <div id="stale-banner" class="system-banner stale-banner hidden" role="status">
-      <div>
-        <strong>实时连接暂时中断</strong>
-        <p>正在保留上次成功状态并自动重试；不会清空任务、Profile 或报告。</p>
-      </div>
+      <div><strong>实时连接暂时中断</strong><p>正在保留上次成功状态并自动重试，不会中断后台任务。</p></div>
       <button id="retry-stale" class="npc-btn npc-btn-secondary" type="button">立即重试</button>
     </div>
 
     <main id="main-content" class="workspace" tabindex="-1">
-      <section id="view-overview" class="view is-active" data-view-panel="overview" aria-labelledby="overview-title">
-        <div class="overview-stage npc-stage npc-stage-grid">
-          <div class="stage-copy">
-            <p class="npc-eyebrow">LOCAL AUTOMATION OS</p>
-            <h1 id="overview-title" tabindex="-1">
-              <span>一个工作台，掌握所有</span>
-              <span>Agent 的浏览器任务。</span>
-            </h1>
-            <p>从实时执行到最终报告，统一查看进度、管理 Profile，并在人类需要时随时介入。</p>
-          </div>
-          <div class="stage-status npc-glass-dark" aria-label="Manager 运行状态">
-            <span id="manager-stage-dot" class="npc-signal-dot is-pending" aria-hidden="true"></span>
-            <div>
-              <small>MANAGER STATUS</small>
-              <strong id="manager-stage-label">等待本机服务</strong>
-              <span id="manager-stage-meta">THIS DEVICE · OWNER CONSOLE</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="metric-strip" aria-label="运行摘要">
-          <article class="metric primary-metric">
-            <span>已接入 Agent</span>
-            <strong id="summary-agents" class="npc-number">—</strong>
-            <small id="summary-online-agents">— 在线</small>
-          </article>
-          <article class="metric">
-            <span>全局 Profiles</span>
-            <strong id="summary-profiles" class="npc-number">—</strong>
-            <small>本机 Agent 共享</small>
-          </article>
-          <article class="metric">
-            <span>运行中任务</span>
-            <strong id="summary-running" class="npc-number">—</strong>
-            <small id="summary-queued">— 排队</small>
-          </article>
-          <article class="metric">
-            <span>需要关注</span>
-            <strong id="summary-attention" class="npc-number">—</strong>
-            <small>等待指令或异常</small>
-          </article>
-        </div>
-
-        <div class="overview-grid">
-          <section class="surface-card attention-card" aria-labelledby="attention-title">
-            <div class="section-heading compact-heading">
-              <div>
-                <p class="npc-eyebrow">NEEDS ATTENTION</p>
-                <h2 id="attention-title">现在需要你处理</h2>
-              </div>
-              <button class="text-link" type="button" data-open-view="tasks">查看全部任务 →</button>
-            </div>
-            <div id="attention-list" class="compact-list" aria-live="polite">
-              <p class="empty-state">正在读取任务状态…</p>
-            </div>
-          </section>
-
-          <section class="surface-card report-card" aria-labelledby="reports-title">
-            <div class="section-heading compact-heading">
-              <div>
-                <p class="npc-eyebrow">LATEST REPORTS</p>
-                <h2 id="reports-title">最近完成的报告</h2>
-              </div>
-            </div>
-            <div id="recent-reports" class="compact-list" aria-live="polite">
-              <p class="empty-state">正在读取任务报告…</p>
-            </div>
-          </section>
-        </div>
-      </section>
-
-      <section id="view-agents" class="view" data-view-panel="agents" aria-labelledby="agents-title" hidden>
+      <section id="view-tasks" class="view is-active" data-view-panel="tasks" aria-labelledby="tasks-title">
         <div class="section-heading page-heading">
-          <div>
-            <p class="npc-eyebrow">AGENT REGISTRY</p>
-            <h1 id="agents-title" tabindex="-1">已接入 Manager 的 Agent</h1>
-            <p>在线表示适配器最近有心跳；执行中表示它当前拥有活动任务，两者不是同一件事。</p>
-          </div>
-          <span id="agent-count-chip" class="npc-chip npc-chip-info">读取中</span>
+          <div><p class="npc-eyebrow">TASKS</p><h1 id="tasks-title" tabindex="-1">任务进度</h1><p>查看 Agent 正在做什么，并可暂停、恢复、取消或删除已结束的任务记录。</p></div>
+          <span id="task-count-chip" class="npc-chip npc-chip-info" aria-live="polite">读取中</span>
         </div>
-        <div id="agents" class="agent-grid" aria-live="polite">
-          <p class="empty-state span-all">正在读取 Agent Registry…</p>
-        </div>
-        <p id="agents-error" class="inline-error hidden" role="status"></p>
+        <div id="tasks" class="task-list" aria-live="polite"><p class="empty-state">正在读取任务…</p></div>
+        <p id="tasks-error" class="inline-error hidden" role="status"></p>
       </section>
 
       <section id="view-profiles" class="view" data-view-panel="profiles" aria-labelledby="profiles-title" hidden>
         <div class="section-heading page-heading">
-          <div>
-            <p class="npc-eyebrow">GLOBAL PROFILE POOL</p>
-            <h1 id="profiles-title" tabindex="-1">Playwright Profiles</h1>
-            <p>所有 Profile 都是本机全局资源。任务按 Profile 串行，互不抢占浏览器状态。</p>
-          </div>
+          <div><p class="npc-eyebrow">PROFILES</p><h1 id="profiles-title" tabindex="-1">浏览器 Profiles</h1><p>管理独立浏览器环境。任务按 Profile 串行，彼此不会抢占登录状态。</p></div>
           <button id="toggle-profile-create" class="npc-btn npc-btn-primary" type="button" aria-expanded="false" aria-controls="profile-create-panel">新建 Profile</button>
         </div>
 
         <section id="profile-create-panel" class="surface-card create-profile-panel hidden" aria-labelledby="profile-create-title">
-          <div class="compact-heading">
-            <div>
-              <p class="npc-eyebrow">NEW PROFILE</p>
-              <h2 id="profile-create-title">创建独立浏览器环境</h2>
-            </div>
-            <button id="close-profile-create" class="npc-btn npc-btn-ghost compact-button" type="button">关闭</button>
-          </div>
+          <div class="compact-heading"><div><p class="npc-eyebrow">NEW PROFILE</p><h2 id="profile-create-title">创建浏览器环境</h2></div><button id="close-profile-create" class="npc-btn npc-btn-ghost compact-button" type="button">关闭</button></div>
           <form id="create-profile-form" class="profile-form">
-            <label>
-              <span>Profile 名称</span>
-              <input id="profile-name" class="npc-field" maxlength="80" autocomplete="off" placeholder="例如：Reddit 账号" required>
-            </label>
-            <label>
-              <span>类型</span>
-              <select id="profile-kind" class="npc-field">
-                <option value="persistent">持久登录</option>
-                <option value="ephemeral">临时无登录</option>
-              </select>
-            </label>
-            <label>
-              <span>浏览器</span>
-              <select id="profile-engine" class="npc-field">
-                <option value="chrome">本机稳定版 Chrome</option>
-                <option value="chromium">项目锁定 Chromium</option>
-              </select>
-            </label>
-            <label>
-              <span>任务行为</span>
-              <select id="profile-mode" class="npc-field">
-                <option value="human">深度拟人</option>
-                <option value="adaptive">自适应</option>
-                <option value="fast">快速</option>
-              </select>
-            </label>
-            <label class="check-field">
-              <input id="profile-headless" type="checkbox">
-              <span>任务在后台运行</span>
-            </label>
+            <label><span>Profile 名称</span><input id="profile-name" class="npc-field" maxlength="80" autocomplete="off" placeholder="例如：工作账号" required></label>
+            <label><span>类型</span><select id="profile-kind" class="npc-field"><option value="persistent">持久登录</option><option value="ephemeral">临时无登录</option></select></label>
+            <label><span>浏览器</span><select id="profile-engine" class="npc-field"><option value="chrome">本机稳定版 Chrome</option><option value="chromium">项目锁定 Chromium</option></select></label>
+            <label><span>任务行为</span><select id="profile-mode" class="npc-field"><option value="human">深度拟人</option><option value="adaptive">自适应</option><option value="fast">快速</option></select></label>
+            <label class="check-field"><input id="profile-headless" type="checkbox"><span>任务在后台运行</span></label>
             <button class="npc-btn npc-btn-primary" type="submit">创建 Profile</button>
           </form>
-          <p class="form-note">持久 Profile 固定使用本机 Chrome 与深度拟人行为；临时 Profile 每个任务结束后销毁浏览器状态。</p>
+          <p class="form-note">持久 Profile 固定使用本机 Chrome 与深度拟人行为；临时 Profile 会在任务结束后销毁浏览器状态。</p>
         </section>
 
-        <div id="profiles" class="profile-grid" aria-live="polite">
-          <p class="empty-state span-all">正在读取 Profiles…</p>
-        </div>
+        <div id="profiles" class="profile-grid" aria-live="polite"><p class="empty-state span-all">正在读取 Profiles…</p></div>
         <p id="profiles-error" class="inline-error hidden" role="status"></p>
-      </section>
-
-      <section id="view-tasks" class="view" data-view-panel="tasks" aria-labelledby="tasks-title" hidden>
-        <div class="section-heading page-heading tasks-heading">
-          <div>
-            <p class="npc-eyebrow">TASK OPERATIONS</p>
-            <h1 id="tasks-title" tabindex="-1">任务、进度与报告</h1>
-            <p>默认展示人类可读结果；原始运行诊断只在任务详情底部按需展开。</p>
-          </div>
-          <div class="task-filters" aria-label="任务筛选">
-            <label class="search-field">
-              <span class="sr-only">搜索任务</span>
-              <input id="task-search" class="npc-field" type="search" placeholder="搜索任务或 Agent">
-            </label>
-            <label>
-              <span class="sr-only">按 Agent 筛选</span>
-              <select id="task-agent-filter" class="npc-field">
-                <option value="">全部 Agent</option>
-              </select>
-            </label>
-            <label>
-              <span class="sr-only">按状态筛选</span>
-              <select id="task-state-filter" class="npc-field">
-                <option value="">全部状态</option>
-                <option value="active">运行中</option>
-                <option value="attention">需关注</option>
-                <option value="completed">已完成</option>
-                <option value="cancelled">已终止</option>
-              </select>
-            </label>
-          </div>
-        </div>
-        <div id="tasks" class="task-list" aria-live="polite">
-          <p class="empty-state">正在读取任务…</p>
-        </div>
-        <p id="tasks-error" class="inline-error hidden" role="status"></p>
       </section>
 
       <p id="dashboard-message" class="toast hidden" role="status" aria-live="polite"></p>
     </main>
-
-    <dialog id="task-detail-dialog" class="task-dialog" aria-labelledby="task-detail-title">
-      <div class="dialog-shell">
-        <header class="dialog-header">
-          <div>
-            <p class="npc-eyebrow">TASK DETAIL</p>
-            <h1 id="task-detail-title">任务详情</h1>
-            <div id="task-detail-meta" class="detail-meta"></div>
-          </div>
-          <button id="close-task-detail" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="关闭任务详情">×</button>
-        </header>
-
-        <div id="task-detail-loading" class="detail-loading" role="status">正在读取任务状态与最终报告…</div>
-        <p id="task-detail-error" class="inline-error detail-inline-error hidden" role="alert"></p>
-        <div id="task-detail-content" class="hidden">
-          <section class="task-control-strip" aria-label="任务控制">
-            <div class="live-progress">
-              <div class="live-progress-heading">
-                <span id="detail-activity">等待任务反馈</span>
-                <strong id="detail-progress-copy" class="npc-number">—</strong>
-              </div>
-              <div id="detail-progress-track" class="progress-track" role="progressbar" aria-label="任务进度">
-                <span id="detail-progress-bar" class="progress-bar"></span>
-              </div>
-              <p id="detail-progress-message">尚无进度信息</p>
-            </div>
-            <div class="task-actions">
-              <button id="task-pause" class="npc-btn npc-btn-secondary" type="button">暂停</button>
-              <button id="task-resume" class="npc-btn npc-btn-primary" type="button">继续</button>
-              <button id="task-terminate" class="npc-btn npc-btn-danger" type="button">终止</button>
-              <button id="task-modify" class="npc-btn npc-btn-dark" type="button">修改任务</button>
-              <button id="task-ask" class="npc-btn npc-btn-secondary" type="button">询问 Agent</button>
-            </div>
-          </section>
-          <div class="detail-layout">
-            <div class="detail-primary">
-              <section class="report-surface" aria-labelledby="report-title">
-                <div class="report-heading">
-                  <div>
-                    <p class="npc-eyebrow">AGENT REPORT</p>
-                    <h2 id="report-title">最终报告</h2>
-                  </div>
-                  <span id="report-status" class="npc-chip npc-chip-info">等待生成</span>
-                </div>
-                <div id="task-report" class="report-content">
-                  <p class="empty-state">Agent 尚未发布最终报告。</p>
-                </div>
-              </section>
-
-              <section id="command-panel" class="command-panel" aria-labelledby="command-title">
-                <div class="compact-heading">
-                  <div>
-                    <p class="npc-eyebrow">HUMAN → AGENT</p>
-                    <h2 id="command-title">向 Agent 发送指令</h2>
-                  </div>
-                  <span id="command-target" class="npc-chip">当前任务 Agent</span>
-                </div>
-                <form id="task-command-form">
-                  <input id="command-kind" type="hidden" value="ask">
-                  <label for="command-text">你的要求</label>
-                  <textarea id="command-text" class="npc-field" rows="4" maxlength="4000" placeholder="询问任务状况，或说明需要修改的目标…" required></textarea>
-                  <div class="command-footer">
-                    <p id="command-help">这条消息会持久保存，并在 Agent 可用时送达。</p>
-                    <button id="send-command" class="npc-btn npc-btn-primary" type="submit">发送给 Agent</button>
-                  </div>
-                </form>
-              </section>
-            </div>
-
-            <aside class="detail-secondary">
-              <section class="timeline-surface" aria-labelledby="timeline-title">
-                <div class="compact-heading">
-                  <div>
-                    <p class="npc-eyebrow">ACTIVITY</p>
-                    <h2 id="timeline-title">任务时间线</h2>
-                  </div>
-                </div>
-                <ol id="task-timeline" class="timeline"></ol>
-              </section>
-
-              <section class="artifact-surface" aria-labelledby="artifacts-title">
-                <div class="compact-heading">
-                  <div>
-                    <p class="npc-eyebrow">DELIVERABLES</p>
-                    <h2 id="artifacts-title">交付文件</h2>
-                  </div>
-                </div>
-                <div id="task-artifacts" class="artifact-list"></div>
-              </section>
-            </aside>
-          </div>
-
-          <details class="developer-details">
-            <summary>开发者诊断 · 仅排障时展开</summary>
-            <p>这里显示受限的运行状态、错误和清理信息，不作为人类任务结果。</p>
-            <pre id="developer-diagnostics"></pre>
-          </details>
-        </div>
-      </div>
-    </dialog>
-
     <script type="module" src="/dashboard/dashboard.js"></script>
   </body>
 </html>

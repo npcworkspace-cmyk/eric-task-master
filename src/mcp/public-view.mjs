@@ -269,12 +269,22 @@ export function publicTask(task, { includeResult = true } = {}) {
       ['name', stringValue(task.agent.name, 160)]
     ])
     : undefined;
+  const timing = task?.timing && typeof task.timing === 'object'
+    ? definedEntries([
+      ['recorded', booleanValue(task.timing.recorded)],
+      ['runDurationMs', task.timing.runDurationMs === null ? null : numberValue(task.timing.runDurationMs)],
+      ['cooldownDurationMs', task.timing.cooldownDurationMs === null ? null : numberValue(task.timing.cooldownDurationMs)],
+      ['totalDurationMs', numberValue(task.timing.totalDurationMs)]
+    ])
+    : undefined;
   return definedEntries([
     ['id', stringValue(task?.id, 128)],
     ['jobId', stringValue(task?.jobId, 128)],
     ['revision', Number.isSafeInteger(task?.revision) ? task.revision : undefined],
     ['profileId', stringValue(task?.profileId, 128)],
     ['taskType', stringValue(task?.taskType, 128)],
+    ['taskLabel', stringValue(task?.taskLabel, 80)],
+    ['displayName', stringValue(task?.displayName, 200)],
     ['createdBy', stringValue(task?.createdBy, 128)],
     ['agent', agent?.clientId && agent?.name ? agent : undefined],
     ['behavior', stringValue(task?.behavior, 32)],
@@ -292,6 +302,7 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['health', health],
     ['behaviorState', behaviorState],
     ['cooldown', cooldown],
+    ['timing', timing],
     ['queuePosition', numberValue(task?.queuePosition)],
     ['queueReason', stringValue(task?.queueReason, 160)],
     ['cleanup', cleanup && Object.keys(cleanup).length ? cleanup : undefined],

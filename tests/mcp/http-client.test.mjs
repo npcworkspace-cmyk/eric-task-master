@@ -140,6 +140,7 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   const started = await client.startTask({
     taskType: 'fixture.read',
     profileId: 'profile_safe',
+    taskLabel: 'Read fixture page',
     input: { url: 'https://example.com/' },
     idempotencyKey: 'request-safe-0001'
   });
@@ -158,7 +159,7 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.match(requests[0].body.connectionId, /^mcp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
   assert.equal(requests[0].connectionId, requests[0].body.connectionId);
   assert.equal(new Set(requests.map((request) => request.connectionId)).size, 1);
-  assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['idempotencyKey', 'input', 'profileId', 'taskType']);
+  assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['idempotencyKey', 'input', 'profileId', 'taskLabel', 'taskType']);
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
 });
 

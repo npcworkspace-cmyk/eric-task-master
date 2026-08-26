@@ -127,6 +127,8 @@ const TaskSchema = z.strictObject({
   revision: z.number().int().positive().optional(),
   profileId: z.string().optional(),
   taskType: z.string().optional(),
+  taskLabel: z.string().max(80).optional(),
+  displayName: z.string().max(200).optional(),
   createdBy: z.string().optional(),
   agent: AgentSchema.optional(),
   behavior: z.string().optional(),
@@ -168,6 +170,12 @@ const TaskSchema = z.strictObject({
     resumeAt: z.string().optional(),
     reason: z.string().optional(),
     updatedAt: z.string().optional()
+  }).optional(),
+  timing: z.strictObject({
+    recorded: z.boolean(),
+    runDurationMs: z.number().nonnegative().nullable(),
+    cooldownDurationMs: z.number().nonnegative().nullable(),
+    totalDurationMs: z.number().nonnegative()
   }).optional(),
   queuePosition: z.number().optional(),
   queueReason: z.string().optional(),
@@ -515,6 +523,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
     inputSchema: z.strictObject({
       taskType: IdentifierSchema,
       profileId: IdentifierSchema,
+      taskLabel: z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/u).optional(),
       input: JsonObjectSchema.default({}),
       timeoutMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).optional(),
       idempotencyKey: IdempotencyKeySchema

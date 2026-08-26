@@ -13,7 +13,7 @@ test('all production recipes scaffold and pass isolated module preflight without
     for (const recipe of TASK_RECIPES) {
       const location = path.join(root, recipe);
       const created = await scaffoldTaskPack(location, { name: `recipe-${recipe}`, recipe });
-      assert.equal(created.pack.tasks[0].name, `recipe-${recipe}.${recipe}`);
+      assert.equal(created.pack.tasks[0].name, `recipe-${recipe}.${recipe}.v1`);
       const checked = await preflightTaskPack(location);
       assert.equal(checked.ok, true, `${recipe}: ${JSON.stringify(checked.checks)}`);
       assert.equal(checked.checks.length, 1);

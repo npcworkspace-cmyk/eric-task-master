@@ -346,6 +346,99 @@ test('task identity snapshots the signed Agent name and legacy tasks fall back t
   await service.close();
 });
 
+test('task records use stable names, cumulative cooldown timing, and safe logical deletion', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-task-record-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, "export const meta = { title: 'Fallback task' }; export async function run() {}\n");
+  const store = fakeProfileStore(root);
+  const agent = Object.freeze({ role: 'agent', clientId: 'fixture-installation:codex', agentName: 'Variable task name' });
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(async () => {
+          child.emit('message', { type: 'state', state: 'running' });
+          child.emit('message', {
+            type: 'cooldown',
+            cooldown: {
+              status: 'active', durationMs: 5_000, startedAt: '2026-08-26T00:00:00.000Z',
+              resumeAt: '2026-08-26T00:00:05.000Z', reason: 'Fixture cooldown'
+            }
+          });
+          child.emit('message', {
+            type: 'cooldown',
+            cooldown: {
+              status: 'completed', durationMs: 5_000, elapsedMs: 1,
+              startedAt: '2026-08-26T00:00:00.000Z', finishedAt: '2026-08-26T00:00:01.234Z',
+              resumeAt: '2026-08-26T00:00:05.000Z', reason: 'Fixture cooldown'
+            }
+          });
+          child.emit('message', {
+            type: 'result',
+            result: { summary: 'Done', evidence: [{ kind: 'message', value: 'fixture verified' }] }
+          });
+          child.emit('message', { type: 'state', state: 'completed' });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          await writeSessionReceipt(message, child, 'completed');
+          child.finish(0);
+        });
+      });
+    }
+  });
+  await service.installTaskType({ name: 'fixture.named', modulePath }, ADMIN);
+  await assert.rejects(service.create({
+    profileId: 'profile_test', taskType: 'fixture.named', taskLabel: 'bad\nlabel',
+    idempotencyKey: 'invalid-label-fixture'
+  }, agent), { code: 'INVALID_TASK_LABEL' });
+
+  const created = await service.create({
+    profileId: 'profile_test', taskType: 'fixture.named', taskLabel: '采集 5 个页面',
+    idempotencyKey: 'task-record-fixture'
+  }, agent);
+  assert.match(created.displayName, /^Codex-采集 5 个页面-\d{8}-\d{6}Z$/u);
+  assert.equal(created.taskLabel, '采集 5 个页面');
+  const completed = await waitFor(async () => {
+    const task = await service.get(created.id, agent);
+    return task.state === 'completed' ? task : null;
+  });
+  assert.equal(completed.cleanup?.settled, true);
+  assert.equal(completed.timing?.cooldownDurationMs, 1);
+  assert.equal(completed.timing.recorded, true);
+  assert.ok(completed.timing.totalDurationMs >= completed.timing.runDurationMs + completed.timing.cooldownDurationMs);
+  const deleted = await service.deleteTask(created.id, {
+    commandId: 'delete-fixture-1',
+    expectedRevision: completed.revision
+  }, ADMIN);
+  assert.equal(deleted.id, created.id);
+  assert.equal((await service.list({ caller: ADMIN })).tasks.length, 0);
+  await assert.rejects(service.get(created.id, ADMIN), { code: 'TASK_NOT_FOUND' });
+  await assert.rejects(service.create({
+    profileId: 'profile_test', taskType: 'fixture.named', taskLabel: '采集 5 个页面',
+    idempotencyKey: 'task-record-fixture'
+  }, agent), { code: 'TASK_IDEMPOTENCY_RETIRED' });
+  await service.close();
+
+  const reopened = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() { throw new Error('deleted task must not relaunch'); }
+  });
+  assert.equal((await reopened.list({ caller: ADMIN })).tasks.length, 0);
+  await assert.rejects(reopened.get(created.id, ADMIN), { code: 'TASK_NOT_FOUND' });
+  await assert.rejects(reopened.create({
+    profileId: 'profile_test', taskType: 'fixture.named', taskLabel: '采集 5 个页面',
+    idempotencyKey: 'task-record-fixture'
+  }, agent), { code: 'TASK_IDEMPOTENCY_RETIRED' });
+  await reopened.close();
+});
+
 test('Profile behavior changes do not break idempotency and queued attempts use launch-time policy', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-policy-idempotency-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -402,7 +495,7 @@ test('Profile behavior changes do not break idempotency and queued attempts use 
   const queued = await service.create(request, ADMIN);
   assert.equal(queued.state, 'queued');
   assert.equal(queued.behavior, 'fast');
-  assert.equal((await service.getInternal(queued.id)).requestHashVersion, 2);
+  assert.equal((await service.getInternal(queued.id)).requestHashVersion, 3);
 
   store.profile.defaultBehavior = 'human';
   assert.equal((await service.create(request, ADMIN)).id, queued.id);

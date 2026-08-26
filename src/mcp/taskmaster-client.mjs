@@ -403,12 +403,19 @@ export class HttpTaskMasterClient {
   }
 
   async startTask(input) {
-    assertAllowedKeys(input, new Set(['taskType', 'profileId', 'input', 'timeoutMs', 'idempotencyKey']), 'Task request');
+    assertAllowedKeys(input, new Set(['taskType', 'profileId', 'taskLabel', 'input', 'timeoutMs', 'idempotencyKey']), 'Task request');
     assertIdentifier(input.taskType, 'taskType');
     assertIdentifier(input.profileId, 'profileId');
     assertIdentifier(input.idempotencyKey, 'idempotencyKey');
     if (input.idempotencyKey.length < 8) {
       throw clientError('INVALID_IDEMPOTENCY_KEY', 'idempotencyKey must contain at least 8 characters.');
+    }
+    if (
+      input.taskLabel !== undefined &&
+      (typeof input.taskLabel !== 'string' || !input.taskLabel.trim() || input.taskLabel.length > 80 ||
+        /[\u0000-\u001f\u007f]/u.test(input.taskLabel))
+    ) {
+      throw clientError('INVALID_TASK_LABEL', 'taskLabel must be 1-80 characters without control characters.');
     }
     assertSafeTaskInput(input.input);
     const payload = await this.#request('/v1/tasks', { method: 'POST', body: input });
@@ -847,7 +854,9 @@ function createManagerStarter({ baseUrl, host, port, stateDir, fetchImpl = globa
       throw clientError(
         'MANAGER_VERSION_MISMATCH',
         `Running Task Master ${payload.version || 'unknown'} does not match MCP ${VERSION}.`,
-        { nextAction: 'Stop the older Manager and reconnect Task Master once.' }
+        {
+          nextAction: 'If Task Master was just upgraded, reload this Agent host once; otherwise run the fixed connect command once to reconcile Manager and MCP versions.'
+        }
       );
     }
     return payload;
