@@ -121,6 +121,36 @@ test('human click reaches an offscreen target through bounded wheel gestures ins
   assert.ok(action.audit.pointerMoves >= 14);
 });
 
+test('human select closes the native popup, moves relative to the current option, and verifies the result', async () => {
+  const { calls, locator, page } = fixture();
+  let selectedIndex = 2;
+  const values = ['alpha', 'beta', 'gamma'];
+  locator.evaluate = async (_callback, requested) => {
+    const targetIndex = values.indexOf(String(requested));
+    return { currentIndex: selectedIndex, targetIndex, targetValue: values[targetIndex] ?? null };
+  };
+  locator.inputValue = async () => values[selectedIndex];
+  page.keyboard.press = async (key) => {
+    calls.push(['key', key]);
+    if (key === 'ArrowUp') selectedIndex -= 1;
+    if (key === 'ArrowDown') selectedIndex += 1;
+  };
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    random: () => 0.5,
+    sleep: async () => {}
+  });
+
+  const selected = await action.select('#choice', 'alpha');
+
+  assert.equal(selected, 'alpha');
+  assert.deepEqual(calls.filter((item) => item[0] === 'key').map((item) => item[1]), [
+    'Escape', 'ArrowUp', 'ArrowUp', 'Tab'
+  ]);
+  assert.equal(action.audit.selectionKeyEvents, 4);
+});
+
 test('adaptive mode grades ordinary dynamic signals separately from ambiguous failures', async () => {
   const { locator, page } = fixture();
   const sleeps = [];

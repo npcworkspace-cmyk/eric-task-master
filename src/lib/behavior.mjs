@@ -330,32 +330,51 @@ export function createActionHelper({
 
   async function chooseSelectOption(locator, value, options) {
     if (!usesHumanTiming()) return locator.selectOption(value, options);
-    const targetIndex = await locator.evaluate((select, requested) => {
+    const selection = await locator.evaluate((select, requested) => {
       const first = Array.isArray(requested) ? requested[0] : requested;
-      const requestedValue = typeof first === 'object' && first !== null
-        ? first.value ?? first.label
-        : first;
-      return [...select.options].findIndex((option) => (
-        option.value === String(requestedValue) || option.label === String(requestedValue)
-      ));
+      const requestedIndex = typeof first === 'object' && first !== null ? first.index : undefined;
+      const requestedValue = typeof first === 'object' && first !== null ? first.value ?? first.label : first;
+      const targetIndex = Number.isSafeInteger(requestedIndex)
+        ? requestedIndex
+        : [...select.options].findIndex((option) => (
+          option.value === String(requestedValue) || option.label === String(requestedValue)
+        ));
+      return {
+        currentIndex: select.selectedIndex,
+        targetIndex,
+        targetValue: targetIndex >= 0 && targetIndex < select.options.length
+          ? select.options[targetIndex].value
+          : null
+      };
     }, value);
-    if (!Number.isSafeInteger(targetIndex) || targetIndex < 0) {
+    if (!Number.isSafeInteger(selection?.targetIndex) || selection.targetIndex < 0 || selection.targetValue === null) {
       const error = new Error('Requested select option is unavailable');
       error.code = 'JOURNEY_SELECT_OPTION_NOT_FOUND';
       throw error;
     }
     await humanClick(locator);
-    await page.keyboard.press('Home');
+    // Native select popups differ across Chromium platforms. Close the popup
+    // while retaining focus, move from the current option with real arrow-key
+    // events, then blur with Tab so input/change handlers settle consistently.
+    await page.keyboard.press('Escape');
     metrics.selectionKeyEvents += 1;
-    for (let index = 0; index < targetIndex; index += 1) {
+    const direction = selection.targetIndex >= selection.currentIndex ? 'ArrowDown' : 'ArrowUp';
+    const distance = Math.abs(selection.targetIndex - selection.currentIndex);
+    for (let index = 0; index < distance; index += 1) {
       await sleep(numberBetween(timing.selectionKeyPause, random));
-      await page.keyboard.press('ArrowDown');
+      await page.keyboard.press(direction);
       metrics.selectionKeyEvents += 1;
     }
     await sleep(numberBetween(timing.selectionKeyPause, random));
-    await page.keyboard.press('Enter');
+    await page.keyboard.press('Tab');
     metrics.selectionKeyEvents += 1;
-    return locator.inputValue?.();
+    const actual = await locator.inputValue?.();
+    if (actual !== selection.targetValue) {
+      const error = new Error('Requested select option was not applied by keyboard interaction');
+      error.code = 'JOURNEY_SELECT_OPTION_UNCHANGED';
+      throw error;
+    }
+    return actual;
   }
 
   function signal(kind) {

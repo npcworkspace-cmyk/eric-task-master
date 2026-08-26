@@ -146,6 +146,7 @@ export async function runHostCommand(command, args, {
   platform = process.platform,
   timeoutMs = COMMAND_TIMEOUT_MS
 } = {}) {
+  const runtimePlatform = process.platform;
   const launch = platform === 'win32'
     ? await resolveWindowsLaunch(command, args, env)
     : { command, args };
@@ -153,7 +154,11 @@ export async function runHostCommand(command, args, {
     const child = spawn(launch.command, launch.args, {
       env,
       windowsHide: true,
-      detached: platform !== 'win32',
+      // `platform` may intentionally simulate Windows command resolution in a
+      // cross-platform test. Process-tree ownership must follow the OS that is
+      // actually running this child, otherwise POSIX CI cannot terminate the
+      // simulated Windows shim's descendants.
+      detached: runtimePlatform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe']
     });
     const chunks = [];
@@ -177,7 +182,7 @@ export async function runHostCommand(command, args, {
       if (settled || terminating) return;
       terminating = true;
       clearTimeout(timer);
-      await terminateProcessTree(child, { env, platform });
+      await terminateProcessTree(child, { env, platform: runtimePlatform });
       finish(error);
     }
 

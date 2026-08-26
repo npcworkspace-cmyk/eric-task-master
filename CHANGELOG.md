@@ -7,6 +7,7 @@
 - Added read-only Page, Context, Frame, FrameLocator, and Locator observation facades plus Pack source preflight so direct Playwright mutation and legacy action bypasses fail closed.
 - Added a ten-check `interaction-audit.json` completion gate. A contracted task cannot publish success unless visible target acquisition, pointer/click mechanics, input cadence where applicable, segmented scrolling, transition verification, bypass absence, and step settlement all pass.
 - Migrated all five Task Pack recipes and the real Chromium acceptance task to Human Journey, added an offscreen pagination browser test, and expanded acceptance to validate the generated 10/10 audit and cleanup.
+- Stabilized native select interaction across Windows, macOS, and Linux by using focus-preserving keyboard traversal with explicit value verification, and bound OpenClaw process-tree cleanup to the actual runner OS during cross-platform shim validation.
 - Kept the boundary explicit: Human Journey improves reliability and consistency but does not spoof fingerprints, bypass CAPTCHA, or promise that websites cannot identify automation.
 
 ## 2.1.3 - 2026-08-26
