@@ -734,7 +734,9 @@ export async function createManager({
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
       const profileId = decodeURIComponent(profileMatch[1]);
       requireProfileAccess(await profileStore.get(profileId), auth, { manage: true });
-      const removed = await profileStore.remove(profileId);
+      const removed = await profileStore.remove(profileId, {
+        discardQuarantinedEphemeral: true
+      });
       sendJson(response, 200, { removed: publicProfile(removed) }, cors);
       return;
     }

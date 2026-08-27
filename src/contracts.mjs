@@ -1,7 +1,7 @@
 import { isSensitiveKey, redactPublicText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
 
-export const VERSION = '2.5.1';
+export const VERSION = '2.5.2';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -65,6 +65,7 @@ export function publicProfile(profile) {
   ]) {
     if (profile?.[key] !== undefined) safe[key] = profile[key];
   }
+  if (profile?.lease?.cleanupRequired === true) safe.cleanupRequired = true;
   return safe;
 }
 

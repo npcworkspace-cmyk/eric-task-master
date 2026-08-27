@@ -77,6 +77,8 @@ Action failure, task timeout, delayed heartbeat, stalled progress, and explicit 
 
 The Worker emits liveness heartbeats automatically. Task modules must still report meaningful progress after each externally verifiable unit. Manager distinguishes “process alive” from “work advancing,” wakes bounded waits with attention states, requests diagnostics on silence, and requires proof that every task browser closed. If closure cannot be confirmed, cleanup stays unsettled and the Profile remains blocked; never submit a replacement task on that Profile.
 
+The Dashboard labels an unconfirmed ephemeral cleanup as `需检查` and offers `清理残留` only after the backend can prove its task Worker is absent and its state-free template directory is empty. This discards the unusable ephemeral Profile; it does not convert the related failed task into a cleanup success. Persistent Profile data never gets this discard path.
+
 Stop Manager only through `node scripts/taskmaster.mjs manager stop --json`. If a hard operating-system stop or power loss leaves cleanup unproved, report the affected Profile as quarantined and do not kill or reuse a process solely from a persisted PID.
 
 ## Specialized Skills and Task Packs

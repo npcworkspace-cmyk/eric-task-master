@@ -622,6 +622,7 @@ function renderProfiles(force = false) {
       const currentState = profileState(profile);
       const persistent = profile.kind !== 'ephemeral';
       const busy = !['idle', 'closed'].includes(currentState);
+      const quarantinedEphemeral = !persistent && currentState === 'error' && profile.cleanupRequired === true;
       const pending = state.pendingMutations.has(`profile:${id}`);
       const card = element('article', `profile-card profile-${profile.kind || 'persistent'}`);
       const heading = element('div', 'card-heading');
@@ -664,12 +665,18 @@ function renderProfiles(force = false) {
 
       const actions = element('div', 'profile-actions');
       const rename = focusKey(button('改名', 'npc-btn-ghost compact-button', () => void renameProfile(profile)), `profile:${id}:rename`);
-      const toggle = focusKey(button(busy ? '关闭窗口' : '打开登录窗口', 'npc-btn-secondary compact-button', () => void setProfileOpen(profile, !busy)), `profile:${id}:toggle`);
+      const toggleLabel = persistent ? (busy ? '关闭窗口' : '打开登录窗口') : '仅任务启动';
+      const toggle = focusKey(button(toggleLabel, 'npc-btn-secondary compact-button', () => void setProfileOpen(profile, !busy)), `profile:${id}:toggle`);
       toggle.disabled = !persistent || pending || currentState === 'starting';
       toggle.title = persistent ? '打开独立可见 Chrome 窗口进行人工登录或检查' : '临时 Profile 只在任务中启动';
-      const remove = focusKey(button('删除', 'npc-btn-danger compact-button', () => void deleteProfile(profile)), `profile:${id}:delete`);
+      const remove = focusKey(button(quarantinedEphemeral ? '清理残留' : '删除', 'npc-btn-danger compact-button', () => void deleteProfile(profile)), `profile:${id}:delete`);
       rename.disabled = pending;
-      remove.disabled = busy || pending;
+      remove.disabled = (busy && !quarantinedEphemeral) || pending;
+      remove.title = quarantinedEphemeral
+        ? '任务清理未确认；Manager 会再次确认 Worker 已退出且临时目录为空后再清理'
+        : busy
+          ? 'Profile 空闲后才能删除'
+          : '删除这个 Profile';
       actions.append(rename, toggle, remove);
       card.append(heading, facts, settings, actions);
       ui.profiles.append(card);
@@ -894,11 +901,15 @@ async function setProfileOpen(profile, shouldOpen) {
 }
 
 async function deleteProfile(profile) {
+  const quarantinedEphemeral = profile.kind === 'ephemeral' && profileState(profile) === 'error' && profile.cleanupRequired === true;
   const description = profile.kind === 'ephemeral' ? '临时任务设置' : '持久浏览器数据';
-  if (!confirm(`确定删除 Profile“${profile.name || profile.id}”及其${description}？此操作无法撤销。`)) return;
+  const question = quarantinedEphemeral
+    ? `确定清理异常临时 Profile“${profile.name || profile.id}”？Manager 只会在 Worker 已退出且目录为空时执行。`
+    : `确定删除 Profile“${profile.name || profile.id}”及其${description}？此操作无法撤销。`;
+  if (!confirm(question)) return;
   await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
     method: 'DELETE'
-  }), 'Profile 已删除', { focusAfter: 'profiles-title' });
+  }), quarantinedEphemeral ? '残留临时 Profile 已清理' : 'Profile 已删除', { focusAfter: 'profiles-title' });
 }
 
 async function sendTaskAction(task, action) {

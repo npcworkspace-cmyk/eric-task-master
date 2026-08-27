@@ -103,6 +103,8 @@ The Dashboard has exactly two primary views: Tasks and Profiles. Task cards expo
 
 An active task changes the state to `leased`. A stale non-browser lock is recovered only after the recorded process is proven absent. Browser-bearing task/Profile leases additionally require a matching private cleanup receipt; Worker PID disappearance alone never proves browser closure.
 
+A quarantined persistent Profile remains blocked until cleanup proof is recovered; its retained browser data is never force-deleted. The Owner may explicitly discard a quarantined ephemeral Profile because it owns no retained browser state, but only after Manager proves the task Worker is absent and the Profile template directory is empty. This removes the unusable Profile record without rewriting the associated failed task as cleanup-settled.
+
 ## Task states
 
 `queued -> acquiring_profile -> starting_browser -> running -> verifying -> completed`

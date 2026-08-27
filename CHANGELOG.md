@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.2 - 2026-08-27
+
+- Added an explicit, fail-closed cleanup path for task-quarantined ephemeral Profiles: Manager requires the Worker process to be absent and the state-free template directory to be empty before discarding the unusable Profile record.
+- Unblocked upgrades from an older Manager stranded by the same safe-to-discard quarantine: the CLI authenticates the old Manager, verifies zero live work, waits for process exit, takes the state lock, revalidates the evidence, and only then starts the new version.
+- Kept persistent Profile data and live or non-empty ephemeral Profiles blocked, and preserved the related failed task as cleanup-unsettled instead of rewriting missing browser-close proof as success.
+- Updated the Owner Console to explain `需检查`, expose `清理残留` only for eligible ephemeral Profiles, and label normal ephemeral Profiles as task-started rather than showing a misleading manual-window action.
+
 ## 2.5.1 - 2026-08-27
 
 - Collapsed static-page survey into one continuous downward wheel stream plus one continuous return stream, with no viewport-sized stop-start staircase; dynamically growing or partially consumed pages retain at most one immediate continuation.

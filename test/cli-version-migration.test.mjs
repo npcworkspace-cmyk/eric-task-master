@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { lstat, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path, { dirname } from 'node:path';
@@ -150,6 +151,45 @@ async function startLegacyManager({
     close: () => new Promise((resolveClose) => server.close(resolveClose)),
     wasShutdownAuthorized: () => shutdownAuthorized
   };
+}
+
+async function writeBlockedProfile(stateDir, {
+  id,
+  kind = 'ephemeral',
+  pid,
+  retainedData = false
+}) {
+  const userDataDir = path.join(stateDir, 'profiles', id);
+  await mkdir(userDataDir, { recursive: true });
+  if (retainedData) await writeFile(path.join(userDataDir, 'retained.txt'), 'keep');
+  const timestamp = new Date().toISOString();
+  const profile = {
+    id,
+    name: `Blocked ${id.slice(-4)}`,
+    kind,
+    userDataDir,
+    defaultBehavior: kind === 'persistent' ? 'human' : 'auto',
+    headless: false,
+    browserEngine: kind === 'persistent' ? 'chrome' : 'chromium',
+    state: 'error',
+    lease: {
+      ownerId: 'task:interrupted-upgrade',
+      pid,
+      acquiredAt: timestamp,
+      heartbeatAt: timestamp,
+      expiresAt: timestamp,
+      cleanupRequired: true
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastUsedAt: timestamp,
+    cleanupUnknownAt: timestamp
+  };
+  await writeFile(path.join(stateDir, 'profiles.json'), `${JSON.stringify({
+    version: 5,
+    profiles: [profile]
+  }, null, 2)}\n`);
+  return profile;
 }
 
 test('connect authenticates and gracefully replaces an idle older Manager', async (t) => {
@@ -322,4 +362,80 @@ test('connect leaves a busy older Manager running and fails closed', async (t) =
   assert.equal(legacy.wasShutdownAuthorized(), false);
   const health = await fetch(`${legacy.baseUrl}/v1/health`).then((response) => response.json());
   assert.equal(health.version, '1.0.4');
+});
+
+test('connect safely discards a dead empty task-quarantined ephemeral Profile during upgrade', async (t) => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'eric-task-master-cli-upgrade-quarantine-'));
+  const deadWorker = spawn(process.execPath, ['-e', '']);
+  const deadWorkerPid = deadWorker.pid;
+  await once(deadWorker, 'exit');
+  const profile = await writeBlockedProfile(stateDir, {
+    id: 'profile_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    pid: deadWorkerPid
+  });
+  const legacy = await startLegacyManager({
+    stateDir,
+    profiles: [{ id: profile.id, state: profile.state }]
+  });
+  let currentStarted = false;
+  t.after(async () => {
+    if (currentStarted) {
+      await execFileAsync(process.execPath, [
+        CLI, 'manager', 'stop', '--host', '127.0.0.1', '--port', String(legacy.port),
+        '--state-dir', stateDir, '--json'
+      ], { cwd: ROOT }).catch(() => {});
+    }
+    await legacy.close().catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  await writeFile(path.join(stateDir, `acceptance-${VERSION}.json`), `${JSON.stringify({
+    ok: true,
+    version: VERSION,
+    checks: []
+  })}\n`, 'utf8');
+  const result = JSON.parse((await execFileAsync(process.execPath, [
+    CLI, 'connect', '--host', '127.0.0.1', '--port', String(legacy.port),
+    '--state-dir', stateDir, '--skip-mcp-registration', '--json'
+  ], { cwd: ROOT, timeout: 30_000 })).stdout);
+  currentStarted = true;
+
+  assert.equal(legacy.wasShutdownAuthorized(), true);
+  assert.equal(result.manager.version, VERSION);
+  assert.equal(result.manager.migratedFrom, '1.0.4');
+  assert.equal(result.manager.recoveredQuarantinedProfiles, 1);
+  const profiles = JSON.parse(await readFile(path.join(stateDir, 'profiles.json'), 'utf8'));
+  assert.deepEqual(profiles.profiles, []);
+  await assert.rejects(lstat(profile.userDataDir), { code: 'ENOENT' });
+});
+
+test('connect preserves a non-discardable blocked Profile and leaves the older Manager running', async (t) => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'eric-task-master-cli-upgrade-profile-busy-'));
+  const profile = await writeBlockedProfile(stateDir, {
+    id: 'profile_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    kind: 'persistent',
+    pid: 1
+  });
+  const legacy = await startLegacyManager({
+    stateDir,
+    profiles: [{ id: profile.id, state: profile.state }]
+  });
+  t.after(async () => {
+    await legacy.close().catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [
+      CLI, 'connect', '--host', '127.0.0.1', '--port', String(legacy.port),
+      '--state-dir', stateDir, '--skip-mcp-registration', '--json'
+    ], { cwd: ROOT, timeout: 10_000 }),
+    (error) => {
+      assert.match(error.stderr, /MANAGER_UPGRADE_BUSY/);
+      return true;
+    }
+  );
+  assert.equal(legacy.wasShutdownAuthorized(), false);
+  assert.equal((await fetch(`${legacy.baseUrl}/v1/health`).then((response) => response.json())).version, '1.0.4');
+  assert.equal((await lstat(profile.userDataDir)).isDirectory(), true);
 });

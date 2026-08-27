@@ -19,6 +19,10 @@ import {
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 import { waitForManagerShutdownProof } from './lib/manager-shutdown-proof.mjs';
 import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
+import {
+  discardQuarantinedProfilesAfterShutdown,
+  inspectQuarantinedEphemeralUpgrade
+} from './lib/quarantined-profile-upgrade.mjs';
 import { preflightTaskPack, readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
 import { assertSafeTaskInput, HttpTaskMasterClient } from './mcp/taskmaster-client.mjs';
 
@@ -320,12 +324,14 @@ async function waitForManager(config, timeoutMs = 20_000) {
 
 async function ensureManager(config) {
   let migratedFrom;
+  let recoveredQuarantinedProfiles = 0;
   try {
     return { health: await health(config), started: false };
   } catch (error) {
     if (error.code === 'MANAGER_VERSION_MISMATCH') {
       const stopped = await shutdownManager(config, { requireIdle: true });
       migratedFrom = stopped.version;
+      recoveredQuarantinedProfiles = stopped.recoveredQuarantinedProfiles || 0;
     } else if (error.code !== 'MANAGER_UNREACHABLE') {
       throw error;
     }
@@ -354,7 +360,8 @@ async function ensureManager(config) {
   return {
     health: await Promise.race([waitForManager(config), spawnFailure]),
     started: true,
-    ...(migratedFrom ? { migratedFrom } : {})
+    ...(migratedFrom ? { migratedFrom } : {}),
+    ...(recoveredQuarantinedProfiles > 0 ? { recoveredQuarantinedProfiles } : {})
   };
 }
 
@@ -575,7 +582,10 @@ async function connect(options, json) {
       ...connection.health,
       startedNow: connection.started,
       agentHostReloadRequired,
-      ...(connection.migratedFrom ? { migratedFrom: connection.migratedFrom } : {})
+      ...(connection.migratedFrom ? { migratedFrom: connection.migratedFrom } : {}),
+      ...(connection.recoveredQuarantinedProfiles > 0
+        ? { recoveredQuarantinedProfiles: connection.recoveredQuarantinedProfiles }
+        : {})
     },
     acceptance,
     mcpRegistration: registration,
@@ -588,6 +598,7 @@ async function connect(options, json) {
 
 async function shutdownManager(config, { requireIdle = false } = {}) {
   let running;
+  let quarantinedProfileIds = [];
   try {
     running = await health(config, 1_500, null);
   } catch (error) {
@@ -637,7 +648,14 @@ async function shutdownManager(config, { requireIdle = false } = {}) {
     }
     const busyTasks = countKeys.reduce((total, key) => total + counts[key], 0);
     const busyProfiles = profiles.filter((profile) => profile?.state !== 'idle').length;
-    if (busyTasks > 0 || busyProfiles > 0) {
+    if (busyTasks === 0 && busyProfiles > 0) {
+      const inspection = await inspectQuarantinedEphemeralUpgrade({
+        stateDir: config.stateDir,
+        publicProfiles: profiles
+      });
+      if (inspection.eligible) quarantinedProfileIds = inspection.profileIds;
+    }
+    if (busyTasks > 0 || busyProfiles > quarantinedProfileIds.length) {
       throw cliError(
         'MANAGER_UPGRADE_BUSY',
         `Manager ${running.version} still has ${busyTasks} active/queued tasks and ${busyProfiles} non-idle Profiles.`,
@@ -702,19 +720,27 @@ async function shutdownManager(config, { requireIdle = false } = {}) {
     } catch (error) {
       if (error.code === 'MANAGER_UNREACHABLE') {
         const cleanShutdown = await waitForManagerShutdownProof(pidFile, recorded);
-        if (!cleanShutdown) {
+        if (!cleanShutdown && quarantinedProfileIds.length === 0) {
           throw cliError(
             'MANAGER_SHUTDOWN_UNCONFIRMED',
             `Manager process ${recorded.pid} became unreachable without publishing a clean shutdown proof`,
             `Keep the Manager state directory intact and inspect ${join(config.stateDir, 'manager-shutdown-failure.json')} before restarting.`
           );
         }
+        const recoveredQuarantinedProfiles = quarantinedProfileIds.length > 0
+          ? await discardQuarantinedProfilesAfterShutdown({
+            stateDir: config.stateDir,
+            profileIds: quarantinedProfileIds,
+            expectedManager: recorded
+          })
+          : 0;
         return {
           ok: true,
           stopped: true,
           graceful: gracefulRequested,
           pid: recorded.pid,
-          version: running.version
+          version: running.version,
+          ...(recoveredQuarantinedProfiles > 0 ? { recoveredQuarantinedProfiles } : {})
         };
       }
       throw error;

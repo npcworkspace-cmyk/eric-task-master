@@ -21,7 +21,7 @@ function headers(token, origin) {
   };
 }
 
-async function managerFixture(t) {
+async function managerFixture(t, { profileProcessAlive } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'eric-task-master-manager-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const dashboardDir = join(root, 'dashboard');
@@ -115,12 +115,47 @@ async function managerFixture(t) {
     port: 0,
     dataDir: join(root, 'data'),
     dashboardDir,
-    taskServiceFactory: buildTaskService
+    taskServiceFactory: buildTaskService,
+    profileProcessAlive
   });
   await manager.start();
   t.after(() => manager.stop());
   return { root, manager, taskService, calls, baseUrl: manager.baseUrl };
 }
+
+test('Manager DELETE discards a dead task-quarantined ephemeral Profile', async (t) => {
+  const { manager, baseUrl } = await managerFixture(t, {
+    profileProcessAlive: async () => false
+  });
+  const created = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify({ name: 'Interrupted temporary Profile', kind: 'ephemeral' })
+  }));
+  assert.equal(created.response.status, 201);
+  const profileId = created.body.profile.id;
+  await manager.profileStore.acquireLease(profileId, 'task:interrupted', {
+    pid: 999_999,
+    cleanupRequired: true
+  });
+  await manager.profileStore.markCleanupUnknown(profileId, 'task:interrupted');
+  const listed = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    headers: headers(manager.token)
+  }));
+  const quarantined = listed.body.profiles.find((profile) => profile.id === profileId);
+  assert.equal(quarantined.state, 'error');
+  assert.equal(quarantined.cleanupRequired, true);
+  assert.equal(Object.hasOwn(quarantined, 'lease'), false);
+  assert.equal(Object.hasOwn(quarantined, 'pid'), false);
+
+  const removed = await json(await fetch(`${baseUrl}/v1/profiles/${encodeURIComponent(profileId)}`, {
+    method: 'DELETE',
+    headers: headers(manager.token)
+  }));
+  assert.equal(removed.response.status, 200);
+  assert.equal(removed.body.removed.id, profileId);
+  await assert.rejects(manager.profileStore.get(profileId), { code: 'PROFILE_NOT_FOUND' });
+});
 
 async function issueAgent(baseUrl, managerToken, clientId, name = clientId) {
   const result = await json(await fetch(`${baseUrl}/v1/agents/issue`, {

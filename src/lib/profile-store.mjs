@@ -330,15 +330,14 @@ export class ProfileStore {
     return structuredClone(updated);
   }
 
-  async remove(profileId) {
-    const profile = await this.get(profileId);
-    if (profile.lease || profile.state !== 'idle') {
+  async remove(profileId, { discardQuarantinedEphemeral = false } = {}) {
+    if (typeof discardQuarantinedEphemeral !== 'boolean') {
       throw new ProfileStoreError(
-        'PROFILE_IN_USE',
-        `Profile ${profileId} must be idle before it can be removed`,
-        409
+        'INVALID_PROFILE_DELETE',
+        'discardQuarantinedEphemeral must be a boolean'
       );
     }
+    const profile = await this.get(profileId);
     const expectedPath = resolve(this.#profilesRoot, profileId);
     const resolvedRoot = resolve(this.#profilesRoot);
     if (
@@ -352,6 +351,52 @@ export class ProfileStore {
         500
       );
     }
+    const ordinaryRemoval = !profile.lease && profile.state === 'idle';
+    const quarantinedEphemeral = discardQuarantinedEphemeral === true &&
+      profile.kind === 'ephemeral' &&
+      profile.state === 'error' &&
+      profile.lease?.cleanupRequired === true &&
+      /^task:/u.test(profile.lease.ownerId || '') &&
+      typeof profile.cleanupUnknownAt === 'string';
+    if (!ordinaryRemoval && !quarantinedEphemeral) {
+      const cleanupBlocked = discardQuarantinedEphemeral === true && profile.state === 'error';
+      throw new ProfileStoreError(
+        cleanupBlocked ? 'PROFILE_CLEANUP_UNCONFIRMED' : 'PROFILE_IN_USE',
+        cleanupBlocked
+          ? `Profile ${profileId} cleanup is not confirmed`
+          : `Profile ${profileId} must be idle before it can be removed`,
+        409
+      );
+    }
+    if (quarantinedEphemeral) {
+      if (await this.#processAlive(profile.lease.pid)) {
+        throw new ProfileStoreError(
+          'PROFILE_IN_USE',
+          `Profile ${profileId} still has a live task owner`,
+          409
+        );
+      }
+      let retainedEntries;
+      try {
+        retainedEntries = await readdir(expectedPath);
+      } catch (error) {
+        throw new ProfileStoreError(
+          'PROFILE_DELETE_IO_FAILED',
+          `Profile ${profileId} data could not be inspected: ${error?.message || 'filesystem error'}`,
+          500
+        );
+      }
+      if (retainedEntries.length > 0) {
+        throw new ProfileStoreError(
+          'EPHEMERAL_PROFILE_NOT_EMPTY',
+          `Profile ${profileId} retained unexpected browser data and cannot be discarded`,
+          409
+        );
+      }
+    }
+    const restorableState = profile.state;
+    const restorableLease = structuredClone(profile.lease);
+    const restorableCleanupUnknownAt = profile.cleanupUnknownAt;
     const tombstonePath = resolve(this.#profilesRoot, `.deleting-${profileId}-${randomUUID()}`);
     const tombstoneName = tombstonePath.slice(resolve(this.#profilesRoot).length + 1);
     const deletionOwner = `profile-delete:${randomUUID().replaceAll('-', '')}`;
@@ -361,10 +406,16 @@ export class ProfileStore {
     try {
       await this.#store.update((data) => {
         const current = findProfile(data, profileId);
-        if (current.lease || current.state !== 'idle') {
+        const stillOrdinary = !current.lease && current.state === 'idle';
+        const stillQuarantined = quarantinedEphemeral &&
+          current.kind === 'ephemeral' &&
+          current.state === 'error' &&
+          current.cleanupUnknownAt === profile.cleanupUnknownAt &&
+          isDeepStrictEqual(current.lease, profile.lease);
+        if (!stillOrdinary && !stillQuarantined) {
           throw new ProfileStoreError(
             'PROFILE_IN_USE',
-            `Profile ${profileId} must be idle before it can be removed`,
+            `Profile ${profileId} deletion state changed concurrently`,
             409
           );
         }
@@ -441,9 +492,16 @@ export class ProfileStore {
         await this.#store.update((data) => {
           const current = data.profiles.find((item) => item.id === profileId);
           if (current?.lease?.ownerId !== deletionOwner) return;
-          current.state = expectedExists && !tombstoneExists ? 'idle' : 'error';
-          current.lease = null;
-          if (expectedExists && !tombstoneExists) delete current.deletion;
+          if (expectedExists && !tombstoneExists) {
+            current.state = restorableState;
+            current.lease = structuredClone(restorableLease);
+            if (restorableCleanupUnknownAt) current.cleanupUnknownAt = restorableCleanupUnknownAt;
+            else delete current.cleanupUnknownAt;
+            delete current.deletion;
+          } else {
+            current.state = 'error';
+            current.lease = null;
+          }
           current.updatedAt = new Date(this.#now()).toISOString();
         }).catch(() => {});
       }

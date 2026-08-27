@@ -94,6 +94,10 @@ test('task panel keeps bounded same-origin reads, concurrency guards, task timin
   assert.match(source, /scheduleDurationTick/);
   assert.match(source, /data-task-duration/);
   assert.match(source, /cleanup\?\.settled === true/);
+  assert.match(source, /quarantinedEphemeral/);
+  assert.match(source, /清理残留/);
+  assert.match(source, /任务清理未确认/);
+  assert.match(source, /仅任务启动/);
   assert.match(source, /确定取消任务/);
   assert.match(source, /确定删除任务记录/);
   assert.match(source, /focusAfter/);

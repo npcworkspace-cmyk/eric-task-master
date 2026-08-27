@@ -386,3 +386,55 @@ test('ProfileStore never TTL-reclaims a session import lease without confirmed c
   ), true);
   assert.equal((await reopened.get(profile.id)).state, 'idle');
 });
+
+test('ProfileStore explicitly discards only dead empty task-quarantined ephemeral Profiles', async (t) => {
+  const livePid = 202;
+  const { store } = await fixture(t, {
+    processAlive: async (pid) => pid === livePid
+  });
+
+  const disposable = await store.create({ name: 'Discardable quarantine', kind: 'ephemeral' });
+  await store.acquireLease(disposable.id, 'task:interrupted', {
+    pid: 101,
+    cleanupRequired: true
+  });
+  await store.markCleanupUnknown(disposable.id, 'task:interrupted');
+  await assert.rejects(store.remove(disposable.id), { code: 'PROFILE_IN_USE', statusCode: 409 });
+  const removed = await store.remove(disposable.id, { discardQuarantinedEphemeral: true });
+  assert.equal(removed.id, disposable.id);
+  await assert.rejects(store.get(disposable.id), { code: 'PROFILE_NOT_FOUND' });
+
+  const persistent = await store.create({ name: 'Persistent quarantine' });
+  await store.acquireLease(persistent.id, 'task:persistent', {
+    pid: 102,
+    cleanupRequired: true
+  });
+  await store.markCleanupUnknown(persistent.id, 'task:persistent');
+  await assert.rejects(
+    store.remove(persistent.id, { discardQuarantinedEphemeral: true }),
+    { code: 'PROFILE_CLEANUP_UNCONFIRMED', statusCode: 409 }
+  );
+
+  const live = await store.create({ name: 'Live quarantine', kind: 'ephemeral' });
+  await store.acquireLease(live.id, 'task:live', {
+    pid: livePid,
+    cleanupRequired: true
+  });
+  await store.markCleanupUnknown(live.id, 'task:live');
+  await assert.rejects(
+    store.remove(live.id, { discardQuarantinedEphemeral: true }),
+    { code: 'PROFILE_IN_USE', statusCode: 409 }
+  );
+
+  const dirty = await store.create({ name: 'Dirty quarantine', kind: 'ephemeral' });
+  await store.acquireLease(dirty.id, 'task:dirty', {
+    pid: 103,
+    cleanupRequired: true
+  });
+  await store.markCleanupUnknown(dirty.id, 'task:dirty');
+  await writeFile(join(dirty.userDataDir, 'unexpected-state.txt'), 'must not be discarded');
+  await assert.rejects(
+    store.remove(dirty.id, { discardQuarantinedEphemeral: true }),
+    { code: 'EPHEMERAL_PROFILE_NOT_EMPTY', statusCode: 409 }
+  );
+});
