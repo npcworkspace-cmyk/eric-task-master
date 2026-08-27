@@ -8,7 +8,7 @@ const DEFAULT_HUMAN_TIMING = Object.freeze({
   hoverPause: [55, 155],
   clickDelay: [38, 105],
   mouseSteps: [16, 32],
-  mouseStepPause: [4, 10],
+  mouseStepPause: [2, 6],
   mouseCorrectionSteps: [4, 8],
   keyDelay: [30, 92],
   typingBurstPause: [18, 58],
@@ -17,8 +17,8 @@ const DEFAULT_HUMAN_TIMING = Object.freeze({
   punctuationPause: [90, 220],
   // Segment waits are frame-like. Deliberate pauses belong between gestures,
   // never between large, visibly separated wheel chunks.
-  scrollPause: [5, 14],
-  scrollGesturePause: [70, 240],
+  scrollPause: [2, 7],
+  scrollGesturePause: [35, 95],
   readingBase: [320, 650],
   readingPerWord: [28, 65],
   readingMaximum: 7_500
@@ -258,20 +258,17 @@ export function createActionHelper({
         : 0.30 + random() * 0.08);
       const rawDelta = centerY - desiredY;
       const far = Math.abs(rawDelta) > viewport.height * 1.75;
-      const maximumGesture = viewport.height * (far
-        ? 1.35 + random() * 0.70
-        : 0.70 + random() * 0.45);
+      // A far rendered target is one continuous approach, not a staircase of
+      // viewport-sized gestures. Fine wheel events still supply the natural
+      // acceleration/deceleration inside that single gesture.
+      const maximumGesture = far
+        ? Math.abs(rawDelta)
+        : viewport.height * (0.70 + random() * 0.45);
       const deltaY = Math.sign(rawDelta) * Math.min(Math.abs(rawDelta), maximumGesture);
       if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 8) break;
       await humanWheel(0, deltaY);
       metrics.targetTraversals += 1;
-      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 12 }));
-      if (Math.abs(deltaY) > viewport.height * 0.8 && random() < 0.28) {
-        const correction = -Math.sign(deltaY) * numberBetween([24, 72], random);
-        await humanWheel(0, correction, numberBetween([8, 10], random));
-        metrics.pointerCorrections += 1;
-        await pacingSleep(pacingNumber(timing.scrollPause));
-      }
+      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 8 }));
       const next = await locator.boundingBox?.(measurementOptions);
       if (!next) break;
       const nextCenterY = next.y + next.height / 2;
@@ -483,18 +480,19 @@ export function createActionHelper({
     const needsScroll = start.maxScroll - start.scrollY > start.viewportHeight * 0.35;
     if (needsScroll) metrics.surveysNeedingScroll += 1;
     let state = start;
-    let unchanged = 0;
     let gestures = 0;
-    while (gestures < maxGestures && state.scrollY < state.maxScroll - Math.max(8, state.viewportHeight * 0.04)) {
+    // A normal static document uses one continuous downward wheel stream. One
+    // immediate continuation is retained only for a page that grows or does
+    // not consume the full first gesture; this avoids visible stop-start loops.
+    const maximumPasses = Math.min(maxGestures, 2);
+    while (gestures < maximumPasses && state.scrollY < state.maxScroll - Math.max(8, state.viewportHeight * 0.04)) {
       const remaining = state.maxScroll - state.scrollY;
-      const deltaY = Math.min(remaining, state.viewportHeight * (1.35 + random() * 0.65));
-      await humanWheel(0, deltaY);
+      const before = state;
+      await humanWheel(0, remaining);
       gestures += 1;
-      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 12 }));
       const next = await readScrollState();
-      unchanged = next.scrollY <= state.scrollY + 1 ? unchanged + 1 : 0;
       state = next;
-      if (unchanged >= 2) break;
+      if (next.scrollY <= before.scrollY + 1) break;
     }
     const reachedBottom = state.scrollY >= state.maxScroll - Math.max(8, state.viewportHeight * 0.06);
     if (reachedBottom) metrics.surveyReachedBottom += 1;
@@ -503,10 +501,10 @@ export function createActionHelper({
       const beforeBacktrackY = state.scrollY;
       const backtrackDistance = Math.min(
         state.scrollY - start.scrollY,
-        state.viewportHeight * (0.48 + random() * 0.42)
+        state.viewportHeight * (0.72 + random() * 0.46)
       );
+      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 8 }));
       await humanWheel(0, -backtrackDistance);
-      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 12 }));
       state = await readScrollState();
       backtracked = state.scrollY < beforeBacktrackY - 1;
       if (backtracked) metrics.surveyBacktracks += 1;

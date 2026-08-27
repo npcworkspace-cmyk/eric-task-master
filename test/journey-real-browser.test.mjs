@@ -85,11 +85,17 @@ test('real Chromium traverses the rendered page before clicking a visible pagina
 
     const survey = await journey.survey({ maxGestures: 8 });
     const wheelTrace = await page.evaluate(() => window.__wheelTrace);
+    const surveyAudit = action.audit;
     assert.equal(survey.reachedBottom, true);
     assert.equal(survey.backtracked, true);
+    assert.equal(survey.gestures, 1);
+    assert.equal(surveyAudit.scrollGestures, 2);
+    assert.equal(surveyAudit.scrollDirectionChanges, 1);
     assert.ok(wheelTrace.some((event) => event.deltaY > 0));
     assert.ok(wheelTrace.some((event) => event.deltaY < 0));
     assert.ok(wheelTrace.length >= 16);
+    const directions = wheelTrace.map((event) => Math.sign(event.deltaY)).filter(Boolean);
+    assert.equal(directions.findIndex((direction) => direction < 0), directions.lastIndexOf(1) + 1);
 
     await journey.nextPage(next, {
       timeoutMs: 10_000,

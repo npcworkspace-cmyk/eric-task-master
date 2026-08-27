@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.1 - 2026-08-27
+
+- Collapsed static-page survey into one continuous downward wheel stream plus one continuous return stream, with no viewport-sized stop-start staircase; dynamically growing or partially consumed pages retain at most one immediate continuation.
+- Made far rendered-target traversal one continuous approach, removed random reverse wheel corrections, shortened wheel-frame and direction-change gaps, and reduced survey reading settlement while keeping minimum-jerk acceleration and precision acquisition.
+- Kept the Task Pack dual lane explicit and tested: visible state changes use Human Journey, while read-only DOM text, attributes, current values, and record arrays remain available through fast unpaced extraction; only mutations are rejected.
+- Added deterministic long-page gesture-count and pacing-budget tests plus real Chromium proof that a survey has exactly two high-level gestures with one direction reversal.
+
 ## 2.5.0 - 2026-08-27
 
 - Rebuilt visible motion around minimum-jerk acceleration: pointer sampling now adapts to travel distance and target size, far controls use a rapid approach followed by precision acquisition, document-edge controls stop futile scrolling, and wheel gestures use 8-32 fine-grained frame-like events instead of visibly separated chunks.

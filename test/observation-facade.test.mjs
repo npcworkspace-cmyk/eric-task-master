@@ -9,7 +9,7 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
   const violations = [];
   const locator = {
     async innerText() { return 'readable'; },
-    async evaluate(callback) { return callback({ textContent: 'safe' }); },
+    async evaluate(callback) { return callback({ textContent: 'safe', value: 'existing value' }); },
     async click() { throw new Error('raw click should not run'); },
     first() { return this; }
   };
@@ -38,6 +38,7 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
   const visible = observed.page.locator('body').first();
   assert.equal(await visible.innerText(), 'readable');
   assert.equal(await visible.evaluate((node) => node.textContent), 'safe');
+  assert.equal(await visible.evaluate((node) => node.value), 'existing value');
   assert.equal(await observed.page.evaluate(() => document.title), undefined);
   assert.equal(unwrapObservationLocator(visible), locator);
   assert.deepEqual(await observed.context.cookies(), []);

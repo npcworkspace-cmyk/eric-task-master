@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.5.0**
+Version: **2.5.1**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -103,7 +103,7 @@ New persistent Profiles default to the local stable Chrome channel and `human`; 
 - **auto** — balances speed and caution, escalating after dynamic-page signals, occlusion, timeout, uncertain navigation, action failure, or rate limiting, then accelerating again after recovery.
 
 Human pacing is a reliability policy, not fingerprint spoofing, a promise to bypass website controls, or protection from platform enforcement.
-All three modes use smooth minimum-jerk pointer acceleration, rapid long-distance approach plus precision acquisition, in-target clicks, explicit per-character keyboard events, fine-grained inertial wheel motion, optional rapid page survey with visible backtracking, keyboard selection, and reading dwell. A mode changes central timing and guard depth only; `fast` never becomes paste or jump scrolling. Behavior is selected on the Profile and can be changed while its task runs; task start does not accept an override. Task cards show the actual Worker-confirmed configured/effective mode and receipt time instead of merely echoing the Profile value. Every versioned Task Pack additionally enforces visible-transition verification through the stricter `full-human-v1` journey contract and records its 10/10 interaction audit.
+All three modes use smooth minimum-jerk pointer acceleration, one continuous long-distance approach plus precision acquisition, in-target clicks, explicit per-character keyboard events, fine-grained inertial wheel motion, and an optional rapid page survey that normally completes as one continuous downward stream plus one return stream. Fine wheel events are motion frames, not separately paused actions; even `human` keeps long traversal fast. A mode changes central timing and guard depth only; `fast` never becomes paste or jump scrolling. Behavior is selected on the Profile and can be changed while its task runs; task start does not accept an override. Task cards show the actual Worker-confirmed configured/effective mode and receipt time instead of merely echoing the Profile value. Every versioned Task Pack additionally enforces visible-transition verification through the stricter `full-human-v1` journey contract and records its 10/10 interaction audit.
 
 ### Multi-Agent workbench
 
@@ -122,7 +122,7 @@ node scripts/taskmaster.mjs task-packs validate ./my-pack --json
 node scripts/taskmaster.mjs task-packs install ./my-pack --json
 ```
 
-A Task Pack defines reusable task types. It specifies the target, sequence, selectors, platform rate limits, extraction, checkpoints, outputs, and proof—not custom mouse or scrolling code. The central Human Journey engine handles rendered-page traversal, pointer movement, input, reading pauses, visible pagination, and transition verification; direct browser-action bypasses, including common DOM mutation hidden in `evaluate`, are rejected. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. When no specialized capability covers a large request, the built-in read-only `surface-probe` first samples one representative surface, performs a bounded survey/backtrack, identifies blockers, and recommends a recipe; one bounded pilot must pass before scale. A specialized Skill teaches the Agent when to use the resulting type, how to interpret results, and which platform rules apply.
+A Task Pack defines reusable task types. It specifies the target, sequence, selectors, platform rate limits, extraction, checkpoints, outputs, and proof—not custom mouse or scrolling code. The central Human Journey engine handles rendered-page state changes, while read-only Playwright locators and `evaluate` remain a fast, unpaced path for bulk DOM extraction. Reading values and attributes is allowed; mutation hidden in `evaluate` is rejected. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. When no specialized capability covers a large request, the built-in read-only `surface-probe` first samples one representative surface, performs a bounded survey/backtrack, identifies blockers, and recommends a recipe; one bounded pilot must pass before scale. A specialized Skill teaches the Agent when to use the resulting type, how to interpret results, and which platform rules apply.
 
 ## Host integration
 

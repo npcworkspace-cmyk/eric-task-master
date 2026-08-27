@@ -168,31 +168,36 @@ test('fast typing still emits keyboard events one character at a time with a non
 test('page survey makes a bounded rapid pass to the bottom and visibly backtracks', async () => {
   const { calls, page } = fixture();
   let scrollY = 0;
-  const maxScroll = 4_200;
+  const maxScroll = 24_000;
   page.viewportSize = () => ({ width: 1_000, height: 700 });
   page.evaluate = async () => ({ scrollY, maxScroll, viewportHeight: 700 });
   page.mouse.wheel = async (x, deltaY) => {
     calls.push(['wheel', x, deltaY]);
     scrollY = Math.max(0, Math.min(maxScroll, scrollY + deltaY));
   };
+  const sleeps = [];
   const action = createActionHelper({
     page,
     mode: 'human',
     random: () => 0.5,
-    sleep: async () => {}
+    sleep: async (milliseconds) => sleeps.push(milliseconds)
   });
 
   const result = await action.survey({ maxGestures: 8 });
 
   const wheels = calls.filter((item) => item[0] === 'wheel');
   assert.equal(result.reachedBottom, true);
+  assert.equal(result.gestures, 1);
   assert.ok(wheels.some((item) => item[2] > 0));
   assert.ok(wheels.some((item) => item[2] < 0));
   assert.ok(scrollY < maxScroll);
   assert.equal(action.audit.pageSurveys, 1);
   assert.equal(action.audit.surveysNeedingScroll, 1);
-  assert.ok(action.audit.surveyBacktracks >= 1);
+  assert.equal(action.audit.surveyBacktracks, 1);
+  assert.equal(action.audit.scrollGestures, 2);
+  assert.equal(action.audit.scrollDirectionChanges, 1);
   assert.ok(action.audit.wheelEvents >= action.audit.scrollGestures * 8);
+  assert.ok(sleeps.reduce((total, milliseconds) => total + milliseconds, 0) < 700);
 });
 
 test('page survey counts backtracking only after the rendered page actually moves upward', async () => {
@@ -239,7 +244,8 @@ test('human click reaches an offscreen target through bounded wheel gestures ins
   assert.ok(calls.filter((item) => item[0] === 'wheel').length >= 6);
   assert.ok(y >= 0 && y <= 720);
   assert.equal(calls.some((item) => item[0] === 'scrollIntoViewIfNeeded'), false);
-  assert.ok(action.audit.targetTraversals >= 1);
+  assert.equal(action.audit.targetTraversals, 1);
+  assert.equal(action.audit.scrollGestures, 1);
   assert.ok(action.audit.pointerMoves >= 14);
 });
 

@@ -239,7 +239,7 @@ export function createJourneyHelper({
       return step('survey-visible', async () => {
         const result = await action.survey(options);
         counters.pageSurveys += 1;
-        await settle({ maximumWords: 36 });
+        await settle({ maximumWords: 18 });
         return result;
       });
     },
