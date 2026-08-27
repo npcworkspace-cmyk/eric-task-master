@@ -62,6 +62,20 @@ const CONTEXT_MUTATIONS = new Set([
   'storageState', 'unroute', 'unrouteAll', 'newCDPSession'
 ]);
 
+const EVALUATION_MUTATIONS = Object.freeze([
+  /\.(?:click|focus|blur|submit|reset|remove|append|prepend|replaceWith|scrollIntoView)\s*\(/u,
+  /\b(?:scrollTo|scrollBy|dispatchEvent)\s*\(/u,
+  /\.(?:setAttribute|removeAttribute|toggleAttribute)\s*\(/u,
+  /\.(?:value|checked|selectedIndex|innerHTML|outerHTML|innerText|textContent|className)\s*(?:\+\+|--|[+\-*/%]?=(?!=))/u,
+  /\b(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|removeItem|clear)\s*\(/u,
+  /\bdocument\s*\.\s*(?:cookie|domain)\s*=(?!=)/u
+]);
+
+function evaluationMutates(callback) {
+  const source = typeof callback === 'function' ? Function.prototype.toString.call(callback) : String(callback || '');
+  return EVALUATION_MUTATIONS.some((pattern) => pattern.test(source));
+}
+
 function bindOrValue(target, property) {
   const value = Reflect.get(target, property, target);
   return typeof value === 'function' ? value.bind(target) : value;
@@ -80,6 +94,11 @@ export function createObservationFacade({ page, context, onViolation = () => {} 
       onViolation({ surface, operation: String(operation), code: error.code });
     } catch {}
     throw error;
+  }
+
+  async function evaluateReadOnly(surface, operation, value, callback, args) {
+    if (evaluationMutates(callback)) return reject(surface, operation);
+    return value(callback, ...args);
   }
 
   function wrapFrameLocator(frameLocator) {
@@ -110,6 +129,9 @@ export function createObservationFacade({ page, context, onViolation = () => {} 
         if (typeof value !== 'function') return value;
         if (LOCATOR_BUILDERS.has(property)) return (...args) => wrapLocator(value(...args));
         if (property === 'all') return async (...args) => (await value(...args)).map(wrapLocator);
+        if (property === 'evaluate' || property === 'evaluateAll') {
+          return (callback, ...args) => evaluateReadOnly('Locator', property, value, callback, args);
+        }
         return value;
       }
     });
@@ -127,6 +149,9 @@ export function createObservationFacade({ page, context, onViolation = () => {} 
         if (FRAME_HANDLE_ESCAPES.has(property)) return async () => reject('Frame', property);
         const value = bindOrValue(target, property);
         if (typeof value !== 'function') return value;
+        if (property === 'evaluate') {
+          return (callback, ...args) => evaluateReadOnly('Frame', property, value, callback, args);
+        }
         if (FRAME_LOCATOR_BUILDERS.has(property)) {
           return (...args) => property === 'frameLocator'
             ? wrapFrameLocator(value(...args))
@@ -152,6 +177,9 @@ export function createObservationFacade({ page, context, onViolation = () => {} 
         if (PAGE_INPUT_DEVICES.has(property)) return reject('Page', property);
         const value = bindOrValue(target, property);
         if (typeof value !== 'function') return value;
+        if (property === 'evaluate') {
+          return (callback, ...args) => evaluateReadOnly('Page', property, value, callback, args);
+        }
         if (PAGE_LOCATOR_BUILDERS.has(property)) {
           return (...args) => property === 'frameLocator'
             ? wrapFrameLocator(value(...args))

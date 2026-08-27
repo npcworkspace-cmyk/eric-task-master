@@ -12,6 +12,7 @@ import {
   MANAGER_SERVICE,
   verifyManagerIdentityProof
 } from '../src/lib/manager-identity.mjs';
+import { redactPublicText } from '../src/lib/redaction.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -134,13 +135,14 @@ function evidenceMap(reports) {
   return map;
 }
 
-export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
+export async function runAcceptance({ baseUrl, token, stateDir, readInternalTask } = {}) {
   if (!baseUrl || !token || !stateDir) throw new TypeError('runAcceptance requires baseUrl, token, and stateDir');
   const checks = [];
   const add = (name, passed, detail) => checks.push({ name, passed: Boolean(passed), ...(detail ? { detail } : {}) });
   const fixture = await fixtureServer();
   let profile;
   let ephemeralProfile;
+  let probeTask;
   const tasks = [];
   const acceptanceReports = [];
   const interactionAudits = [];
@@ -262,6 +264,59 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
       ephemeralProfile?.id && ephemeralProfile.kind === 'ephemeral' &&
       ephemeralProfile.state === 'idle' && ephemeralProfile.browserEngine === 'chromium' &&
       ephemeralProfile.defaultBehavior === 'auto'
+    );
+
+    const probeCreated = await api(baseUrl, '/v1/tasks', {
+      method: 'POST',
+      token,
+      body: {
+        profileId: ephemeralProfile.id,
+        taskType: 'surface-probe',
+        idempotencyKey: `acceptance-${acceptanceRunId}-surface-probe`,
+        timeoutMs: 90_000,
+        input: { url: fixture.url, maxItems: 40, maxGestures: 4 }
+      }
+    });
+    probeTask = await waitForTask(baseUrl, token, probeCreated.task.id);
+    const probeInternal = probeTask.state === 'failed' && typeof readInternalTask === 'function'
+      ? await readInternalTask(probeTask.id)
+      : null;
+    const probeInternalError = probeInternal?.error
+      ? {
+          code: probeInternal.error.code,
+          message: redactPublicText(probeInternal.error.message || 'Surface probe failed').slice(0, 500)
+        }
+      : null;
+    const probeArtifacts = await api(
+      baseUrl,
+      `/v1/tasks/${encodeURIComponent(probeTask.id)}/artifacts`,
+      { token }
+    );
+    const probeArtifact = probeArtifacts.artifacts.find((item) => item.name === 'surface-probe.json');
+    const probeReport = probeArtifact
+      ? JSON.parse(await readArtifactText(baseUrl, token, probeTask.id, probeArtifact.id))
+      : null;
+    const probePassed =
+      probeTask.state === 'completed' && probeTask.interactionContract === 'full-human-v1' &&
+        probeTask.cleanup?.settled === true && probeReport?.scope?.exhaustive === false &&
+        ['single-page', 'paginated-list', 'list-detail', 'resumable-batch', 'form-workflow']
+          .includes(probeReport?.recommendation?.recipe) &&
+        probeReport?.recommendation?.scaleAllowed === true &&
+        typeof probeReport?.survey?.reachedBottom === 'boolean';
+    add(
+      'bounded surface preflight probe before unknown scale',
+      probePassed,
+      probePassed ? undefined : JSON.stringify({
+        state: probeTask.state,
+        error: probeInternalError || probeTask.error?.code,
+        interactionContract: probeTask.interactionContract,
+        cleanupSettled: probeTask.cleanup?.settled,
+        artifactFound: Boolean(probeArtifact),
+        exhaustive: probeReport?.scope?.exhaustive,
+        recipe: probeReport?.recommendation?.recipe,
+        scaleAllowed: probeReport?.recommendation?.scaleAllowed,
+        surveyReachedBottom: probeReport?.survey?.reachedBottom
+      })
     );
 
     let taskBehaviorRejected = false;
@@ -523,7 +578,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
     const remaining = await api(baseUrl, '/v1/profiles', { token });
     add(
       'browser and profile cleanup',
-      tasks.every((task) => task.cleanup?.browserClosed && task.cleanup?.leaseReleased && task.cleanup?.workerExited && task.cleanup?.settled) &&
+      [...tasks, probeTask].every((task) => task?.cleanup?.browserClosed && task?.cleanup?.leaseReleased && task?.cleanup?.workerExited && task?.cleanup?.settled) &&
       !remaining.profiles.some((item) => item.id === profile.id)
     );
     profile = null;
@@ -558,6 +613,7 @@ export async function runAcceptance({ baseUrl, token, stateDir } = {}) {
 async function directRun() {
   const stateDir = await mkdtemp(join(tmpdir(), 'eric-task-master-acceptance-'));
   let manager;
+  let taskService;
   try {
     manager = await startManager({
       host: '127.0.0.1',
@@ -565,10 +621,16 @@ async function directRun() {
       dataDir: stateDir,
       dashboardDir: resolve(ROOT, 'dashboard'),
       taskServiceFactory(taskOptions) {
-        return createTaskService(taskOptions);
+        taskService = createTaskService(taskOptions);
+        return taskService;
       }
     });
-    const result = await runAcceptance({ baseUrl: manager.baseUrl, token: manager.token, stateDir });
+    const result = await runAcceptance({
+      baseUrl: manager.baseUrl,
+      token: manager.token,
+      stateDir,
+      readInternalTask: (id) => taskService.getInternal(id)
+    });
     if (process.env.TASKMASTER_ACCEPTANCE_REPORT) {
       const reportPath = resolve(process.env.TASKMASTER_ACCEPTANCE_REPORT);
       await mkdir(dirname(reportPath), { recursive: true });

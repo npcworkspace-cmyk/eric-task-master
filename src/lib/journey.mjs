@@ -83,6 +83,7 @@ export function createJourneyHelper({
     verifiedTransitions: 0,
     textInputs: 0,
     explicitScrolls: 0,
+    pageSurveys: 0,
     viewportReads: 0,
     selections: 0,
     uploads: 0
@@ -234,6 +235,15 @@ export function createJourneyHelper({
       });
     },
 
+    async survey(options = {}) {
+      return step('survey-visible', async () => {
+        const result = await action.survey(options);
+        counters.pageSurveys += 1;
+        await settle({ maximumWords: 36 });
+        return result;
+      });
+    },
+
     async read(input = {}) {
       return step('read-viewport', async () => {
         counters.viewportReads += 1;
@@ -269,11 +279,21 @@ export function createJourneyHelper({
       const checks = {
         entryEstablished: counters.entries > 0,
         viewportObserved: counters.viewportReads >= counters.entries,
-        pointerPathUsed: counters.visibleClicks === 0 || Number(primitive.pointerMoves) >= counters.visibleClicks * 4,
+        pointerPathUsed: counters.visibleClicks === 0 || Number(primitive.pointerMoves) >= counters.visibleClicks * 10,
         clickMechanicsUsed: counters.visibleClicks === 0 || Number(primitive.clicks) >= counters.visibleClicks,
-        typedWithCadence: counters.textInputs === 0 || Number(primitive.typedCharacters) > 0,
+        typedWithCadence: counters.textInputs === 0 || (
+          Number(primitive.typedCharacters) > 0 &&
+          Number(primitive.keyboardEvents) >= Number(primitive.typedCharacters) &&
+          Number(primitive.typingCadencePauses) >= Number(primitive.typedCharacters) - counters.textInputs
+        ),
         visibleTargetsAcquired: Number(primitive.visibleTargetAcquisitions) >= Number(primitive.clicks),
-        scrollingIsSegmented: Number(primitive.scrollGestures) === 0 || Number(primitive.wheelEvents) >= Number(primitive.scrollGestures) * 3,
+        scrollingIsSegmented: (
+          Number(primitive.scrollGestures) === 0 ||
+          Number(primitive.wheelEvents) >= Number(primitive.scrollGestures) * 8
+        ) && (
+          Number(primitive.surveysNeedingScroll || 0) === 0 ||
+          Number(primitive.surveyBacktracks || 0) >= Number(primitive.surveysNeedingScroll || 0)
+        ),
         transitionsVerified: counters.nextPages === 0 || counters.verifiedTransitions >= counters.nextPages,
         noBypassViolation: violations.length === 0,
         allJourneyStepsSettled: active === 0

@@ -64,7 +64,7 @@ test('fast, auto, and human use identical visible mechanics while only pacing ch
   assert.deepEqual(mechanicsAudit(fast.audit), mechanicsAudit(human.audit));
   assert.ok(fast.calls.some((item) => item[0] === 'move'));
   assert.equal(fast.calls.filter((item) => item[0] === 'pressSequentially').length, 4);
-  assert.equal(fast.calls.filter((item) => item[0] === 'wheel').length, 5);
+  assert.equal(fast.calls.filter((item) => item[0] === 'wheel').length, 8);
   assert.ok(fast.readingDelay > 0);
   assert.ok(fast.readingDelay < human.readingDelay);
   assert.equal(fast.sleeps.length, human.sleeps.length);
@@ -72,7 +72,7 @@ test('fast, auto, and human use identical visible mechanics while only pacing ch
   assert.ok(fast.calls.find((item) => item[0] === 'click')[1].delay < human.calls.find((item) => item[0] === 'click')[1].delay);
 });
 
-test('human mode uses bounded pointer motion, typing rhythm, eased scroll, and reading dwell', async () => {
+test('human mode uses bounded pointer motion, typing rhythm, minimum-jerk scroll, and reading dwell', async () => {
   const { calls, page } = fixture();
   const sleeps = [];
   const randomValues = [0.1, 0.9, 0.3, 0.7];
@@ -103,18 +103,119 @@ test('human mode uses bounded pointer motion, typing rhythm, eased scroll, and r
   const keystrokes = calls.filter((item) => item[0] === 'pressSequentially');
   assert.equal(keystrokes.length, 5);
   assert.deepEqual(keystrokes.map((item) => item[1]), ['H', 'i', ',', ' ', 'x']);
-  assert.ok(keystrokes.every((item) => item[2].delay >= 25 && item[2].delay <= 85));
-  assert.ok(new Set(keystrokes.map((item) => item[2].delay)).size > 1);
+  assert.ok(keystrokes.every((item) => item[2].delay === 0));
+  assert.ok(action.audit.typingCadencePauses >= 4);
+  assert.ok(action.audit.keyboardEvents >= 5);
   const wheels = calls.filter((item) => item[0] === 'wheel');
-  assert.equal(wheels.length, 5);
+  assert.equal(wheels.length, 8);
   assert.equal(wheels.reduce((total, item) => total + item[2], 0), 300);
   assert.ok(new Set(wheels.map((item) => item[2])).size > 1);
-  assert.ok(Math.abs(wheels[2][2]) > Math.abs(wheels[0][2]));
-  assert.ok(readingDelay >= 2_150 && readingDelay <= 3_900);
+  assert.ok(Math.max(...wheels.map((item) => Math.abs(item[2]))) > Math.abs(wheels[0][2]) * 3);
+  assert.ok(Math.max(...wheels.map((item) => Math.abs(item[2]))) > Math.abs(wheels.at(-1)[2]) * 3);
+  assert.ok(readingDelay >= 880 && readingDelay <= 2_100);
   assert.ok(sleeps.includes(readingDelay));
   assert.equal(calls.some((item) => item[0] === 'scrollIntoViewIfNeeded'), false);
   assert.ok(action.audit.pointerMoves >= 14);
-  assert.equal(action.audit.wheelEvents, 5);
+  assert.equal(action.audit.wheelEvents, 8);
+});
+
+test('pointer motion follows a smooth accelerate-cruise-decelerate velocity profile', async () => {
+  const { calls, locator, page } = fixture();
+  locator.boundingBox = async () => ({ x: 600, y: 300, width: 100, height: 40 });
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    random: () => 0.9,
+    sleep: async () => {}
+  });
+
+  await action.hover('#nearby');
+
+  const points = calls.filter((item) => item[0] === 'move').map((item) => ({ x: item[1], y: item[2] }));
+  const distances = points.slice(1).map((point, index) => Math.hypot(
+    point.x - points[index].x,
+    point.y - points[index].y
+  ));
+  const middle = distances.slice(Math.floor(distances.length * 0.3), Math.ceil(distances.length * 0.7));
+  assert.ok(points.length >= 12);
+  assert.ok(Math.max(...middle) > distances[0] * 2);
+  assert.ok(Math.max(...middle) > distances.at(-1) * 2);
+  assert.ok(action.audit.pointerPeakStepPx > 0);
+  assert.ok(action.audit.pointerDistancePx > 0);
+});
+
+test('fast typing still emits keyboard events one character at a time with a non-zero cadence floor', async () => {
+  const { calls, page } = fixture();
+  const sleeps = [];
+  const action = createActionHelper({
+    page,
+    mode: 'fast',
+    random: () => 0,
+    sleep: async (milliseconds) => sleeps.push(milliseconds)
+  });
+
+  await action.fill('#name', 'abc def');
+
+  const characters = calls.filter((item) => item[0] === 'pressSequentially');
+  assert.deepEqual(characters.map((item) => item[1]), Array.from('abc def'));
+  assert.ok(characters.every((item) => item[2].delay === 0));
+  assert.ok(sleeps.filter((milliseconds) => milliseconds >= 12).length >= 6);
+  assert.equal(action.audit.typedCharacters, 7);
+  assert.equal(action.audit.keyboardEvents, 7);
+  assert.ok(action.audit.typingCadencePauses >= 6);
+});
+
+test('page survey makes a bounded rapid pass to the bottom and visibly backtracks', async () => {
+  const { calls, page } = fixture();
+  let scrollY = 0;
+  const maxScroll = 4_200;
+  page.viewportSize = () => ({ width: 1_000, height: 700 });
+  page.evaluate = async () => ({ scrollY, maxScroll, viewportHeight: 700 });
+  page.mouse.wheel = async (x, deltaY) => {
+    calls.push(['wheel', x, deltaY]);
+    scrollY = Math.max(0, Math.min(maxScroll, scrollY + deltaY));
+  };
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    random: () => 0.5,
+    sleep: async () => {}
+  });
+
+  const result = await action.survey({ maxGestures: 8 });
+
+  const wheels = calls.filter((item) => item[0] === 'wheel');
+  assert.equal(result.reachedBottom, true);
+  assert.ok(wheels.some((item) => item[2] > 0));
+  assert.ok(wheels.some((item) => item[2] < 0));
+  assert.ok(scrollY < maxScroll);
+  assert.equal(action.audit.pageSurveys, 1);
+  assert.equal(action.audit.surveysNeedingScroll, 1);
+  assert.ok(action.audit.surveyBacktracks >= 1);
+  assert.ok(action.audit.wheelEvents >= action.audit.scrollGestures * 8);
+});
+
+test('page survey counts backtracking only after the rendered page actually moves upward', async () => {
+  const { page } = fixture();
+  let scrollY = 0;
+  const maxScroll = 1_400;
+  page.viewportSize = () => ({ width: 1_000, height: 700 });
+  page.evaluate = async () => ({ scrollY, maxScroll, viewportHeight: 700 });
+  page.mouse.wheel = async (_x, deltaY) => {
+    if (deltaY > 0) scrollY = Math.min(maxScroll, scrollY + deltaY);
+  };
+  const action = createActionHelper({
+    page,
+    mode: 'human',
+    random: () => 0.5,
+    sleep: async () => {}
+  });
+
+  const result = await action.survey({ maxGestures: 2 });
+
+  assert.equal(result.reachedBottom, true);
+  assert.equal(result.backtracked, false);
+  assert.equal(action.audit.surveyBacktracks, 0);
 });
 
 test('human click reaches an offscreen target through bounded wheel gestures instead of instant positioning', async () => {

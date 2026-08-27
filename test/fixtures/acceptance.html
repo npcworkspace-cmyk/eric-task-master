@@ -22,9 +22,19 @@
       <a id="download" download="taskmaster-fixture.txt" href="data:text/plain,taskmaster-download-ok">Download fixture</a>
     </main>
     <script>
-      window.__taskmasterTrace = { pointerMoves: 0, inputEvents: 0, wheelEvents: 0 };
+      window.__taskmasterTrace = {
+        pointerMoves: 0,
+        inputEvents: 0,
+        keyEvents: 0,
+        wheelEvents: 0,
+        inputTimeline: []
+      };
       document.addEventListener('pointermove', () => { window.__taskmasterTrace.pointerMoves += 1; });
-      document.addEventListener('input', () => { window.__taskmasterTrace.inputEvents += 1; });
+      document.addEventListener('keydown', () => { window.__taskmasterTrace.keyEvents += 1; });
+      document.addEventListener('input', () => {
+        window.__taskmasterTrace.inputEvents += 1;
+        window.__taskmasterTrace.inputTimeline.push(performance.now());
+      });
       document.addEventListener('wheel', () => { window.__taskmasterTrace.wheelEvents += 1; });
       document.querySelector('#submit').addEventListener('click', () => {
         const name = document.querySelector('#name').value;

@@ -17,6 +17,7 @@ const PROJECT_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const ACCEPTANCE_TASK = fileURLToPath(new URL('../../examples/tasks/acceptance-task.mjs', import.meta.url));
 const READ_PAGE_TASK = fileURLToPath(new URL('../../examples/tasks/read-page-task.mjs', import.meta.url));
 const OBSERVE_PAGE_TASK = fileURLToPath(new URL('../../examples/tasks/observe-page-task.mjs', import.meta.url));
+const SURFACE_PROBE_TASK = fileURLToPath(new URL('../../examples/tasks/surface-probe-task.mjs', import.meta.url));
 const DURABLE_DELAY_TASK = fileURLToPath(new URL('../../examples/tasks/durable-delay-task.mjs', import.meta.url));
 const HANDOFF_ACCEPTANCE_TASK = fileURLToPath(new URL('../../examples/tasks/handoff-acceptance-task.mjs', import.meta.url));
 const LEASE_TTL_MS = 60_000;
@@ -708,6 +709,7 @@ export function createTaskService({
     { name: 'acceptance', modulePath: ACCEPTANCE_TASK },
     { name: 'read-page', modulePath: READ_PAGE_TASK },
     { name: 'observe-page', modulePath: OBSERVE_PAGE_TASK },
+    { name: 'surface-probe', modulePath: SURFACE_PROBE_TASK },
     { name: 'handoff-acceptance', modulePath: HANDOFF_ACCEPTANCE_TASK },
     { name: 'durable-delay', modulePath: DURABLE_DELAY_TASK }
   ]

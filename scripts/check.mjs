@@ -105,6 +105,12 @@ async function staticChecks() {
     'task scheduler or progress-health boundary drift'
   );
   invariant(
+    taskService.includes("{ name: 'surface-probe', modulePath: SURFACE_PROBE_TASK }") &&
+      journey.includes("async survey(options = {})") && behavior.includes("async survey(options = {})") &&
+      taskWorker.includes("survey: guardedAction('survey')"),
+    'bounded surface probe or central page-survey boundary drift'
+  );
+  invariant(
     manager.includes('DashboardSessionStore') && manager.includes('AgentRegistry') &&
       manager.includes('/v1/dashboard/summary') && manager.includes('/v1/agents'),
     'Owner session or Agent registry boundary drift'

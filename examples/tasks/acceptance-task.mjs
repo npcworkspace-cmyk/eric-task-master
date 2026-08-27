@@ -63,16 +63,21 @@ export async function run({ page, context, input, outputDir, journey, progress, 
   await journey.scroll({ deltaY: 120, steps: 4 });
   const readingDelay = await journey.read({ words: 20 });
   const behaviorTrace = await page.evaluate(() => window.__taskmasterTrace);
+  const inputGaps = behaviorTrace.inputTimeline.slice(1).map((at, index) => at - behaviorTrace.inputTimeline[index]);
   const humanBehavior = journey.contract === 'full-human-v1';
   evidence.push({
     kind: 'behavior',
     ok: humanBehavior
-      ? behaviorTrace.pointerMoves >= 4 && behaviorTrace.inputEvents >= 16 &&
-        behaviorTrace.wheelEvents >= 2 && readingDelay > 0 && readingDelay <= 8_000
+      ? behaviorTrace.pointerMoves >= 10 && behaviorTrace.inputEvents >= 16 &&
+        behaviorTrace.keyEvents >= 16 && inputGaps.some((gap) => gap >= 8) &&
+        behaviorTrace.wheelEvents >= 8 && readingDelay > 0 && readingDelay <= 8_000
       : readingDelay === 0,
     mode: 'profile-controlled',
     pointerMoves: behaviorTrace.pointerMoves,
     inputEvents: behaviorTrace.inputEvents,
+    keyEvents: behaviorTrace.keyEvents,
+    minimumObservedInputGap: inputGaps.length ? Math.min(...inputGaps) : 0,
+    maximumObservedInputGap: inputGaps.length ? Math.max(...inputGaps) : 0,
     wheelEvents: behaviorTrace.wheelEvents,
     readingDelay
   });

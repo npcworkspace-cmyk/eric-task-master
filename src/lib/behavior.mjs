@@ -3,22 +3,25 @@ import { isBehaviorMode } from '../contracts.mjs';
 const DEFAULT_HUMAN_TIMING = Object.freeze({
   cautiousBeforeAction: [15, 45],
   cautiousAfterAction: [25, 75],
-  beforeAction: [45, 140],
-  afterAction: [55, 180],
-  hoverPause: [90, 260],
-  clickDelay: [45, 120],
-  mouseSteps: [14, 30],
-  mouseStepPause: [3, 11],
+  beforeAction: [30, 105],
+  afterAction: [35, 130],
+  hoverPause: [55, 155],
+  clickDelay: [38, 105],
+  mouseSteps: [16, 32],
+  mouseStepPause: [4, 10],
   mouseCorrectionSteps: [4, 8],
-  keyDelay: [25, 85],
+  keyDelay: [30, 92],
+  typingBurstPause: [18, 58],
   selectionKeyPause: [35, 95],
-  wordPause: [30, 90],
-  punctuationPause: [120, 320],
-  scrollPause: [45, 135],
-  scrollGesturePause: [180, 620],
-  readingBase: [450, 900],
-  readingPerWord: [85, 145],
-  readingMaximum: 12_000
+  wordPause: [24, 72],
+  punctuationPause: [90, 220],
+  // Segment waits are frame-like. Deliberate pauses belong between gestures,
+  // never between large, visibly separated wheel chunks.
+  scrollPause: [5, 14],
+  scrollGesturePause: [70, 240],
+  readingBase: [320, 650],
+  readingPerWord: [28, 65],
+  readingMaximum: 7_500
 });
 
 const AUTO_SIGNALS = Object.freeze({
@@ -31,7 +34,7 @@ const AUTO_SIGNALS = Object.freeze({
 });
 
 const AUTO_LABELS = Object.freeze(['fast', 'cautious', 'guarded', 'cooldown']);
-const PACING_SCALE = Object.freeze({ fast: 0.18, cautious: 0.52, human: 1 });
+const PACING_SCALE = Object.freeze({ fast: 0.22, cautious: 0.55, human: 1 });
 
 export class BehaviorActionError extends Error {
   constructor(operation, cause) {
@@ -57,15 +60,24 @@ function asLocator(page, target) {
   throw new TypeError('Action target must be a selector string or Playwright Locator');
 }
 
-function easedSegments(total, steps, random) {
-  const weights = Array.from({ length: steps }, (_, index) => {
-    const easing = Math.sin(Math.PI * (index + 1) / (steps + 1));
-    return easing * (0.9 + random() * 0.2);
-  });
-  const weightTotal = weights.reduce((sum, value) => sum + value, 0);
+function minimumJerk(progress) {
+  const value = Math.max(0, Math.min(1, progress));
+  return 10 * value ** 3 - 15 * value ** 4 + 6 * value ** 5;
+}
+
+function motionSegments(total, steps, random) {
+  let priorSample = 0;
+  let priorProgress = 0;
   let sent = 0;
-  return weights.map((weight, index) => {
-    const value = index === steps - 1 ? total - sent : Math.round(total * weight / weightTotal);
+  return Array.from({ length: steps }, (_, index) => {
+    if (index === steps - 1) return total - sent;
+    const linear = (index + 1) / steps;
+    const boundedJitter = (random() - 0.5) * 0.12 / steps;
+    const sample = Math.max(priorSample + 0.0001, Math.min(0.9999, linear + boundedJitter));
+    const progress = minimumJerk(sample);
+    const value = Math.round(total * (progress - priorProgress));
+    priorSample = sample;
+    priorProgress = progress;
     sent += value;
     return value;
   });
@@ -118,16 +130,28 @@ export function createActionHelper({
     clicks: 0,
     pointerMoves: 0,
     pointerCorrections: 0,
+    pointerDistancePx: 0,
+    pointerPeakStepPx: 0,
     visibleTargetAcquisitions: 0,
     typedCharacters: 0,
+    keyboardEvents: 0,
+    typingCadencePauses: 0,
+    typingBursts: 0,
     selectionKeyEvents: 0,
     selectionFallbacks: 0,
     scrollGestures: 0,
     wheelEvents: 0,
+    scrollDistancePx: 0,
+    scrollDirectionChanges: 0,
     targetTraversals: 0,
+    pageSurveys: 0,
+    surveysNeedingScroll: 0,
+    surveyBacktracks: 0,
+    surveyReachedBottom: 0,
     readingDwells: 0,
     readingDurationMs: 0
   };
+  let lastScrollDirection = 0;
 
   const throwIfAborted = () => {
     if (!abortSignal?.aborted) return;
@@ -185,21 +209,26 @@ export function createActionHelper({
   }
 
   async function humanWheel(deltaX, deltaY, requestedSteps) {
-    // Gesture topology is mode-invariant. Only the pause between its segments
-    // is scaled, so fast never deletes wheel events from the human journey.
-    const defaultSteps = numberBetween([5, 9], random);
+    const distance = Math.hypot(deltaX, deltaY);
+    const defaultSteps = Math.round(10 + Math.min(18, Math.sqrt(distance) * 0.45));
     const steps = Math.max(
-      3,
-      Math.min(12, strictVisibleTraversal ? defaultSteps : Number(requestedSteps) || defaultSteps)
+      8,
+      Math.min(32, strictVisibleTraversal ? defaultSteps : Number(requestedSteps) || defaultSteps)
     );
-    const xSegments = easedSegments(deltaX, steps, random);
-    const ySegments = easedSegments(deltaY, steps, random);
+    const xSegments = motionSegments(deltaX, steps, random);
+    const ySegments = motionSegments(deltaY, steps, random);
+    const direction = Math.sign(deltaY || deltaX);
+    if (lastScrollDirection && direction && direction !== lastScrollDirection) metrics.scrollDirectionChanges += 1;
+    if (direction) lastScrollDirection = direction;
     metrics.scrollGestures += 1;
     for (let index = 0; index < steps; index += 1) {
       throwIfAborted();
       await page.mouse.wheel(xSegments[index], ySegments[index]);
       metrics.wheelEvents += 1;
-      if (index !== steps - 1) await pacingSleep(pacingNumber(timing.scrollPause));
+      metrics.scrollDistancePx += Math.hypot(xSegments[index], ySegments[index]);
+      if (index !== steps - 1) {
+        await pacingSleep(pacingNumber(timing.scrollPause, { minimum: effectiveMode() === 'human' ? 4 : 2 }));
+      }
     }
   }
 
@@ -214,33 +243,52 @@ export function createActionHelper({
       }
       return null;
     }
-    for (let attempt = 0; attempt < 24; attempt += 1) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
       throwIfAborted();
       const centerY = box.y + box.height / 2;
-      if (centerY >= 0 && centerY <= viewport.height) {
+      const acquisitionTop = strictVisibleTraversal ? viewport.height * 0.16 : 0;
+      const acquisitionBottom = strictVisibleTraversal ? viewport.height * 0.84 : viewport.height;
+      if (centerY >= acquisitionTop && centerY <= acquisitionBottom) {
         metrics.visibleTargetAcquisitions += 1;
         return box;
       }
-      const desiredY = viewport.height * (0.48 + (random() - 0.5) * 0.12);
+      const below = centerY > acquisitionBottom;
+      const desiredY = viewport.height * (below
+        ? 0.62 + random() * 0.08
+        : 0.30 + random() * 0.08);
       const rawDelta = centerY - desiredY;
-      const maximumGesture = viewport.height * (0.56 + random() * 0.18);
+      const far = Math.abs(rawDelta) > viewport.height * 1.75;
+      const maximumGesture = viewport.height * (far
+        ? 1.35 + random() * 0.70
+        : 0.70 + random() * 0.45);
       const deltaY = Math.sign(rawDelta) * Math.min(Math.abs(rawDelta), maximumGesture);
       if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 8) break;
       await humanWheel(0, deltaY);
       metrics.targetTraversals += 1;
-      await pacingSleep(pacingNumber(timing.scrollGesturePause));
-      if (Math.abs(deltaY) > viewport.height * 0.35 && random() < 0.22) {
-        const correction = -Math.sign(deltaY) * numberBetween([18, 54], random);
-        await humanWheel(0, correction, numberBetween([3, 5], random));
+      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 12 }));
+      if (Math.abs(deltaY) > viewport.height * 0.8 && random() < 0.28) {
+        const correction = -Math.sign(deltaY) * numberBetween([24, 72], random);
+        await humanWheel(0, correction, numberBetween([8, 10], random));
         metrics.pointerCorrections += 1;
         await pacingSleep(pacingNumber(timing.scrollPause));
       }
       const next = await locator.boundingBox?.(measurementOptions);
       if (!next) break;
+      const nextCenterY = next.y + next.height / 2;
+      if (
+        nextCenterY >= 0 && nextCenterY <= viewport.height &&
+        Math.abs(nextCenterY - centerY) < 2
+      ) {
+        // A document boundary can prevent a visible footer target from being
+        // centered any further. Clicking the already visible control is safer
+        // than issuing twenty ineffective wheel gestures.
+        metrics.visibleTargetAcquisitions += 1;
+        return next;
+      }
       box = next;
     }
     const centerY = box.y + box.height / 2;
-    if (centerY >= 0 && centerY <= viewport.height) {
+    if (centerY >= viewport.height * 0.12 && centerY <= viewport.height * 0.88) {
       metrics.visibleTargetAcquisitions += 1;
       return box;
     }
@@ -264,22 +312,30 @@ export function createActionHelper({
       y: start.y + dy * (0.68 + random() * 0.12) - normal.y * curve * 0.45
     };
     const viewport = viewportSize();
+    let priorPoint = start;
     for (let index = 1; index <= steps; index += 1) {
       throwIfAborted();
       const linear = index / steps;
-      const progress = linear * linear * (3 - 2 * linear);
+      const progress = minimumJerk(linear);
       const inverse = 1 - progress;
       const x = inverse ** 3 * start.x + 3 * inverse ** 2 * progress * control1.x +
         3 * inverse * progress ** 2 * control2.x + progress ** 3 * target.x;
       const y = inverse ** 3 * start.y + 3 * inverse ** 2 * progress * control1.y +
         3 * inverse * progress ** 2 * control2.y + progress ** 3 * target.y;
-      await page.mouse.move(
-        Math.max(0, Math.min(viewport.width - 1, x)),
-        Math.max(0, Math.min(viewport.height - 1, y))
-      );
+      const point = {
+        x: Math.max(0, Math.min(viewport.width - 1, x)),
+        y: Math.max(0, Math.min(viewport.height - 1, y))
+      };
+      await page.mouse.move(point.x, point.y);
+      const stepDistance = Math.hypot(point.x - priorPoint.x, point.y - priorPoint.y);
+      metrics.pointerDistancePx += stepDistance;
+      metrics.pointerPeakStepPx = Math.max(metrics.pointerPeakStepPx, stepDistance);
+      priorPoint = point;
       metrics.pointerMoves += 1;
       if (correction) metrics.pointerCorrections += 1;
-      if (index !== steps) await pacingSleep(pacingNumber(timing.mouseStepPause));
+      if (index !== steps) {
+        await pacingSleep(pacingNumber(timing.mouseStepPause, { minimum: effectiveMode() === 'human' ? 3 : 2 }));
+      }
     }
   }
 
@@ -321,10 +377,10 @@ export function createActionHelper({
     const dx = target.x - cursor.x;
     const dy = target.y - cursor.y;
     const distance = Math.hypot(dx, dy);
-    const steps = Math.max(
-      numberBetween(timing.mouseSteps, random),
-      Math.min(36, Math.round(distance / 28))
-    );
+    const targetWidth = Math.max(8, Math.min(box.width, box.height));
+    const difficulty = Math.log2(distance / targetWidth + 1);
+    const adaptiveSteps = Math.round(9 + difficulty * 4.5 + Math.min(7, distance / 160));
+    const steps = Math.max(numberBetween(timing.mouseSteps, random), Math.min(48, adaptiveSteps));
     const start = cursor;
     if (distance > 140 && random() < 0.52) {
       const overshootDistance = Math.min(14, Math.max(4, distance * 0.025));
@@ -369,19 +425,100 @@ export function createActionHelper({
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
     await page.keyboard.press('Backspace');
     let result;
-    for (const character of Array.from(String(value))) {
+    const characters = Array.from(String(value));
+    let burstRemaining = numberBetween([3, 7], random);
+    metrics.typingBursts += characters.length > 0 ? 1 : 0;
+    for (const [index, character] of characters.entries()) {
       throwIfAborted();
-      const delay = pacingNumber(timing.keyDelay);
+      const delay = pacingNumber(timing.keyDelay, { minimum: 12 });
       if (typeof locator.pressSequentially === 'function') {
-        result = await locator.pressSequentially(character, { delay });
+        result = await locator.pressSequentially(character, { delay: 0 });
       } else {
-        result = await locator.type(character, { delay });
+        result = await locator.type(character, { delay: 0 });
       }
       metrics.typedCharacters += 1;
-      if (/[,.;:!?，。！？；：、]/u.test(character)) await pacingSleep(pacingNumber(timing.punctuationPause));
-      else if (/\s/u.test(character)) await pacingSleep(pacingNumber(timing.wordPause));
+      metrics.keyboardEvents += 1;
+      const isLast = index === characters.length - 1;
+      if (!isLast) {
+        await pacingSleep(delay);
+        metrics.typingCadencePauses += 1;
+      }
+      if (/[,.;:!?，。！？；：、]/u.test(character)) {
+        await pacingSleep(pacingNumber(timing.punctuationPause));
+      } else if (/\s/u.test(character)) {
+        await pacingSleep(pacingNumber(timing.wordPause));
+      } else if (!isLast && --burstRemaining === 0) {
+        await pacingSleep(pacingNumber(timing.typingBurstPause ?? DEFAULT_HUMAN_TIMING.typingBurstPause));
+        metrics.typingCadencePauses += 1;
+        metrics.typingBursts += 1;
+        burstRemaining = numberBetween([3, 7], random);
+      }
     }
     return result;
+  }
+
+  async function readScrollState() {
+    return page.evaluate(() => {
+      const root = document.scrollingElement || document.documentElement;
+      const height = Math.max(
+        root?.scrollHeight || 0,
+        document.body?.scrollHeight || 0,
+        document.documentElement?.scrollHeight || 0
+      );
+      return {
+        scrollY: Math.max(0, window.scrollY || root?.scrollTop || 0),
+        maxScroll: Math.max(0, height - window.innerHeight),
+        viewportHeight: Math.max(1, window.innerHeight)
+      };
+    });
+  }
+
+  async function surveyPage(options = {}) {
+    const maxGestures = Number(options.maxGestures ?? 8);
+    if (!Number.isSafeInteger(maxGestures) || maxGestures < 1 || maxGestures > 24) {
+      throw new TypeError('survey maxGestures must be an integer from 1 to 24');
+    }
+    const start = await readScrollState();
+    metrics.pageSurveys += 1;
+    const needsScroll = start.maxScroll - start.scrollY > start.viewportHeight * 0.35;
+    if (needsScroll) metrics.surveysNeedingScroll += 1;
+    let state = start;
+    let unchanged = 0;
+    let gestures = 0;
+    while (gestures < maxGestures && state.scrollY < state.maxScroll - Math.max(8, state.viewportHeight * 0.04)) {
+      const remaining = state.maxScroll - state.scrollY;
+      const deltaY = Math.min(remaining, state.viewportHeight * (1.35 + random() * 0.65));
+      await humanWheel(0, deltaY);
+      gestures += 1;
+      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 12 }));
+      const next = await readScrollState();
+      unchanged = next.scrollY <= state.scrollY + 1 ? unchanged + 1 : 0;
+      state = next;
+      if (unchanged >= 2) break;
+    }
+    const reachedBottom = state.scrollY >= state.maxScroll - Math.max(8, state.viewportHeight * 0.06);
+    if (reachedBottom) metrics.surveyReachedBottom += 1;
+    let backtracked = false;
+    if (needsScroll && state.scrollY - start.scrollY > state.viewportHeight * 0.4) {
+      const beforeBacktrackY = state.scrollY;
+      const backtrackDistance = Math.min(
+        state.scrollY - start.scrollY,
+        state.viewportHeight * (0.48 + random() * 0.42)
+      );
+      await humanWheel(0, -backtrackDistance);
+      await pacingSleep(pacingNumber(timing.scrollGesturePause, { minimum: 12 }));
+      state = await readScrollState();
+      backtracked = state.scrollY < beforeBacktrackY - 1;
+      if (backtracked) metrics.surveyBacktracks += 1;
+    }
+    return Object.freeze({
+      startY: start.scrollY,
+      endY: state.scrollY,
+      maxScroll: state.maxScroll,
+      gestures,
+      reachedBottom,
+      backtracked
+    });
   }
 
   async function chooseSelectOption(locator, value, options) {
@@ -620,6 +757,10 @@ export function createActionHelper({
       return execute('scroll', async () => {
         await humanWheel(deltaX, deltaY, normalized.steps);
       });
+    },
+
+    async survey(options = {}) {
+      return execute('survey', () => surveyPage(options));
     },
 
     async read(input = {}) {

@@ -14,7 +14,12 @@ function fixture() {
     typedCharacters: 0,
     scrollGestures: 0,
     wheelEvents: 0,
-    targetTraversals: 0
+    targetTraversals: 0,
+    pageSurveys: 0,
+    surveysNeedingScroll: 0,
+    surveyBacktracks: 0,
+    keyboardEvents: 0,
+    typingCadencePauses: 0
   };
   const locator = {
     async selectOption() {},
@@ -55,6 +60,11 @@ function fixture() {
         scrollGestures: state.scrollGestures,
         wheelEvents: state.wheelEvents,
         targetTraversals: state.targetTraversals,
+        pageSurveys: state.pageSurveys,
+        surveysNeedingScroll: state.surveysNeedingScroll,
+        surveyBacktracks: state.surveyBacktracks,
+        keyboardEvents: state.keyboardEvents,
+        typingCadencePauses: state.typingCadencePauses,
         readingDwells: 1,
         readingDurationMs: 1
       };
@@ -72,16 +82,32 @@ function fixture() {
       state.pointerMoves += 18;
       state.targetTraversals += 1;
       state.scrollGestures += 2;
-      state.wheelEvents += 12;
+      state.wheelEvents += 16;
       state.url = 'https://example.test?page=2';
       state.title = 'Page two';
       state.heading = 'Second';
       state.body = 'Second body';
     },
-    async fill(_target, value) { state.typedCharacters += String(value).length; },
-    async type(_target, value) { state.typedCharacters += String(value).length; },
+    async fill(_target, value) {
+      state.typedCharacters += String(value).length;
+      state.keyboardEvents += String(value).length;
+      state.typingCadencePauses += Math.max(0, String(value).length - 1);
+    },
+    async type(_target, value) {
+      state.typedCharacters += String(value).length;
+      state.keyboardEvents += String(value).length;
+      state.typingCadencePauses += Math.max(0, String(value).length - 1);
+    },
     async hover() {},
-    async scroll() { state.scrollGestures += 1; state.wheelEvents += 5; },
+    async scroll() { state.scrollGestures += 1; state.wheelEvents += 8; },
+    async survey() {
+      state.pageSurveys += 1;
+      state.surveysNeedingScroll += 1;
+      state.surveyBacktracks += 1;
+      state.scrollGestures += 2;
+      state.wheelEvents += 16;
+      return { reachedBottom: true, backtracked: true };
+    },
     async read() { return 100; },
     async run(_name, callback) { return callback(); },
     async wait() {}

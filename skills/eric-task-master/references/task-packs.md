@@ -36,17 +36,23 @@ The manifest is named `taskpack.json`:
 - Use bounded `camelCase` input fields that describe only business intent. Do not put runtime controls, Profile IDs, behavior modes, Agent IDs, cookies, tokens, or other credentials in task input.
 - Keep applicable output names stable within one task type, preferring `result.json`, `records.jsonl`, `summary.json`, and `manifest.json`. A Pack need not emit every file, but it must not rename equivalent outputs between runs.
 
+## Mandatory probe-before-scale gate
+
+When no specialized Skill or registered task type covers a large request, first run the built-in `surface-probe` task type against one representative entry URL. Large means at least 20 independent pages/items, pagination or recursive expansion, an expected run above ten minutes, or unattended batch execution. Read its declared `surface-probe.json` artifact before authoring the Task Pack. Probe at most three URLs only when the site has materially different list/detail/account surfaces.
+
+The probe is read-only and bounded. It samples headings, links, controls, page length, stable locator hints, pagination candidates, challenge signals, and a central rapid survey/backtrack journey, then recommends the closest recipe. It does not prove full-site coverage, grant permission, or defeat a login, CAPTCHA, or rate limit. A CAPTCHA or rate-limit blocker makes `scaleAllowed` false. After the probe, customize the recommended recipe and run one bounded pilot whose result schema, checkpoints, rate policy, and completion evidence pass before raising the scale.
+
 ## Mandatory Human Journey contract
 
 Every Task Pack declares `"interactionContract": "full-human-v1"`, and every Pack module declares `meta.interactionContract: 'full-human-v1'`. The Pack defines **what** to do, in what order, platform rate limits, when to checkpoint, and how to prove completion. The base runtime owns **how each visible browser action is physically performed and paced by the Profile's live mode**.
 
 - Use `journey.open` for an entry URL or an explicit recovery entry.
 - Use `journey.navigate` and `journey.nextPage` for links, detail pages, and pagination controls. Do not construct the next-page URL when the page exposes a usable Next control.
-- Use `journey.click/fill/type/hover/scroll/read/select/upload` for visible actions.
+- Use `journey.click/fill/type/hover/scroll/survey/read/select/upload` for visible actions. `journey.survey()` is the centrally paced rapid pass toward the page bottom followed by visible backtracking; do not recreate its wheel mechanics in a Pack.
 - Use `page`, `context`, locators, `evaluate`, and `semantic` only for reads, assertions, extraction, and observation. Contracted Packs receive read-only wrappers; direct mutation fails at runtime even if task code catches the first error.
 - Do not accept behavior mode, pointer timing, scroll shape, or typing cadence in Pack input. Those mechanics are centrally owned and versioned.
 
-In `fast`, `auto`, and `human`, the runtime still traverses rendered content with bounded wheel gestures before an offscreen target, uses curved pointer movement and in-target clicks, types through keyboard cadence, adds bounded reading dwell, verifies visible page transitions, and appends an Agent-visible `interaction-audit.json`. The selected Profile mode changes speed and caution, not the required journey. Completion fails unless all ten journey checks pass. This is a reliability and consistency contract, not fingerprint spoofing, CAPTCHA bypass, or a guarantee that a website cannot identify automation.
+In `fast`, `auto`, and `human`, the runtime still traverses rendered content with minimum-jerk wheel and pointer acceleration, rapid long-distance approach followed by precision acquisition, visible survey backtracking, in-target clicks, explicit per-character keyboard cadence, bounded reading dwell, verified visible transitions, and an Agent-visible `interaction-audit.json`. `fast` compresses time but keeps a non-zero keyboard cadence and the same motion topology. The selected Profile mode changes speed and caution, not the required journey. Completion fails unless all ten journey checks pass. This is a reliability and consistency contract, not fingerprint spoofing, CAPTCHA bypass, or a guarantee that a website cannot identify automation.
 
 For independent items in a batch, opening each supplied URL is a valid new entry. Within one item, use visible site controls for pagination and drill-down. A direct URL may be used as a checkpoint-recovery entry when the previous rendered page no longer exists; record that recovery in task progress or coverage.
 

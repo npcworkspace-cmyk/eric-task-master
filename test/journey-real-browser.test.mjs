@@ -43,6 +43,8 @@ function htmlPage(pageNumber) {
     <a id="next" href="/page-2">Next page</a>
     <script>
       let count = Number(sessionStorage.getItem('scroll-count') || 0);
+      window.__wheelTrace = [];
+      addEventListener('wheel', (event) => window.__wheelTrace.push({ deltaY: event.deltaY, at: performance.now() }), { passive: true });
       addEventListener('scroll', () => sessionStorage.setItem('scroll-count', String(++count)), { passive: true });
     </script>`;
 }
@@ -81,6 +83,14 @@ test('real Chromium traverses the rendered page before clicking a visible pagina
     const initialBox = await next.boundingBox();
     assert.ok(initialBox.y > 620, 'pagination control must begin below the viewport');
 
+    const survey = await journey.survey({ maxGestures: 8 });
+    const wheelTrace = await page.evaluate(() => window.__wheelTrace);
+    assert.equal(survey.reachedBottom, true);
+    assert.equal(survey.backtracked, true);
+    assert.ok(wheelTrace.some((event) => event.deltaY > 0));
+    assert.ok(wheelTrace.some((event) => event.deltaY < 0));
+    assert.ok(wheelTrace.length >= 16);
+
     await journey.nextPage(next, {
       timeoutMs: 10_000,
       verify: ({ after }) => after.url.endsWith('/page-2')
@@ -91,8 +101,10 @@ test('real Chromium traverses the rendered page before clicking a visible pagina
     const audit = journey.assertComplete();
     assert.equal(audit.score, 10);
     assert.ok(audit.primitives.targetTraversals > 0);
-    assert.ok(audit.primitives.wheelEvents >= audit.primitives.scrollGestures * 3);
-    assert.ok(audit.primitives.pointerMoves >= 14);
+    assert.equal(audit.counters.pageSurveys, 1);
+    assert.ok(audit.primitives.surveyBacktracks >= 1);
+    assert.ok(audit.primitives.wheelEvents >= audit.primitives.scrollGestures * 8);
+    assert.ok(audit.primitives.pointerMoves >= 16);
   } finally {
     await browser?.close();
     await new Promise((resolve) => server.close(resolve));

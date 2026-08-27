@@ -888,6 +888,7 @@ export async function runTaskWorker(config, {
       hover: guardedAction('hover'),
       select: guardedAction('select'),
       scroll: guardedAction('scroll'),
+      survey: guardedAction('survey'),
       read: guardedAction('read'),
       wait: guardedAction('wait')
     });

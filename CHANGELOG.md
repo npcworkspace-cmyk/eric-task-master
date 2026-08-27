@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.5.0 - 2026-08-27
+
+- Rebuilt visible motion around minimum-jerk acceleration: pointer sampling now adapts to travel distance and target size, far controls use a rapid approach followed by precision acquisition, document-edge controls stop futile scrolling, and wheel gestures use 8-32 fine-grained frame-like events instead of visibly separated chunks.
+- Added a centrally owned bounded page survey that can move quickly toward the bottom and visibly backtrack. `journey.survey()` exposes the intent to Task Packs without exposing scroll-shape controls, and the interaction audit now proves smooth event density plus required survey backtracking.
+- Made text entry unambiguously keyboard-driven. Every character emits its own keyboard path, central pacing supplies the actual inter-character delay with a 12 ms fast-mode floor, and word, punctuation, and burst rhythm remain live-mode controlled; common DOM mutation hidden inside observation `evaluate` callbacks now fails closed.
+- Added the built-in read-only `surface-probe` task type and a mandatory probe-before-scale policy when no specialized capability covers a large request. It samples one representative surface, surveys page structure, reports login/challenge/rate-limit signals, recommends one production recipe, and requires a bounded pilot before volume increases.
+- Expanded deterministic motion, real Chromium survey/backtrack, keyboard-event timing, evaluate-bypass, built-in probe, completion-audit, connect, and full local/cross-platform release-gate coverage.
+
 ## 2.4.0 - 2026-08-27
 
 - Made `fast`, `auto`, and `human` mechanically identical across the base action facade as well as Task Packs: every mode keeps rendered traversal, curved pointer paths and corrections, in-target clicks, per-character input, keyboard selection, segmented scrolling, and reading dwell. Task Pack journeys continue to add mandatory visible-transition verification.

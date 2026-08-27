@@ -9,6 +9,7 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
   const violations = [];
   const locator = {
     async innerText() { return 'readable'; },
+    async evaluate(callback) { return callback({ textContent: 'safe' }); },
     async click() { throw new Error('raw click should not run'); },
     first() { return this; }
   };
@@ -17,6 +18,7 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
     frames() { return []; },
     url() { return 'https://example.test'; },
     async goto() { throw new Error('raw goto should not run'); },
+    async evaluate() { return undefined; },
     async click() { throw new Error('raw page click should not run'); },
     async $() { throw new Error('raw ElementHandle should not escape'); },
     mouse: { async wheel() {} }
@@ -35,6 +37,8 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
 
   const visible = observed.page.locator('body').first();
   assert.equal(await visible.innerText(), 'readable');
+  assert.equal(await visible.evaluate((node) => node.textContent), 'safe');
+  assert.equal(await observed.page.evaluate(() => document.title), undefined);
   assert.equal(unwrapObservationLocator(visible), locator);
   assert.deepEqual(await observed.context.cookies(), []);
   assert.equal(observed.context.pages()[0], observed.page);
@@ -47,6 +51,14 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
   await assert.rejects(visible.click(), { code: 'TASK_UI_ACTION_REQUIRES_JOURNEY' });
   await assert.rejects(observed.context.newPage(), { code: 'TASK_UI_ACTION_REQUIRES_JOURNEY' });
   await assert.rejects(observed.context.newCDPSession(page), { code: 'TASK_UI_ACTION_REQUIRES_JOURNEY' });
+  await assert.rejects(
+    observed.page.evaluate(() => { document.querySelector('input').value = 'pasted'; }),
+    { code: 'TASK_UI_ACTION_REQUIRES_JOURNEY' }
+  );
+  await assert.rejects(
+    visible.evaluate((node) => node.click()),
+    { code: 'TASK_UI_ACTION_REQUIRES_JOURNEY' }
+  );
   assert.throws(() => observed.page.mouse, { code: 'TASK_UI_ACTION_REQUIRES_JOURNEY' });
   assert.deepEqual(violations.map((event) => `${event.surface}.${event.operation}`), [
     'Page.goto',
@@ -55,6 +67,8 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
     'Locator.click',
     'BrowserContext.newPage',
     'BrowserContext.newCDPSession',
+    'Page.evaluate',
+    'Locator.evaluate',
     'Page.mouse'
   ]);
 });
