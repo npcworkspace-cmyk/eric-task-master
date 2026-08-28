@@ -6,6 +6,8 @@
 - Preserved Manager's already-redacted field-level error message, safe details, and a correlated request ID through MCP. `TASK_INPUT_SCHEMA_FAILED` now tells the Agent to describe the selected task type and correct the named field once.
 - Added one bounded, rotated, permission-restricted Manager operational journal with MCP request-ID correlation, plus `taskmaster doctor --json` for Manager, registration, and recent-redacted-error health without source-code debugging or starting a browser service.
 - Added `taskmaster_scale_prepare` and CLI `task prepare-scale` as one-call, registered `surface-probe` preparation for unknown large work; simplified the base Skill so the runtime owns this preflight dispatch while specialized Task Packs retain site logic.
+- Repaired an upgrade edge case where a previously verified-empty ephemeral Profile had already been discarded but its interrupted task still retained a stale lease, preventing every later clean Manager shutdown. Recovery is limited to dead Workers, missing Profile records/directories, matching shutdown evidence, and the exact historical interruption states.
+- Made owned Hermes registration resilient to harmless YAML quote/comment formatting and runtime-marker-only edits by another Agent while continuing to reject any command, entrypoint, stable identity, or environment change outside that narrow contract.
 
 ## 2.5.3 - 2026-08-28
 

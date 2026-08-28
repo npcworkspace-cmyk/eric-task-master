@@ -273,6 +273,66 @@ test('registration runtime marker is backward compatible and requires one full-i
   assert.equal(repeated.agentHostReloadRequired, false);
 });
 
+test('a runtime-marker-only edit to an owned Hermes entry remains safely upgradeable', async () => {
+  const setup = await fixture();
+  const oldRegistrar = registrarFor(setup, { runtimeVersion: '2.5.2' });
+  const installed = await oldRegistrar.install({ hostKeys: ['hermes'] });
+  assert.equal(installed.ok, true);
+  const oldSource = await readFile(setup.paths.hermes, 'utf8');
+  assert.match(oldSource, /ERIC_TASK_MASTER_RUNTIME_VERSION: "2\.5\.2"/u);
+  const sourceWithTrailingComment = oldSource.replace(
+    'theme: dark',
+    '# Retain this top-level host comment\ntheme: dark'
+  );
+  await write(
+    setup.paths.hermes,
+    sourceWithTrailingComment.replace(
+      'ERIC_TASK_MASTER_RUNTIME_VERSION: "2.5.2"',
+      'ERIC_TASK_MASTER_RUNTIME_VERSION: "2.5.3"'
+    ).replace(
+      new RegExp(`command: ${JSON.stringify(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'u'),
+      `command: ${process.execPath}`
+    ).replace(
+      new RegExp(`- ${JSON.stringify(setup.entrypoint).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'u'),
+      `- ${setup.entrypoint}`
+    ).replace(
+      /^(\s+(?:ERIC_TASK_MASTER_CLIENT_ID|ERIC_TASK_MASTER_CLIENT_NAME|TASKMASTER_CLIENT_ID|TASKMASTER_CLIENT_NAME|ERIC_TASK_MASTER_RUNTIME_VERSION)\s*): "([^"]+)"$/gmu,
+      '$1: $2'
+    )
+  );
+
+  const currentRegistrar = registrarFor(setup, { runtimeVersion: '2.5.4' });
+  const status = await currentRegistrar.status({ hostKeys: ['hermes'] });
+  assert.equal(status.results[0].status, 'update_available');
+  const upgraded = await currentRegistrar.install({ hostKeys: ['hermes'] });
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.results[0].status, 'registered_pending_restart');
+  const upgradedSource = await readFile(setup.paths.hermes, 'utf8');
+  assert.match(upgradedSource, /ERIC_TASK_MASTER_RUNTIME_VERSION: "2\.5\.4"/u);
+  assert.match(upgradedSource, /# Retain this top-level host comment/u);
+});
+
+test('Hermes semantic runtime adoption still rejects command changes', async () => {
+  const setup = await fixture();
+  const oldRegistrar = registrarFor(setup, { runtimeVersion: '2.5.2' });
+  const installed = await oldRegistrar.install({ hostKeys: ['hermes'] });
+  assert.equal(installed.ok, true);
+  const oldSource = await readFile(setup.paths.hermes, 'utf8');
+  await write(
+    setup.paths.hermes,
+    oldSource
+      .replace(JSON.stringify(process.execPath), 'C:\\foreign\\node.exe')
+      .replace('ERIC_TASK_MASTER_RUNTIME_VERSION: "2.5.2"', 'ERIC_TASK_MASTER_RUNTIME_VERSION: 2.5.3')
+  );
+
+  const currentRegistrar = registrarFor(setup, { runtimeVersion: '2.5.4' });
+  const status = await currentRegistrar.status({ hostKeys: ['hermes'] });
+  assert.equal(status.results[0].status, 'conflict');
+  const install = await currentRegistrar.install({ hostKeys: ['hermes'] });
+  assert.equal(install.ok, false);
+  assert.equal(install.results[0].error.code, 'OWNED_ENTRY_CHANGED');
+});
+
 test('partial registration cannot consume a pending global runtime reload marker', async () => {
   const setup = await fixture();
   const oldRegistrar = registrarFor(setup, { runtimeVersion: '2.1.2' });

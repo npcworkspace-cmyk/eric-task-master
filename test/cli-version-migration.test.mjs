@@ -157,7 +157,8 @@ async function writeBlockedProfile(stateDir, {
   id,
   kind = 'ephemeral',
   pid,
-  retainedData = false
+  retainedData = false,
+  ownerId = 'task:interrupted-upgrade'
 }) {
   const userDataDir = path.join(stateDir, 'profiles', id);
   await mkdir(userDataDir, { recursive: true });
@@ -173,7 +174,7 @@ async function writeBlockedProfile(stateDir, {
     browserEngine: kind === 'persistent' ? 'chrome' : 'chromium',
     state: 'error',
     lease: {
-      ownerId: 'task:interrupted-upgrade',
+      ownerId,
       pid,
       acquiredAt: timestamp,
       heartbeatAt: timestamp,
@@ -190,6 +191,43 @@ async function writeBlockedProfile(stateDir, {
     profiles: [profile]
   }, null, 2)}\n`);
   return profile;
+}
+
+async function writeInterruptedTask(stateDir, {
+  id,
+  profileId,
+  workerPid
+}) {
+  const timestamp = new Date().toISOString();
+  const task = {
+    id,
+    profileId,
+    state: 'failed',
+    error: {
+      code: 'TASK_INTERRUPTED_BY_MANAGER_RESTART',
+      message: 'Manager restarted before task cleanup completed; inspect the checkpoint before resuming.'
+    },
+    progress: { current: 1, total: 2, message: 'Failed' },
+    health: { status: 'failed', checkedAt: timestamp },
+    cleanup: {
+      browserClosed: false,
+      leaseReleased: false,
+      workerExited: true,
+      settled: false,
+      managerRestartObserved: true
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    startedAt: timestamp,
+    finishedAt: timestamp,
+    leaseHeld: true,
+    leaseOwner: `task:${id}`,
+    workerPid
+  };
+  const taskDir = path.join(stateDir, 'tasks', id);
+  await mkdir(taskDir, { recursive: true });
+  await writeFile(path.join(taskDir, 'task.json'), `${JSON.stringify(task, null, 2)}\n`);
+  return task;
 }
 
 test('connect authenticates and gracefully replaces an idle older Manager', async (t) => {
@@ -379,10 +417,13 @@ test('connect safely discards a dead empty task-quarantined ephemeral Profile du
   const deadWorker = spawn(process.execPath, ['-e', '']);
   const deadWorkerPid = deadWorker.pid;
   await once(deadWorker, 'exit');
+  const taskId = 'task_cccccccccccccccccccccccccccccccc';
   const profile = await writeBlockedProfile(stateDir, {
     id: 'profile_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    pid: deadWorkerPid
+    pid: deadWorkerPid,
+    ownerId: `task:${taskId}`
   });
+  await writeInterruptedTask(stateDir, { id: taskId, profileId: profile.id, workerPid: deadWorkerPid });
   const legacy = await startLegacyManager({
     stateDir,
     profiles: [{ id: profile.id, state: profile.state }]
@@ -417,6 +458,77 @@ test('connect safely discards a dead empty task-quarantined ephemeral Profile du
   const profiles = JSON.parse(await readFile(path.join(stateDir, 'profiles.json'), 'utf8'));
   assert.deepEqual(profiles.profiles, []);
   await assert.rejects(lstat(profile.userDataDir), { code: 'ENOENT' });
+  const recoveredTask = JSON.parse(await readFile(path.join(stateDir, 'tasks', taskId, 'task.json'), 'utf8'));
+  assert.equal(recoveredTask.leaseHeld, false);
+  assert.equal(recoveredTask.cleanup.settled, true);
+  assert.equal(recoveredTask.cleanup.quarantinedProfileDiscardRecovered, true);
+});
+
+test('connect repairs a legacy discarded quarantine task before starting the current Manager', async (t) => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'eric-task-master-cli-legacy-quarantine-task-'));
+  const port = await unusedPort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const deadWorker = spawn(process.execPath, ['-e', '']);
+  const deadWorkerPid = deadWorker.pid;
+  await once(deadWorker, 'exit');
+  const taskId = 'task_dddddddddddddddddddddddddddddddd';
+  const profileId = 'profile_dddddddddddddddddddddddddddddddd';
+  const identity = generateManagerIdentity();
+  const managerToken = randomBytes(32).toString('base64url');
+  const stoppedManager = { pid: deadWorkerPid, version: '2.5.3', baseUrl };
+  let managerStarted = false;
+  t.after(async () => {
+    if (managerStarted) {
+      await execFileAsync(process.execPath, [
+        CLI, 'manager', 'stop', '--host', '127.0.0.1', '--port', String(port),
+        '--state-dir', stateDir, '--json'
+      ], { cwd: ROOT }).catch(() => {});
+    }
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  await mkdir(path.join(stateDir, 'profiles'), { recursive: true });
+  await writeFile(path.join(stateDir, 'config.json'), `${JSON.stringify({
+    version: 1,
+    managerToken,
+    managerIdentity: identity,
+    createdAt: new Date().toISOString(),
+    extensions: [],
+    agents: []
+  })}\n`);
+  await writeFile(path.join(stateDir, 'profiles.json'), `${JSON.stringify({ version: 5, profiles: [] })}\n`);
+  await writeFile(path.join(stateDir, 'manager.json'), `${JSON.stringify(stoppedManager)}\n`);
+  await writeFile(path.join(stateDir, 'manager-shutdown-failure.json'), `${JSON.stringify({
+    ...stoppedManager,
+    trigger: 'api',
+    failedAt: new Date().toISOString(),
+    error: {
+      code: 'SERVICE_SHUTDOWN_UNCONFIRMED',
+      message: 'Task service stopped accepting work, but browser cleanup could not be fully confirmed'
+    }
+  })}\n`);
+  await writeInterruptedTask(stateDir, { id: taskId, profileId, workerPid: deadWorkerPid });
+  await writeFile(path.join(stateDir, `acceptance-${VERSION}.json`), `${JSON.stringify({
+    ok: true,
+    version: VERSION,
+    checks: []
+  })}\n`);
+
+  const result = JSON.parse((await execFileAsync(process.execPath, [
+    CLI, 'connect', '--host', '127.0.0.1', '--port', String(port),
+    '--state-dir', stateDir, '--skip-mcp-registration', '--json'
+  ], { cwd: ROOT, timeout: 30_000 })).stdout);
+  managerStarted = true;
+
+  assert.equal(result.ok, true);
+  assert.equal(result.manager.version, VERSION);
+  assert.equal(result.manager.migratedFrom, '2.5.3');
+  assert.equal(result.manager.recoveredQuarantinedTasks, 1);
+  const recoveredTask = JSON.parse(await readFile(path.join(stateDir, 'tasks', taskId, 'task.json'), 'utf8'));
+  assert.equal(recoveredTask.leaseHeld, false);
+  assert.equal(recoveredTask.cleanup.settled, true);
+  assert.equal(recoveredTask.cleanup.quarantinedProfileDiscardRecovered, true);
+  await assert.rejects(lstat(path.join(stateDir, 'manager-shutdown-failure.json')), { code: 'ENOENT' });
 });
 
 test('connect preserves a non-discardable blocked Profile and leaves the older Manager running', async (t) => {

@@ -22,7 +22,8 @@ import { OperationalJournal } from './lib/operational-journal.mjs';
 import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
 import {
   discardQuarantinedProfilesAfterShutdown,
-  inspectQuarantinedEphemeralUpgrade
+  inspectQuarantinedEphemeralUpgrade,
+  recoverLegacyDiscardedQuarantineTasksAfterShutdown
 } from './lib/quarantined-profile-upgrade.mjs';
 import { preflightTaskPack, readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
 import { assertSafeTaskInput, HttpTaskMasterClient } from './mcp/taskmaster-client.mjs';
@@ -328,6 +329,7 @@ async function waitForManager(config, timeoutMs = 20_000) {
 async function ensureManager(config) {
   let migratedFrom;
   let recoveredQuarantinedProfiles = 0;
+  let recoveredQuarantinedTasks = 0;
   try {
     return { health: await health(config), started: false };
   } catch (error) {
@@ -335,8 +337,23 @@ async function ensureManager(config) {
       const stopped = await shutdownManager(config, { requireIdle: true });
       migratedFrom = stopped.version;
       recoveredQuarantinedProfiles = stopped.recoveredQuarantinedProfiles || 0;
+      recoveredQuarantinedTasks = stopped.recoveredQuarantinedTasks || 0;
     } else if (error.code !== 'MANAGER_UNREACHABLE') {
       throw error;
+    } else {
+      let recorded;
+      try {
+        recorded = JSON.parse(await readFile(join(config.stateDir, 'manager.json'), 'utf8'));
+      } catch (readError) {
+        if (readError?.code !== 'ENOENT') throw readError;
+      }
+      if (recorded) {
+        recoveredQuarantinedTasks = await recoverLegacyDiscardedQuarantineTasksAfterShutdown({
+          stateDir: config.stateDir,
+          expectedManager: recorded
+        });
+        if (recoveredQuarantinedTasks > 0) migratedFrom = recorded.version;
+      }
     }
   }
   await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
@@ -364,7 +381,8 @@ async function ensureManager(config) {
     health: await Promise.race([waitForManager(config), spawnFailure]),
     started: true,
     ...(migratedFrom ? { migratedFrom } : {}),
-    ...(recoveredQuarantinedProfiles > 0 ? { recoveredQuarantinedProfiles } : {})
+    ...(recoveredQuarantinedProfiles > 0 ? { recoveredQuarantinedProfiles } : {}),
+    ...(recoveredQuarantinedTasks > 0 ? { recoveredQuarantinedTasks } : {})
   };
 }
 
@@ -597,6 +615,9 @@ async function connect(options, json) {
       ...(connection.migratedFrom ? { migratedFrom: connection.migratedFrom } : {}),
       ...(connection.recoveredQuarantinedProfiles > 0
         ? { recoveredQuarantinedProfiles: connection.recoveredQuarantinedProfiles }
+        : {}),
+      ...(connection.recoveredQuarantinedTasks > 0
+        ? { recoveredQuarantinedTasks: connection.recoveredQuarantinedTasks }
         : {})
     },
     acceptance,
@@ -733,6 +754,20 @@ async function shutdownManager(config, { requireIdle = false } = {}) {
       if (error.code === 'MANAGER_UNREACHABLE') {
         const cleanShutdown = await waitForManagerShutdownProof(pidFile, recorded);
         if (!cleanShutdown && quarantinedProfileIds.length === 0) {
+          const recoveredQuarantinedTasks = await recoverLegacyDiscardedQuarantineTasksAfterShutdown({
+            stateDir: config.stateDir,
+            expectedManager: recorded
+          });
+          if (recoveredQuarantinedTasks > 0) {
+            return {
+              ok: true,
+              stopped: true,
+              graceful: gracefulRequested,
+              pid: recorded.pid,
+              version: running.version,
+              recoveredQuarantinedTasks
+            };
+          }
           throw cliError(
             'MANAGER_SHUTDOWN_UNCONFIRMED',
             `Manager process ${recorded.pid} became unreachable without publishing a clean shutdown proof`,

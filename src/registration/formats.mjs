@@ -216,6 +216,18 @@ function managedJsonEntry(entry, context) {
   }));
 }
 
+function withoutRuntimeVersion(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+  const normalized = {
+    ...entry,
+    ...(entry.env && typeof entry.env === 'object' && !Array.isArray(entry.env)
+      ? { env: { ...entry.env } }
+      : {})
+  };
+  if (normalized.env) delete normalized.env.ERIC_TASK_MASTER_RUNTIME_VERSION;
+  return normalized;
+}
+
 function jsonAdapter(options = {}) {
   return {
     inspect(source, context) {
@@ -225,11 +237,27 @@ function jsonAdapter(options = {}) {
       if (current === undefined) return { state: 'absent' };
       const currentEntry = managedJsonEntry(current, context);
       const currentFingerprint = fingerprint(currentEntry);
+      const currentRuntimeAgnosticFingerprint = fingerprint(withoutRuntimeVersion(currentEntry));
+      const desiredRuntimeAgnosticFingerprint = fingerprint(withoutRuntimeVersion(
+        managedJsonEntry(desired, context)
+      ));
       if (fingerprint(managedJsonEntry(desired, context)) === currentFingerprint) {
-        return { state: 'registered', currentFingerprint, currentEntry };
+        return {
+          state: 'registered',
+          currentFingerprint,
+          currentEntry,
+          currentRuntimeAgnosticFingerprint,
+          desiredRuntimeAgnosticFingerprint
+        };
       }
       if (ownsJsonEntry(current, clientId)) {
-        return { state: 'owned_outdated', currentFingerprint, currentEntry };
+        return {
+          state: 'owned_outdated',
+          currentFingerprint,
+          currentEntry,
+          currentRuntimeAgnosticFingerprint,
+          desiredRuntimeAgnosticFingerprint
+        };
       }
       return { state: 'conflict', currentFingerprint };
     },
@@ -348,6 +376,100 @@ function ownsText(block, clientId) {
     || block.includes(`TASKMASTER_CLIENT_ID: ${JSON.stringify(clientId)}`);
 }
 
+function runtimeAgnosticText(kind, text) {
+  if (kind === 'toml') {
+    return text.replace(
+      /ERIC_TASK_MASTER_RUNTIME_VERSION\s*=\s*"(?:\\.|[^"\\])*"/gu,
+      'ERIC_TASK_MASTER_RUNTIME_VERSION = "<runtime>"'
+    );
+  }
+  return text.replace(
+    /^(\s*ERIC_TASK_MASTER_RUNTIME_VERSION\s*:\s*).+$/gmu,
+    '$1"<runtime>"'
+  );
+}
+
+function parseYamlScalar(source) {
+  const value = source.trim();
+  if (!value || /\s#/u.test(value)) return null;
+  if (value.startsWith('"')) {
+    try {
+      const parsed = JSON.parse(value);
+      return typeof parsed === 'string' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
+    return value.slice(1, -1).replaceAll("''", "'");
+  }
+  if (/^[\[\]{}&,*!|>@`]/u.test(value)) return null;
+  return value;
+}
+
+function parseYamlManagedEntry(block) {
+  const entry = { args: [], env: {} };
+  let section = null;
+  const envKeys = new Set([
+    'ERIC_TASK_MASTER_CLIENT_ID',
+    'ERIC_TASK_MASTER_CLIENT_NAME',
+    'TASKMASTER_CLIENT_ID',
+    'TASKMASTER_CLIENT_NAME',
+    'ERIC_TASK_MASTER_RUNTIME_VERSION'
+  ]);
+  for (const line of block.replace(/\r\n/g, '\n').split('\n')) {
+    if (!line.trim() || /^ {2}(?:eric-task-master|"eric-task-master"|'eric-task-master')\s*:\s*$/u.test(line)) {
+      continue;
+    }
+    const command = /^ {4}command\s*:\s*(.+)$/u.exec(line);
+    if (command) {
+      if (entry.command !== undefined) return null;
+      entry.command = parseYamlScalar(command[1]);
+      if (entry.command === null) return null;
+      section = null;
+      continue;
+    }
+    if (/^ {4}args\s*:\s*$/u.test(line)) {
+      section = 'args';
+      continue;
+    }
+    if (/^ {4}env\s*:\s*$/u.test(line)) {
+      section = 'env';
+      continue;
+    }
+    const argument = /^ {6}-\s+(.+)$/u.exec(line);
+    if (argument && section === 'args') {
+      const parsed = parseYamlScalar(argument[1]);
+      if (parsed === null) return null;
+      entry.args.push(parsed);
+      continue;
+    }
+    const environment = /^ {6}([A-Z0-9_]+)\s*:\s*(.+)$/u.exec(line);
+    if (environment && section === 'env' && envKeys.has(environment[1])) {
+      if (Object.hasOwn(entry.env, environment[1])) return null;
+      const parsed = parseYamlScalar(environment[2]);
+      if (parsed === null) return null;
+      entry.env[environment[1]] = parsed;
+      continue;
+    }
+    return null;
+  }
+  if (
+    typeof entry.command !== 'string' ||
+    entry.args.length !== 1 ||
+    [...envKeys].slice(0, 4).some((key) => typeof entry.env[key] !== 'string')
+  ) return null;
+  return entry;
+}
+
+function ownsYamlEntry(entry, clientId) {
+  const ids = [
+    entry?.env?.TASKMASTER_CLIENT_ID,
+    entry?.env?.ERIC_TASK_MASTER_CLIENT_ID
+  ].filter((value) => typeof value === 'string');
+  return ids.length === 2 && ids.every((value) => value === clientId);
+}
+
 function textAdapter(kind) {
   const find = kind === 'toml' ? findTomlBlock : findYamlBlock;
   const render = kind === 'toml' ? tomlBlock : yamlBlock;
@@ -355,19 +477,49 @@ function textAdapter(kind) {
     inspect(source, context) {
       const current = find(source, context.filePath);
       if (!current) return { state: 'absent' };
+      const currentEntry = kind === 'yaml' ? parseYamlManagedEntry(current.text) : null;
       const currentFingerprint = sha256(Buffer.from(current.text, 'utf8'));
-      const desiredFingerprint = sha256(Buffer.from(render(context), 'utf8'));
+      const desiredText = render(context);
+      const desiredFingerprint = sha256(Buffer.from(desiredText, 'utf8'));
+      const currentRuntimeAgnosticFingerprint = sha256(Buffer.from(
+        runtimeAgnosticText(kind, current.text),
+        'utf8'
+      ));
+      const desiredRuntimeAgnosticFingerprint = sha256(Buffer.from(
+        runtimeAgnosticText(kind, desiredText),
+        'utf8'
+      ));
       if (currentFingerprint === desiredFingerprint) {
-        return { state: 'registered', currentFingerprint };
+        return {
+          state: 'registered',
+          currentFingerprint,
+          ...(kind === 'yaml' ? { currentEntry } : {}),
+          currentRuntimeAgnosticFingerprint,
+          desiredRuntimeAgnosticFingerprint
+        };
       }
-      if (ownsText(current.text, context.clientId)) {
-        return { state: 'owned_outdated', currentFingerprint };
+      if (
+        ownsText(current.text, context.clientId)
+        || kind === 'yaml' && ownsYamlEntry(currentEntry, context.clientId)
+      ) {
+        return {
+          state: 'owned_outdated',
+          currentFingerprint,
+          ...(kind === 'yaml' ? { currentEntry } : {}),
+          currentRuntimeAgnosticFingerprint,
+          desiredRuntimeAgnosticFingerprint
+        };
       }
       return { state: 'conflict', currentFingerprint };
     },
     install(source, context) {
       const current = find(source, context.filePath);
-      if (current && !ownsText(current.text, context.clientId)) throw conflict(context.filePath);
+      const yamlEntry = current && kind === 'yaml' ? parseYamlManagedEntry(current.text) : null;
+      if (
+        current
+        && !ownsText(current.text, context.clientId)
+        && !(kind === 'yaml' && ownsYamlEntry(yamlEntry, context.clientId))
+      ) throw conflict(context.filePath);
       const block = render(context);
       if (!current) return kind === 'toml' ? appendToml(source, block) : appendYaml(source, block);
       const replacement = [...current.lines];
@@ -377,7 +529,11 @@ function textAdapter(kind) {
     remove(source, context) {
       const current = find(source, context.filePath);
       if (!current) return source;
-      if (!ownsText(current.text, context.clientId)) throw conflict(context.filePath);
+      const yamlEntry = kind === 'yaml' ? parseYamlManagedEntry(current.text) : null;
+      if (
+        !ownsText(current.text, context.clientId)
+        && !(kind === 'yaml' && ownsYamlEntry(yamlEntry, context.clientId))
+      ) throw conflict(context.filePath);
       const replacement = [...current.lines];
       replacement.splice(current.start, current.end - current.start);
       return `${replacement.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '')}${replacement.some((line) => line.trim()) ? '\n' : ''}`;
@@ -452,6 +608,10 @@ function findYamlBlock(source, filePath = 'YAML host configuration') {
   if (start === -1) return null;
   let end = lines.length;
   for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^#/u.test(lines[index])) {
+      end = index;
+      break;
+    }
     if (/^(?:\S|  [^\s#])/.test(lines[index]) && lines[index].trim() && !/^\s*#/.test(lines[index])) {
       end = index;
       break;

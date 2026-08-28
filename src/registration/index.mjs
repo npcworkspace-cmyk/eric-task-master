@@ -358,16 +358,37 @@ export function createRegistrar(options = {}) {
       || inspection.currentEntry?.env?.NODE_OPTIONS === context.desired.env.NODE_OPTIONS;
   }
 
-  function matchesRecordedEntry(inspection, context, registration) {
+  function matchesRecordedEntry(inspection, context, registration, source, adapter) {
     if (!registration) return false;
     if (inspection.currentFingerprint === registration.entryFingerprint) return true;
-    if (context.host.key !== 'workbuddy' || !inspection.currentEntry) return false;
-    const legacyEntry = {
-      ...inspection.currentEntry,
-      env: { ...(inspection.currentEntry.env || {}) }
-    };
-    delete legacyEntry.env.NODE_OPTIONS;
-    return fingerprint(legacyEntry) === registration.entryFingerprint;
+    if (context.host.key === 'workbuddy' && inspection.currentEntry) {
+      const legacyEntry = {
+        ...inspection.currentEntry,
+        env: { ...(inspection.currentEntry.env || {}) }
+      };
+      delete legacyEntry.env.NODE_OPTIONS;
+      if (fingerprint(legacyEntry) === registration.entryFingerprint) return true;
+    }
+    if (inspection.currentEntry && registration.entry) {
+      const runtimeAgnosticManaged = (entry) => ({
+        command: entry.command,
+        args: entry.args,
+        env: Object.fromEntries(Object.entries(entry.env || {})
+          .filter(([key]) => key !== 'ERIC_TASK_MASTER_RUNTIME_VERSION'))
+      });
+      if (
+        fingerprint(runtimeAgnosticManaged(inspection.currentEntry))
+          === fingerprint(runtimeAgnosticManaged(registration.entry))
+      ) return true;
+    }
+    if (!registration.entry || typeof source !== 'string' || !adapter) return false;
+    const recordedInspection = adapter.inspect(source, {
+      ...context,
+      desired: registration.entry
+    });
+    return recordedInspection.state !== 'conflict'
+      && recordedInspection.currentRuntimeAgnosticFingerprint
+        === recordedInspection.desiredRuntimeAgnosticFingerprint;
   }
 
   function workBuddyUpdateContext(inspection, context) {
@@ -646,11 +667,12 @@ export function createRegistrar(options = {}) {
       }
       const context = contextFor({ ...host, configPath }, state.installationId);
       try {
-        const inspection = adapterFor(host.format).inspect(file.text, context);
+        const adapter = adapterFor(host.format);
+        const inspection = adapter.inspect(file.text, context);
         if (
           inspection.state === 'owned_outdated'
           && registration
-          && !matchesRecordedEntry(inspection, context, registration)
+          && !matchesRecordedEntry(inspection, context, registration, file.text, adapter)
         ) {
           results.push(publicHost({ ...host, configPath }, true, 'conflict', {
             reason: 'The owned entry changed after installation.'
@@ -807,7 +829,13 @@ export function createRegistrar(options = {}) {
         const inspection = adapter.inspect(before.text, context);
         const safeWorkBuddyAdoption = isSafeWorkBuddyAdoption(inspection, context);
         const workBuddyNodeOptionsIsolated = isWorkBuddyNodeOptionsIsolated(inspection, context);
-        const recordedEntryMatches = matchesRecordedEntry(inspection, context, previousRegistration);
+        const recordedEntryMatches = matchesRecordedEntry(
+          inspection,
+          context,
+          previousRegistration,
+          before.text,
+          adapter
+        );
         if (inspection.state === 'conflict') {
           preflightFailed = true;
           results.push(publicHost(host, true, 'conflict', {
