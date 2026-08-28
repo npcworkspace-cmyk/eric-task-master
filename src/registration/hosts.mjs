@@ -138,13 +138,15 @@ export function createHostDefinitions({ home, env, platform }) {
       executable: 'workbuddy',
       includeType: false,
       entryDefaults: { description: 'Eric Task Master', disabled: false },
+      entryEnvDefaults: { NODE_OPTIONS: '' },
       managedEntryKeys: ['command', 'args', 'env'],
       managedEnvKeys: [
         'ERIC_TASK_MASTER_CLIENT_ID',
         'ERIC_TASK_MASTER_CLIENT_NAME',
         'TASKMASTER_CLIENT_ID',
         'TASKMASTER_CLIENT_NAME',
-        'ERIC_TASK_MASTER_RUNTIME_VERSION'
+        'ERIC_TASK_MASTER_RUNTIME_VERSION',
+        'NODE_OPTIONS'
       ],
       installedStatus: 'registered_pending_approval_or_reload',
       knownPaths: platform === 'darwin'

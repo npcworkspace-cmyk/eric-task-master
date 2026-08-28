@@ -15,7 +15,7 @@ import {
   sha256,
   writeJsonAtomic
 } from './files.mjs';
-import { adapterFor, desiredEntry } from './formats.mjs';
+import { adapterFor, desiredEntry, fingerprint } from './formats.mjs';
 import { createHostDefinitions, DEFAULT_HOST_KEYS, REGISTRATION_MODES } from './hosts.mjs';
 import { RegistrationLock } from './lock.mjs';
 import { createOfficialCliAdapter } from './official-cli.mjs';
@@ -353,6 +353,35 @@ export function createRegistrar(options = {}) {
     );
   }
 
+  function isWorkBuddyNodeOptionsIsolated(inspection, context) {
+    return context.host.key !== 'workbuddy'
+      || inspection.currentEntry?.env?.NODE_OPTIONS === context.desired.env.NODE_OPTIONS;
+  }
+
+  function matchesRecordedEntry(inspection, context, registration) {
+    if (!registration) return false;
+    if (inspection.currentFingerprint === registration.entryFingerprint) return true;
+    if (context.host.key !== 'workbuddy' || !inspection.currentEntry) return false;
+    const legacyEntry = {
+      ...inspection.currentEntry,
+      env: { ...(inspection.currentEntry.env || {}) }
+    };
+    delete legacyEntry.env.NODE_OPTIONS;
+    return fingerprint(legacyEntry) === registration.entryFingerprint;
+  }
+
+  function workBuddyUpdateContext(inspection, context) {
+    if (!isSafeWorkBuddyAdoption(inspection, context)) return context;
+    return {
+      ...context,
+      desired: {
+        ...context.desired,
+        command: inspection.currentEntry.command,
+        args: [...inspection.currentEntry.args]
+      }
+    };
+  }
+
   function officialCliAdapterFor(host) {
     return createOfficialCliAdapter(host, { commandRunner, env, platform });
   }
@@ -621,7 +650,7 @@ export function createRegistrar(options = {}) {
         if (
           inspection.state === 'owned_outdated'
           && registration
-          && inspection.currentFingerprint !== registration.entryFingerprint
+          && !matchesRecordedEntry(inspection, context, registration)
         ) {
           results.push(publicHost({ ...host, configPath }, true, 'conflict', {
             reason: 'The owned entry changed after installation.'
@@ -629,6 +658,7 @@ export function createRegistrar(options = {}) {
           continue;
         }
         const safeWorkBuddyAdoption = isSafeWorkBuddyAdoption(inspection, context);
+        const workBuddyNodeOptionsIsolated = isWorkBuddyNodeOptionsIsolated(inspection, context);
         const workBuddyRuntimeCurrent = inspection.currentEntry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION
           === context.desired.env.ERIC_TASK_MASTER_RUNTIME_VERSION
           || Boolean(
@@ -639,7 +669,8 @@ export function createRegistrar(options = {}) {
         const statusName = {
           absent: 'unregistered',
           registered: registration ? 'registered' : 'adoption_available',
-          owned_outdated: safeWorkBuddyAdoption && (!registration || workBuddyRuntimeCurrent)
+          owned_outdated: safeWorkBuddyAdoption && workBuddyNodeOptionsIsolated
+            && (!registration || workBuddyRuntimeCurrent)
             ? (registration ? 'registered' : 'adoption_available')
             : 'update_available',
           conflict: 'conflict'
@@ -774,6 +805,9 @@ export function createRegistrar(options = {}) {
         const before = await readOptionalFile(host.configPath);
         const adapter = adapterFor(host.format);
         const inspection = adapter.inspect(before.text, context);
+        const safeWorkBuddyAdoption = isSafeWorkBuddyAdoption(inspection, context);
+        const workBuddyNodeOptionsIsolated = isWorkBuddyNodeOptionsIsolated(inspection, context);
+        const recordedEntryMatches = matchesRecordedEntry(inspection, context, previousRegistration);
         if (inspection.state === 'conflict') {
           preflightFailed = true;
           results.push(publicHost(host, true, 'conflict', {
@@ -783,9 +817,9 @@ export function createRegistrar(options = {}) {
         }
         if (
           inspection.state === 'owned_outdated'
-          && (!previousRegistration || inspection.currentFingerprint !== previousRegistration.entryFingerprint)
+          && (!previousRegistration || !recordedEntryMatches)
         ) {
-          if (!previousRegistration && isSafeWorkBuddyAdoption(inspection, context)) {
+          if (!previousRegistration && safeWorkBuddyAdoption && workBuddyNodeOptionsIsolated) {
             actions.push({
               kind: 'adoption',
               host,
@@ -800,20 +834,23 @@ export function createRegistrar(options = {}) {
             results.push(publicHost(host, true, dryRun ? 'would_adopt' : 'pending', { changed: !dryRun }));
             continue;
           }
-          preflightFailed = true;
-          results.push(publicHost(host, true, 'conflict', {
-            error: {
-              code: 'OWNED_ENTRY_CHANGED',
-              message: 'The owned entry changed after installation; it was not overwritten.'
-            }
-          }));
-          continue;
+          if (previousRegistration || !safeWorkBuddyAdoption) {
+            preflightFailed = true;
+            results.push(publicHost(host, true, 'conflict', {
+              error: {
+                code: 'OWNED_ENTRY_CHANGED',
+                message: 'The owned entry changed after installation; it was not overwritten.'
+              }
+            }));
+            continue;
+          }
         }
         if (
           inspection.state === 'owned_outdated'
           && previousRegistration
-          && inspection.currentFingerprint === previousRegistration.entryFingerprint
-          && isSafeWorkBuddyAdoption(inspection, context)
+          && recordedEntryMatches
+          && safeWorkBuddyAdoption
+          && workBuddyNodeOptionsIsolated
           && (
             inspection.currentEntry?.env?.ERIC_TASK_MASTER_RUNTIME_VERSION
               === context.desired.env.ERIC_TASK_MASTER_RUNTIME_VERSION
@@ -845,16 +882,17 @@ export function createRegistrar(options = {}) {
           results.push(publicHost(host, true, dryRun ? 'would_adopt' : 'pending', { changed: !dryRun }));
           continue;
         }
-        const afterText = adapter.install(before.text, context);
+        const updateContext = workBuddyUpdateContext(inspection, context);
+        const afterText = adapter.install(before.text, updateContext);
         const afterBytes = Buffer.from(afterText, 'utf8');
         actions.push({
           kind: REGISTRATION_MODES.FILE,
           host,
-          context,
+          context: updateContext,
           before,
           afterBytes,
           afterHash: sha256(afterBytes),
-          entryFingerprint: adapter.entryFingerprint(afterText, context),
+          entryFingerprint: adapter.entryFingerprint(afterText, updateContext),
           registrationBefore: previousRegistration || null
         });
         results.push(publicHost(host, true, dryRun ? 'would_register' : 'pending', { changed: !dryRun }));

@@ -171,6 +171,8 @@ rejected rather than followed or replaced.
 
 WorkBuddy Desktop is intentionally narrower than the generic JSON contract. Task Master writes only `~/.workbuddy/mcp.json`; it never writes WorkBuddy's internal `~/.workbuddy/.mcp.json` connector proxy or `mcp-approvals.json`. An existing WorkBuddy entry can be adopted without rewriting the file only when it uses an absolute Node executable, this installation's exact STDIO entrypoint and client IDs, and either the current or the known legacy WorkBuddy display name. WorkBuddy-managed metadata and extra environment fields are preserved, while any other change to managed launch or identity fields fails closed.
 
+Task Master's own WorkBuddy MCP entry explicitly sets `NODE_OPTIONS` to an empty string. This isolates the Task Master child process from WorkBuddy-injected Node shims that can otherwise alter filesystem cleanup behavior. The registrar manages only that one entry: it does not modify the user or machine environment, another MCP server, or another Agent host. Existing compatible WorkBuddy entries are migrated transactionally while preserving their absolute Node executable and host-owned metadata.
+
 JSON files are parsed and semantically merged. Invalid JSON/JSONC and duplicate
 object keys at any depth are rejected without a write. CodeBuddy's JSONC
 comments and trailing commas are accepted, then normalized on a managed write;

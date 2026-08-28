@@ -11,6 +11,7 @@ import {
   removeFileCas
 } from '../../src/registration/files.mjs';
 import { createRegistrar } from '../../src/registration/index.mjs';
+import { fingerprint } from '../../src/registration/formats.mjs';
 import { RegistrationLock } from '../../src/registration/lock.mjs';
 import { createOfficialCliAdapter, runHostCommand } from '../../src/registration/official-cli.mjs';
 import { VERSION } from '../../src/contracts.mjs';
@@ -203,6 +204,9 @@ test('install merges five verified host configs including WorkBuddy and is idemp
   assert.equal(workbuddy.mcpServers['eric-task-master'].type, undefined);
   assert.equal(workbuddy.mcpServers['eric-task-master'].disabled, false);
   assert.equal(workbuddy.mcpServers['eric-task-master'].description, 'Eric Task Master');
+  assert.equal(workbuddy.mcpServers['eric-task-master'].env.NODE_OPTIONS, '');
+  assert.equal(desktop.mcpServers['eric-task-master'].env.NODE_OPTIONS, undefined);
+  assert.equal(claudeCode.mcpServers['eric-task-master'].env.NODE_OPTIONS, undefined);
   assert.equal(first.results.find((item) => item.hostKey === 'workbuddy').activationStatus, 'pending_approval_or_reload');
 
   const clientIds = new Set();
@@ -467,7 +471,7 @@ test('WorkBuddy proxy and approval paths are rejected even when an override poin
   }
 });
 
-test('WorkBuddy adopts an exact same-install entry without rewriting host metadata, proxy, or approvals', async () => {
+test('WorkBuddy isolates an exact same-install entry while preserving host metadata, proxy, and approvals', async () => {
   const setup = await fixture();
   const installed = await setup.registrar.install({ hostKeys: ['codex'] });
   const clientId = `${installed.installationId}:workbuddy`;
@@ -487,18 +491,21 @@ test('WorkBuddy adopts an exact same-install entry without rewriting host metada
     disabled: true
   };
   await write(setup.paths.workbuddy, `${JSON.stringify(document, null, 2)}\n`);
-  const workBuddyBefore = await readFile(setup.paths.workbuddy, 'utf8');
   const protectedBefore = await Promise.all(Object.values(setup.protectedPaths).map((path) => readFile(path, 'utf8')));
 
   const beforeStatus = await setup.registrar.status({ hostKeys: ['workbuddy'] });
-  assert.equal(beforeStatus.results[0].status, 'adoption_available');
-  assert.equal(beforeStatus.results[0].configurationStatus, 'registered_unowned');
+  assert.equal(beforeStatus.results[0].status, 'update_available');
+  assert.equal(beforeStatus.results[0].configurationStatus, 'registered_outdated');
 
   const adopted = await setup.registrar.install({ hostKeys: ['workbuddy'] });
   assert.equal(adopted.ok, true);
   assert.equal(adopted.changed, true);
-  assert.equal(adopted.results[0].status, 'adopted');
-  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), workBuddyBefore);
+  assert.equal(adopted.results[0].status, 'registered_pending_approval_or_reload');
+  const isolated = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  assert.equal(isolated.mcpServers['eric-task-master'].env.NODE_OPTIONS, '');
+  assert.equal(isolated.mcpServers['eric-task-master'].env.WORKBUDDY_RUNTIME_HINT, 'preserve-me');
+  assert.equal(isolated.mcpServers['eric-task-master'].description, 'User-managed description');
+  assert.equal(isolated.mcpServers['eric-task-master'].disabled, true);
   assert.deepEqual(
     await Promise.all(Object.values(setup.protectedPaths).map((path) => readFile(path, 'utf8'))),
     protectedBefore
@@ -509,10 +516,11 @@ test('WorkBuddy adopts an exact same-install entry without rewriting host metada
 
   const adoptionRollback = await setup.registrar.rollback({ transactionId: adopted.transactionId });
   assert.equal(adoptionRollback.ok, true);
-  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), workBuddyBefore);
-  assert.equal((await setup.registrar.status({ hostKeys: ['workbuddy'] })).results[0].status, 'adoption_available');
+  const rolledBack = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  assert.equal(rolledBack.mcpServers['eric-task-master'].env.NODE_OPTIONS, undefined);
+  assert.equal((await setup.registrar.status({ hostKeys: ['workbuddy'] })).results[0].status, 'update_available');
   const readopted = await setup.registrar.install({ hostKeys: ['workbuddy'] });
-  assert.equal(readopted.results[0].status, 'adopted');
+  assert.equal(readopted.results[0].status, 'registered_pending_approval_or_reload');
 
   const removed = await setup.registrar.uninstall({ hostKeys: ['workbuddy'] });
   assert.equal(removed.ok, true);
@@ -522,7 +530,7 @@ test('WorkBuddy adopts an exact same-install entry without rewriting host metada
   assert.equal(after.preferences.language, 'zh-CN');
 });
 
-test('WorkBuddy safely adopts a live legacy entry that uses its own absolute Node runtime', async () => {
+test('WorkBuddy isolates a live legacy entry while preserving its absolute Node runtime', async () => {
   const setup = await fixture();
   const installed = await setup.registrar.install({ hostKeys: ['codex'] });
   const clientId = `${installed.installationId}:workbuddy`;
@@ -543,17 +551,19 @@ test('WorkBuddy safely adopts a live legacy entry that uses its own absolute Nod
     disabled: false
   };
   await write(setup.paths.workbuddy, `${JSON.stringify(document, null, 2)}\n`);
-  const before = await readFile(setup.paths.workbuddy, 'utf8');
-
   const status = await setup.registrar.status({ hostKeys: ['workbuddy'] });
-  assert.equal(status.results[0].status, 'adoption_available');
+  assert.equal(status.results[0].status, 'update_available');
   const dryRun = await setup.registrar.install({ hostKeys: ['workbuddy'], dryRun: true });
   assert.equal(dryRun.ok, true);
-  assert.equal(dryRun.results[0].status, 'would_adopt');
+  assert.equal(dryRun.results[0].status, 'would_register');
   const adopted = await setup.registrar.install({ hostKeys: ['workbuddy'] });
   assert.equal(adopted.ok, true);
-  assert.equal(adopted.results[0].status, 'adopted');
-  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), before);
+  assert.equal(adopted.results[0].status, 'registered_pending_approval_or_reload');
+  const isolated = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  assert.equal(isolated.mcpServers['eric-task-master'].command, workBuddyNode);
+  assert.equal(isolated.mcpServers['eric-task-master'].env.NODE_OPTIONS, '');
+  assert.equal(isolated.mcpServers['eric-task-master'].description, 'Host-maintained metadata');
+  assert.equal(isolated.mcpServers['eric-task-master'].disabled, false);
 
   const state = JSON.parse(await readFile(setup.registrar.statePath, 'utf8'));
   assert.equal(state.registrations.workbuddy.command, workBuddyNode);
@@ -561,6 +571,8 @@ test('WorkBuddy safely adopts a live legacy entry that uses its own absolute Nod
   assert.deepEqual(Object.keys(state.registrations.workbuddy.entry.env).sort(), [
     'ERIC_TASK_MASTER_CLIENT_ID',
     'ERIC_TASK_MASTER_CLIENT_NAME',
+    'ERIC_TASK_MASTER_RUNTIME_VERSION',
+    'NODE_OPTIONS',
     'TASKMASTER_CLIENT_ID',
     'TASKMASTER_CLIENT_NAME'
   ]);
@@ -569,7 +581,52 @@ test('WorkBuddy safely adopts a live legacy entry that uses its own absolute Nod
   assert.equal(repeated.ok, true);
   assert.equal(repeated.changed, false);
   assert.equal(repeated.results[0].status, 'registered');
-  assert.equal(await readFile(setup.paths.workbuddy, 'utf8'), before);
+  assert.deepEqual(JSON.parse(await readFile(setup.paths.workbuddy, 'utf8')), isolated);
+});
+
+test('WorkBuddy upgrades a pre-isolation registration without treating its legacy fingerprint as a user edit', async () => {
+  const setup = await fixture();
+  const oldRuntimeVersion = '2.5.2-test';
+  const currentRuntimeVersion = '2.5.3-test';
+  const oldRegistrar = registrarFor(setup, { runtimeVersion: oldRuntimeVersion });
+  const installed = await oldRegistrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(installed.ok, true);
+
+  const document = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'));
+  const entry = document.mcpServers['eric-task-master'];
+  assert.equal(entry.env.NODE_OPTIONS, '');
+
+  const state = JSON.parse(await readFile(oldRegistrar.statePath, 'utf8'));
+  const legacyManagedEntry = {
+    command: entry.command,
+    args: entry.args,
+    env: {
+      ERIC_TASK_MASTER_CLIENT_ID: entry.env.ERIC_TASK_MASTER_CLIENT_ID,
+      ERIC_TASK_MASTER_CLIENT_NAME: entry.env.ERIC_TASK_MASTER_CLIENT_NAME,
+      TASKMASTER_CLIENT_ID: entry.env.TASKMASTER_CLIENT_ID,
+      TASKMASTER_CLIENT_NAME: entry.env.TASKMASTER_CLIENT_NAME,
+      ERIC_TASK_MASTER_RUNTIME_VERSION: entry.env.ERIC_TASK_MASTER_RUNTIME_VERSION
+    }
+  };
+  state.registrations.workbuddy.entryFingerprint = fingerprint(legacyManagedEntry);
+  delete state.registrations.workbuddy.entry.env.NODE_OPTIONS;
+  await write(oldRegistrar.statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+  const upgradedRegistrar = registrarFor(setup, { runtimeVersion: currentRuntimeVersion });
+  const status = await upgradedRegistrar.status({ hostKeys: ['workbuddy'] });
+  assert.equal(status.results[0].status, 'update_available');
+  const upgraded = await upgradedRegistrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.changed, true);
+  assert.equal(upgraded.results[0].status, 'registered_pending_approval_or_reload');
+  const upgradedEntry = JSON.parse(await readFile(setup.paths.workbuddy, 'utf8'))
+    .mcpServers['eric-task-master'];
+  assert.equal(upgradedEntry.env.NODE_OPTIONS, '');
+  assert.equal(upgradedEntry.env.ERIC_TASK_MASTER_RUNTIME_VERSION, currentRuntimeVersion);
+  assert.equal((await upgradedRegistrar.status({ hostKeys: ['workbuddy'] })).results[0].status, 'registered');
+  const repeated = await upgradedRegistrar.install({ hostKeys: ['workbuddy'] });
+  assert.equal(repeated.ok, true);
+  assert.equal(repeated.changed, false);
 });
 
 test('WorkBuddy refuses same-command adoption when stable identity names do not match', async () => {

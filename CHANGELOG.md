@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.5.3 - 2026-08-28
+
+- Isolated Task Master's WorkBuddy MCP child process from host-injected `NODE_OPTIONS`, preventing WorkBuddy's safe-delete shim from changing Profile deletion and cleanup semantics.
+- Kept the override scoped to Task Master's own WorkBuddy server entry; system environment variables, other MCP servers, and other Agent hosts remain untouched.
+- Added transactional migration for existing and legacy WorkBuddy registrations, preserving host-owned Node executables, metadata, unrelated environment fields, proxy files, and approval files while upgrading old registration fingerprints safely.
+
 ## 2.5.2 - 2026-08-27
 
 - Added an explicit, fail-closed cleanup path for task-quarantined ephemeral Profiles: Manager requires the Worker process to be absent and the state-free template directory to be empty before discarding the unusable Profile record.

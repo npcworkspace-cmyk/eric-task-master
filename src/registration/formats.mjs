@@ -16,6 +16,7 @@ export function desiredEntry(host, installationId, executablePath, entrypoint, r
   const clientId = `${installationId}:${host.key}`;
   const clientName = `Eric Task Master / ${host.displayName}`;
   const env = {
+    ...(host.entryEnvDefaults || {}),
     ERIC_TASK_MASTER_CLIENT_ID: clientId,
     ERIC_TASK_MASTER_CLIENT_NAME: clientName,
     TASKMASTER_CLIENT_ID: clientId,
