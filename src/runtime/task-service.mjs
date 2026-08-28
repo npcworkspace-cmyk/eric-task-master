@@ -108,11 +108,12 @@ const ARTIFACT_MIME_TYPES = Object.freeze({
 });
 
 export class TaskServiceError extends Error {
-  constructor(code, message, statusCode = 400) {
+  constructor(code, message, statusCode = 400, details) {
     super(message);
     this.name = 'TaskServiceError';
     this.code = code;
     this.statusCode = statusCode;
+    this.details = details;
   }
 }
 
@@ -449,7 +450,8 @@ function inputSchemaError(location, message) {
   throw new TaskServiceError(
     'TASK_INPUT_SCHEMA_FAILED',
     `Task input ${location} ${message}`,
-    400
+    400,
+    { field: location, reason: message }
   );
 }
 

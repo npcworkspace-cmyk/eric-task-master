@@ -281,7 +281,9 @@ async function staticChecks() {
   );
   invariant(
     skill.includes('node scripts/taskmaster.mjs connect --json') &&
-      skill.includes('manager.agentHostReloadRequired'),
+      skill.includes('agent_host_reload_required') &&
+      skill.includes('taskmaster_scale_prepare') &&
+      skill.includes('taskmaster.mjs doctor --json'),
     'Skill lacks the fixed startup or Manager-migration reload contract'
   );
   invariant(

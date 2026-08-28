@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.4 - 2026-08-29
+
+- Added a fail-fast Agent-host reload gate. Every MCP request carries its runtime version; a missing or stale bridge now stops before task routing with `AGENT_HOST_RELOAD_REQUIRED`, exact version details, and one reload instruction instead of surfacing a misleading task-schema error.
+- Preserved Manager's already-redacted field-level error message, safe details, and a correlated request ID through MCP. `TASK_INPUT_SCHEMA_FAILED` now tells the Agent to describe the selected task type and correct the named field once.
+- Added one bounded, rotated, permission-restricted Manager operational journal with MCP request-ID correlation, plus `taskmaster doctor --json` for Manager, registration, and recent-redacted-error health without source-code debugging or starting a browser service.
+- Added `taskmaster_scale_prepare` and CLI `task prepare-scale` as one-call, registered `surface-probe` preparation for unknown large work; simplified the base Skill so the runtime owns this preflight dispatch while specialized Task Packs retain site logic.
+
 ## 2.5.3 - 2026-08-28
 
 - Isolated Task Master's WorkBuddy MCP child process from host-injected `NODE_OPTIONS`, preventing WorkBuddy's safe-delete shim from changing Profile deletion and cleanup semantics.

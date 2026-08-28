@@ -226,7 +226,8 @@ test('CLI final JSON does not expose credential markers from Manager responses',
   ]);
   assert.equal(result.code, 1);
   assert.equal(result.stderr.includes(marker), false);
-  assert.match(result.stderr, /Task Master manager rejected the request\./);
+  assert.match(result.stderr, /managerToken=\[REDACTED\]/u);
+  assert.match(result.stderr, /FIXTURE_REJECTED/u);
 });
 
 test('Manager errorResponse redacts message and nested details', async (t) => {

@@ -272,7 +272,12 @@ test('task type installation rejects unsupported schemas and enforces the declar
     taskType: 'constrained',
     idempotencyKey: 'schema:invalid',
     input: { count: 4, unexpected: true }
-  }, AGENT_A), { code: 'TASK_INPUT_SCHEMA_FAILED' });
+  }, AGENT_A), (error) => {
+    assert.equal(error.code, 'TASK_INPUT_SCHEMA_FAILED');
+    assert.equal(typeof error.details?.field, 'string');
+    assert.equal(typeof error.details?.reason, 'string');
+    return true;
+  });
 });
 
 test('idempotency is persistent, payload-bound, and isolated per Agent owner', async (t) => {

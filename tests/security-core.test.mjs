@@ -7,6 +7,7 @@ import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { ManagerLock } from '../src/lib/manager-lock.mjs';
 import { createManager } from '../src/manager.mjs';
+import { VERSION } from '../src/contracts.mjs';
 
 
 async function call(baseUrl, pathname, { method = 'GET', token, cookie, origin, headers = {}, body } = {}) {
@@ -14,6 +15,7 @@ async function call(baseUrl, pathname, { method = 'GET', token, cookie, origin, 
     method,
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(token ? { 'x-taskmaster-runtime-version': VERSION } : {}),
       ...(cookie ? { cookie } : {}),
       ...(origin ? { origin } : {}),
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),

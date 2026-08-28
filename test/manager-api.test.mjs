@@ -17,13 +17,18 @@ function headers(token, origin) {
   return {
     authorization: `Bearer ${token}`,
     'content-type': 'application/json',
+    'x-taskmaster-runtime-version': VERSION,
     ...(origin ? { origin } : {})
   };
 }
 
 async function managerFixture(t, { profileProcessAlive } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'eric-task-master-manager-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  let manager;
+  t.after(async () => {
+    await manager?.stop();
+    await rm(root, { recursive: true, force: true });
+  });
   const dashboardDir = join(root, 'dashboard');
   await mkdir(dashboardDir);
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Task Master</title>');
@@ -111,7 +116,7 @@ async function managerFixture(t, { profileProcessAlive } = {}) {
       }
     }
   };
-  const manager = await createManager({
+  manager = await createManager({
     port: 0,
     dataDir: join(root, 'data'),
     dashboardDir,
@@ -119,7 +124,6 @@ async function managerFixture(t, { profileProcessAlive } = {}) {
     profileProcessAlive
   });
   await manager.start();
-  t.after(() => manager.stop());
   return { root, manager, taskService, calls, baseUrl: manager.baseUrl };
 }
 
@@ -166,6 +170,54 @@ async function issueAgent(baseUrl, managerToken, clientId, name = clientId) {
   assert.equal(result.response.status, 201);
   return result.body.agentToken;
 }
+
+test('Manager rejects stale Agent runtimes before task routing and correlates redacted logs', async (t) => {
+  const { manager, baseUrl } = await managerFixture(t);
+  const stale = await json(await fetch(`${baseUrl}/v1/agents/issue`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${manager.token}`,
+      'content-type': 'application/json',
+      'x-taskmaster-runtime-version': '2.5.2'
+    },
+    body: JSON.stringify({ clientId: 'stale.host', name: 'Stale host' })
+  }));
+  assert.equal(stale.response.status, 428);
+  assert.equal(stale.body.error.code, 'AGENT_HOST_RELOAD_REQUIRED');
+  assert.deepEqual(stale.body.error.details, { clientVersion: '2.5.2', managerVersion: VERSION });
+  assert.match(stale.response.headers.get('x-taskmaster-request-id'), /^req_[0-9a-f]{24}$/u);
+  assert.equal(stale.body.requestId, stale.response.headers.get('x-taskmaster-request-id'));
+
+  const missing = await json(await fetch(`${baseUrl}/v1/agents/issue`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${manager.token}`,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({ clientId: 'missing.host', name: 'Missing host' })
+  }));
+  assert.equal(missing.response.status, 428);
+  assert.equal(missing.body.error.code, 'AGENT_HOST_RELOAD_REQUIRED');
+
+  const agentToken = await issueAgent(baseUrl, manager.token, 'current.host');
+  const staleScoped = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    headers: {
+      authorization: `Bearer ${agentToken}`,
+      'x-taskmaster-runtime-version': '2.5.2'
+    }
+  }));
+  assert.equal(staleScoped.response.status, 428);
+  assert.equal(staleScoped.body.error.code, 'AGENT_HOST_RELOAD_REQUIRED');
+
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const events = await manager.operationalJournal.readRecent({ limit: 20 });
+  const rejected = events.filter((entry) => entry.code === 'AGENT_HOST_RELOAD_REQUIRED');
+  assert.equal(rejected.length >= 3, true);
+  assert.equal(rejected.some((entry) => entry.requestId === stale.body.requestId), true);
+  const serialized = JSON.stringify(events);
+  assert.equal(serialized.includes(manager.token), false);
+  assert.equal(serialized.includes('Stale host'), false);
+});
 
 test('manager serves loopback health/dashboard and persists its token', async (t) => {
   const { manager, baseUrl } = await managerFixture(t);

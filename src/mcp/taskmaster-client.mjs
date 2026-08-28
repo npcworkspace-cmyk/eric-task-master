@@ -12,7 +12,7 @@ import {
   validateManagerIdentityPin,
   verifyManagerIdentityProof
 } from '../lib/manager-identity.mjs';
-import { isSensitiveKey } from '../lib/redaction.mjs';
+import { isSensitiveKey, redactPublicText, redactPublicValue } from '../lib/redaction.mjs';
 import { TaskMasterClientError } from './errors.mjs';
 
 const DEFAULT_PORT = 19_946;
@@ -217,55 +217,85 @@ async function readBoundedText(response, maxBytes, abortController) {
   return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
 }
 
-function remoteError(status, payload) {
+function remoteError(status, payload, responseRequestId) {
   const candidate = payload?.error?.code ?? payload?.code;
   const code = typeof candidate === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(candidate)
     ? candidate
     : `HTTP_${status}`;
+  const rawMessage = payload?.error?.message ?? payload?.message;
+  const managerMessage = typeof rawMessage === 'string' && rawMessage.trim()
+    ? redactPublicText(rawMessage).slice(0, 1_024)
+    : '';
+  const details = payload?.error?.details === undefined
+    ? undefined
+    : redactPublicValue(payload.error.details, { maxDepth: 6, maxItems: 100 });
+  const requestIdCandidate = responseRequestId ?? payload?.requestId;
+  const requestId = /^req_[0-9a-f]{24}$/u.test(requestIdCandidate ?? '')
+    ? requestIdCandidate
+    : undefined;
+  const common = {
+    statusCode: status,
+    ...(details === undefined ? {} : { details }),
+    ...(requestId ? { requestId } : {})
+  };
+  if (code === 'AGENT_HOST_RELOAD_REQUIRED') {
+    return clientError(code, managerMessage || 'The running Agent host must reload its Task Master bridge.', {
+      ...common,
+      retryable: false,
+      nextAction: 'Stop this task path and reload this Agent host once. Then call taskmaster_status before sending the same task again; do not invent another Manager or port.'
+    });
+  }
+  if (code === 'TASK_INPUT_SCHEMA_FAILED') {
+    return clientError(code, managerMessage || 'Task input does not match the registered task contract.', {
+      ...common,
+      retryable: false,
+      nextAction: 'Call taskmaster_task_types_describe for the selected task type, correct only the named input field, and retry once with the same stable intent.'
+    });
+  }
   if (status === 401) {
-    return clientError(code, 'Task Master rejected the scoped agent credential.', {
+    return clientError(code, managerMessage || 'Task Master rejected the scoped agent credential.', {
+      ...common,
       retryable: true,
-      statusCode: status,
       nextAction: 'Reconnect through the same Task Master installation and reuse the same stable Agent ID so it can issue a fresh scoped credential.'
     });
   }
   if (status === 403) {
     if (code === 'AGENT_REVOKED') {
-      return clientError(code, 'This Agent was revoked in the local Owner Console.', {
+      return clientError(code, managerMessage || 'This Agent was revoked in the local Owner Console.', {
+        ...common,
         retryable: false,
-        statusCode: status,
         nextAction: 'Ask the local Owner to restore this Agent in the fixed Task Master Console; do not create a replacement identity to bypass revocation.'
       });
     }
-    return clientError(code, 'This Agent is not authorized for the requested Task Master resource.', {
+    return clientError(code, managerMessage || 'This Agent is not authorized for the requested Task Master resource.', {
+      ...common,
       retryable: false,
-      statusCode: status,
       nextAction: 'Refresh Manager status and Profile state, then report the denial without creating another controller.'
     });
   }
   if (status === 404) {
-    return clientError(code, 'The requested scoped Task Master endpoint is unavailable.', {
-      statusCode: status,
+    return clientError(code, managerMessage || 'The requested scoped Task Master endpoint is unavailable.', {
+      ...common,
       nextAction: 'Start or upgrade the Task Master manager before retrying.'
     });
   }
   if (status === 409) {
-    return clientError(code, 'Task Master rejected the operation because its state changed.', {
+    return clientError(code, managerMessage || 'Task Master rejected the operation because its state changed.', {
+      ...common,
       retryable: true,
-      statusCode: status,
       nextAction: 'Read the latest task or profile state before retrying.'
     });
   }
   if (status === 429) {
-    return clientError(code, 'Task Master is rate limited.', {
+    return clientError(code, managerMessage || 'Task Master is rate limited.', {
+      ...common,
       retryable: true,
-      statusCode: status,
       nextAction: 'Wait for the manager-provided cooldown before retrying.'
     });
   }
-  return clientError(code, 'Task Master manager rejected the request.', {
+  return clientError(code, managerMessage || 'Task Master manager rejected the request.', {
+    ...common,
     retryable: status >= 500,
-    statusCode: status,
     ...(status >= 500 ? { nextAction: 'Retry once, then inspect manager status.' } : {})
   });
 }
@@ -776,6 +806,7 @@ export class HttpTaskMasterClient {
           Accept: 'application/json',
           Authorization: `Bearer ${token}`,
           'X-Taskmaster-Connection-Id': this.#connectionId,
+          'X-Taskmaster-Runtime-Version': VERSION,
           ...(encodedBody === undefined ? {} : { 'Content-Type': 'application/json' })
         },
         ...(encodedBody === undefined ? {} : { body: encodedBody }),
@@ -784,17 +815,22 @@ export class HttpTaskMasterClient {
       });
     } catch {
       requestSignal.cleanup();
-      if (parentSignal?.aborted) throw clientError('REQUEST_CANCELLED', 'The MCP request was cancelled.');
+      if (parentSignal?.aborted) {
+        const error = clientError('REQUEST_CANCELLED', 'The MCP request was cancelled.');
+        throw error;
+      }
       if (requestSignal.signal.aborted) {
-        throw clientError('MANAGER_TIMEOUT', 'Task Master manager did not respond before the request deadline.', {
+        const error = clientError('MANAGER_TIMEOUT', 'Task Master manager did not respond before the request deadline.', {
           retryable: true,
           nextAction: 'Read manager status before retrying the operation.'
         });
+        throw error;
       }
-      throw clientError('MANAGER_UNREACHABLE', 'Task Master manager could not be reached.', {
+      const error = clientError('MANAGER_UNREACHABLE', 'Task Master manager could not be reached.', {
         retryable: true,
         nextAction: 'Start Task Master with the fixed connect command and retry once.'
       });
+      throw error;
     }
     let text;
     try {
@@ -823,7 +859,14 @@ export class HttpTaskMasterClient {
         throw clientError('INVALID_MANAGER_RESPONSE', 'Task Master manager returned invalid JSON.');
       }
     }
-    if (!response.ok) throw remoteError(response.status, payload);
+    if (!response.ok) {
+      const error = remoteError(
+        response.status,
+        payload,
+        response.headers.get('x-taskmaster-request-id')
+      );
+      throw error;
+    }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       throw clientError('INVALID_MANAGER_RESPONSE', 'Task Master manager returned an invalid response shape.');
     }

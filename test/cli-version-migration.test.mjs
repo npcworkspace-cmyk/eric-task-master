@@ -244,13 +244,17 @@ test('connect authenticates and gracefully replaces an idle older Manager', asyn
     method: 'POST',
     headers: {
       Authorization: `Bearer ${currentConfig.managerToken}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'X-Taskmaster-Runtime-Version': VERSION
     },
     body: JSON.stringify({ clientId: 'upgrade.fixture', name: 'Upgrade fixture' })
   }).then((response) => response.json());
   assert.match(newIssue.agentToken, /^ETMA2\./);
   const scopedProfiles = await fetch(`${legacy.baseUrl}/v1/profiles`, {
-    headers: { Authorization: `Bearer ${newIssue.agentToken}` }
+    headers: {
+      Authorization: `Bearer ${newIssue.agentToken}`,
+      'X-Taskmaster-Runtime-Version': VERSION
+    }
   });
   assert.equal(scopedProfiles.status, 200);
 });
@@ -326,6 +330,9 @@ test('connect requires an Agent host reload after a registration runtime upgrade
   assert.equal(first.mcpRegistration.previousRuntimeVersion, '2.1.2');
   assert.equal(first.mcpRegistration.agentHostReloadRequired, true);
   assert.equal(first.manager.agentHostReloadRequired, true);
+  assert.equal(first.readyForTasks, false);
+  assert.equal(first.state, 'agent_host_reload_required');
+  assert.equal(first.blockingAction.code, 'AGENT_HOST_RELOAD_REQUIRED');
   assert.match(first.nextAction, /runtime changed; reload this Agent host once/u);
 
   const second = JSON.parse((await execFileAsync(process.execPath, connectArgs, {
@@ -336,6 +343,9 @@ test('connect requires an Agent host reload after a registration runtime upgrade
   assert.equal(second.manager.startedNow, false);
   assert.equal(second.mcpRegistration.agentHostReloadRequired, false);
   assert.equal(second.manager.agentHostReloadRequired, false);
+  assert.equal(second.readyForTasks, true);
+  assert.equal(second.state, 'ready');
+  assert.equal(second.blockingAction, undefined);
 });
 
 test('connect leaves a busy older Manager running and fails closed', async (t) => {

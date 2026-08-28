@@ -97,6 +97,7 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
       url: request.url,
       authorization: request.headers.authorization,
       connectionId: request.headers['x-taskmaster-connection-id'],
+      runtimeVersion: request.headers['x-taskmaster-runtime-version'],
       body
     });
     if (request.url === '/v1/health') {
@@ -127,6 +128,7 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
       return;
     }
     assert.equal(request.headers.authorization, `Bearer ${agentToken}`);
+    assert.equal(request.headers['x-taskmaster-runtime-version'], VERSION);
     assert.equal(issuedConnections.has(request.headers['x-taskmaster-connection-id']), true);
     const origin = `http://${request.headers.host}`;
     if (request.url === '/v1/dashboard/authorize') {
@@ -266,6 +268,24 @@ test('non-MCP CLI uses one scoped Agent contract for Dashboard, Profiles, tasks,
     taskType: 'fixture.read',
     input: { url: 'https://example.com/' },
     idempotencyKey: 'cli-start-0001'
+  });
+
+  const prepared = singleJson(await runCli([
+    'task', 'prepare-scale', '--profile', profile.id,
+    '--url', 'https://example.com/catalog?page=1',
+    '--label', 'Probe catalog', '--request-key', 'cli-scale-probe-0001', ...common
+  ]));
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.event, 'surface-probe-started');
+  const preparedRequest = requests.find((request) => (
+    request.url === '/v1/tasks' && request.body.taskType === 'surface-probe'
+  ));
+  assert.deepEqual(preparedRequest.body, {
+    profileId: profile.id,
+    taskType: 'surface-probe',
+    taskLabel: 'Probe catalog',
+    input: { url: 'https://example.com/catalog?page=1' },
+    idempotencyKey: 'cli-scale-probe-0001'
   });
 
   const waited = singleJson(await runCli(['task', 'wait', waitingTask.id, '--wait-ms', '30000', ...common]));

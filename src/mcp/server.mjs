@@ -20,13 +20,22 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const IdentifierSchema = z.string().regex(IDENTIFIER);
 const IdempotencyKeySchema = z.string().regex(IDEMPOTENCY_KEY);
 const JsonObjectSchema = z.record(z.string().max(128), z.json());
+const HttpUrlSchema = z.string().url().max(4_096).refine((value) => {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}, { message: 'URL must use HTTP or HTTPS' });
 const RESUME_NOTICE = 'Inspect the checkpoint and current site state before repeating any action whose external outcome is unknown.';
 
 const PublicErrorSchema = z.strictObject({
   code: z.string(),
   message: z.string(),
   retryable: z.boolean(),
-  nextAction: z.string().optional()
+  nextAction: z.string().optional(),
+  requestId: z.string().optional(),
+  details: z.json().optional()
 });
 
 const ProfileSchema = z.strictObject({
@@ -264,6 +273,12 @@ const OPEN_WORLD_TASK = Object.freeze({
   idempotentHint: true,
   openWorldHint: true
 });
+const OPEN_WORLD_NONDESTRUCTIVE_TASK = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true
+});
 const OPEN_WORLD_CONTINUE = Object.freeze({
   readOnlyHint: false,
   destructiveHint: true,
@@ -382,7 +397,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   const server = new McpServer(
     { name: 'eric-task-master', version },
     {
-      instructions: 'Use registered task types only. Claim the durable Owner inbox once after connecting and whenever task wait returns a pending command. Every task start returns the fixed Owner Console link and durable task ID; poll or wait for progress. MCP cancellation stops waiting but does not cancel the browser task. Publish a concise human report after interpreting task evidence.'
+      instructions: 'Use registered task types only. Claim the durable Owner inbox once after connecting. If no specialized type covers large work, call taskmaster_scale_prepare instead of inventing a probe or controller. Every task start returns the fixed Owner Console link and durable task ID; poll or wait for progress. MCP cancellation stops waiting but does not cancel the browser task. On AGENT_HOST_RELOAD_REQUIRED reload the host before any retry. Publish a concise human report after interpreting task evidence.'
     }
   );
 
@@ -518,6 +533,37 @@ export function createMcpServer({ client, version = VERSION } = {}) {
     handler: async ({ taskType }, _ctx, api) => success({
       taskType: requireId(publicTaskType(await api.describeTaskType(taskType)), 'task type')
     })
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_scale_prepare',
+    title: 'Prepare an unknown large browser task',
+    description: 'When no specialized registered task type covers a large request, run one bounded built-in surface probe before authoring or scaling a Task Pack.',
+    inputSchema: z.strictObject({
+      profileId: IdentifierSchema,
+      url: HttpUrlSchema,
+      taskLabel: z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/u).optional(),
+      idempotencyKey: IdempotencyKeySchema
+    }),
+    outputSchema: z.strictObject({ taskId: IdentifierSchema, dashboardUrl: z.string().url(), task: TaskSchema }),
+    annotations: OPEN_WORLD_NONDESTRUCTIVE_TASK,
+    handler: async (args, _ctx, api) => {
+      const started = await api.startTask({
+        taskType: 'surface-probe',
+        profileId: args.profileId,
+        ...(args.taskLabel ? { taskLabel: args.taskLabel } : {}),
+        input: { url: args.url },
+        idempotencyKey: args.idempotencyKey
+      });
+      const task = requireId(publicTask(started?.task, { includeResult: false }), 'task');
+      if (started?.taskId !== task.id || typeof started?.dashboardUrl !== 'string') {
+        throw new TaskMasterClientError('INVALID_MANAGER_RESPONSE', 'Task Master returned an inconsistent surface probe start envelope.');
+      }
+      return success(
+        { taskId: task.id, dashboardUrl: started.dashboardUrl, task },
+        `[打开任务面板](${started.dashboardUrl})\nStarted bounded surface probe ${task.id}. Wait for its evidence before building a pilot or scaling the task.`
+      );
+    }
   });
 
   register(server, taskMaster, {

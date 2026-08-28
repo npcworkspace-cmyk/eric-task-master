@@ -38,7 +38,7 @@ The manifest is named `taskpack.json`:
 
 ## Mandatory probe-before-scale gate
 
-When no specialized Skill or registered task type covers a large request, first run the built-in `surface-probe` task type against one representative entry URL. Large means at least 20 independent pages/items, pagination or recursive expansion, an expected run above ten minutes, or unattended batch execution. Read its declared `surface-probe.json` artifact before authoring the Task Pack. Probe at most three URLs only when the site has materially different list/detail/account surfaces.
+When no specialized Skill or registered task type covers a large request, first call MCP `taskmaster_scale_prepare` or CLI `task prepare-scale` against one representative entry URL. The runtime starts the built-in `surface-probe`; task authors do not recreate or vary that probe contract. Large means at least 20 independent pages/items, pagination or recursive expansion, an expected run above ten minutes, or unattended batch execution. Read its declared `surface-probe.json` artifact before authoring the Task Pack. Probe at most three URLs only when the site has materially different list/detail/account surfaces.
 
 The probe is read-only and bounded. It samples headings, links, controls, page length, stable locator hints, pagination candidates, challenge signals, and a central rapid survey/backtrack journey, then recommends the closest recipe. It does not prove full-site coverage, grant permission, or defeat a login, CAPTCHA, or rate limit. A CAPTCHA or rate-limit blocker makes `scaleAllowed` false. After the probe, customize the recommended recipe and run one bounded pilot whose result schema, checkpoints, rate policy, and completion evidence pass before raising the scale.
 

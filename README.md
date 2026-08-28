@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.5.3**
+Version: **2.5.4**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -60,8 +60,8 @@ If a user gives you this GitHub URL, follow the steps below in order. Do not inv
    node scripts/taskmaster.mjs connect --json
    ```
 
-5. `connect` installs the lockfile-pinned runtime and matching Playwright Chromium, safely migrates an idle older Manager, starts the loopback Manager, runs real-browser acceptance, and registers supported local MCP hosts. If an older Manager still has work, migration stops without interrupting it. If `manager.agentHostReloadRequired` is true, reload this Agent host once before MCP verification; the upgraded Manager should remain running.
-6. Follow the returned `nextAction`. After correcting the named precondition, retry the same command at most once; do not branch into a speculative replacement controller.
+5. `connect` installs the lockfile-pinned runtime and matching Playwright Chromium, safely migrates an idle older Manager, starts the loopback Manager, runs real-browser acceptance, and registers supported local MCP hosts. If an older Manager still has work, migration stops without interrupting it. Read the top-level `state` and `readyForTasks`: `agent_host_reload_required` is a hard stop for task calls—leave Manager running, reload this Agent host once, then run the same command again.
+6. Follow the returned `blockingAction` or `nextAction` exactly. After correcting the named precondition, retry the same command at most once; do not branch into a speculative replacement controller. For one compact diagnosis, run `node scripts/taskmaster.mjs doctor --json`; it reports Manager, MCP registration, and recent redacted errors without starting another Manager or browser.
 7. Open the returned Owner Console link once. It silently establishes a persistent local session; there is no code to type or Agent-binding flow. Bookmark `http://127.0.0.1:19946/dashboard` for later use.
 8. MCP is the default Agent path. For any `registered_pending_*` result, complete the named one-time approval or reload, then verify the live host with `taskmaster_status` and `taskmaster_profiles_list`.
 9. Choose one operation path and keep it for the task:
@@ -86,6 +86,8 @@ After the first bootstrap, the user should be able to ask naturally:
 > Use Eric Task Master with an ephemeral Profile and auto behavior to research these sites, report progress, save evidence, and close every task window when finished.
 
 The Agent then uses one durable loop: discover a task type, start once with an idempotency key, retain the task ID, wait or reconnect to that ID, inspect diagnostics when attention is required, and accept completion only after evidence and cleanup are verified.
+
+Connection and task errors remain machine-readable. A stale Agent bridge is stopped before task routing with one host-reload action; a task-input error keeps the exact rejected field, safe details, and a request ID instead of collapsing into a generic Manager rejection.
 
 Every task start returns a clickable Owner Console link focused on that task. The first link silently establishes the local Owner cookie; later visits can use the fixed bookmarked address. If the user says “启动任务面板”, use MCP `taskmaster_dashboard_open` or CLI `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json`, then return the link. Task Master does not automatically open an operating-system browser.
 
@@ -122,7 +124,7 @@ node scripts/taskmaster.mjs task-packs validate ./my-pack --json
 node scripts/taskmaster.mjs task-packs install ./my-pack --json
 ```
 
-A Task Pack defines reusable task types. It specifies the target, sequence, selectors, platform rate limits, extraction, checkpoints, outputs, and proof—not custom mouse or scrolling code. The central Human Journey engine handles rendered-page state changes, while read-only Playwright locators and `evaluate` remain a fast, unpaced path for bulk DOM extraction. Reading values and attributes is allowed; mutation hidden in `evaluate` is rejected. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. When no specialized capability covers a large request, the built-in read-only `surface-probe` first samples one representative surface, performs a bounded survey/backtrack, identifies blockers, and recommends a recipe; one bounded pilot must pass before scale. A specialized Skill teaches the Agent when to use the resulting type, how to interpret results, and which platform rules apply.
+A Task Pack defines reusable task types. It specifies the target, sequence, selectors, platform rate limits, extraction, checkpoints, outputs, and proof—not custom mouse or scrolling code. The central Human Journey engine handles rendered-page state changes, while read-only Playwright locators and `evaluate` remain a fast, unpaced path for bulk DOM extraction. Reading values and attributes is allowed; mutation hidden in `evaluate` is rejected. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. When no specialized capability covers a large request, one high-level `taskmaster_scale_prepare` call launches the built-in read-only `surface-probe`: it samples one representative surface, performs a bounded survey/backtrack, identifies blockers, and recommends a recipe; one bounded pilot must pass before scale. A specialized Skill teaches the Agent when to use the resulting type, how to interpret results, and which platform rules apply.
 
 ## Host integration
 
@@ -130,7 +132,7 @@ A Task Pack defines reusable task types. It specifies the target, sequence, sele
 | --- | --- |
 | Codex | automatic registration; live tool discovery and Task Master calls verified locally |
 | WorkBuddy Desktop | automatic registration; live host-launched bridge verified, with a host reload required after runtime upgrades |
-| Hermes | automatic registration; live discovery of 21 tools plus `taskmaster_status` and `taskmaster_profiles_list` calls verified locally |
+| Hermes | automatic registration; live discovery of the MCP tool surface plus `taskmaster_status` and `taskmaster_profiles_list` calls verified locally |
 | Claude Desktop, Claude Code | automatic registration; activation still requires that host to load the entry and complete a live tool call |
 | CodeBuddy CLI, Gemini CLI | automatic registration adapter; real-host matrix pending |
 | OpenClaw | official-CLI registration adapter; real-host matrix pending |

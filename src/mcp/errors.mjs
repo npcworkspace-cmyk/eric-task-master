@@ -1,13 +1,15 @@
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 export class TaskMasterClientError extends Error {
-  constructor(code, message, { retryable = false, nextAction, statusCode } = {}) {
+  constructor(code, message, { retryable = false, nextAction, statusCode, details, requestId } = {}) {
     super(message);
     this.name = 'TaskMasterClientError';
     this.code = SAFE_CODE.test(code) ? code : 'TASKMASTER_ERROR';
     this.retryable = retryable === true;
     this.nextAction = typeof nextAction === 'string' ? nextAction : undefined;
     this.statusCode = Number.isInteger(statusCode) ? statusCode : undefined;
+    this.details = details;
+    this.requestId = typeof requestId === 'string' ? requestId : undefined;
   }
 }
 
@@ -17,7 +19,9 @@ export function toPublicError(error) {
       code: error.code,
       message: error.message,
       retryable: error.retryable,
-      ...(error.nextAction ? { nextAction: error.nextAction } : {})
+      ...(error.nextAction ? { nextAction: error.nextAction } : {}),
+      ...(error.requestId ? { requestId: error.requestId } : {}),
+      ...(error.details === undefined ? {} : { details: error.details })
     };
   }
   return {

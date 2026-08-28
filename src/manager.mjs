@@ -17,6 +17,7 @@ import {
   DashboardSessionStore
 } from './lib/dashboard-session-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
+import { OperationalJournal } from './lib/operational-journal.mjs';
 import {
   createManagerIdentityProof,
   generateManagerIdentity,
@@ -198,7 +199,7 @@ function requireTaskMethod(service, name) {
   return service[name].bind(service);
 }
 
-function errorResponse(error) {
+function errorResponse(error, requestId) {
   if (error instanceof HttpError || error instanceof ProfileStoreError || error instanceof AgentRegistryError || error instanceof AgentTokenError) {
     const message = redactPublicText(error.message);
     const details = error.details === undefined
@@ -207,6 +208,7 @@ function errorResponse(error) {
     return {
       statusCode: error.statusCode ?? 400,
       body: {
+        requestId,
         code: error.code,
         message,
         error: {
@@ -221,14 +223,19 @@ function errorResponse(error) {
     const message = redactPublicText(
       typeof error.message === 'string' ? error.message : 'Request failed'
     );
+    const details = error.details === undefined
+      ? undefined
+      : redactPublicValue(error.details);
     return {
       statusCode: error.statusCode,
       body: {
+        requestId,
         code: typeof error.code === 'string' ? error.code : 'REQUEST_FAILED',
         message,
         error: {
           code: typeof error.code === 'string' ? error.code : 'REQUEST_FAILED',
-          message
+          message,
+          ...(details === undefined ? {} : { details })
         }
       }
     };
@@ -236,6 +243,7 @@ function errorResponse(error) {
   return {
     statusCode: 500,
     body: {
+      requestId,
       code: 'INTERNAL_ERROR',
       message: 'Internal manager error',
       error: { code: 'INTERNAL_ERROR', message: 'Internal manager error' }
@@ -259,6 +267,7 @@ export async function createManager({
     throw new TypeError('port must be an integer from 0 to 65535');
   }
   const resolvedDataDir = resolve(dataDir);
+  const operationalJournal = new OperationalJournal({ stateDir: resolvedDataDir, now });
   const managerLock = new ManagerLock(join(resolvedDataDir, '.manager.lock'));
   await managerLock.acquire();
   try {
@@ -441,6 +450,20 @@ export async function createManager({
     throw new HttpError(403, 'ORIGIN_NOT_ALLOWED', 'Request origin is not allowed');
   }
 
+  function requireCurrentAgentRuntime(request) {
+    const raw = request.headers['x-taskmaster-runtime-version'];
+    const clientVersion = typeof raw === 'string' && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(raw)
+      ? raw
+      : 'unknown';
+    if (clientVersion === VERSION) return;
+    throw new HttpError(
+      428,
+      'AGENT_HOST_RELOAD_REQUIRED',
+      `The running Agent host uses Task Master ${clientVersion} while Manager is ${VERSION}; reload this Agent host once before sending tasks.`,
+      { clientVersion, managerVersion: VERSION }
+    );
+  }
+
   async function authenticate(request) {
     const bearer = parseBearer(request);
     if (bearer) {
@@ -449,6 +472,7 @@ export async function createManager({
       }
       const agent = authenticateAgentToken(bearer, config.managerToken);
       if (agent) {
+        requireCurrentAgentRuntime(request);
         if (await agentRegistry.isRevoked(agent.clientId)) {
           throw new HttpError(403, 'AGENT_REVOKED', 'This Agent has been revoked in the Owner Console');
         }
@@ -560,6 +584,7 @@ export async function createManager({
     }
 
     if (request.method === 'POST' && url.pathname === '/v1/agents/issue') {
+      requireCurrentAgentRuntime(request);
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin');
       const body = await readJson(request, { maxBytes: 16 * 1024 });
@@ -1025,12 +1050,19 @@ export async function createManager({
   }
 
   async function handle(request, response) {
+    const requestId = `req_${randomBytes(12).toString('hex')}`;
+    const requestStartedAt = now();
+    response.setHeader('x-taskmaster-request-id', requestId);
     let healthRequest = false;
     let identityRequest = false;
     let shutdownRequest = false;
+    let requestPathname = '/';
+    let requestCode;
+    let requestMessage;
     let acceptedShutdown;
     try {
       const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+      requestPathname = requestUrl.pathname;
       healthRequest = request.method === 'GET' && requestUrl.pathname === '/v1/health';
       identityRequest = request.method === 'POST' && requestUrl.pathname === '/v1/identity/challenge';
       shutdownRequest = request.method === 'POST' && requestUrl.pathname === '/v1/manager/shutdown';
@@ -1055,9 +1087,25 @@ export async function createManager({
       } catch {
         // Do not grant CORS access to rejected origins.
       }
-      const normalized = errorResponse(error);
+      const normalized = errorResponse(error, requestId);
+      requestCode = normalized.body.code;
+      requestMessage = normalized.body.message;
       sendJson(response, normalized.statusCode, normalized.body, cors);
     } finally {
+      if (!healthRequest && !identityRequest) {
+        void operationalJournal.append({
+          level: response.statusCode >= 400 ? 'error' : 'info',
+          component: 'manager',
+          event: response.statusCode >= 400 ? 'request.failed' : 'request.completed',
+          requestId,
+          method: request.method,
+          pathname: requestPathname,
+          statusCode: response.statusCode,
+          ...(requestCode ? { code: requestCode } : {}),
+          ...(requestMessage ? { message: requestMessage } : {}),
+          durationMs: Math.max(0, now() - requestStartedAt)
+        }).catch(() => {});
+      }
       if (!healthRequest) {
         activeOperations -= 1;
         if (activeOperations === 0) {
@@ -1106,6 +1154,15 @@ export async function createManager({
     }
     listeningAddress = server.address();
     startedAt = new Date(now()).toISOString();
+    await operationalJournal.append({
+      level: 'info',
+      component: 'manager',
+      event: 'manager.started',
+      version: VERSION,
+      pid: process.pid,
+      port: listeningAddress.port,
+      state: 'ready'
+    }).catch(() => {});
     return api;
   }
 
@@ -1134,6 +1191,14 @@ export async function createManager({
         } finally {
           listeningAddress = undefined;
           stopped = true;
+          await operationalJournal.append({
+            level: 'info',
+            component: 'manager',
+            event: 'manager.stopped',
+            version: VERSION,
+            pid: process.pid,
+            state: 'stopped'
+          }).catch(() => {});
           await managerLock.release().catch(() => {});
         }
       }
@@ -1152,6 +1217,7 @@ export async function createManager({
     profileStore,
     configStore,
     taskService,
+    operationalJournal,
     stateDir,
     start,
     stop,

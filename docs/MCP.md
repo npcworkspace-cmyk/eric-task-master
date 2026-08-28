@@ -18,11 +18,11 @@ Required environment:
 - `TASKMASTER_CLIENT_NAME`: optional human-readable host name.
 
 `ERIC_TASK_MASTER_CLIENT_ID` and `ERIC_TASK_MASTER_CLIENT_NAME` are accepted as compatibility aliases.
-Automatically registered entries also carry the non-secret `ERIC_TASK_MASTER_RUNTIME_VERSION` marker so `connect` can require an Agent-host reload after an offline upgrade. Task code must not use it as an identity or authorization value.
+Automatically registered entries also carry the non-secret `ERIC_TASK_MASTER_RUNTIME_VERSION` marker so `connect` can require an Agent-host reload after an offline upgrade. Every Manager request from the bridge also carries the compiled runtime version. Missing or stale versions fail before task routing with HTTP 428 and `AGENT_HOST_RELOAD_REQUIRED`; task code must not use this version as an identity or authorization value.
 
 Manager location may be overridden with `ERIC_TASK_MASTER_HOME`, `ERIC_TASK_MASTER_HOST`, and `ERIC_TASK_MASTER_PORT`. The host must remain exactly `127.0.0.1`.
 
-STDOUT is reserved exclusively for MCP frames. Diagnostics go to STDERR as a short error code without request bodies, tokens, paths, or remote error text.
+STDOUT is reserved exclusively for MCP frames. STDERR remains a short error code. Safe Manager error messages, bounded safe details, and request IDs are returned through the structured tool error; request bodies, credentials, query strings, and local paths are not.
 
 ## Authentication boundary
 
@@ -56,6 +56,7 @@ This is trusted-local-Agent coordination, not hostile multi-tenant security. Age
 - `taskmaster_profiles_close`
 - `taskmaster_task_types_list`
 - `taskmaster_task_types_describe`
+- `taskmaster_scale_prepare`
 - `taskmaster_tasks_start`
 - `taskmaster_tasks_list`
 - `taskmaster_tasks_get`
@@ -70,6 +71,8 @@ This is trusted-local-Agent coordination, not hostile multi-tenant security. Age
 - `taskmaster_artifacts_read`
 
 Every tool publishes an input schema, output schema, and MCP annotations. Generic task start is conservatively marked destructive and open-world because the selected registered task type may interact with an external website. Task start requires an idempotency key; profile creation is explicitly marked non-idempotent because the current Manager profile API does not yet provide an idempotency contract.
+
+`taskmaster_scale_prepare` is the one-call preflight for unknown large work. It accepts one Profile, representative HTTP(S) URL, optional label, and idempotency key, then dispatches the registered read-only `surface-probe`. The Agent waits for that ordinary durable task and reads its declared artifact before authoring a bounded pilot; site-specific selectors and extraction still belong in a Task Pack.
 
 The MCP surface never accepts arbitrary module paths, JavaScript evaluation, cookie/session transfer, authorization headers, filesystem paths, or raw Playwright handles.
 
@@ -104,6 +107,8 @@ A Worker completion claim is provisional. Manager publishes `completed` only aft
 
 Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow. Pack-backed types expose `interactionContract: "full-human-v1"`; Manager forces those tasks through Human Journey and publishes `interaction-audit.json` only after its ten checks pass.
 
+Errors stay actionable without exposing internals. `TASK_INPUT_SCHEMA_FAILED` retains Manager's redacted field-level message, bounded safe details, and the correlated `requestId`; its single recovery action is to describe the already-selected type and correct the named field. `AGENT_HOST_RELOAD_REQUIRED` is non-retryable inside the current host process: reload that Agent host once, call `taskmaster_status`, and only then submit work. Manager appends allowlisted events to `logs/manager-events.jsonl`, rotated at 5 MiB across three files with protected permissions; MCP returns the same request ID so the event can be correlated without a second file writer. `node scripts/taskmaster.mjs doctor --json` summarizes Manager status, MCP registration, and recent redacted errors without starting another Manager or browser; logs are diagnostics, never task output.
+
 Every successful `taskmaster_tasks_start` result begins with a clickable Owner Console link focused on that task. The first authorized link silently creates a persistent local `HttpOnly` Owner cookie; after that the fixed bookmarked Dashboard URL works across Manager restarts. When the user says “启动任务面板”, call `taskmaster_dashboard_open` and return its clickable link; the tool does not launch an operating-system browser.
 
 ## Output and artifact bounds
@@ -114,7 +119,7 @@ Every successful `taskmaster_tasks_start` result begins with a clickable Owner C
 - Agent-visible artifact chunks are byte-preserving; the task author must never mark credential-bearing files Agent-visible.
 - Lists: at most 100 records per MCP response.
 
-Public views are explicit allowlists. Process IDs, local paths, leases, execution modules, credentials, raw manager errors, and unsafe evidence are removed. Artifact content is returned only when the manager marks the artifact with `agentVisible: true`; missing visibility fails closed.
+Public views are explicit allowlists. Local paths, leases, execution modules, credentials, unredacted Manager internals, and unsafe evidence are removed. Artifact content is returned only when the manager marks the artifact with `agentVisible: true`; missing visibility fails closed.
 
 ## Protocol compatibility
 

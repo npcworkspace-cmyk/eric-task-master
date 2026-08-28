@@ -16,8 +16,9 @@ import {
   validateManagerIdentityPin,
   verifyManagerIdentityProof
 } from './lib/manager-identity.mjs';
-import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
+import { redactPublicText, redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 import { waitForManagerShutdownProof } from './lib/manager-shutdown-proof.mjs';
+import { OperationalJournal } from './lib/operational-journal.mjs';
 import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
 import {
   discardQuarantinedProfilesAfterShutdown,
@@ -32,6 +33,7 @@ const HELP = `eric-task-master ${VERSION}
 
 Usage:
   taskmaster connect [--force-acceptance] [--json]
+  taskmaster doctor [--json]
   taskmaster status [--json]
   taskmaster dashboard-open [TASK_ID] [--json]
   taskmaster manager stop [--json]
@@ -50,6 +52,7 @@ Usage:
   taskmaster task list [--json]
   taskmaster task inbox [--limit N] [--json]
   taskmaster task start --profile ID --type TYPE --request-key KEY [--label TEXT] [--input JSON_OR_@FILE] [--json]
+  taskmaster task prepare-scale --profile ID --url URL --request-key KEY [--label TEXT] [--json]
   taskmaster task run --profile ID --type TYPE [--module PATH] [--label TEXT] [--input JSON_OR_@FILE] [--request-key KEY]
   taskmaster task status|wait|follow|cancel TASK_ID [--json]
   taskmaster task continue TASK_ID [--request-id ID] [--note TEXT] [--json]
@@ -578,6 +581,15 @@ async function connect(options, json) {
   const result = {
     ok: true,
     version: VERSION,
+    state: agentHostReloadRequired ? 'agent_host_reload_required' : 'ready',
+    readyForTasks: !agentHostReloadRequired,
+    ...(agentHostReloadRequired ? {
+      blockingAction: {
+        code: 'AGENT_HOST_RELOAD_REQUIRED',
+        message: 'The installed MCP runtime changed and this Agent host must reload before it can send tasks safely.',
+        nextAction: 'Reload this Agent host once, then run connect again and verify taskmaster_status.'
+      }
+    } : {}),
     manager: {
       ...connection.health,
       startedNow: connection.started,
@@ -843,6 +855,31 @@ async function taskCommand(action, args, options, json) {
     if (terminal.state !== 'completed') process.exitCode = 1;
     return;
   }
+  if (action === 'prepare-scale') {
+    if (!options.profile) throw cliError('PROFILE_ID_REQUIRED', '--profile is required');
+    if (!options.url) throw cliError('URL_REQUIRED', '--url is required');
+    if (!options['request-key']) {
+      throw cliError('REQUEST_KEY_REQUIRED', 'task prepare-scale requires a stable --request-key KEY');
+    }
+    let url;
+    try {
+      url = new URL(options.url);
+    } catch {
+      throw cliError('INVALID_URL', '--url must be a valid HTTP(S) URL');
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      throw cliError('INVALID_URL', '--url must be a valid HTTP(S) URL');
+    }
+    const started = await context.client.startTask({
+      profileId: options.profile,
+      taskType: 'surface-probe',
+      ...(options.label ? { taskLabel: options.label } : {}),
+      input: { url: url.href },
+      idempotencyKey: options['request-key']
+    });
+    emit({ ok: true, event: 'surface-probe-started', ...started }, json);
+    return;
+  }
   if (action === 'inbox') {
     const limit = options.limit === undefined ? 100 : Number(options.limit);
     emit({ ok: true, ...await context.client.claimInbox({ limit }) }, json);
@@ -1079,6 +1116,93 @@ async function mcpCommand(action, options, json) {
   if (!result.ok) process.exitCode = 2;
 }
 
+async function doctor(options, json) {
+  const config = settings(options);
+  const journal = new OperationalJournal({ stateDir: config.stateDir });
+  let manager;
+  let managerError;
+  try {
+    const current = await health(config, 1_500, null);
+    manager = {
+      service: current.service,
+      version: current.version,
+      apiVersion: current.apiVersion,
+      state: current.state,
+      host: current.host,
+      port: current.port,
+      pid: current.pid
+    };
+  } catch (error) {
+    managerError = {
+      code: error.code || 'MANAGER_UNAVAILABLE',
+      message: redactPublicText(error.message).slice(0, 512)
+    };
+  }
+  let registration;
+  try {
+    const status = await createRegistrar({
+      home: options.home,
+      stateDir: options['registration-state-dir'],
+      entrypoint: resolve(ROOT, 'src', 'mcp', 'stdio.mjs')
+    }).status();
+    registration = {
+      ok: status.ok,
+      agentHostReloadRequired: status.agentHostReloadRequired === true,
+      results: Array.isArray(status.results) ? status.results.slice(0, 32).map((item) => ({
+        ...(typeof item.hostKey === 'string' ? { hostKey: item.hostKey.slice(0, 80) } : {}),
+        ...(typeof item.displayName === 'string' ? { displayName: item.displayName.slice(0, 120) } : {}),
+        ...(typeof item.detected === 'boolean' ? { detected: item.detected } : {}),
+        ...(typeof item.status === 'string' ? { status: item.status.slice(0, 64) } : {}),
+        ...(typeof item.configurationStatus === 'string' ? { configurationStatus: item.configurationStatus.slice(0, 64) } : {}),
+        ...(typeof item.activationStatus === 'string' ? { activationStatus: item.activationStatus.slice(0, 64) } : {})
+      })) : []
+    };
+  } catch (error) {
+    registration = {
+      ok: false,
+      error: { code: error.code || 'MCP_STATUS_FAILED', message: redactPublicText(error.message).slice(0, 512) }
+    };
+  }
+  let recentErrors = [];
+  let diagnosticsError;
+  try {
+    recentErrors = await journal.readRecent({ limit: 20, level: 'error' });
+  } catch {
+    diagnosticsError = {
+      code: 'OPERATIONAL_JOURNAL_UNAVAILABLE',
+      message: 'The local Manager diagnostic journal is unavailable or unsafe; no log content was read.'
+    };
+  }
+  const ready = manager?.version === VERSION && registration.ok && !registration.agentHostReloadRequired;
+  const result = {
+    ok: ready,
+    state: ready
+      ? 'ready'
+      : registration.agentHostReloadRequired
+        ? 'agent_host_reload_required'
+        : manager
+          ? 'registration_attention_required'
+          : 'manager_unavailable',
+    runtime: { version: VERSION, node: process.version, platform: process.platform, arch: process.arch },
+    ...(manager ? { manager } : { managerError }),
+    mcpRegistration: registration,
+    diagnostics: {
+      log: journal.relativePath,
+      recentErrors,
+      bounded: true,
+      redacted: true,
+      ...(diagnosticsError ? { error: diagnosticsError } : {})
+    },
+    nextAction: ready
+      ? 'Task Master is ready. Use MCP status and Profile discovery before accepting a browser task.'
+      : registration.agentHostReloadRequired
+        ? 'Reload this Agent host once, then run doctor again.'
+        : 'Run the fixed connect command once, follow its single blocking action, then run doctor again.'
+  };
+  emit(result, json);
+  return result;
+}
+
 async function main() {
   const { positionals, options } = parseArgs(process.argv.slice(2));
   const json = options.json === true || options.json === 'true';
@@ -1089,6 +1213,7 @@ async function main() {
   }
   if (command === 'serve') return serve(settings(options), json);
   if (command === 'connect') return connect(options, json);
+  if (command === 'doctor') return doctor(options, json);
   if (command === 'dashboard-open') return dashboardOpenCommand(positionals, options, json);
   if (command === 'manager') {
     const action = positionals.shift() || 'status';

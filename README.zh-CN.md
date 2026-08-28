@@ -4,7 +4,7 @@
 
 **为 AI Agent 打造的持久化浏览器自动化任务系统。**
 
-版本：**2.5.3**
+版本：**2.5.4**
 
 AI Agent 已经能够理解需求、制定计划和编写代码，但浏览器执行往往仍是最薄弱的一环。Agent 内置浏览器适合短时交互，却很难稳定保留登录态、任务上下文和恢复现场；简单的 CDP 控制器虽然能快速操作真实浏览器，却会迫使每个 Agent 为每次任务重新编写控制器、进度跟踪、异常恢复和清理逻辑。
 
@@ -60,8 +60,8 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
    node scripts/taskmaster.mjs connect --json
    ```
 
-5. `connect` 会安装锁定依赖和匹配的 Playwright Chromium；在旧 Manager 空闲时完成可信的优雅升级；启动本地 Manager；执行真实浏览器验收；并注册已支持的 MCP 宿主。如果旧 Manager 还有任务，升级会停止且不会打断原任务。如果返回 `manager.agentHostReloadRequired: true`，先重载当前 Agent 宿主一次再验证 MCP；已经升级的 Manager 应继续运行。
-6. 严格执行返回的 `nextAction`。修复明确前置条件后，最多原样重试同一条命令一次；不要发散成另一套临时控制器。
+5. `connect` 会安装锁定依赖和匹配的 Playwright Chromium；在旧 Manager 空闲时完成可信的优雅升级；启动本地 Manager；执行真实浏览器验收；并注册已支持的 MCP 宿主。如果旧 Manager 还有任务，升级会停止且不会打断原任务。直接读取顶层 `state` 与 `readyForTasks`：一旦是 `agent_host_reload_required`，必须停止发送任务，保持 Manager 运行，重载当前 Agent 宿主一次，再原样执行同一条命令。
+6. 严格执行返回的 `blockingAction` 或 `nextAction`。修复明确前置条件后，最多原样重试同一条命令一次；不要发散成另一套临时控制器。需要集中诊断时只运行 `node scripts/taskmaster.mjs doctor --json`；它会汇总 Manager、MCP 注册和近期脱敏错误，不会启动第二套 Manager 或浏览器。
 7. 首次打开返回的 Owner Console 链接。页面会静默建立持久本机会话，不需要输入授权码，也没有 Agent 绑定流程；以后直接收藏 `http://127.0.0.1:19946/dashboard`。
 8. MCP 是默认 Agent 路径。任何 `registered_pending_*` 结果都只完成一次返回中指定的审批或重载，然后用 `taskmaster_status` 与 `taskmaster_profiles_list` 验证真实宿主连接。
 9. 二选一并在本次任务中保持同一路径：
@@ -86,6 +86,8 @@ Task Master 不替代 Agent 的思考能力，而是给 Agent 一双长期稳定
 > 使用 Eric Task Master，创建隐身临时 Profile，以 auto 模式研究这些网站，定时反馈进度，保存结果证据，任务结束后关闭所有窗口。
 
 Agent 随后只走一条持久任务路径：发现任务类型、使用幂等键提交一次、保存任务 ID、持续等待或重新接管同一个 ID、在需要关注时读取诊断信息，并且只在证据和清理全部通过后宣布完成。
+
+连接与任务错误保持机器可读：旧 Agent bridge 会在进入任务路由前被明确拦截，只返回一次宿主重载动作；任务输入错误会保留具体失败字段、安全详情和请求 ID，不再被包装成泛化的 Manager 拒绝。
 
 每次启动任务都会返回一个聚焦到该任务的 Owner Console 链接。首次链接静默建立本地 Owner Cookie，之后可以直接访问已收藏的固定地址。用户说“启动任务面板”时，使用 MCP `taskmaster_dashboard_open`，或者使用 CLI `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json`，再把链接返回给用户。Task Master 不会擅自拉起系统浏览器。
 
@@ -123,7 +125,7 @@ node scripts/taskmaster.mjs task-packs validate ./my-pack --json
 node scripts/taskmaster.mjs task-packs install ./my-pack --json
 ```
 
-Task Pack 提供可复用任务类型。它只定义目标、顺序、选择器、平台限速、提取、检查点、输出和完成证据，不再编写鼠标或滚动细节。统一的 Human Journey 引擎负责会改变页面状态的拟人操作；只读 Playwright locator 与 `evaluate` 仍可不加节奏地批量提取 DOM。读取文本、属性和当前 `value` 合法，只有赋值、程序化点击或滚动等写操作会被拒绝。内置单页、分页列表、列表详情、可恢复批处理和表单工作流 5 种生产骨架。没有专项能力却要启动大任务时，内置只读 `surface-probe` 会先抽样一个代表页面、完成有界扫底与回看、识别阻塞并推荐骨架；只有一个小样任务通过后才放量。专项 Skill 只负责使用时机、输入映射、平台规则和结果解释。
+Task Pack 提供可复用任务类型。它只定义目标、顺序、选择器、平台限速、提取、检查点、输出和完成证据，不再编写鼠标或滚动细节。统一的 Human Journey 引擎负责会改变页面状态的拟人操作；只读 Playwright locator 与 `evaluate` 仍可不加节奏地批量提取 DOM。读取文本、属性和当前 `value` 合法，只有赋值、程序化点击或滚动等写操作会被拒绝。内置单页、分页列表、列表详情、可恢复批处理和表单工作流 5 种生产骨架。没有专项能力却要启动大任务时，Agent 只需调用一次高级工具 `taskmaster_scale_prepare`，由运行时启动内置只读 `surface-probe`，抽样一个代表页面、完成有界扫底与回看、识别阻塞并推荐骨架；只有一个小样任务通过后才放量。专项 Skill 只负责使用时机、输入映射、平台规则和结果解释。
 
 ## Agent 宿主支持
 
@@ -131,7 +133,7 @@ Task Pack 提供可复用任务类型。它只定义目标、顺序、选择器�
 | --- | --- |
 | Codex | 自动注册；本机已验证真实工具发现与 Task Master 工具调用 |
 | WorkBuddy Desktop | 自动注册；已验证真实宿主拉起 bridge，运行时升级后需要重载宿主 |
-| Hermes | 自动注册；本机已验证发现 21 个工具，并真实调用 `taskmaster_status` 与 `taskmaster_profiles_list` |
+| Hermes | 自动注册；本机已验证发现 MCP 工具面，并真实调用 `taskmaster_status` 与 `taskmaster_profiles_list` |
 | Claude Desktop、Claude Code | 自动注册；仍需对应宿主加载配置并完成一次真实工具调用，才能证明已激活 |
 | CodeBuddy CLI、Gemini CLI | 已有自动注册适配器，真实宿主矩阵待补 |
 | OpenClaw | 已有官方 CLI 注册适配器，真实宿主矩阵待补 |

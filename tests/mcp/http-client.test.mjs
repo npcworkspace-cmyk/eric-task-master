@@ -26,11 +26,12 @@ async function readJson(request) {
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
 }
 
-function reply(response, status, payload) {
+function reply(response, status, payload, headers = {}) {
   const body = Buffer.from(JSON.stringify(payload));
   response.writeHead(status, {
     'content-type': 'application/json',
-    'content-length': body.length
+    'content-length': body.length,
+    ...headers
   });
   response.end(body);
 }
@@ -87,6 +88,7 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
       url: request.url,
       authorization: request.headers.authorization,
       connectionId: request.headers['x-taskmaster-connection-id'],
+      runtimeVersion: request.headers['x-taskmaster-runtime-version'],
       body
     });
     if (request.url === '/v1/agents/issue') {
@@ -159,8 +161,78 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.match(requests[0].body.connectionId, /^mcp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
   assert.equal(requests[0].connectionId, requests[0].body.connectionId);
   assert.equal(new Set(requests.map((request) => request.connectionId)).size, 1);
+  assert.deepEqual(new Set(requests.map((request) => request.runtimeVersion)), new Set([VERSION]));
   assert.deepEqual(Object.keys(requests.at(-2).body).sort(), ['idempotencyKey', 'input', 'profileId', 'taskLabel', 'taskType']);
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
+});
+
+test('HTTP client preserves redacted Manager errors, request IDs, and exact recovery actions', async (t) => {
+  const requestId = 'req_1234567890abcdef12345678';
+  const connection = await fixture(t, async (request, response) => {
+    const body = await readJson(request);
+    if (request.url === '/v1/agents/issue') {
+      reply(response, 201, {
+        agentToken: scopedToken(body.clientId, body.name),
+        agent: { clientId: body.clientId, name: body.name }
+      });
+      return;
+    }
+    reply(response, 400, {
+      code: 'TASK_INPUT_SCHEMA_FAILED',
+      message: 'Task input $.url is required; token=LEAK42; C:\\private\\task.json',
+      error: {
+        code: 'TASK_INPUT_SCHEMA_FAILED',
+        message: 'Task input $.url is required; token=LEAK42; C:\\private\\task.json'
+      }
+    }, { 'x-taskmaster-request-id': requestId });
+  });
+  const client = new HttpTaskMasterClient({ ...connection, clientId: 'field-error-agent' });
+
+  await assert.rejects(
+    client.startTask({
+      taskType: 'fixture.read',
+      profileId: 'profile_safe',
+      input: {},
+      idempotencyKey: 'field-error-request-0001'
+    }),
+    (error) => {
+      assert.equal(error.code, 'TASK_INPUT_SCHEMA_FAILED');
+      assert.match(error.message, /Task input \$\.url is required/u);
+      assert.equal(error.message.includes('LEAK42'), false);
+      assert.equal(error.message.includes('C:\\private'), false);
+      assert.equal(error.requestId, requestId);
+      assert.match(error.nextAction, /taskmaster_task_types_describe/u);
+      return true;
+    }
+  );
+});
+
+test('HTTP client turns a stale bridge response into one explicit host-reload instruction', async (t) => {
+  const connection = await fixture(t, async (request, response) => {
+    if (request.url === '/v1/agents/issue') {
+      reply(response, 428, {
+        code: 'AGENT_HOST_RELOAD_REQUIRED',
+        message: 'The running Agent host still uses Task Master 2.5.3 while Manager is 2.5.4.',
+        error: {
+          code: 'AGENT_HOST_RELOAD_REQUIRED',
+          message: 'The running Agent host still uses Task Master 2.5.3 while Manager is 2.5.4.',
+          details: { clientVersion: '2.5.3', managerVersion: '2.5.4' }
+        }
+      });
+      return;
+    }
+    reply(response, 500, { code: 'UNEXPECTED_REQUEST' });
+  });
+  const client = new HttpTaskMasterClient({ ...connection, clientId: 'stale-bridge-agent' });
+
+  await assert.rejects(client.getStatus(), (error) => {
+    assert.equal(error.code, 'AGENT_HOST_RELOAD_REQUIRED');
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /running Agent host/u);
+    assert.match(error.nextAction, /reload this Agent host once/u);
+    assert.deepEqual(error.details, { clientVersion: '2.5.3', managerVersion: '2.5.4' });
+    return true;
+  });
 });
 
 test('HTTP client validates scoped Dashboard links and complete task start envelopes', async (t) => {

@@ -1,4 +1,5 @@
 import { startStdioServer } from '../../../src/mcp/stdio.mjs';
+import { TaskMasterClientError } from '../../../src/mcp/errors.mjs';
 
 const task = {
   id: 'task_fixture',
@@ -90,6 +91,14 @@ const client = {
     };
   },
   async startTask(input) {
+    if (input.taskType === 'surface-probe') {
+      if (
+        input.input?.url !== 'https://example.com/catalog?page=1' ||
+        input.idempotencyKey !== 'scale-probe-fixture-0001'
+      ) {
+        throw new Error('surface-probe was not dispatched with the bounded high-level contract');
+      }
+    }
     const startedTask = { ...task, taskType: input.taskType, profileId: input.profileId };
     return {
       taskId: startedTask.id,
@@ -98,7 +107,21 @@ const client = {
     };
   },
   async listTasks() { return { tasks: [task], nextCursor: 'next_fixture' }; },
-  async getTask() { return task; },
+  async getTask(taskId) {
+    if (taskId === 'task_error') {
+      throw new TaskMasterClientError(
+        'TASK_INPUT_SCHEMA_FAILED',
+        'Task input $.url is required.',
+        {
+          retryable: false,
+          nextAction: 'Describe the selected task type and correct only $.url.',
+          requestId: 'req_1234567890abcdef12345678',
+          details: { field: '$.url', reason: 'is required' }
+        }
+      );
+    }
+    return task;
+  },
   async waitTask(_taskId, { onProgress }) {
     await onProgress?.(task.progress, task);
     return { task, timedOut: true };

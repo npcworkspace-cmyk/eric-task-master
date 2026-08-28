@@ -48,6 +48,7 @@ for (const [label, mode] of [
       'taskmaster_profiles_list',
       'taskmaster_profiles_open',
       'taskmaster_profiles_update',
+      'taskmaster_scale_prepare',
       'taskmaster_status',
       'taskmaster_task_command_respond',
       'taskmaster_task_report_publish',
@@ -65,6 +66,13 @@ for (const [label, mode] of [
     assert.deepEqual(start.annotations, {
       readOnlyHint: false,
       destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true
+    });
+    const prepare = listed.tools.find((tool) => tool.name === 'taskmaster_scale_prepare');
+    assert.deepEqual(prepare.annotations, {
+      readOnlyHint: false,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: true
     });
@@ -131,6 +139,41 @@ test('MCP exposes globally shared Profiles without legacy ownership fields', asy
   });
   assert.equal(rejected.isError, true);
   assert.match(rejected.content[0].text, /Unrecognized key/u);
+});
+
+test('MCP prepares unknown large work through one bounded built-in surface probe', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const result = await connection.client.callTool({
+    name: 'taskmaster_scale_prepare',
+    arguments: {
+      profileId: 'profile_fixture',
+      url: 'https://example.com/catalog?page=1',
+      taskLabel: 'Probe catalog before scale',
+      idempotencyKey: 'scale-probe-fixture-0001'
+    }
+  });
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.data.taskId, 'task_fixture');
+  assert.equal(result.structuredContent.data.task.taskType, 'surface-probe');
+  assert.match(result.content[0].text, /bounded surface probe/u);
+});
+
+test('MCP preserves actionable Manager field errors and request correlation', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const result = await connection.client.callTool({
+    name: 'taskmaster_tasks_get',
+    arguments: { taskId: 'task_error' }
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.error.code, 'TASK_INPUT_SCHEMA_FAILED');
+  assert.equal(result.structuredContent.error.message, 'Task input $.url is required.');
+  assert.equal(result.structuredContent.error.requestId, 'req_1234567890abcdef12345678');
+  assert.deepEqual(result.structuredContent.error.details, { field: '$.url', reason: 'is required' });
+  assert.match(result.structuredContent.error.nextAction, /correct only \$\.url/u);
 });
 
 test('non-idempotent Profile creation accepts nullable timestamps without a false failure or retry', async (t) => {
