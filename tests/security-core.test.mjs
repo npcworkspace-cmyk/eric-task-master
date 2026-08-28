@@ -121,22 +121,29 @@ function serviceFixture() {
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), 'taskmaster-security-'));
+  const managers = [];
+  const manage = (manager) => {
+    managers.push(manager);
+    return manager;
+  };
+  t.after(async () => {
+    for (const manager of [...managers].reverse()) {
+      await manager.stop().catch(() => {});
+    }
+    await rm(root, { recursive: true, force: true });
+  });
   const dashboard = path.join(root, 'dashboard');
   await mkdir(dashboard);
   await writeFile(path.join(dashboard, 'index.html'), '<!doctype html><title>fixture</title>');
   const service = serviceFixture();
-  const manager = await createManager({
+  const manager = manage(await createManager({
     port: 0,
     dataDir: path.join(root, 'data'),
     dashboardDir: dashboard,
     taskService: service
-  });
+  }));
   await manager.start();
-  t.after(async () => {
-    await manager.stop().catch(() => {});
-    await rm(root, { recursive: true, force: true });
-  });
-  return { root, manager, service, baseUrl: manager.baseUrl };
+  return { root, manager, service, manage, baseUrl: manager.baseUrl };
 }
 
 test('role matrix keeps Agent tasks scoped while the Owner Console has a global view', async (t) => {
@@ -255,7 +262,7 @@ test('role matrix keeps Agent tasks scoped while the Owner Console has a global 
 });
 
 test('Owner Console exchanges one-time codes for persistent same-origin cookie sessions', async (t) => {
-  const { root, manager, baseUrl } = await fixture(t);
+  const { root, manager, manage, baseUrl } = await fixture(t);
   assert.equal(manager.dashboardUrl, `${baseUrl}/dashboard`);
   assert.equal(manager.dashboardUrl.includes(manager.token), false);
 
@@ -323,14 +330,13 @@ test('Owner Console exchanges one-time codes for persistent same-origin cookie s
 
   await manager.stop();
   const replacementService = serviceFixture();
-  const replacement = await createManager({
+  const replacement = manage(await createManager({
     port: 0,
     dataDir: path.join(root, 'data'),
     dashboardDir: path.join(root, 'dashboard'),
     taskService: replacementService
-  });
+  }));
   await replacement.start();
-  t.after(async () => replacement.stop().catch(() => {}));
 
   const persisted = await call(replacement.baseUrl, '/v1/dashboard/summary', { cookie: ownerCookie });
   assert.equal(persisted.status, 200);
@@ -367,17 +373,17 @@ test('Owner Console exchanges one-time codes for persistent same-origin cookie s
 });
 
 test('a state directory has exactly one live Manager owner', async (t) => {
-  const { root, manager } = await fixture(t);
+  const { root, manager, manage } = await fixture(t);
   await assert.rejects(
     createManager({ port: 0, dataDir: path.join(root, 'data'), taskService: serviceFixture() }),
     { code: 'MANAGER_ALREADY_RUNNING' }
   );
   await manager.stop();
-  const replacement = await createManager({
+  const replacement = manage(await createManager({
     port: 0,
     dataDir: path.join(root, 'data'),
     taskService: serviceFixture()
-  });
+  }));
   await replacement.start();
   await replacement.stop();
 });
