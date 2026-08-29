@@ -1,6 +1,6 @@
 const REQUEST_TIMEOUT_MS = 10_000;
 const READ_RETRY_DELAY_MS = 300;
-const VIEWS = new Set(['tasks', 'profiles']);
+const VIEWS = new Set(['tasks', 'profiles', 'assets']);
 const ACTIVE_TASK_STATES = new Set([
   'queued', 'acquiring_profile', 'starting_browser', 'running', 'cooling_down',
   'recovering', 'verifying', 'pause_requested', 'cancel_requested', 'cancelling'
@@ -69,6 +69,17 @@ const ui = Object.freeze({
   tasksError: document.querySelector('#tasks-error'),
   profiles: document.querySelector('#profiles'),
   profilesError: document.querySelector('#profiles-error'),
+  assets: document.querySelector('#assets'),
+  assetsError: document.querySelector('#assets-error'),
+  assetCountChip: document.querySelector('#asset-count-chip'),
+  assetSearch: document.querySelector('#asset-search'),
+  assetFilter: document.querySelector('#asset-filter'),
+  assetSelectAll: document.querySelector('#asset-select-all'),
+  assetSelectionSummary: document.querySelector('#asset-selection-summary'),
+  assetNote: document.querySelector('#asset-note'),
+  assetDeprecate: document.querySelector('#asset-deprecate'),
+  assetRestore: document.querySelector('#asset-restore'),
+  assetDelete: document.querySelector('#asset-delete'),
   toggleProfileCreate: document.querySelector('#toggle-profile-create'),
   closeProfileCreate: document.querySelector('#close-profile-create'),
   profileCreatePanel: document.querySelector('#profile-create-panel'),
@@ -87,6 +98,8 @@ const state = {
   visibleView: 'tasks',
   profiles: [],
   tasks: [],
+  assets: [],
+  selectedAssetIds: new Set(),
   taskReceivedAt: new Map(),
   sectionErrors: {},
   mutationErrors: {},
@@ -220,6 +233,8 @@ function markAuthorizationRequired() {
   state.refreshSequence += 1;
   state.profiles = [];
   state.tasks = [];
+  state.assets = [];
+  state.selectedAssetIds.clear();
   state.taskReceivedAt.clear();
   state.sectionErrors = {};
   state.mutationErrors = {};
@@ -308,6 +323,14 @@ function formatDuration(value) {
   const rest = seconds % 60;
   const clock = [hours, minutes, rest].map((part) => String(part).padStart(2, '0')).join(':');
   return days ? `${days}天 ${clock}` : clock;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  if (bytes < 1_024) return `${bytes} B`;
+  if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KB`;
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
 function taskState(task) {
@@ -596,12 +619,31 @@ function renderTasks(force = false) {
         durationValue(task, 'total', '总时间')
       );
 
+      let reportPanel = null;
+      if (task.report?.status === 'final' && task.report.summary) {
+        reportPanel = element('details', 'task-report');
+        const reportSummary = element('summary', '', '查看 Agent 最终报告');
+        const reportBody = element('div', 'task-report-body');
+        if (task.report.title) reportBody.append(element('strong', '', task.report.title));
+        reportBody.append(element('p', '', task.report.summary));
+        for (const section of Array.isArray(task.report.sections) ? task.report.sections.slice(0, 8) : []) {
+          if (typeof section === 'string') reportBody.append(element('p', '', section));
+          else if (section && typeof section === 'object') {
+            if (section.heading) reportBody.append(element('h3', '', section.heading));
+            if (section.body) reportBody.append(element('p', '', section.body));
+          }
+        }
+        reportPanel.append(reportSummary, reportBody);
+      }
+
       const footer = element('div', 'task-card-footer');
       footer.append(
         element('span', 'task-updated', `最近反馈 ${formatTime(activity.updatedAt, { relative: true })}`),
         taskActionButtons(task)
       );
-      card.append(heading, progressBlock, metadata, footer);
+      card.append(heading, progressBlock, metadata);
+      if (reportPanel) card.append(reportPanel);
+      card.append(footer);
       ui.tasks.append(card);
     }
   }, force);
@@ -685,10 +727,119 @@ function renderProfiles(force = false) {
   setInlineError(ui.profilesError, state.mutationErrors.profiles || state.sectionErrors.profiles || '');
 }
 
+function filteredAssets() {
+  const query = ui.assetSearch.value.trim().toLocaleLowerCase('zh-CN');
+  const filter = ui.assetFilter.value;
+  return state.assets.filter((asset) => {
+    if (filter === 'discoverable' && !asset.discoverable) return false;
+    if (filter === 'deprecated' && asset.lifecycle !== 'deprecated') return false;
+    if (filter === 'history' && !['history', 'orphan'].includes(asset.kind)) return false;
+    if (filter === 'protected' && !asset.protected) return false;
+    if (!query) return true;
+    const haystack = [
+      asset.name, asset.title, asset.description, asset.note, asset.version,
+      ...(asset.taskTypes || []).flatMap((item) => [item.name, item.title])
+    ].filter(Boolean).join(' ').toLocaleLowerCase('zh-CN');
+    return haystack.includes(query);
+  });
+}
+
+function syncAssetBulkControls(visible = filteredAssets()) {
+  const selected = state.assets.filter((asset) => state.selectedAssetIds.has(asset.id));
+  const visibleIds = visible.map((asset) => asset.id);
+  const selectedVisible = visibleIds.filter((id) => state.selectedAssetIds.has(id)).length;
+  ui.assetSelectAll.checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
+  ui.assetSelectAll.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
+  ui.assetSelectionSummary.textContent = selected.length
+    ? `已选择 ${selected.length} 项 · 删除动作仍会由 Manager 重新检查任务与恢复状态`
+    : '尚未选择资产';
+  ui.assetNote.disabled = !selected.length || selected.some((asset) => !asset.canEditNote);
+  ui.assetDeprecate.disabled = !selected.length || selected.some((asset) => !asset.canChangeLifecycle || asset.lifecycle !== 'active');
+  ui.assetRestore.disabled = !selected.length || selected.some((asset) => !asset.canChangeLifecycle || asset.lifecycle !== 'deprecated');
+  ui.assetDelete.disabled = !selected.length || selected.some((asset) => !asset.deletable);
+}
+
+function renderAssets(force = false) {
+  const visible = filteredAssets();
+  const validIds = new Set(state.assets.map((asset) => asset.id));
+  for (const id of state.selectedAssetIds) if (!validIds.has(id)) state.selectedAssetIds.delete(id);
+  renderWhenChanged('assets', {
+    assets: visible,
+    selected: [...state.selectedAssetIds].sort(),
+    pending: [...state.pendingMutations].filter((key) => key.startsWith('asset:'))
+  }, ui.assets, () => {
+    ui.assets.replaceChildren();
+    if (!visible.length) {
+      ui.assets.append(element('p', 'empty-state', state.authenticated === false
+        ? '建立 Owner 会话后即可查看执行器资产。'
+        : '当前筛选没有匹配的执行器资产。'));
+      return;
+    }
+    for (const asset of visible) {
+      const card = element('article', `asset-card asset-${asset.kind}`);
+      card.dataset.assetId = asset.id;
+      const heading = element('div', 'asset-card-heading');
+      const selector = element('label', 'asset-selector');
+      const checkbox = focusKey(element('input'), `asset:${asset.id}:select`);
+      checkbox.type = 'checkbox';
+      checkbox.checked = state.selectedAssetIds.has(asset.id);
+      checkbox.setAttribute('aria-label', `选择 ${asset.title}`);
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) state.selectedAssetIds.add(asset.id);
+        else state.selectedAssetIds.delete(asset.id);
+        syncAssetBulkControls();
+      });
+      selector.append(checkbox);
+      const copy = element('div', 'asset-title-copy');
+      copy.append(
+        element('p', 'npc-eyebrow', ({
+          pack: 'TASK PACK', standalone: asset.transient ? 'TRANSIENT MODULE' : 'STANDALONE MODULE',
+          system: 'SYSTEM', history: 'TASK HISTORY', orphan: 'ORPHAN FILE'
+        })[asset.kind] || asset.kind),
+        element('h2', '', asset.title || asset.name)
+      );
+      const chips = element('div', 'asset-chips');
+      chips.append(element('span', `npc-chip ${asset.discoverable ? 'npc-chip-success' : ''}`, asset.discoverable ? 'Agent 可发现' : 'Agent 不可发现'));
+      chips.append(element('span', `npc-chip ${asset.lifecycle === 'deprecated' ? 'npc-chip-warning' : ''}`, ({ active: '使用中', deprecated: '已废弃', retired: '仅历史' })[asset.lifecycle] || asset.lifecycle));
+      if (asset.protected) chips.append(element('span', 'npc-chip', '系统保护'));
+      heading.append(selector, copy, chips);
+
+      const purpose = element('p', 'asset-purpose', asset.description || '未填写用途说明；建议通过资产备注补充给后续维护者。');
+      const facts = element('div', 'asset-facts');
+      facts.append(
+        labelledValue('版本', asset.version || '—'),
+        labelledValue('任务类型', String(asset.taskTypes?.length || 0)),
+        labelledValue('运行次数', String(asset.usage?.runCount || 0)),
+        labelledValue('成功 / 失败', `${asset.usage?.successCount || 0} / ${asset.usage?.failureCount || 0}`),
+        labelledValue('最后使用', formatTime(asset.usage?.lastUsedAt, { relative: true })),
+        labelledValue('文件体积', `${asset.fileCount || 0} 个 · ${formatBytes(asset.sizeBytes)}`)
+      );
+      const note = element('div', 'asset-note');
+      note.append(element('strong', '', '资产备注'), element('p', '', asset.note || '暂无备注'));
+      const details = element('details', 'asset-task-types');
+      details.append(element('summary', '', `包含 ${asset.taskTypes?.length || 0} 个任务类型`));
+      const typeList = element('ul');
+      for (const item of asset.taskTypes || []) {
+        typeList.append(element('li', '', `${item.name}${item.title && item.title !== item.name ? ` · ${item.title}` : ''}`));
+      }
+      details.append(typeList);
+      card.append(heading, purpose, facts, note, details);
+      if (!asset.deletable && asset.deleteBlockers?.length) {
+        card.append(element('p', 'asset-blocker', `不可删除：${asset.deleteBlockers.join('；')}`));
+      }
+      ui.assets.append(card);
+    }
+  }, force);
+  ui.assetCountChip.textContent = `${visible.length} / ${state.assets.length} 项资产`;
+  syncAssetBulkControls(visible);
+  setInlineError(ui.assetsError, state.mutationErrors.assets || state.sectionErrors.assets || '');
+}
+
 function renderAll(force = false) {
   const activeFocusKey = document.activeElement?.dataset?.focusKey || state.pendingFocusKey || '';
   renderTasks(force);
   renderProfiles(force);
+  renderAssets(force);
   if (activeFocusKey && restoreFocus(activeFocusKey)) state.pendingFocusKey = '';
   focusInitialTask();
 }
@@ -697,6 +848,7 @@ function applyRefreshResult(key, result, receivedAt) {
   if (result.status === 'fulfilled') {
     state.sectionErrors[key] = '';
     if (key === 'profiles') state.profiles = listFrom(result.value, 'profiles');
+    if (key === 'assets') state.assets = listFrom(result.value, 'assets');
     if (key === 'tasks') {
       state.tasks = listFrom(result.value, 'tasks');
       state.taskReceivedAt = new Map(state.tasks.map((task) => [task.id, receivedAt]));
@@ -719,11 +871,12 @@ async function refreshAll({ force = false } = {}) {
   state.refreshPromise = (async () => {
     const results = await Promise.allSettled([
       request('/v1/profiles'),
-      request('/v1/tasks')
+      request('/v1/tasks'),
+      request('/v1/task-assets')
     ]);
     if (sequence !== state.refreshSequence) return;
     const receivedAt = Date.now();
-    const keys = ['profiles', 'tasks'];
+    const keys = ['profiles', 'tasks', 'assets'];
     const successCount = results.reduce((count, result, index) => count + Number(applyRefreshResult(keys[index], result, receivedAt)), 0);
     const unauthorized = results.some((result) => result.status === 'rejected' && result.reason?.status === 401);
     const connectivityFailure = results.every((result) => result.status === 'rejected' && (result.reason?.status === 0 || result.reason?.status >= 500));
@@ -816,6 +969,7 @@ function syncCreatePolicy() {
 function mutationSection(key) {
   if (key.startsWith('profile:')) return 'profiles';
   if (key.startsWith('task:')) return 'tasks';
+  if (key.startsWith('asset:')) return 'assets';
   return '';
 }
 
@@ -945,6 +1099,38 @@ async function deleteTaskRecord(task) {
   }), '任务记录已删除', { focusAfter });
 }
 
+async function runAssetAction(action) {
+  const assetIds = [...state.selectedAssetIds];
+  if (!assetIds.length) return;
+  const selected = state.assets.filter((asset) => state.selectedAssetIds.has(asset.id));
+  let note;
+  if (action === 'note') {
+    const existing = selected.length === 1 ? selected[0].note || '' : '';
+    const value = prompt('填写资产备注（留空可清除备注）', existing);
+    if (value === null) return;
+    note = value;
+  }
+  if (action === 'delete') {
+    const names = selected.slice(0, 5).map((asset) => `“${asset.title}”`).join('、');
+    const suffix = selected.length > 5 ? `等 ${selected.length} 项` : '';
+    if (!confirm(`确定删除 ${names}${suffix}？Manager 会再次校验任务引用；删除后的执行器文件无法恢复。`)) return;
+  }
+  const labels = {
+    note: '资产备注已保存',
+    deprecate: '所选资产已废弃，Agent 不再发现它们',
+    restore: '所选资产已恢复为可发现',
+    delete: '所选执行器资产已安全删除'
+  };
+  const result = await runMutation('asset:batch', () => request('/v1/task-assets/actions', {
+    method: 'POST',
+    body: { action, assetIds, ...(note !== undefined ? { note } : {}) }
+  }), labels[action], { focusAfter: 'assets-title' });
+  if (result) {
+    state.selectedAssetIds.clear();
+    renderAssets(true);
+  }
+}
+
 async function logout() {
   if (!confirm('退出这台浏览器的 Owner 会话？后台任务不会停止。')) return;
   try {
@@ -965,6 +1151,19 @@ ui.toggleProfileCreate.addEventListener('click', () => profileCreateVisible(true
 ui.closeProfileCreate.addEventListener('click', () => profileCreateVisible(false));
 ui.profileKind.addEventListener('change', syncCreatePolicy);
 ui.createProfileForm.addEventListener('submit', createProfile);
+ui.assetSearch.addEventListener('input', () => renderAssets(true));
+ui.assetFilter.addEventListener('change', () => renderAssets(true));
+ui.assetSelectAll.addEventListener('change', () => {
+  for (const asset of filteredAssets()) {
+    if (ui.assetSelectAll.checked) state.selectedAssetIds.add(asset.id);
+    else state.selectedAssetIds.delete(asset.id);
+  }
+  renderAssets(true);
+});
+ui.assetNote.addEventListener('click', () => void runAssetAction('note'));
+ui.assetDeprecate.addEventListener('click', () => void runAssetAction('deprecate'));
+ui.assetRestore.addEventListener('click', () => void runAssetAction('restore'));
+ui.assetDelete.addEventListener('click', () => void runAssetAction('delete'));
 document.addEventListener('visibilitychange', () => {
   scheduleRefresh();
   scheduleDurationTick();

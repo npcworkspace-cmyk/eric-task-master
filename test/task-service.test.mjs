@@ -210,6 +210,91 @@ test('task service isolates work in a child, tracks progress, and releases its l
   await service.close();
 });
 
+test('task asset administration explains usage, blocks live deletion, retires transient modules, and removes them safely', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-assets-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'temporary-task.mjs');
+  await writeFile(modulePath, [
+    "export const meta = { title: 'Temporary catalog probe', description: 'Checks one bounded catalog page.' };",
+    'export async function run() {}'
+  ].join('\n'));
+  const store = fakeProfileStore(root);
+  let worker;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      worker = new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          setImmediate(() => child.emit('message', { type: 'state', state: 'running' }));
+        }
+        if (message.type === 'cancel') {
+          setImmediate(() => {
+            child.emit('message', { type: 'cleanup', browserClosed: true });
+            child.finish(0);
+          });
+        }
+      });
+      return worker;
+    }
+  });
+  t.after(() => service.close());
+
+  await service.installTaskType({
+    name: 'temporary.catalog.v1', modulePath, transient: true, note: 'Disposable catalog experiment'
+  }, ADMIN);
+  await assert.rejects(service.listTaskAssets({ role: 'agent', clientId: 'agent_test' }), {
+    code: 'TASK_ASSET_LIST_FORBIDDEN'
+  });
+  let inventory = await service.listTaskAssets(ADMIN);
+  let asset = inventory.assets.find((item) => item.id === 'type:temporary.catalog.v1');
+  assert.equal(asset.description, 'Checks one bounded catalog page.');
+  assert.equal(asset.note, 'Disposable catalog experiment');
+  assert.equal(asset.discoverable, true);
+  assert.equal(asset.transient, true);
+  assert.equal(asset.deletable, true);
+
+  const task = await service.create({
+    profileId: 'profile_test',
+    taskType: 'temporary.catalog.v1',
+    idempotencyKey: 'temporary-catalog-live-delete',
+    input: {}
+  }, ADMIN);
+  await waitFor(async () => (await service.get(task.id, ADMIN)).state === 'running');
+  inventory = await service.listTaskAssets(ADMIN);
+  asset = inventory.assets.find((item) => item.id === 'type:temporary.catalog.v1');
+  assert.equal(asset.usage.activeCount, 1);
+  assert.equal(asset.deletable, false);
+  assert.match(asset.deleteBlockers.join(' '), /安全清理/u);
+  await assert.rejects(service.applyTaskAssetAction({
+    action: 'delete', assetIds: [asset.id]
+  }, ADMIN), { code: 'TASK_ASSET_DELETE_BLOCKED' });
+
+  await service.applyTaskAssetAction({
+    action: 'note', assetIds: [asset.id], note: 'Confirmed one-off; remove after cleanup'
+  }, ADMIN);
+  await service.cancel(task.id, ADMIN);
+  await waitFor(async () => {
+    const current = await service.get(task.id, ADMIN);
+    return current.state === 'cancelled' && current.cleanup.settled;
+  });
+  asset = await waitFor(async () => {
+    inventory = await service.listTaskAssets(ADMIN);
+    const candidate = inventory.assets.find((item) => item.id === 'type:temporary.catalog.v1');
+    return candidate?.lifecycle === 'deprecated' ? candidate : null;
+  });
+  assert.equal(asset.lifecycle, 'deprecated');
+  assert.equal(asset.discoverable, false);
+  assert.equal(asset.note, 'Confirmed one-off; remove after cleanup');
+  assert.equal(asset.deletable, true);
+
+  await service.applyTaskAssetAction({ action: 'delete', assetIds: [asset.id] }, ADMIN);
+  inventory = await service.listTaskAssets(ADMIN);
+  assert.equal(inventory.assets.some((item) => item.id === asset.id), false);
+});
+
 test('task activity is redacted, phase-aware, durable, and independent from progress freshness', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-activity-'));
   t.after(() => rm(root, { recursive: true, force: true }));

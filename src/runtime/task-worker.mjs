@@ -828,6 +828,7 @@ export async function runTaskWorker(config, {
     };
 
     let semantic;
+    let cooldown;
     const fullHumanJourney = config.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT;
     const rawAction = createActionHelper({
       page,
@@ -846,6 +847,7 @@ export async function runTaskWorker(config, {
           at: new Date().toISOString()
         }
       }),
+      onNavigationCooldown: (options) => cooldown(options),
       onFailure: async ({ operation }) => {
         safeSend({
           type: 'activity',
@@ -949,7 +951,7 @@ export async function runTaskWorker(config, {
       })
     });
     activeHandoff = handoff;
-    const cooldown = createCooldownHelper({
+    cooldown = createCooldownHelper({
       signal: executionSignal,
       onSignal: (kind) => action.signal(kind),
       onCooldown: async (record) => safeSend({ type: 'cooldown', cooldown: record }),

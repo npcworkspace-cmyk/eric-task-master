@@ -81,7 +81,7 @@ export function createCooldownHelper({
     const startedAt = new Date(startedAtMs).toISOString();
     const resumeAt = new Date(startedAtMs + durationMs).toISOString();
     const reason = String(options.reason || 'Rate limit cooldown').slice(0, 160);
-    onSignal('rate_limit');
+    onSignal(String(options.signalKind || 'rate_limit'));
     await onState('cooling_down');
     await onProgress({ durationMs, resumeAt, reason });
     await onCooldown({ status: 'active', durationMs, startedAt, resumeAt, reason });

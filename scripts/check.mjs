@@ -57,6 +57,7 @@ async function staticChecks() {
     interactionContract,
     journey,
     behavior,
+    cooldown,
     observationFacade,
     acceptance,
     mcpStdio,
@@ -79,6 +80,7 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'src', 'lib', 'interaction-contract.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'journey.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'behavior.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'cooldown.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'observation-facade.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'acceptance.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
@@ -119,11 +121,18 @@ async function staticChecks() {
     dashboard.includes('bootstrapOwnerSession') && dashboard.includes('markAuthorizationRequired') &&
       dashboard.includes('expectedRevision') && dashboard.includes('deleteTaskRecord') &&
       dashboard.includes('taskDurations') && dashboardHtml.includes('data-view-panel="tasks"') &&
-      dashboardHtml.includes('data-view-panel="profiles"') &&
+      dashboardHtml.includes('data-view-panel="profiles"') && dashboardHtml.includes('data-view-panel="assets"') &&
+      dashboard.includes("request('/v1/task-assets')") && dashboard.includes('runAssetAction') &&
+      manager.includes("url.pathname === '/v1/task-assets'") &&
       !dashboardHtml.includes('data-view-panel="overview"') && !dashboardHtml.includes('data-view-panel="agents"') &&
       !dashboard.includes("request('/v1/agents") && !dashboard.includes('/artifacts') &&
       !dashboard.includes('/timeline') && !dashboard.includes('/commands'),
-    'Minimal Owner Console bootstrap, task timing, revision, deletion, or two-view contract drift'
+    'Owner Console bootstrap, task timing, revision, deletion, or three-view asset contract drift'
+  );
+  invariant(
+    behavior.includes('transientNavigationFailure') && behavior.includes('navigationRetries') &&
+      taskWorker.includes('onNavigationCooldown') && cooldown.includes("options.signalKind || 'rate_limit'"),
+    'bounded direct-navigation recovery contract drift'
   );
   invariant(
     agentRegistry.includes("status = 'revoked'") && dashboardSessions.includes('tokenHash') &&

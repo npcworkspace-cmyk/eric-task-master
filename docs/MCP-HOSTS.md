@@ -79,7 +79,7 @@ node scripts/taskmaster.mjs profiles open PROFILE_ID --agent-id STABLE_ID --agen
 node scripts/taskmaster.mjs profiles close PROFILE_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 ```
 
-Persistent Profiles default to `human`; ephemeral Profiles default to `auto`. Either kind may be updated to `fast`, `auto`, or `human`. A running task applies the change through a Worker-confirmed live control without restarting; the browser engine remains immutable. `task-types install` and `task-packs install` are local authoring commands, not the standard no-adapter Agent task loop.
+Persistent Profiles default to `human`; ephemeral Profiles default to `auto`. Either kind may be updated to `fast`, `auto`, or `human`. A running task applies the change through a Worker-confirmed live control without restarting; the browser engine remains immutable. `task-types install` and `task-packs install` are local authoring commands, not the standard no-adapter Agent task loop. CLI standalone installs are transient unless `--persistent` is explicit; reusable capability should normally be a versioned Task Pack.
 
 CLI identities provide the same trusted-local task attribution as registered MCP client IDs. Profiles are intentionally global, while task records, artifacts, reports, and command inboxes remain scoped. This is not a hostile tenant boundary. Do not mix MCP and CLI identities inside one task. Mutually untrusted Agents require separate operating-system users, sandboxes, or machines.
 

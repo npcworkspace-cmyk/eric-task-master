@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -279,4 +279,65 @@ test('seed initialization explicitly updates a same-name built-in task', async (
 
   const persisted = JSON.parse(await readFile(filePath, 'utf8'));
   assert.equal(persisted.types[0].sha256, updated.sha256);
+});
+
+test('asset lifecycle exposes notes, discovery, inventory, and safe physical removal', async (t) => {
+  const { allowed, snapshotRoot, registry } = await fixture(t);
+  const modulePath = await writeModule(
+    allowed,
+    'asset.mjs',
+    'export const meta = { title: "Reusable collector", description: "Collects bounded public data" };\nexport async function run() { return { summary: "ok", evidence: [] }; }\n'
+  );
+  const installed = await registry.install({
+    name: 'asset.collect.v1',
+    modulePath,
+    transient: true,
+    note: 'Created for one campaign'
+  });
+  let [asset] = await registry.listManagement();
+  assert.equal(asset.assetKind, 'standalone');
+  assert.equal(asset.discoverable, true);
+  assert.equal(asset.transient, true);
+  assert.equal(asset.note, 'Created for one campaign');
+
+  await registry.setNoteMany(['asset.collect.v1'], 'Reusable after review');
+  await registry.setLifecycleMany(['asset.collect.v1'], 'deprecated');
+  assert.equal((await registry.listSummaries()).length, 0);
+  asset = (await registry.listManagement())[0];
+  assert.equal(asset.note, 'Reusable after review');
+  assert.equal(asset.lifecycle, 'deprecated');
+
+  await registry.setLifecycleMany(['asset.collect.v1'], 'active');
+  const inventory = await registry.snapshotInventory();
+  assert.equal(inventory.length, 1);
+  assert.equal(inventory[0].registered, true);
+  await registry.removeMany(['asset.collect.v1']);
+  assert.equal((await registry.listManagement()).length, 0);
+  assert.equal(await lstat(path.join(snapshotRoot, `${installed.name}-${installed.sha256}.mjs`)).catch(() => null), null);
+});
+
+test('system seed assets are protected and omitted from ordinary Agent discovery', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-system-assets-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const allowed = path.join(root, 'allowed');
+  await mkdir(allowed);
+  const modulePath = await writeModule(
+    allowed,
+    'system.mjs',
+    'export async function run() { return { summary: "ok", evidence: [] }; }\n'
+  );
+  const registry = new TaskTypeRegistry({
+    filePath: path.join(root, 'types.json'),
+    snapshotRoot: path.join(root, 'snapshots'),
+    allowedRoots: [allowed],
+    seedTypes: [{ name: 'acceptance-system', modulePath }]
+  });
+  assert.deepEqual(await registry.listSummaries(), []);
+  const [asset] = await registry.listManagement();
+  assert.equal(asset.assetKind, 'system');
+  assert.equal(asset.protected, true);
+  assert.equal(asset.discoverable, false);
+  await assert.rejects(registry.removeMany(['acceptance-system']), { code: 'TASK_ASSET_PROTECTED' });
+  await assert.rejects(registry.setLifecycleMany(['acceptance-system'], 'deprecated'), { code: 'TASK_ASSET_PROTECTED' });
+  assert.equal((await registry.resolve('acceptance-system')).name, 'acceptance-system');
 });

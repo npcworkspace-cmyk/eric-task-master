@@ -67,6 +67,33 @@ function createTaskHarness(profileStore, tasks, control) {
       }
       return [...tasks.values()].map((value) => structuredClone(value));
     },
+    async listTaskAssets() {
+      return { assets: structuredClone(control.assets), total: control.assets.length };
+    },
+    async applyTaskAssetAction(body) {
+      control.assetActions.push({ action: body.action, assetIds: [...body.assetIds], note: body.note });
+      const selected = control.assets.filter((asset) => body.assetIds.includes(asset.id));
+      if (selected.length !== body.assetIds.length) throw serviceError(404, 'TASK_ASSET_NOT_FOUND', 'Asset not found');
+      if (body.action === 'delete' && selected.some((asset) => !asset.deletable)) {
+        throw serviceError(409, 'TASK_ASSET_DELETE_BLOCKED', 'Asset is still referenced');
+      }
+      if (body.action === 'delete') {
+        control.assets = control.assets.filter((asset) => !body.assetIds.includes(asset.id));
+      } else {
+        for (const asset of selected) {
+          if (body.action === 'note') asset.note = body.note;
+          if (body.action === 'deprecate') {
+            asset.lifecycle = 'deprecated';
+            asset.discoverable = false;
+          }
+          if (body.action === 'restore') {
+            asset.lifecycle = 'active';
+            asset.discoverable = true;
+          }
+        }
+      }
+      return { assets: structuredClone(control.assets), total: control.assets.length, changed: selected.length };
+    },
     async get(id) {
       return structuredClone(task(id));
     },
@@ -187,7 +214,45 @@ const control = {
   conflictNextPause: false,
   taskActions: [],
   deleteRequests: 0,
-  behaviorChanges: []
+  behaviorChanges: [],
+  assetActions: [],
+  assets: [
+    {
+      id: 'pack:news-pack@2.0.0', kind: 'pack', source: 'task-pack', name: 'news-pack', version: '2.0.0',
+      title: '新闻采集 Pack', description: '按站点探针、分页与验收流程采集公开新闻。', note: '生产使用',
+      lifecycle: 'active', discoverable: true, protected: false, transient: false,
+      taskTypes: [{ name: 'news.collect.v2', title: '新闻采集', lifecycle: 'active', discoverable: true }],
+      fileCount: 1, sizeBytes: 4_096, installedAt: ago(86_400_000),
+      usage: { runCount: 12, successCount: 10, failureCount: 2, activeCount: 1, states: { completed: 10, failed: 2 }, lastUsedAt: now() },
+      canEditNote: true, canChangeLifecycle: true, deletable: false, deleteBlockers: ['任务 Codex-抓取新闻 尚未完成安全清理']
+    },
+    {
+      id: 'type:campaign-once.v1', kind: 'standalone', source: 'standalone', name: 'campaign-once.v1', version: '1.0.0',
+      title: '一次性活动探针', description: '一次性页面结构探测脚本。', note: '',
+      lifecycle: 'deprecated', discoverable: false, protected: false, transient: true,
+      taskTypes: [{ name: 'campaign-once.v1', title: '一次性活动探针', lifecycle: 'deprecated', discoverable: false }],
+      fileCount: 1, sizeBytes: 2_048, installedAt: ago(172_800_000),
+      usage: { runCount: 1, successCount: 1, failureCount: 0, activeCount: 0, states: { completed: 1 }, lastUsedAt: ago(86_400_000) },
+      canEditNote: true, canChangeLifecycle: true, deletable: true, deleteBlockers: []
+    },
+    {
+      id: 'type:acceptance', kind: 'system', source: 'system', name: 'acceptance', version: '1.0.0',
+      title: '系统验收', description: '安装和升级时使用的受保护基础验收能力。', note: '',
+      lifecycle: 'active', discoverable: false, protected: true, transient: false,
+      taskTypes: [{ name: 'acceptance', title: '系统验收', lifecycle: 'active', discoverable: false }],
+      fileCount: 1, sizeBytes: 1_024, installedAt: ago(259_200_000),
+      usage: { runCount: 3, successCount: 3, failureCount: 0, activeCount: 0, states: { completed: 3 }, lastUsedAt: ago(3_600_000) },
+      canEditNote: true, canChangeLifecycle: false, deletable: false, deleteBlockers: ['系统验收或基础能力受保护']
+    },
+    {
+      id: 'snapshot:abc:fixture', kind: 'orphan', source: 'orphan-snapshot', name: 'old-demo', version: '',
+      title: 'old-demo（孤立快照）', description: '没有注册记录或任务引用的遗留文件，可安全清理。', note: '',
+      lifecycle: 'retired', discoverable: false, protected: false, transient: false, taskTypes: [],
+      fileCount: 1, sizeBytes: 512, installedAt: ago(604_800_000),
+      usage: { runCount: 0, successCount: 0, failureCount: 0, activeCount: 0, states: {}, lastUsedAt: null },
+      canEditNote: false, canChangeLifecycle: false, deletable: true, deleteBlockers: []
+    }
+  ]
 };
 const checks = [];
 let manager;
@@ -296,7 +361,13 @@ try {
     timing: { version: 1, cooldownDurationMs: 12_000, activeCooldownStartedAt: null },
     history: [{ attempt: 1, workerStartedAt: ago(170_000), finishedAt: ago(20_000) }],
     cleanup: { browserClosed: true, workerExited: true, leaseReleased: true, settled: true },
-    completion: { integrity: 'valid', verifiedAt: ago(20_000) }
+    completion: { integrity: 'valid', verifiedAt: ago(20_000) },
+    report: {
+      status: 'final',
+      title: '表单验收报告',
+      summary: '5 项表单检查全部通过。',
+      sections: [{ heading: '结论', body: '没有发现需要人工处理的异常。' }]
+    }
   });
 
   control.listFailures = 1;
@@ -320,7 +391,7 @@ try {
   assert.equal(await page.evaluate(() => location.hash), '');
   assert.equal(await page.locator('#auth-banner').isHidden(), true);
   assert.equal(await page.locator('[data-view-panel="tasks"]').isVisible(), true);
-  assert.equal(await page.locator('.nav-link').count(), 2);
+  assert.equal(await page.locator('.nav-link').count(), 3);
   assert.equal(await page.locator('.task-card').count(), 3);
   await page.locator('[data-task-id="task_running"]').filter({ hasText: 'Codex-抓取新闻-20260826-101500Z' }).waitFor();
   assert.equal(await page.evaluate(() => document.activeElement?.dataset.taskId), 'task_running');
@@ -330,7 +401,7 @@ try {
     assert.equal(requestedApiPaths.some((value) => value.includes(forbidden)), false, `Unexpected Dashboard request: ${forbidden}`);
   }
   assert.equal(await page.locator('.agent-card, dialog, [data-view-panel="agents"]').count(), 0);
-  checks.push('only Tasks and Profiles are rendered and no secondary APIs are fetched');
+  checks.push('Tasks, Profiles, and Task Pack assets are rendered without Agent or raw artifact APIs');
 
   const runningCard = page.locator('.task-card[data-task-id="task_running"]');
   await runningCard.getByText('正在提取第 3 批结果').waitFor();
@@ -382,6 +453,12 @@ try {
   checks.push('409 refresh, double-submit guard, pause, resume, and cleanup-proved cancel');
 
   const completedCard = page.locator('.task-card[data-task-id="task_completed"]');
+  await completedCard.getByText('查看 Agent 最终报告', { exact: true }).click();
+  await completedCard.getByText('表单验收报告', { exact: true }).waitFor();
+  await completedCard.getByText('5 项表单检查全部通过。', { exact: true }).waitFor();
+  await completedCard.getByRole('heading', { name: '结论', exact: true }).waitFor();
+  await completedCard.getByText('没有发现需要人工处理的异常。', { exact: true }).waitFor();
+  checks.push('bounded final Agent report renders as readable owner content');
   page.once('dialog', (dialog) => dialog.accept());
   await completedCard.getByRole('button', { name: '删除记录' }).click();
   await completedCard.waitFor({ state: 'detached' });
@@ -427,6 +504,50 @@ try {
   await temporaryCard.waitFor({ state: 'detached' });
   checks.push('Profile defaults, fast/auto/human live control, create, edit, rename, open, close, and delete');
 
+  await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
+  assert.equal(await page.evaluate(() => document.activeElement?.id), 'assets-title');
+  assert.equal(await page.locator('.asset-card').count(), 4);
+  const packCard = page.locator('.asset-card').filter({ hasText: '新闻采集 Pack' });
+  await packCard.getByText('Agent 可发现', { exact: true }).waitFor();
+  await packCard.getByText('生产使用', { exact: true }).waitFor();
+  await packCard.getByText('12', { exact: true }).waitFor();
+  await packCard.getByText(/不可删除/u).waitFor();
+  await packCard.locator('input[type="checkbox"]').check();
+  assert.equal(await page.getByRole('button', { name: '删除', exact: true }).isDisabled(), true);
+  await packCard.locator('input[type="checkbox"]').uncheck();
+
+  await page.locator('#asset-search').fill('活动');
+  assert.equal(await page.locator('.asset-card').count(), 1);
+  let campaignCard = page.locator('.asset-card').filter({ hasText: '一次性活动探针' });
+  await campaignCard.locator('input[type="checkbox"]').check();
+  page.once('dialog', (dialog) => dialog.accept('已复核，可在同类活动复用'));
+  await page.getByRole('button', { name: '批量备注' }).click();
+  campaignCard = page.locator('.asset-card').filter({ hasText: '一次性活动探针' });
+  await campaignCard.getByText('已复核，可在同类活动复用', { exact: true }).waitFor();
+  await campaignCard.locator('input[type="checkbox"]').check();
+  await page.getByRole('button', { name: '恢复', exact: true }).click();
+  await campaignCard.getByText('Agent 可发现', { exact: true }).waitFor();
+  await campaignCard.locator('input[type="checkbox"]').check();
+  await page.getByRole('button', { name: '废弃', exact: true }).click();
+  await campaignCard.getByText('已废弃', { exact: true }).waitFor();
+  await campaignCard.locator('input[type="checkbox"]').check();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '删除', exact: true }).click();
+  await campaignCard.waitFor({ state: 'detached' });
+
+  await page.locator('#asset-search').fill('');
+  await page.locator('#asset-filter').selectOption('history');
+  assert.equal(await page.locator('.asset-card').count(), 1);
+  const orphanCard = page.locator('.asset-card').filter({ hasText: 'old-demo（孤立快照）' });
+  await page.locator('#asset-select-all').check();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '删除', exact: true }).click();
+  await orphanCard.waitFor({ state: 'detached' });
+  await page.locator('#asset-filter').selectOption('all');
+  assert.equal(await page.locator('.asset-card').count(), 2);
+  assert.deepEqual(control.assetActions.map((entry) => entry.action), ['note', 'restore', 'deprecate', 'delete', 'delete']);
+  checks.push('asset purpose, discovery, usage, notes, search, filters, protected state, and batch lifecycle deletion');
+
   if (screenshotPath) {
     await page.getByRole('button', { name: '任务', exact: true }).click();
     await mkdir(path.dirname(screenshotPath), { recursive: true });
@@ -457,6 +578,19 @@ try {
   assert.equal(mobile.taskOverflow, false);
   assert.deepEqual(mobile.shortTargets, []);
   assert.equal(mobile.reducedMotion, true);
+  await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
+  const assetMobile = await page.evaluate(() => ({
+    innerWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+    assetOverflow: [...document.querySelectorAll('.asset-card')].some((node) => node.scrollWidth > node.clientWidth),
+    shortTargets: [...document.querySelectorAll('button, select, a.skip-link')]
+      .filter((node) => !node.hidden && getComputedStyle(node).display !== 'none')
+      .map((node) => node.getBoundingClientRect().height)
+      .filter((height) => height > 0 && height < 44)
+  }));
+  assert.equal(assetMobile.scrollWidth <= assetMobile.innerWidth, true);
+  assert.equal(assetMobile.assetOverflow, false);
+  assert.deepEqual(assetMobile.shortTargets, []);
   await page.keyboard.press('Tab');
   assert.notEqual(await page.evaluate(() => document.activeElement?.tagName), 'BODY');
   checks.push('mobile layout, 44px targets, keyboard focus, and reduced motion');
@@ -467,6 +601,7 @@ try {
   await unauthorizedPage.locator('#auth-banner').waitFor({ state: 'visible' });
   assert.equal(await unauthorizedPage.locator('.task-card').count(), 0);
   assert.equal(await unauthorizedPage.locator('.profile-card').count(), 0);
+  assert.equal(await unauthorizedPage.locator('.asset-card').count(), 0);
   await unauthorizedContext.close();
   checks.push('unauthorized browser receives no cached task or Profile data');
 
@@ -478,6 +613,7 @@ try {
     checks,
     taskActions: control.taskActions.map((value) => value.action),
     deleteRequests: control.deleteRequests,
+    assetActions: control.assetActions.map((value) => value.action),
     pageErrors
   };
   if (reportPath) {

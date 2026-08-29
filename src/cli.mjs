@@ -44,7 +44,7 @@ Usage:
   taskmaster profiles open|close PROFILE_ID
   taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
   taskmaster task-types describe TASK_TYPE [--json]
-  taskmaster task-types install --type NAME --module PATH [--json]
+  taskmaster task-types install --type NAME --module PATH [--persistent] [--note TEXT] [--json]
   taskmaster task-types deprecate TASK_TYPE [--replacement TASK_TYPE] [--json]
   taskmaster task-types restore TASK_TYPE [--json]
   taskmaster task-packs validate PATH [--json]
@@ -1024,7 +1024,12 @@ async function taskTypeCommand(action, args, options, json) {
     const modulePath = await stageTaskModule(admin.config, options.module);
     const result = await requestJson(admin.config.baseUrl, '/v1/task-types/install', {
       method: 'POST',
-      body: { name: options.type, modulePath },
+      body: {
+        name: options.type,
+        modulePath,
+        transient: options.persistent !== true,
+        ...(typeof options.note === 'string' ? { note: options.note } : {})
+      },
       token: admin.token
     });
     emit({ ok: true, ...result }, json);

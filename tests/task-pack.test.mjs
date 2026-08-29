@@ -21,6 +21,17 @@ async function registryFixture(t) {
   return { root, allowed, registry };
 }
 
+function packModuleSource(version, intent) {
+  return [
+    'export const meta = {',
+    `  version: ${JSON.stringify(version)}, intents: [${JSON.stringify(intent)}],`,
+    "  tags: ['pack-fixture'], outputs: ['json'], risk: 'read', readOnly: true, supportsResume: true",
+    '};',
+    'export async function run({ journey }) { await journey.open("https://example.test"); return { summary: "ok", evidence: [] }; }',
+    ''
+  ].join('\n');
+}
+
 test('Task Pack scaffold is portable, bounded, and path-safe', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-pack-scaffold-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -156,4 +167,28 @@ test('Task Pack preflight rejects legacy action and direct Page mutation bypasse
   const result = await preflightTaskPack(root);
   assert.equal(result.ok, false);
   assert.equal(result.checks[0].code, 'TASK_PACK_JOURNEY_BYPASS');
+});
+
+test('installing a newer Task Pack version retires the older version and blocks downgrade', async (t) => {
+  const { allowed, registry } = await registryFixture(t);
+  const oldModule = path.join(allowed, 'old.mjs');
+  const nextModule = path.join(allowed, 'next.mjs');
+  await writeFile(oldModule, packModuleSource('1.0.0', 'collect-v1'));
+  await writeFile(nextModule, packModuleSource('2.0.0', 'collect-v2'));
+  await registry.installBatch([{ name: 'news.collect.v1', modulePath: oldModule }], {
+    pack: { name: 'news-pack', version: '1.0.0', title: 'News collection', interactionContract: 'full-human-v1' }
+  });
+  await registry.installBatch([{ name: 'news.collect.v2', modulePath: nextModule }], {
+    pack: { name: 'news-pack', version: '2.0.0', title: 'News collection', interactionContract: 'full-human-v1' }
+  });
+  const managed = await registry.listManagement();
+  assert.equal(managed.find((item) => item.name === 'news.collect.v1').lifecycle, 'deprecated');
+  assert.equal(managed.find((item) => item.name === 'news.collect.v2').lifecycle, 'active');
+  assert.equal(managed.find((item) => item.name === 'news.collect.v2').pack.title, 'News collection');
+  await assert.rejects(
+    registry.installBatch([{ name: 'news.collect.v1b', modulePath: oldModule }], {
+      pack: { name: 'news-pack', version: '1.5.0', interactionContract: 'full-human-v1' }
+    }),
+    { code: 'TASK_PACK_VERSION_REGRESSION', statusCode: 409 }
+  );
 });

@@ -18,7 +18,7 @@ be a task name; supply the action + object + scope separately with `--label`:
 
 ```bash
 node scripts/taskmaster.mjs task-types list --agent-id STABLE_ID --agent-name AGENT_NAME --json
-node scripts/taskmaster.mjs task-types install --type TASK_TYPE --module MODULE.mjs --json
+node scripts/taskmaster.mjs task-types install --type TASK_TYPE --module MODULE.mjs --note "PURPOSE" --json
 node scripts/taskmaster.mjs task run --profile PROFILE_ID --type TASK_TYPE --module MODULE.mjs --label TASK_LABEL --input @INPUT_FILE.json --request-key UNIQUE_KEY --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task status TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
 node scripts/taskmaster.mjs task follow TASK_ID --agent-id STABLE_ID --agent-name AGENT_NAME --json
@@ -31,6 +31,8 @@ node scripts/taskmaster.mjs task cancel TASK_ID --agent-id STABLE_ID --agent-nam
 Put the bounded task input object in `INPUT_FILE.json`. The `@FILE` form is the portable default because it avoids shell-specific JSON quoting; inline JSON remains available for controlled environments.
 
 `task run` follows progress until cleanup settles unless `--detach` is set. The module may live outside the repository: the CLI accepts only a regular single-file `.mjs` of at most 2 MiB, copies it into a Manager-owned inbox, verifies its hash, and snapshots it. Imports of sibling files are therefore not portable; bundle needed logic into the one module.
+
+CLI-installed standalone modules are transient by default. After the first terminal task has confirmed cleanup, the module retires from ordinary Agent discovery and remains recoverable for seven days before guarded cleanup. Add `--persistent` only when a standalone module is intentionally reusable; use a versioned Task Pack for production capability. The Owner Console Task Packs view shows purpose, notes, usage, discovery and lifecycle state, and protects system, live, cleanup-unsettled, or resumable assets from deletion.
 
 Installation inspects the snapshot in a short-lived child process and never imports task code into Manager. A top-level exit, exception, or wait fails installation without stopping Manager. This is a stability boundary, not a security sandbox: install only trusted local task code. Reinstalling the same name and SHA is idempotent; using an existing name for different source returns `409 TASK_TYPE_CONFLICT`, so choose a new task-type name for a distinct workflow revision.
 
@@ -154,7 +156,7 @@ The supported `inputSchema` subset is deliberately small and enforced at registr
 - A resume reruns `run(runtime)` in a new isolated Worker and browser context while preserving the same task ID, input, output directory, and checkpoint. Manager verifies and freezes one attempt-scoped checkpoint snapshot. The first executable boundary of a resumed module must be `const previous = await checkpoint.read()`. Until that read succeeds, the runtime rejects every browser `action`, `checkpoint(data)`, and `effects.resolveUnknown(...)`; `effects.pending()` remains observation-only. Branch from fields such as `previous?.nextIndex`; do not assume in-memory variables from the previous attempt still exist.
 - Make output writes idempotent with the checkpoint. For append-style results, use a deterministic per-unit filename or stable record key and rebuild the final JSONL/CSV in sorted order. A crash can happen between writing output and saving the next checkpoint, so blind `appendFile()` may duplicate the last unit after resume.
 - Inspect current page state and diagnostic evidence before retrying an unknown action outcome. Do not blindly replay writes.
-- On 429 or a site-provided cooldown, checkpoint first, then call `await cooldown({ response, attempt, fallbackMs, reason })`. It honors `Retry-After`, applies bounded exponential fallback with positive jitter, switches task state to `cooling_down`, exposes `resumeAt` in status, keeps heartbeats visible, and returns to `running` without replaying an action. Platform-specific retry limits remain in the specialized module.
+- Direct initial or independent GET navigation through `action.goto()` has one centrally owned recovery lane: it retries only a bounded set of transient connection failures and 429/502/503/504 responses, honors `Retry-After`, reports `cooling_down`, and stops after the fixed retry budget. Do not wrap it in a second navigation retry loop. For later platform responses or site-defined limits, checkpoint first, then call `await cooldown({ response, attempt, fallbackMs, reason })`. Clicks, form submissions, uploads, downloads, and other potentially mutating actions are never auto-replayed.
 - Check `signal.aborted` inside long loops and stop cleanly.
 - Persist large results below `outputDir`, but expose only explicit relative files as `{ kind: 'artifact', file, agentVisible: true }`.
 - Agent-visible artifact chunks are returned byte-for-byte so JSON/JSONL/CSV and SHA-256 verification remain valid. Treat `agentVisible: true` as an explicit disclosure decision: never declare a credential-bearing file.

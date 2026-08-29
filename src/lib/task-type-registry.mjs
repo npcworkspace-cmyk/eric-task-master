@@ -1,6 +1,6 @@
 import { fork } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore } from './json-store.mjs';
@@ -18,6 +18,8 @@ const INPUT_SCHEMA_TYPES = new Set(['array', 'boolean', 'integer', 'null', 'numb
 const TASK_RISKS = new Set(['read', 'write', 'mixed']);
 const DISCOVERY_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
 const PACK_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const ASSET_KINDS = new Set(['pack', 'standalone', 'system']);
+const MAX_ASSET_NOTE_LENGTH = 1_000;
 const INPUT_SCHEMA_KEYS = new Set([
   'additionalProperties',
   'default',
@@ -51,7 +53,11 @@ function inside(root, candidate) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function publicType(record, { includeSchema = true, includeIntegrity = true } = {}) {
+function publicType(record, {
+  includeSchema = true,
+  includeIntegrity = true,
+  includeManagement = false
+} = {}) {
   return {
     id: record.name,
     name: record.name,
@@ -65,18 +71,85 @@ function publicType(record, { includeSchema = true, includeIntegrity = true } = 
     ...(record.tags?.length ? { tags: [...record.tags] } : {}),
     ...(record.outputs?.length ? { outputs: [...record.outputs] } : {}),
     ...(record.risk ? { risk: record.risk } : {}),
-    ...(record.pack ? { pack: { name: record.pack.name, version: record.pack.version } } : {}),
+    ...(record.pack ? {
+      pack: {
+        name: record.pack.name,
+        version: record.pack.version,
+        ...(record.pack.title ? { title: record.pack.title } : {}),
+        ...(record.pack.description ? { description: record.pack.description } : {})
+      }
+    } : {}),
     ...(record.interactionContract ? { interactionContract: record.interactionContract } : {}),
     lifecycle: record.deprecatedAt ? 'deprecated' : 'active',
     ...(record.deprecatedAt ? { deprecatedAt: record.deprecatedAt } : {}),
     ...(record.replacedBy ? { replacedBy: record.replacedBy } : {}),
     supportsResume: record.supportsResume === true,
+    ...(includeManagement ? {
+      assetKind: record.assetKind,
+      discoverable: record.discoverable === true,
+      protected: record.protected === true,
+      transient: record.transient === true,
+      note: record.note || '',
+      snapshotName: record.snapshotName
+    } : {}),
     ...(includeIntegrity ? {
       sha256: record.sha256,
       size: record.size,
       installedAt: record.installedAt
     } : {})
   };
+}
+
+function boundedAssetNote(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string' || value.length > MAX_ASSET_NOTE_LENGTH) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_ASSET_NOTE',
+      `Task asset note must contain at most ${MAX_ASSET_NOTE_LENGTH} characters`
+    );
+  }
+  return value.trim();
+}
+
+function boundedPackText(value, maximum) {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, maximum) : undefined;
+}
+
+function comparePackVersions(left, right) {
+  const parse = (value) => {
+    const [core, prerelease = ''] = String(value).split('-', 2);
+    return { numbers: core.split('.').map(Number), prerelease };
+  };
+  const a = parse(left);
+  const b = parse(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (a.numbers[index] !== b.numbers[index]) return a.numbers[index] - b.numbers[index];
+  }
+  if (a.prerelease === b.prerelease) return 0;
+  if (!a.prerelease) return 1;
+  if (!b.prerelease) return -1;
+  return a.prerelease.localeCompare(b.prerelease);
+}
+
+function normalizeManagementRecord(record, systemNames = new Set()) {
+  const system = systemNames.has(record.name) || record.assetKind === 'system';
+  record.assetKind = system ? 'system' : record.pack ? 'pack' : 'standalone';
+  record.protected = system || record.protected === true;
+  record.discoverable = system ? false : record.discoverable !== false;
+  record.transient = !system && !record.pack && record.transient === true;
+  record.note = typeof record.note === 'string' ? record.note.slice(0, MAX_ASSET_NOTE_LENGTH) : '';
+  record.deprecatedAt = typeof record.deprecatedAt === 'string' ? record.deprecatedAt : null;
+  record.replacedBy = typeof record.replacedBy === 'string' ? record.replacedBy : null;
+  if (record.pack) {
+    const title = boundedPackText(record.pack.title, 120);
+    const description = boundedPackText(record.pack.description, 2_000);
+    record.pack = {
+      name: record.pack.name,
+      version: record.pack.version,
+      ...(title ? { title } : {}),
+      ...(description ? { description } : {})
+    };
+  }
 }
 
 function boundedTokenList(value, field, maximum = 32) {
@@ -447,15 +520,22 @@ export class TaskTypeRegistry {
       }
     }
     this.#allowedRoots = [...new Set(canonicalRoots)];
+    const systemNames = new Set(this.#seedTypes.map((seed) => seed.name));
     await this.#store.update((data) => {
-      for (const record of data.types) {
-        record.deprecatedAt = typeof record.deprecatedAt === 'string' ? record.deprecatedAt : null;
-        record.replacedBy = typeof record.replacedBy === 'string' ? record.replacedBy : null;
-      }
+      for (const record of data.types) normalizeManagementRecord(record, systemNames);
     });
     for (const seed of this.#seedTypes) {
-      await this.#install(seed, { allowUpdate: true });
+      await this.#install({
+        ...seed,
+        assetKind: 'system',
+        protected: true,
+        discoverable: false,
+        transient: false
+      }, { allowUpdate: true });
     }
+    await this.#store.update((data) => {
+      for (const record of data.types) normalizeManagementRecord(record, systemNames);
+    });
   }
 
   async install(input = {}) {
@@ -482,6 +562,10 @@ export class TaskTypeRegistry {
             ? {
                 name: pack.name,
                 version: pack.version,
+                ...(boundedPackText(pack.title, 120) ? { title: boundedPackText(pack.title, 120) } : {}),
+                ...(boundedPackText(pack.description, 2_000)
+                  ? { description: boundedPackText(pack.description, 2_000) }
+                  : {}),
                 interactionContract: FULL_HUMAN_INTERACTION_CONTRACT
               }
             : null
@@ -493,11 +577,28 @@ export class TaskTypeRegistry {
       );
     }
     const snapshot = await this.#store.read();
+    if (packReference) {
+      const newer = snapshot.types.find((record) => (
+        record.pack?.name === packReference.name &&
+        comparePackVersions(record.pack.version, packReference.version) > 0
+      ));
+      if (newer) {
+        throw new TaskTypeRegistryError(
+          'TASK_PACK_VERSION_REGRESSION',
+          `Task Pack ${packReference.name} ${newer.pack.version} is newer than ${packReference.version}`,
+          409
+        );
+      }
+    }
     const prepared = [];
     for (const input of inputs) {
       const candidate = await this.#prepareInstall(input, { currentTypes: snapshot.types });
       if (candidate.changed && packReference) {
         candidate.record.pack = { ...packReference };
+        candidate.record.assetKind = 'pack';
+        candidate.record.discoverable = true;
+        candidate.record.protected = false;
+        candidate.record.transient = false;
         candidate.record.interactionContract = FULL_HUMAN_INTERACTION_CONTRACT;
       }
       if (packReference) {
@@ -532,6 +633,10 @@ export class TaskTypeRegistry {
         if (current) {
           if (packReference) {
             current.pack = { ...packReference };
+            current.assetKind = 'pack';
+            current.discoverable = true;
+            current.protected = false;
+            current.transient = false;
             current.interactionContract = FULL_HUMAN_INTERACTION_CONTRACT;
           }
           installed.push(current);
@@ -541,11 +646,32 @@ export class TaskTypeRegistry {
           installed.push(candidate.record);
         }
       }
+      if (packReference) {
+        const deprecatedAt = new Date().toISOString();
+        for (const record of data.types) {
+          if (
+            record.pack?.name === packReference.name &&
+            comparePackVersions(record.pack.version, packReference.version) < 0 &&
+            !record.protected
+          ) {
+            record.deprecatedAt ||= deprecatedAt;
+            record.replacedBy = null;
+          }
+        }
+      }
     });
     return installed.map((record) => publicType(record));
   }
 
-  async #prepareInstall({ name, modulePath } = {}, { allowUpdate = false, currentTypes = [] } = {}) {
+  async #prepareInstall({
+    name,
+    modulePath,
+    assetKind = 'standalone',
+    discoverable = true,
+    protected: protectedAsset = false,
+    transient = false,
+    note = ''
+  } = {}, { allowUpdate = false, currentTypes = [] } = {}) {
     if (typeof name !== 'string' || !TASK_TYPE_PATTERN.test(name)) {
       throw new TaskTypeRegistryError(
         'INVALID_TASK_TYPE',
@@ -612,6 +738,11 @@ export class TaskTypeRegistry {
     const record = {
       name,
       ...metadata,
+      assetKind: ASSET_KINDS.has(assetKind) ? assetKind : 'standalone',
+      discoverable: discoverable !== false,
+      protected: protectedAsset === true,
+      transient: transient === true,
+      note: boundedAssetNote(note),
       sha256,
       size: source.length,
       snapshotName,
@@ -623,7 +754,21 @@ export class TaskTypeRegistry {
   async #install(input, { allowUpdate = false } = {}) {
     const snapshot = await this.#store.read();
     const prepared = await this.#prepareInstall(input, { allowUpdate, currentTypes: snapshot.types });
-    if (!prepared.changed) return publicType(prepared.record);
+    if (!prepared.changed) {
+      let current = prepared.record;
+      await this.#store.update((data) => {
+        const record = data.types.find((item) => item.name === prepared.record.name);
+        if (!record) return;
+        if (input.assetKind === 'system') {
+          record.assetKind = 'system';
+          record.protected = true;
+          record.discoverable = false;
+          record.transient = false;
+        }
+        current = record;
+      });
+      return publicType(current);
+    }
     let installed;
     await this.#store.update((data) => {
       const { record } = prepared;
@@ -660,7 +805,7 @@ export class TaskTypeRegistry {
     await this.#ready;
     const data = await this.#store.read();
     return data.types
-      .filter((record) => includeDeprecated || !record.deprecatedAt)
+      .filter((record) => record.discoverable !== false && (includeDeprecated || !record.deprecatedAt))
       .map((record) => publicType(record, { includeSchema: false, includeIntegrity: false }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -673,6 +818,145 @@ export class TaskTypeRegistry {
       throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
     }
     return publicType(record, { includeSchema: true, includeIntegrity: false });
+  }
+
+  async listManagement() {
+    await this.#ready;
+    const data = await this.#store.read();
+    return data.types
+      .map((record) => publicType(record, {
+        includeSchema: false,
+        includeIntegrity: true,
+        includeManagement: true
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async setNoteMany(names, note) {
+    await this.#ready;
+    const normalized = this.#validateNames(names);
+    const safeNote = boundedAssetNote(note);
+    const updated = [];
+    await this.#store.update((data) => {
+      for (const name of normalized) {
+        const record = data.types.find((item) => item.name === name);
+        if (!record) throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
+        record.note = safeNote;
+        updated.push(record);
+      }
+    });
+    return updated.map((record) => publicType(record, {
+      includeSchema: false,
+      includeIntegrity: false,
+      includeManagement: true
+    }));
+  }
+
+  async setLifecycleMany(names, lifecycle) {
+    await this.#ready;
+    const normalized = this.#validateNames(names);
+    if (!['active', 'deprecated'].includes(lifecycle)) {
+      throw new TaskTypeRegistryError('INVALID_TASK_TYPE_LIFECYCLE', 'Lifecycle must be active or deprecated');
+    }
+    const changed = [];
+    await this.#store.update((data) => {
+      for (const name of normalized) {
+        const record = data.types.find((item) => item.name === name);
+        if (!record) throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
+        if (record.protected) {
+          throw new TaskTypeRegistryError('TASK_ASSET_PROTECTED', `System task type ${name} cannot change lifecycle`, 409);
+        }
+        record.deprecatedAt = lifecycle === 'deprecated' ? (record.deprecatedAt || new Date().toISOString()) : null;
+        record.replacedBy = null;
+        changed.push(record);
+      }
+    });
+    return changed.map((record) => publicType(record, {
+      includeSchema: false,
+      includeIntegrity: false,
+      includeManagement: true
+    }));
+  }
+
+  async removeMany(names) {
+    await this.#ready;
+    const normalized = this.#validateNames(names);
+    const removed = [];
+    await this.#store.update((data) => {
+      for (const name of normalized) {
+        const record = data.types.find((item) => item.name === name);
+        if (!record) throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
+        if (record.protected) {
+          throw new TaskTypeRegistryError('TASK_ASSET_PROTECTED', `System task type ${name} cannot be deleted`, 409);
+        }
+        removed.push(record);
+      }
+      data.types = data.types.filter((record) => !normalized.includes(record.name));
+    });
+    for (const record of removed) {
+      const candidate = path.resolve(this.#snapshotRoot, record.snapshotName);
+      if (inside(this.#snapshotRoot, candidate)) await rm(candidate, { force: true });
+    }
+    return removed.map((record) => publicType(record, {
+      includeSchema: false,
+      includeIntegrity: false,
+      includeManagement: true
+    }));
+  }
+
+  async snapshotInventory() {
+    await this.#ready;
+    const data = await this.#store.read();
+    const registered = new Set(data.types.map((record) => record.snapshotName));
+    const entries = await readdir(this.#snapshotRoot, { withFileTypes: true });
+    const inventory = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !/^[a-z][a-z0-9._-]{0,79}-[a-f0-9]{64}\.mjs$/u.test(entry.name)) continue;
+      const stats = await lstat(path.join(this.#snapshotRoot, entry.name)).catch((error) => {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (!stats?.isFile()) continue;
+      inventory.push({
+        snapshotName: entry.name,
+        sha256: entry.name.slice(-68, -4),
+        size: stats.size,
+        modifiedAt: stats.mtime.toISOString(),
+        registered: registered.has(entry.name)
+      });
+    }
+    return inventory.sort((left, right) => left.snapshotName.localeCompare(right.snapshotName));
+  }
+
+  async removeSnapshots(snapshotNames) {
+    await this.#ready;
+    if (!Array.isArray(snapshotNames) || snapshotNames.length < 1 || snapshotNames.length > 256) {
+      throw new TaskTypeRegistryError('INVALID_TASK_ASSET_BATCH', 'Snapshot batch must contain 1 to 256 items');
+    }
+    const data = await this.#store.read();
+    const registered = new Set(data.types.map((record) => record.snapshotName));
+    const removed = [];
+    for (const snapshotName of [...new Set(snapshotNames)]) {
+      if (typeof snapshotName !== 'string' || !/^[a-z][a-z0-9._-]{0,79}-[a-f0-9]{64}\.mjs$/u.test(snapshotName)) {
+        throw new TaskTypeRegistryError('INVALID_TASK_SNAPSHOT', 'Task snapshot name is invalid');
+      }
+      if (registered.has(snapshotName)) {
+        throw new TaskTypeRegistryError('TASK_SNAPSHOT_REGISTERED', 'Registered snapshots must be deleted through their asset', 409);
+      }
+      await rm(path.join(this.#snapshotRoot, snapshotName), { force: true });
+      removed.push(snapshotName);
+    }
+    return removed;
+  }
+
+  #validateNames(names) {
+    if (
+      !Array.isArray(names) || names.length < 1 || names.length > 256 ||
+      names.some((name) => typeof name !== 'string' || !TASK_TYPE_PATTERN.test(name))
+    ) {
+      throw new TaskTypeRegistryError('INVALID_TASK_ASSET_BATCH', 'Task asset batch must contain 1 to 256 valid task types');
+    }
+    return [...new Set(names)];
   }
 
   async resolve(name) {

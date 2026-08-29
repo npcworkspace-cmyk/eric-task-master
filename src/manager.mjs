@@ -786,6 +786,24 @@ export async function createManager({
       return;
     }
 
+    if (request.method === 'GET' && url.pathname === '/v1/task-assets') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const result = await requireTaskMethod(taskService, 'listTaskAssets')(serviceCaller(auth));
+      sendJson(response, 200, result, cors);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/task-assets/actions') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const result = await requireTaskMethod(taskService, 'applyTaskAssetAction')(
+        await readJson(request, { maxBytes: 128 * 1024 }),
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, result, cors);
+      return;
+    }
+
     if (request.method === 'GET' && url.pathname === '/v1/task-types') {
       const auth = await authenticate(request);
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');

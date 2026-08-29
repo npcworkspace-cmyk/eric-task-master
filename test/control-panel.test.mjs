@@ -8,13 +8,16 @@ async function text(path) {
   return readFile(new URL(path, root), 'utf8');
 }
 
-test('task panel exposes only Tasks and Profiles with accessible retained controls', async () => {
+test('task panel exposes Tasks, Profiles, and bounded Task Pack assets with accessible controls', async () => {
   const [html, css] = await Promise.all([
     text('dashboard/index.html'),
     text('dashboard/styles.css')
   ]);
 
-  for (const id of ['view-tasks', 'view-profiles', 'tasks', 'profiles', 'tasks-error', 'profiles-error']) {
+  for (const id of [
+    'view-tasks', 'view-profiles', 'view-assets', 'tasks', 'profiles', 'assets',
+    'tasks-error', 'profiles-error', 'assets-error', 'asset-search', 'asset-filter', 'asset-select-all'
+  ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
   for (const removed of [
@@ -24,7 +27,7 @@ test('task panel exposes only Tasks and Profiles with accessible retained contro
     assert.doesNotMatch(html, new RegExp(`id="${removed}"`));
   }
   const views = [...html.matchAll(/data-view="([^"]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(views, ['tasks', 'profiles']);
+  assert.deepEqual(views, ['tasks', 'profiles', 'assets']);
   assert.match(html, /id="view-tasks" class="view is-active"/);
   assert.match(html, /href="#main-content"/);
   assert.match(html, /<nav[^>]+aria-label="主要导航"/);
@@ -44,7 +47,7 @@ test('task panel exposes only Tasks and Profiles with accessible retained contro
   assert.match(css, /--npc-signal:/);
 });
 
-test('task panel keeps bounded same-origin reads, concurrency guards, task timing, and four safe mutations', async () => {
+test('task panel keeps bounded same-origin reads, concurrency guards, task timing, and safe batch assets', async () => {
   const [html, source] = await Promise.all([
     text('dashboard/index.html'),
     text('dashboard/dashboard.js')
@@ -71,7 +74,7 @@ test('task panel keeps bounded same-origin reads, concurrency guards, task timin
   assert.match(source, /window\.addEventListener\('pageshow'/);
   assert.match(source, /window\.addEventListener\('popstate'/);
 
-  for (const path of ['/v1/profiles', '/v1/tasks', '/v1/dashboard/logout']) {
+  for (const path of ['/v1/profiles', '/v1/tasks', '/v1/task-assets', '/v1/dashboard/logout']) {
     assert.ok(source.includes(path), `Dashboard must call ${path}`);
   }
   for (const removedPath of ['/v1/agents', '/v1/dashboard/summary', '/artifacts', '/timeline', '/commands', '/continue']) {
@@ -101,6 +104,8 @@ test('task panel keeps bounded same-origin reads, concurrency guards, task timin
   assert.match(source, /确定取消任务/);
   assert.match(source, /确定删除任务记录/);
   assert.match(source, /focusAfter/);
+  assert.match(source, /runAssetAction/);
+  assert.match(source, /assetIds/);
 
   assert.doesNotMatch(source, /ownerAgentName|taskAgent\(|agentName\(/);
   assert.doesNotMatch(source, /sessionStorage|localStorage|['"]Authorization['"]/i);

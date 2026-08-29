@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.6.0 - 2026-08-29
+
+- Added a dedicated Owner Console Task Packs asset view for Pack, standalone, transient, protected system, historical, and orphan executors, with plain-language purpose, owner notes, Agent discovery/lifecycle state, usage, last use, file size, and deletion blockers.
+- Added bounded batch note, deprecate, restore, and guarded delete controls. Manager revalidates every selection, serializes deletion against task creation, and protects system assets plus live, cleanup-unsettled, or checkpoint-resumable task dependencies.
+- Made CLI one-off task modules transient by default: they retire from Agent discovery after their first safely settled task and become eligible for cleanup only after a seven-day recovery window. Versioned Task Pack upgrades retire older versions and reject downgrades.
+- Added centrally owned, bounded recovery for direct GET navigation on transient connection failures and 429/502/503/504 responses, including visible cooldown/backoff state. Potentially mutating actions are never automatically replayed.
+- Added bounded Agent final-report rendering to task cards while keeping raw artifacts, diagnostics, logs, and Agent messaging out of the human workbench.
+- Expanded static, registry, navigation fault, service, and real Chromium Dashboard acceptance to cover executor discovery, lifecycle, batch management, guarded deletion, responsive UI, and recovery behavior.
+
 ## 2.5.4 - 2026-08-29
 
 - Added a fail-fast Agent-host reload gate. Every MCP request carries its runtime version; a missing or stale bridge now stops before task routing with `AGENT_HOST_RELOAD_REQUIRED`, exact version details, and one reload instruction instead of surfacing a misleading task-schema error.

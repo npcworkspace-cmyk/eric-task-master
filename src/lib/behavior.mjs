@@ -93,6 +93,25 @@ function autoFailureSignal(error) {
   return 'action_failure';
 }
 
+function transientNavigationFailure(error) {
+  const text = `${error?.name || ''} ${error?.code || ''} ${error?.message || ''}`.toUpperCase();
+  return [
+    'ERR_CONNECTION_RESET',
+    'ERR_CONNECTION_CLOSED',
+    'ERR_NETWORK_CHANGED',
+    'ERR_TIMED_OUT',
+    'ERR_PROXY_CONNECTION_FAILED',
+    'ERR_TUNNEL_CONNECTION_FAILED',
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'EAI_AGAIN'
+  ].some((token) => text.includes(token));
+}
+
+function retryableNavigationStatus(status) {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
 /**
  * Creates the task-scoped action facade used by task modules. Every mode uses
  * the same visible action mechanics; modes change only the central pacing and
@@ -111,6 +130,7 @@ export function createActionHelper({
   onAutoState = null,
   onAdaptiveState = () => {},
   onBehaviorState = () => {},
+  onNavigationCooldown = null,
   timing = DEFAULT_HUMAN_TIMING,
   strictVisibleTraversal = false
 } = {}) {
@@ -127,6 +147,7 @@ export function createActionHelper({
   const autoStateListener = typeof onAutoState === 'function' ? onAutoState : onAdaptiveState;
   const metrics = {
     navigations: 0,
+    navigationRetries: 0,
     clicks: 0,
     pointerMoves: 0,
     pointerCorrections: 0,
@@ -710,11 +731,44 @@ export function createActionHelper({
 
     async goto(url, options = {}) {
       return execute('goto', async () => {
-        const response = await page.goto(url, options);
-        metrics.navigations += 1;
-        const status = response?.status?.();
-        if (status === 429 || (status === 503 && response?.headers?.()['retry-after'])) signal('rate_limit');
-        return response;
+        const attempts = 4;
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+          try {
+            const response = await page.goto(url, options);
+            metrics.navigations += 1;
+            const status = response?.status?.();
+            if (!retryableNavigationStatus(status)) return response;
+            signal('rate_limit');
+            if (attempt === attempts) return response;
+            metrics.navigationRetries += 1;
+            if (typeof onNavigationCooldown === 'function') {
+              await onNavigationCooldown({
+                response,
+                attempt,
+                fallbackMs: 60_000,
+                reason: `HTTP ${status} during navigation; retrying automatically`,
+                signalKind: 'rate_limit'
+              });
+            } else {
+              await sleep(Math.min(240_000, 60_000 * (2 ** (attempt - 1))));
+            }
+          } catch (error) {
+            if (!transientNavigationFailure(error) || attempt === attempts) throw error;
+            signal('navigation_unknown');
+            metrics.navigationRetries += 1;
+            if (typeof onNavigationCooldown === 'function') {
+              await onNavigationCooldown({
+                attempt,
+                milliseconds: [1_000, 3_000, 7_000][attempt - 1],
+                reason: 'Transient network navigation failure; retrying automatically',
+                signalKind: 'navigation_unknown'
+              });
+            } else {
+              await sleep([1_000, 3_000, 7_000][attempt - 1]);
+            }
+          }
+        }
+        throw new Error('Navigation retry loop ended unexpectedly');
       });
     },
 

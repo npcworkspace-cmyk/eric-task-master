@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.5.4**
+Version: **2.6.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -40,7 +40,7 @@ Task Master does not replace Agent reasoning. It gives that reasoning a dependab
 ## The three-layer model
 
 1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, cleanup, and a central Human Journey engine for visible browser interaction.
-2. **Owner Console** — one fixed local web address does only shared Profile management, task progress, pause, resume, cancel, and safe record deletion. Users sign in directly inside isolated persistent Playwright Profiles.
+2. **Owner Console** — one fixed local web address keeps human control simple: shared Profile management, task progress and lifecycle controls, bounded final reports, plus a Task Pack asset catalog with purpose, notes, usage, discovery state, batch lifecycle actions, and guarded deletion. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
 This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
@@ -110,9 +110,10 @@ All three modes use smooth minimum-jerk pointer acceleration, one continuous lon
 ### Multi-Agent workbench
 
 - Profiles are shared by all trusted local Agents; there is no meaningless “Profile creator” field. A Profile still has one live lease, so two Agents cannot corrupt the same login state.
-- The Console has only two work areas: Tasks and Profiles. It does not expose a confusing Agent registry, reports, files, or a second messaging workbench.
+- The Console has three focused work areas: Tasks, Profiles, and Task Packs. It does not expose a confusing Agent registry, raw files, diagnostics, or a second messaging workbench.
 - Every task gets a stable `Agent-specific task-created time` name and shows its current action, Worker-confirmed runtime behavior, visual progress, execution time, cumulative cooldown time, and total time.
 - Pause, resume, cancel, and record deletion are revision-checked. Deletion hides only terminal records with confirmed cleanup and never makes an executed action replayable.
+- The Task Packs catalog explains what each executor does, whether Agents can discover it, when it was last used, and why it cannot yet be deleted. Owners can add notes and batch deprecate, restore, or safely remove stale assets; system assets and modules needed by live, uncleaned, or resumable tasks remain protected.
 
 ## Build specialized production workers
 
@@ -125,6 +126,8 @@ node scripts/taskmaster.mjs task-packs install ./my-pack --json
 ```
 
 A Task Pack defines reusable task types. It specifies the target, sequence, selectors, platform rate limits, extraction, checkpoints, outputs, and proof—not custom mouse or scrolling code. The central Human Journey engine handles rendered-page state changes, while read-only Playwright locators and `evaluate` remain a fast, unpaced path for bulk DOM extraction. Reading values and attributes is allowed; mutation hidden in `evaluate` is rejected. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. When no specialized capability covers a large request, one high-level `taskmaster_scale_prepare` call launches the built-in read-only `surface-probe`: it samples one representative surface, performs a bounded survey/backtrack, identifies blockers, and recommends a recipe; one bounded pilot must pass before scale. A specialized Skill teaches the Agent when to use the resulting type, how to interpret results, and which platform rules apply.
+
+The CLI treats a one-off standalone module as transient by default: after its first safely settled task it retires from Agent discovery, then becomes eligible for guarded cleanup after a seven-day recovery window. Use `--persistent` only for a deliberately reusable standalone module; prefer a versioned Task Pack for reusable production capability. A direct initial/independent GET navigation automatically retries a small set of transient connection failures and 429/502/503/504 responses with bounded backoff and visible cooldown state. Clicks, form submissions, uploads, and other potentially mutating actions are never auto-replayed.
 
 ## Host integration
 

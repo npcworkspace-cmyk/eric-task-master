@@ -19,6 +19,7 @@
       <nav class="primary-nav" aria-label="主要导航">
         <button class="nav-link is-active" type="button" data-view="tasks" aria-current="page">任务</button>
         <button class="nav-link" type="button" data-view="profiles">Profiles</button>
+        <button class="nav-link" type="button" data-view="assets">Task Packs</button>
       </nav>
 
       <div class="header-actions">
@@ -26,7 +27,7 @@
           <span id="connection-dot" class="npc-signal-dot is-pending" aria-hidden="true"></span>
           <span><strong id="connection-label">正在连接本机 Manager</strong><small id="last-refresh">尚未刷新</small></span>
         </div>
-        <button id="refresh-all" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="刷新任务和 Profiles" title="刷新任务和 Profiles"><span aria-hidden="true">↻</span></button>
+        <button id="refresh-all" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="刷新任务、Profiles 和执行器资产" title="刷新全部面板数据"><span aria-hidden="true">↻</span></button>
         <button id="logout-button" class="npc-btn npc-btn-ghost compact-button hidden" type="button">退出</button>
       </div>
     </header>
@@ -72,6 +73,28 @@
 
         <div id="profiles" class="profile-grid" aria-live="polite"><p class="empty-state span-all">正在读取 Profiles…</p></div>
         <p id="profiles-error" class="inline-error hidden" role="status"></p>
+      </section>
+
+      <section id="view-assets" class="view" data-view-panel="assets" aria-labelledby="assets-title" hidden>
+        <div class="section-heading page-heading">
+          <div><p class="npc-eyebrow">TASK PACK ASSETS</p><h1 id="assets-title" tabindex="-1">执行器资产</h1><p>看清每个 Task Pack 或脚本能做什么、Agent 能否发现、使用情况与清理风险；支持备注和批量管理。</p></div>
+          <span id="asset-count-chip" class="npc-chip npc-chip-info" aria-live="polite">读取中</span>
+        </div>
+
+        <div class="asset-toolbar surface-card" aria-label="执行器资产筛选和批量操作">
+          <label class="asset-search"><span>搜索资产</span><input id="asset-search" class="npc-field" type="search" autocomplete="off" placeholder="名称、用途、备注或任务类型"></label>
+          <label><span>状态</span><select id="asset-filter" class="npc-field"><option value="all">全部资产</option><option value="discoverable">Agent 可发现</option><option value="deprecated">已废弃</option><option value="history">历史与孤立文件</option><option value="protected">系统保护</option></select></label>
+          <label class="check-field asset-select-all"><input id="asset-select-all" type="checkbox"><span>全选当前结果</span></label>
+          <div class="asset-bulk-actions" role="group" aria-label="批量管理">
+            <button id="asset-note" class="npc-btn npc-btn-secondary compact-button" type="button" disabled>批量备注</button>
+            <button id="asset-deprecate" class="npc-btn npc-btn-secondary compact-button" type="button" disabled>废弃</button>
+            <button id="asset-restore" class="npc-btn npc-btn-secondary compact-button" type="button" disabled>恢复</button>
+            <button id="asset-delete" class="npc-btn npc-btn-danger compact-button" type="button" disabled>删除</button>
+          </div>
+        </div>
+        <p id="asset-selection-summary" class="asset-selection-summary" aria-live="polite">尚未选择资产</p>
+        <div id="assets" class="asset-list" aria-live="polite"><p class="empty-state">正在读取执行器资产…</p></div>
+        <p id="assets-error" class="inline-error hidden" role="status"></p>
       </section>
 
       <p id="dashboard-message" class="toast hidden" role="status" aria-live="polite"></p>
