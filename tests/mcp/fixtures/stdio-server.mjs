@@ -67,20 +67,80 @@ const client = {
   async updateProfile(_profileId, patch) { return { ...profile, ...patch }; },
   async openProfile() { return profile; },
   async closeProfile() { return { ...profile, state: 'idle' }; },
-  async listTaskTypes() {
+  async listTaskPacks() {
     return [{
-      id: 'fixture.read',
-      title: 'Fixture reader',
-      readOnly: true,
-      inputSchema: { type: 'object', properties: { url: { type: 'string' } } },
-      modulePath: 'C:\\secret\\task.mjs'
+      id: 'pack:archive-pack@0.9.0',
+      name: 'archive-pack',
+      version: '0.9.0',
+      title: 'Archive Pack',
+      description: 'Fixture pagination predecessor',
+      lifecycle: 'deprecated',
+      discoverable: false,
+      protected: false,
+      transient: false,
+      fileCount: 1,
+      sizeBytes: 512,
+      installedAt: '2026-08-23T00:00:00.000Z',
+      usage: { runCount: 1, activeCount: 0, lastUsedAt: '2026-08-23T00:00:00.000Z' },
+      taskTypes: [{ name: 'archive.read', title: 'Archive reader', lifecycle: 'deprecated', discoverable: false }],
+      deletable: true,
+      deleteBlockerCodes: []
+    }, {
+      id: 'pack:fixture-pack@1.2.3',
+      name: 'fixture-pack',
+      version: '1.2.3',
+      title: 'Fixture Pack',
+      description: 'Fixture lifecycle visibility',
+      lifecycle: 'active',
+      discoverable: true,
+      protected: false,
+      transient: false,
+      fileCount: 2,
+      sizeBytes: 1_024,
+      installedAt: '2026-08-24T00:00:00.000Z',
+      usage: { runCount: 3, activeCount: 1, lastUsedAt: '2026-08-24T00:00:00.000Z' },
+      taskTypes: [{ name: 'fixture.read', title: 'Fixture reader', lifecycle: 'active', discoverable: true }],
+      deletable: false,
+      deleteBlockerCodes: ['active_task'],
+      taskNames: ['must-not-leak']
     }];
+  },
+  async listTaskTypes() {
+    return [
+      {
+        id: 'fixture.read',
+        title: 'Fixture reader',
+        readOnly: true,
+        pack: {
+          name: 'fixture-pack', version: '1.2.3', title: 'Fixture Pack',
+          lifecycle: 'active', discoverable: true, protected: false, transient: false
+        },
+        inputSchema: { type: 'object', properties: { url: { type: 'string' } } },
+        modulePath: 'C:\\secret\\task.mjs'
+      },
+      {
+        id: 'surface-probe',
+        title: 'Surface probe',
+        readOnly: true,
+        intents: ['preflight', 'scale'],
+        tags: ['probe', 'surface'],
+        inputSchema: { type: 'object', required: ['url'], properties: { url: { type: 'string' } } }
+      }
+    ];
   },
   async describeTaskType(name) {
     return {
       id: name,
       title: 'Fixture reader',
       readOnly: true,
+      ...(name === 'fixture.paid' ? {
+        externalCost: { currency: 'USD', maxAmountPerRun: 5 },
+        pack: {
+          name: 'fixture-pack', version: '1.2.3', title: 'Fixture Pack',
+          description: 'Fixture lifecycle visibility', lifecycle: 'active',
+          discoverable: true, protected: false, transient: false
+        }
+      } : {}),
       inputSchema: { type: 'object', properties: { url: { type: 'string' } } }
     };
   },
@@ -99,7 +159,19 @@ const client = {
         throw new Error('surface-probe was not dispatched with the bounded high-level contract');
       }
     }
-    const startedTask = { ...task, taskType: input.taskType, profileId: input.profileId };
+    const startedTask = {
+      ...task,
+      taskType: input.taskType,
+      profileId: input.profileId,
+      ...(input.externalCostBudget ? {
+        externalCostUsage: {
+          currency: input.externalCostBudget.currency,
+          estimatedTotal: 0,
+          actualTotal: 0,
+          remainingAmount: input.externalCostBudget.maxAmount
+        }
+      } : {})
+    };
     return {
       taskId: startedTask.id,
       dashboardUrl: `http://127.0.0.1:19946/dashboard?task=${startedTask.id}#code=${'b'.repeat(32)}`,
@@ -170,6 +242,21 @@ const client = {
     };
   },
   async continueTask() { return { ...task, state: 'recovering' }; },
+  async focusTask() {
+    return {
+      task: {
+        ...task,
+        state: 'waiting_user',
+        userRequest: {
+          id: 'handoff_0123456789abcdef0123456789abcdef',
+          kind: 'human_verification',
+          reason: 'Verification needs the Owner',
+          status: 'pending'
+        }
+      },
+      focusedAt: '2026-08-24T00:00:02.000Z'
+    };
+  },
   async resumeTask() {
     return {
       task: { ...task, attempt: 2, state: 'queued' },

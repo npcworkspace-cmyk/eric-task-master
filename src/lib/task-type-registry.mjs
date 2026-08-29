@@ -18,6 +18,8 @@ const INPUT_SCHEMA_TYPES = new Set(['array', 'boolean', 'integer', 'null', 'numb
 const TASK_RISKS = new Set(['read', 'write', 'mixed']);
 const DISCOVERY_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
 const PACK_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const EXTERNAL_COST_CURRENCY = /^[A-Z]{3}$/;
+const MAX_EXTERNAL_COST_PER_RUN = 1_000_000_000;
 const ASSET_KINDS = new Set(['pack', 'standalone', 'system']);
 const MAX_ASSET_NOTE_LENGTH = 1_000;
 const INPUT_SCHEMA_KEYS = new Set([
@@ -71,12 +73,17 @@ function publicType(record, {
     ...(record.tags?.length ? { tags: [...record.tags] } : {}),
     ...(record.outputs?.length ? { outputs: [...record.outputs] } : {}),
     ...(record.risk ? { risk: record.risk } : {}),
+    ...(record.externalCost ? { externalCost: structuredClone(record.externalCost) } : {}),
     ...(record.pack ? {
       pack: {
         name: record.pack.name,
         version: record.pack.version,
         ...(record.pack.title ? { title: record.pack.title } : {}),
-        ...(record.pack.description ? { description: record.pack.description } : {})
+        ...(record.pack.description ? { description: record.pack.description } : {}),
+        lifecycle: record.deprecatedAt ? 'deprecated' : 'active',
+        discoverable: record.discoverable === true && !record.deprecatedAt,
+        protected: record.protected === true,
+        transient: record.transient === true
       }
     } : {}),
     ...(record.interactionContract ? { interactionContract: record.interactionContract } : {}),
@@ -135,7 +142,7 @@ function normalizeManagementRecord(record, systemNames = new Set()) {
   const system = systemNames.has(record.name) || record.assetKind === 'system';
   record.assetKind = system ? 'system' : record.pack ? 'pack' : 'standalone';
   record.protected = system || record.protected === true;
-  record.discoverable = system ? false : record.discoverable !== false;
+  record.discoverable = system ? record.discoverable === true : record.discoverable !== false;
   record.transient = !system && !record.pack && record.transient === true;
   record.note = typeof record.note === 'string' ? record.note.slice(0, MAX_ASSET_NOTE_LENGTH) : '';
   record.deprecatedAt = typeof record.deprecatedAt === 'string' ? record.deprecatedAt : null;
@@ -150,6 +157,39 @@ function normalizeManagementRecord(record, systemNames = new Set()) {
       ...(description ? { description } : {})
     };
   }
+}
+
+function boundedExternalCost(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TaskTypeRegistryError('INVALID_TASK_METADATA', 'meta.externalCost must be an object');
+  }
+  const unknown = Object.keys(value).filter((key) => !['currency', 'maxAmountPerRun'].includes(key));
+  if (unknown.length) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_METADATA',
+      `meta.externalCost has unsupported fields: ${unknown.join(', ')}`
+    );
+  }
+  if (typeof value.currency !== 'string' || !EXTERNAL_COST_CURRENCY.test(value.currency)) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_METADATA',
+      'meta.externalCost.currency must be a three-letter uppercase currency code'
+    );
+  }
+  if (
+    typeof value.maxAmountPerRun !== 'number' || !Number.isFinite(value.maxAmountPerRun) ||
+    value.maxAmountPerRun <= 0 || value.maxAmountPerRun > MAX_EXTERNAL_COST_PER_RUN
+  ) {
+    throw new TaskTypeRegistryError(
+      'INVALID_TASK_METADATA',
+      `meta.externalCost.maxAmountPerRun must be greater than 0 and at most ${MAX_EXTERNAL_COST_PER_RUN}`
+    );
+  }
+  return Object.freeze({
+    currency: value.currency,
+    maxAmountPerRun: value.maxAmountPerRun
+  });
 }
 
 function boundedTokenList(value, field, maximum = 32) {
@@ -281,6 +321,7 @@ function safeMetadata(meta, expectedName) {
   const intents = boundedTokenList(source.intents, 'intents', 16);
   const tags = boundedTokenList(source.tags, 'tags');
   const outputs = boundedTokenList(source.outputs, 'outputs');
+  const externalCost = boundedExternalCost(source.externalCost);
   if (source.preferredBehavior !== undefined) {
     throw new TaskTypeRegistryError(
       'TASK_BEHAVIOR_PROFILE_OWNED',
@@ -313,6 +354,7 @@ function safeMetadata(meta, expectedName) {
     ...(tags ? { tags } : {}),
     ...(outputs ? { outputs } : {}),
     ...(source.risk ? { risk: source.risk } : {}),
+    ...(externalCost ? { externalCost } : {}),
     ...(source.interactionContract ? { interactionContract: source.interactionContract } : {}),
     supportsResume: source.supportsResume === true
   };
@@ -529,7 +571,7 @@ export class TaskTypeRegistry {
         ...seed,
         assetKind: 'system',
         protected: true,
-        discoverable: false,
+        discoverable: seed.discoverable === true,
         transient: false
       }, { allowUpdate: true });
     }
@@ -762,7 +804,7 @@ export class TaskTypeRegistry {
         if (input.assetKind === 'system') {
           record.assetKind = 'system';
           record.protected = true;
-          record.discoverable = false;
+          record.discoverable = input.discoverable === true;
           record.transient = false;
         }
         current = record;

@@ -109,6 +109,40 @@ test('task worker launches Chrome with the Profile headless policy and never fal
   assert.equal(fallbackLaunches, 0);
 });
 
+test('paid Task Pack receives only the reserve and settle external cost facade', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-worker-external-cost-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run(runtime) {',
+    "  if (!runtime.externalCost || 'operations' in runtime.externalCost) throw new Error('unsafe facade');",
+    "  const grant = await runtime.externalCost.reserve({ operationId: 'paid-call-1', estimatedAmount: 2 });",
+    "  if (grant.execute !== true || grant.status !== 'reserved') throw new Error('paid call not granted');",
+    "  await runtime.externalCost.settle({ operationId: 'paid-call-1', actualAmount: 1.5 });",
+    "  return { summary: 'paid facade verified', evidence: [{ kind: 'count', label: 'external-cost-estimated', value: 2 }, { kind: 'count', label: 'external-cost-actual', value: 1.5 }] };",
+    '}'
+  ].join('\n'));
+  const config = workerConfig(root, modulePath);
+  config.externalCostBudget = { currency: 'USD', maxAmount: 5 };
+  const browser = fakeBrowser();
+  const requests = [];
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } }),
+    externalCostRequest: async (request) => {
+      requests.push(request);
+      return {
+        execute: request.action === 'reserve',
+        status: request.action === 'reserve' ? 'reserved' : 'settled',
+        usage: { currency: 'USD', estimatedTotal: 2, actualTotal: request.action === 'settle' ? 1.5 : 0, remainingAmount: 3 }
+      };
+    }
+  });
+  assert.equal(outcome.state, 'completed');
+  assert.deepEqual(requests, [
+    { action: 'reserve', operationId: 'paid-call-1', amount: 2 },
+    { action: 'settle', operationId: 'paid-call-1', amount: 1.5 }
+  ]);
+});
+
 test('output budget preserves user files and reserves bounded diagnostic capacity', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-output-budget-');
   const output = path.join(root, 'output');

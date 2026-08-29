@@ -5,8 +5,8 @@ export const meta = Object.freeze({
   name: 'surface-probe',
   version: '1.0.0',
   description: 'Inspect one bounded representative web surface before authoring an unknown large-scale workflow.',
-  intents: ['inspect-surface', 'preflight-probe', 'plan-task-pack'],
-  tags: ['builtin', 'observation', 'probe'],
+  intents: ['inspect-surface', 'preflight-probe', 'plan-task-pack', 'probe', 'surface', 'preflight', 'scale'],
+  tags: ['builtin', 'observation', 'preflight', 'probe', 'scale', 'surface'],
   outputs: ['json'],
   risk: 'read',
   readOnly: true,
@@ -32,8 +32,20 @@ function httpUrl(value) {
   return url.href;
 }
 
-async function observe(page, limit) {
-  return page.evaluate((maximum) => {
+const BLOCKING_SIGNALS = new Set(['captcha', 'rate-limit', 'frame-unreadable']);
+
+function detectChallengeSignals(value) {
+  const source = String(value || '').slice(0, 50_000).toLowerCase();
+  return [
+    ['login', /\b(?:log in|sign in)\b|登录|登入/u],
+    ['captcha', /captcha|verify you are human|robot or human|press and hold|activate and hold|人机验证|验证码|按住/u],
+    ['rate-limit', /too many requests|rate limit|请求过于频繁|访问频繁/u],
+    ['cookie-dialog', /cookie preferences|accept cookies|管理 cookie|接受.*cookie/u]
+  ].filter(([, pattern]) => pattern.test(source)).map(([name]) => name);
+}
+
+async function observe(page, semantic, limit) {
+  const observation = await page.evaluate((maximum) => {
     const text = (node) => (node?.innerText || node?.textContent || '').replace(/\s+/gu, ' ').trim();
     const bounded = (value, length = 240) => String(value || '').slice(0, length);
     const root = document.scrollingElement || document.documentElement;
@@ -62,13 +74,12 @@ async function observe(page, limit) {
     const nextCandidates = links.filter((link) => (
       /(?:^|\s)next(?:\s|$)/iu.test(link.rel) || /^(?:next|older|more|下一页|下页|查看更多)$/iu.test(link.text)
     ));
-    const bodyText = text(document.body).slice(0, 12_000).toLowerCase();
-    const challengeSignals = [
-      ['login', /\b(?:log in|sign in)\b|登录|登入/u],
-      ['captcha', /captcha|verify you are human|人机验证|验证码/u],
-      ['rate-limit', /too many requests|rate limit|请求过于频繁|访问频繁/u],
-      ['cookie-dialog', /cookie preferences|accept cookies|管理 cookie|接受.*cookie/u]
-    ].filter(([, pattern]) => pattern.test(bodyText)).map(([name]) => name);
+    const shadowText = [];
+    const candidates = [...document.querySelectorAll('*')].slice(0, 5_000);
+    for (const node of candidates) {
+      if (node.shadowRoot) shadowText.push(text(node.shadowRoot).slice(0, 2_000));
+      if (shadowText.length >= 32) break;
+    }
     return {
       url: location.href,
       title: bounded(document.title, 500),
@@ -87,7 +98,7 @@ async function observe(page, limit) {
       links,
       controls,
       nextCandidates,
-      challengeSignals,
+      challengeText: `${text(document.body).slice(0, 12_000)}\n${shadowText.join('\n')}`.slice(0, 50_000),
       stableLocatorHints: {
         testIds: document.querySelectorAll('[data-testid],[data-test],[data-qa]').length,
         labelledControls: document.querySelectorAll('[aria-label],[aria-labelledby],label[for]').length,
@@ -95,6 +106,45 @@ async function observe(page, limit) {
       }
     };
   }, limit);
+  let semanticSnapshot = null;
+  try {
+    semanticSnapshot = await semantic.snapshot({
+      scope: 'full_page',
+      maxNodes: Math.min(120, limit * 2),
+      maxTextChars: 30_000
+    });
+  } catch {
+    semanticSnapshot = { content: '', frameErrors: observation.counts.frames > 0 ? 1 : 0 };
+  }
+  const challengeSignals = new Set([
+    ...detectChallengeSignals(observation.challengeText),
+    ...detectChallengeSignals(semanticSnapshot.content)
+  ]);
+  const framesTotal = Number.isSafeInteger(semanticSnapshot.framesTotal)
+    ? semanticSnapshot.framesTotal
+    : observation.counts.frames + 1;
+  const framesInspected = Number.isSafeInteger(semanticSnapshot.framesInspected)
+    ? semanticSnapshot.framesInspected
+    : Math.max(0, framesTotal - (Number(semanticSnapshot.frameErrors) || 0));
+  const truncatedFrames = Number(semanticSnapshot.truncatedFrames) || 0;
+  const omittedFrames = Number(semanticSnapshot.framesOmitted) || 0;
+  const frameInspectionIncomplete = Boolean(semanticSnapshot.truncated) ||
+    Number(semanticSnapshot.frameErrors) > 0 || framesInspected < framesTotal ||
+    truncatedFrames > 0 || omittedFrames > 0;
+  if (frameInspectionIncomplete) challengeSignals.add('frame-unreadable');
+  const { challengeText: _challengeText, ...safeObservation } = observation;
+  return {
+    ...safeObservation,
+    challengeSignals: [...challengeSignals],
+    frameInspection: {
+      total: framesTotal,
+      inspected: framesInspected,
+      errors: Number(semanticSnapshot.frameErrors) || 0,
+      truncatedFrames,
+      omitted: omittedFrames,
+      incomplete: frameInspectionIncomplete
+    }
+  };
 }
 
 function recommendRecipe(observation) {
@@ -104,19 +154,37 @@ function recommendRecipe(observation) {
   return 'single-page';
 }
 
-export async function run({ page, input, outputDir, journey, progress, checkpoint, signal }) {
+export async function run({ page, semantic, input, outputDir, journey, handoff, progress, checkpoint, signal }) {
   const url = httpUrl(input.url);
   const maxItems = input.maxItems ?? 60;
   const maxGestures = input.maxGestures ?? 6;
   await mkdir(outputDir, { recursive: true });
 
   await journey.open(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  const before = await observe(page, maxItems);
+  const initial = await observe(page, semantic, maxItems);
   await progress({ current: 1, total: 3, message: 'Representative surface loaded and bounded structure sampled' });
   if (signal?.aborted) throw signal.reason || new Error('Surface probe aborted');
 
-  const survey = await journey.survey({ maxGestures });
-  const after = await observe(page, maxItems);
+  let verification = null;
+  if (initial.challengeSignals.includes('captcha')) {
+    const continuation = await handoff.request({
+      kind: 'human_verification',
+      reason: 'The representative surface requires human verification before read-only preflight can continue',
+      instructions: 'Complete the visible verification in this task window, then continue the same task. Task Master will not solve or bypass the challenge.'
+    });
+    verification = {
+      kind: 'human_verification',
+      requestId: continuation.requestId,
+      continuedAt: continuation.continuedAt
+    };
+  }
+
+  const afterVerification = await observe(page, semantic, maxItems);
+  const verificationStillRequired = afterVerification.challengeSignals.includes('captcha');
+  const survey = verificationStillRequired
+    ? { skipped: true, reason: 'human_verification_still_present' }
+    : await journey.survey({ maxGestures });
+  const after = await observe(page, semantic, maxItems);
   await progress({ current: 2, total: 3, message: 'Bounded full-page survey and backtrack completed' });
 
   const recommendedRecipe = recommendRecipe(after);
@@ -130,13 +198,19 @@ export async function run({ page, input, outputDir, journey, progress, checkpoin
       exhaustive: false,
       note: 'This is a bounded preflight sample, not proof of full-site coverage.'
     },
-    before,
+    before: initial,
     after,
     survey,
+    challengeBoundary: {
+      detected: initial.challengeSignals,
+      ...(verification ? { handoff: verification } : {}),
+      unresolved: after.challengeSignals.filter((signalName) => BLOCKING_SIGNALS.has(signalName)),
+      automation: 'none'
+    },
     recommendation: {
       recipe: recommendedRecipe,
-      scaleAllowed: after.challengeSignals.every((signalName) => !['captcha', 'rate-limit'].includes(signalName)),
-      blockers: after.challengeSignals.filter((signalName) => ['captcha', 'rate-limit'].includes(signalName)),
+      scaleAllowed: after.challengeSignals.every((signalName) => !BLOCKING_SIGNALS.has(signalName)),
+      blockers: after.challengeSignals.filter((signalName) => BLOCKING_SIGNALS.has(signalName)),
       nextAction: `Customize the ${recommendedRecipe} recipe with site-specific selectors, checkpoints, rate limits, outputs, and completion evidence; validate one bounded sample before scale.`
     }
   };

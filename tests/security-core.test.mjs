@@ -45,6 +45,18 @@ function serviceFixture() {
     async describeTaskType(name) {
       return { id: name, name, inputSchema: { type: 'object' } };
     },
+    async listTaskPacks(caller) {
+      calls.push(['list-packs', caller]);
+      return {
+        taskPacks: [{
+          id: 'pack:fixture@1.0.0', name: 'fixture', version: '1.0.0', title: 'Fixture',
+          lifecycle: 'active', discoverable: true, protected: false, transient: false,
+          fileCount: 1, sizeBytes: 128, installedAt: '2026-08-29T00:00:00.000Z',
+          usage: { runCount: 1, activeCount: 0 }, taskTypes: [], deletable: true, deleteBlockers: []
+        }],
+        total: 1
+      };
+    },
     async installTaskType(input, caller) {
       calls.push(['install-type', input, caller]);
       return { name: input.name, sha256: 'a'.repeat(64) };
@@ -67,6 +79,7 @@ function serviceFixture() {
         state: 'queued',
         ownerRole: caller.role,
         ownerClientId: caller.clientId,
+        ...(input.externalCostBudget ? { externalCostBudget: input.externalCostBudget } : {}),
         ...(caller.agentName ? { ownerAgentName: caller.agentName } : {})
       };
       tasks.set(task.id, task);
@@ -85,6 +98,15 @@ function serviceFixture() {
     async cancel(id, caller) {
       calls.push(['cancel', id, caller]);
       return { id, state: 'cancelled' };
+    },
+    async focusTask(id, caller) {
+      calls.push(['focus', id, caller]);
+      const task = await this.get(id, caller);
+      return { task, focusedAt: '2026-08-29T00:00:02.000Z' };
+    },
+    async claimUserRequest(id, input, caller) {
+      calls.push(['claim-user-request', id, input, caller]);
+      return { id, state: 'waiting_user', userRequest: { id: input.requestId, kind: 'human_verification', status: 'claimed' } };
     },
     async listArtifacts(id, caller) {
       calls.push(['list-artifacts', id, caller]);
@@ -259,6 +281,56 @@ test('role matrix keeps Agent tasks scoped while the Owner Console has a global 
     });
     assert.equal(removed.status, 404, pathname);
   }
+});
+
+test('2.7 Manager routes expose read-only Pack state, paid budget, and focus while keeping human claim Owner-only', async (t) => {
+  const { manager, service, baseUrl } = await fixture(t);
+  const issued = await call(baseUrl, '/v1/agents/issue', {
+    method: 'POST', token: manager.token, body: { clientId: 'v27.fixture', name: 'V27 fixture' }
+  });
+  assert.equal(issued.status, 201);
+  const agentToken = issued.payload.agentToken;
+
+  const packs = await call(baseUrl, '/v1/task-packs', { token: agentToken });
+  assert.equal(packs.status, 200);
+  assert.equal(packs.payload.taskPacks[0].name, 'fixture');
+  assert.equal(JSON.stringify(packs.payload).includes('modulePath'), false);
+
+  const started = await call(baseUrl, '/v1/tasks', {
+    method: 'POST', token: agentToken, body: {
+      profileId: 'profile_fixture',
+      taskType: 'fixture',
+      externalCostBudget: { currency: 'USD', maxAmount: 2.5 },
+      idempotencyKey: 'v27:paid:fixture'
+    }
+  });
+  assert.equal(started.status, 202);
+  assert.equal('externalCostBudget' in started.payload.task, false);
+  assert.equal(JSON.stringify(started.payload.task).includes('maxAmount'), false);
+  assert.deepEqual(
+    service.calls.find((entry) => entry[0] === 'create')[1].externalCostBudget,
+    { currency: 'USD', maxAmount: 2.5 }
+  );
+
+  const focused = await call(baseUrl, `/v1/tasks/${started.payload.taskId}/focus`, {
+    method: 'POST', token: agentToken, body: {}
+  });
+  assert.equal(focused.status, 200);
+  assert.equal(focused.payload.focusedAt, '2026-08-29T00:00:02.000Z');
+
+  const requestId = 'handoff_0123456789abcdef0123456789abcdef';
+  const agentClaim = await call(baseUrl, `/v1/tasks/${started.payload.taskId}/user-request/claim`, {
+    method: 'POST', token: agentToken, body: { requestId }
+  });
+  assert.equal(agentClaim.status, 403);
+  assert.equal(agentClaim.payload.error.code, 'ROLE_FORBIDDEN');
+  assert.equal(service.calls.some((entry) => entry[0] === 'claim-user-request'), false);
+
+  const ownerClaim = await call(baseUrl, `/v1/tasks/${started.payload.taskId}/user-request/claim`, {
+    method: 'POST', token: manager.token, body: { requestId }
+  });
+  assert.equal(ownerClaim.status, 200);
+  assert.equal(ownerClaim.payload.task.userRequest.status, 'claimed');
 });
 
 test('Owner Console exchanges one-time codes for persistent same-origin cookie sessions', async (t) => {

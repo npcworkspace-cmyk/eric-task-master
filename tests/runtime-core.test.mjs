@@ -88,7 +88,9 @@ async function serviceFixture(t, {
   terminalWorkerOpen = false,
   terminalError = null,
   childErrorOpen = false,
+  moduleSource = null,
   workerResult = null,
+  externalCostOperations = [],
   withArtifacts = false,
   withDiagnostic = false,
   withLostDiagnosticManifest = false,
@@ -102,7 +104,7 @@ async function serviceFixture(t, {
   const allowed = path.join(root, 'allowed');
   await mkdir(allowed);
   const modulePath = path.join(allowed, 'fixture.mjs');
-  await writeFile(modulePath, 'export async function run() { return { summary: "ok", evidence: [{ kind: "message", value: "ok" }] }; }\n');
+  await writeFile(modulePath, moduleSource ?? 'export async function run() { return { summary: "ok", evidence: [{ kind: "message", value: "ok" }] }; }\n');
   const profiles = fakeProfiles(root);
   const starts = [];
   const workers = [];
@@ -116,7 +118,29 @@ async function serviceFixture(t, {
     workerHardKillGraceMs,
     artifactValidationHook,
     workerFactory(_workerPath, kind) {
+      const externalCostResponses = new Map();
+      const requestExternalCost = (child, operation, index) => new Promise((resolve, reject) => {
+        const requestId = `fixture-cost-${index}`;
+        externalCostResponses.set(requestId, { resolve, reject });
+        child.emit('message', {
+          type: 'external_cost_request',
+          requestId,
+          action: operation.action,
+          operationId: operation.operationId,
+          amount: operation.amount
+        });
+      });
       const worker = new FakeWorker((message, child) => {
+        if (kind === 'task' && message.type === 'external_cost_response') {
+          const pending = externalCostResponses.get(message.requestId);
+          if (!pending) return;
+          externalCostResponses.delete(message.requestId);
+          if (message.ok === true) pending.resolve(message.result);
+          else pending.reject(Object.assign(new Error(message.error?.message || 'external cost rejected'), {
+            code: message.error?.code
+          }));
+          return;
+        }
         if (kind === 'task' && message.type === 'start') {
           starts.push(message.config);
           if (childErrorOpen) {
@@ -140,6 +164,9 @@ async function serviceFixture(t, {
             return;
           }
           if (!keepWorkerOpen) setImmediate(() => void (async () => {
+            for (const [index, operation] of externalCostOperations.entries()) {
+              await requestExternalCost(child, operation, index);
+            }
             let evidence = [{ kind: 'message', value: 'ok' }];
             if (withArtifacts) {
               await writeFile(path.join(message.config.outputDir, 'visible.txt'), 'hello 世界 and more', 'utf8');
@@ -234,6 +261,99 @@ test('task registry snapshots trusted modules and task create rejects raw module
     timeoutMs: 24 * 60 * 60 * 1_000 + 1,
     idempotencyKey: 'snapshot:timeout'
   }, AGENT_A), { code: 'INVALID_TASK_TIMEOUT' });
+  await assert.rejects(service.create({
+    profileId: 'profile_fixture',
+    taskType: 'fixture',
+    externalCostBudget: { currency: 'USD', maxAmount: 1 },
+    idempotencyKey: 'snapshot:undeclared-budget'
+  }, AGENT_A), { code: 'TASK_EXTERNAL_COST_NOT_DECLARED' });
+});
+
+test('paid Task Packs require a bounded per-run budget and verified final cost evidence', async (t) => {
+  const moduleSource = [
+    'export const meta = { externalCost: { currency: "USD", maxAmountPerRun: 5 } };',
+    'export async function run() { return { summary: "unused", evidence: [{ kind: "message", value: "unused" }] }; }',
+    ''
+  ].join('\n');
+  const validFixture = await serviceFixture(t, {
+    moduleSource,
+    externalCostOperations: [
+      { action: 'reserve', operationId: 'provider-call-1', amount: 2.5 },
+      { action: 'settle', operationId: 'provider-call-1', amount: 2 }
+    ],
+    workerResult: {
+      summary: 'paid run complete',
+      evidence: [
+        { kind: 'message', value: 'provider work complete' },
+        { kind: 'count', label: 'external-cost-estimated', value: 2.5 },
+        { kind: 'count', label: 'external-cost-actual', value: 2 }
+      ]
+    }
+  });
+  await assert.rejects(validFixture.service.create({
+    profileId: 'profile_fixture', taskType: 'fixture', idempotencyKey: 'paid:missing-budget'
+  }, AGENT_A), { code: 'TASK_EXTERNAL_COST_BUDGET_REQUIRED' });
+  await assert.rejects(validFixture.service.create({
+    profileId: 'profile_fixture', taskType: 'fixture',
+    externalCostBudget: { currency: 'EUR', maxAmount: 2 },
+    idempotencyKey: 'paid:wrong-currency'
+  }, AGENT_A), { code: 'INVALID_TASK_EXTERNAL_COST_BUDGET' });
+  await assert.rejects(validFixture.service.create({
+    profileId: 'profile_fixture', taskType: 'fixture',
+    externalCostBudget: { currency: 'USD', maxAmount: 6 },
+    idempotencyKey: 'paid:over-ceiling'
+  }, AGENT_A), { code: 'TASK_EXTERNAL_COST_BUDGET_EXCEEDS_CEILING' });
+
+  const created = await validFixture.service.create({
+    profileId: 'profile_fixture', taskType: 'fixture',
+    externalCostBudget: { currency: 'USD', maxAmount: 3 },
+    idempotencyKey: 'paid:valid-budget'
+  }, AGENT_A);
+  const completed = await waitFor(async () => {
+    const task = await validFixture.service.get(created.id, AGENT_A);
+    return task.cleanup?.settled ? task : null;
+  });
+  assert.equal(completed.state, 'completed');
+  assert.equal('externalCostBudget' in completed, false);
+  assert.deepEqual(completed.externalCostUsage, {
+    currency: 'USD', estimatedTotal: 2.5, actualTotal: 2, remainingAmount: 1
+  });
+  assert.deepEqual(validFixture.starts[0].externalCostBudget, { currency: 'USD', maxAmount: 3 });
+
+  const missingEvidenceFixture = await serviceFixture(t, { moduleSource });
+  const missingEvidence = await missingEvidenceFixture.service.create({
+    profileId: 'profile_fixture', taskType: 'fixture',
+    externalCostBudget: { currency: 'USD', maxAmount: 3 },
+    idempotencyKey: 'paid:missing-evidence'
+  }, AGENT_A);
+  const missingFailed = await waitFor(async () => {
+    const task = await missingEvidenceFixture.service.get(missingEvidence.id, AGENT_A);
+    return task.cleanup?.settled ? task : null;
+  });
+  assert.equal(missingFailed.state, 'failed');
+  assert.equal(missingFailed.error.code, 'TASK_COMPLETION_GATE_FAILED');
+
+  const overBudgetFixture = await serviceFixture(t, {
+    moduleSource,
+    workerResult: {
+      summary: 'over budget',
+      evidence: [
+        { kind: 'count', label: 'external-cost-estimated', value: 2 },
+        { kind: 'count', label: 'external-cost-actual', value: 4 }
+      ]
+    }
+  });
+  const overBudget = await overBudgetFixture.service.create({
+    profileId: 'profile_fixture', taskType: 'fixture',
+    externalCostBudget: { currency: 'USD', maxAmount: 3 },
+    idempotencyKey: 'paid:actual-over-budget'
+  }, AGENT_A);
+  const overBudgetFailed = await waitFor(async () => {
+    const task = await overBudgetFixture.service.get(overBudget.id, AGENT_A);
+    return task.cleanup?.settled ? task : null;
+  });
+  assert.equal(overBudgetFailed.state, 'failed');
+  assert.equal(overBudgetFailed.error.code, 'TASK_COMPLETION_GATE_FAILED');
 });
 
 test('task type installation rejects unsupported schemas and enforces the declared input contract', async (t) => {

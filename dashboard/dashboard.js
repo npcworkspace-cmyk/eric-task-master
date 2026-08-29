@@ -1,5 +1,6 @@
 const REQUEST_TIMEOUT_MS = 10_000;
 const READ_RETRY_DELAY_MS = 300;
+const LANGUAGE_STORAGE_KEY = 'eric-task-master-language';
 const VIEWS = new Set(['tasks', 'profiles', 'assets']);
 const ACTIVE_TASK_STATES = new Set([
   'queued', 'acquiring_profile', 'starting_browser', 'running', 'cooling_down',
@@ -7,50 +8,243 @@ const ACTIVE_TASK_STATES = new Set([
 ]);
 const TERMINAL_TASK_STATES = new Set(['completed', 'failed', 'cancelled', 'terminated']);
 const PAUSABLE_TASK_STATES = new Set(['running', 'cooling_down', 'recovering', 'verifying']);
-const TASK_STATE_LABELS = Object.freeze({
-  queued: '排队中',
-  acquiring_profile: '准备 Profile',
-  starting_browser: '启动浏览器',
-  running: '执行中',
-  pause_requested: '正在暂停',
-  paused: '已暂停',
-  waiting_user: '等待处理',
-  cooling_down: '限流冷却',
-  recovering: '恢复中',
-  verifying: '验收中',
-  cancel_requested: '正在取消',
-  cancelling: '正在取消',
-  completed: '已完成',
-  failed: '失败',
-  cancelled: '已取消',
-  terminated: '已取消'
+const TASK_STATE_KEYS = Object.freeze({
+  queued: 'state.queued', acquiring_profile: 'state.acquiringProfile', starting_browser: 'state.startingBrowser',
+  running: 'state.running', pause_requested: 'state.pauseRequested', paused: 'state.paused',
+  waiting_user: 'state.waitingUser', cooling_down: 'state.coolingDown', recovering: 'state.recovering',
+  verifying: 'state.verifying', cancel_requested: 'state.cancelRequested', cancelling: 'state.cancelling',
+  completed: 'state.completed', failed: 'state.failed', cancelled: 'state.cancelled', terminated: 'state.cancelled'
 });
-const ACTIVITY_LABELS = Object.freeze({
-  queued: '等待调度',
-  acquiring_profile: '准备 Profile',
-  starting_browser: '启动浏览器',
-  navigating: '正在打开页面',
-  clicking: '正在点击',
-  typing: '正在输入',
-  hovering: '正在悬停',
-  scrolling: '正在滚动页面',
-  extracting: '正在提取内容',
-  analyzing: '正在分析',
-  working: '正在执行',
-  running: '正在执行任务',
-  waiting_user: '等待 Agent 处理',
-  cooling_down: '正在等待限流恢复',
-  recovering: '正在从检查点恢复',
-  verifying: '正在验收结果',
-  reporting: '正在收尾',
-  cleaning_up: '正在关闭任务窗口',
-  paused: '任务已暂停',
-  completed: '任务已完成',
-  failed: '任务失败',
-  cancel_requested: '正在安全取消任务',
-  cancelling: '正在安全取消任务',
-  cancelled: '任务已取消'
+const ACTIVITY_KEYS = Object.freeze({
+  queued: 'activity.queued', acquiring_profile: 'activity.acquiringProfile', starting_browser: 'activity.startingBrowser',
+  navigating: 'activity.navigating', clicking: 'activity.clicking', typing: 'activity.typing', hovering: 'activity.hovering',
+  scrolling: 'activity.scrolling', extracting: 'activity.extracting', analyzing: 'activity.analyzing', working: 'activity.working',
+  running: 'activity.running', waiting_user: 'activity.waitingUser', cooling_down: 'activity.coolingDown',
+  recovering: 'activity.recovering', verifying: 'activity.verifying', reporting: 'activity.reporting',
+  cleaning_up: 'activity.cleaningUp', paused: 'activity.paused', completed: 'activity.completed', failed: 'activity.failed',
+  cancel_requested: 'activity.cancelRequested', cancelling: 'activity.cancelling', cancelled: 'activity.cancelled'
 });
+
+const I18N = Object.freeze({
+  'zh-CN': Object.freeze({
+    'page.title': 'Eric Task Master · 本机任务面板', 'skip.main': '跳到主要内容', 'brand.home': 'Eric Task Master 任务面板首页',
+    'nav.primary': '主要导航', 'nav.tasks': '任务', 'nav.profiles': 'Profiles', 'nav.assets': 'Task Packs',
+    'common.loading': '读取中', 'common.close': '关闭', 'common.delete': '删除', 'common.status': '状态',
+    'connection.connecting': '正在连接本机 Manager', 'connection.online': '本机 Manager 在线', 'connection.ownerRequired': '需要建立 Owner 会话',
+    'connection.stale': '连接中断 · 自动重试', 'connection.never': '尚未刷新', 'connection.refreshed': '刷新于 {time}',
+    'refresh.aria': '刷新任务、Profiles、执行器资产和通知', 'refresh.title': '刷新全部面板数据',
+    'auth.logout': '退出', 'auth.requiredTitle': '此浏览器尚未建立 Owner 会话',
+    'auth.requiredBody': '请从部署完成页打开一次面板。首次可信连接后，这个固定地址可以直接收藏使用。',
+    'auth.retry': '重新检查连接', 'stale.title': '实时连接暂时中断',
+    'stale.body': '正在保留上次成功状态并自动重试，不会中断后台任务。', 'stale.retry': '立即重试',
+    'tasks.title': '任务进度', 'tasks.description': '查看 Agent 正在做什么，并可暂停、恢复、取消或删除已结束的任务记录。',
+    'tasks.loading': '正在读取任务…', 'tasks.authEmpty': '建立 Owner 会话后即可查看任务。', 'tasks.empty': '当前还没有任务。',
+    'tasks.active': '{active} 个进行中 · {total} 个任务', 'tasks.inProgress': '进行中', 'tasks.progressAria': '{title}进度',
+    'tasks.progressUnknown': '正在执行，尚无总量', 'tasks.runTime': '运行时间', 'tasks.cooldownTime': '冷却时间',
+    'tasks.totalTime': '总时间', 'tasks.report': '查看 Agent 最终报告', 'tasks.lastFeedback': '最近反馈 {time}',
+    'tasks.targetMissing': '指定的任务记录不存在或已删除', 'task.untitled': '未命名任务', 'task.waitingFeedback': '等待反馈',
+    'state.queued': '排队中', 'state.acquiringProfile': '准备 Profile', 'state.startingBrowser': '启动浏览器', 'state.running': '执行中',
+    'state.pauseRequested': '正在暂停', 'state.paused': '已暂停', 'state.waitingUser': '等待处理', 'state.coolingDown': '限流冷却',
+    'state.recovering': '恢复中', 'state.verifying': '验收中', 'state.cancelRequested': '正在取消', 'state.cancelling': '正在取消',
+    'state.completed': '已完成', 'state.failed': '失败', 'state.cancelled': '已取消',
+    'activity.queued': '等待调度', 'activity.acquiringProfile': '准备 Profile', 'activity.startingBrowser': '启动浏览器',
+    'activity.navigating': '正在打开页面', 'activity.clicking': '正在点击', 'activity.typing': '正在输入', 'activity.hovering': '正在悬停',
+    'activity.scrolling': '正在滚动页面', 'activity.extracting': '正在提取内容', 'activity.analyzing': '正在分析',
+    'activity.working': '正在执行', 'activity.running': '正在执行任务', 'activity.waitingUser': '等待 Agent 处理',
+    'activity.coolingDown': '正在等待限流恢复', 'activity.recovering': '正在从检查点恢复', 'activity.verifying': '正在验收结果',
+    'activity.reporting': '正在收尾', 'activity.cleaningUp': '正在关闭任务窗口', 'activity.paused': '任务已暂停',
+    'activity.completed': '任务已完成', 'activity.failed': '任务失败', 'activity.cancelRequested': '正在安全取消任务',
+    'activity.cancelling': '正在安全取消任务', 'activity.cancelled': '任务已取消',
+    'behavior.fast': '快速', 'behavior.auto': '自动', 'behavior.autoBalanced': '自动平衡', 'behavior.human': '深度拟人',
+    'behavior.fastPace': '快速节奏', 'behavior.cautiousPace': '谨慎节奏', 'behavior.humanPace': '深度拟人节奏',
+    'behavior.unassigned': '待分配', 'behavior.unapplied': '待应用', 'behavior.actual': '实际行为',
+    'behavior.workerConfirmed': 'Worker 已确认 · {time}', 'behavior.workerWaiting': '等待 Worker 应用',
+    'actions.pause': '暂停', 'actions.resume': '恢复', 'actions.cancel': '取消', 'actions.deleteRecord': '删除记录',
+    'actions.cleanupFirst': '任务清理完成后才能删除记录',
+    'profiles.title': '浏览器 Profiles', 'profiles.description': '管理独立浏览器环境。任务按 Profile 串行，彼此不会抢占登录状态。',
+    'profiles.new': '新建 Profile', 'profiles.createTitle': '创建浏览器环境', 'profiles.name': 'Profile 名称',
+    'profiles.namePlaceholder': '例如：工作账号', 'profiles.kind': '类型', 'profiles.persistent': '持久登录',
+    'profiles.ephemeral': '临时无登录', 'profiles.browser': '浏览器', 'profiles.chrome': '本机稳定版 Chrome',
+    'profiles.chromium': '项目锁定 Chromium', 'profiles.speed': '操作速度', 'profiles.background': '任务在后台运行',
+    'profiles.create': '创建 Profile', 'profiles.formNote': '持久 Profile 固定使用本机 Chrome 与深度拟人行为；临时 Profile 会在任务结束后销毁浏览器状态。',
+    'profiles.loading': '正在读取 Profiles…', 'profiles.authEmpty': '建立 Owner 会话后即可查看 Profiles。',
+    'profiles.empty': '还没有 Profile。创建一个浏览器环境开始任务。', 'profiles.browserFact': '浏览器',
+    'profiles.speedFact': '操作速度', 'profiles.recent': '最近使用', 'profiles.speedLive': '运行中切换会立即应用到当前任务，无需重启',
+    'profiles.speedChoose': '为这个 Profile 选择快速、自动平衡或深度拟人', 'profiles.rename': '改名',
+    'profiles.closeWindow': '关闭窗口', 'profiles.openWindow': '打开登录窗口', 'profiles.taskOnly': '仅任务启动',
+    'profiles.openTitle': '打开独立可见 Chrome 窗口进行人工登录或检查', 'profiles.taskOnlyTitle': '临时 Profile 只在任务中启动',
+    'profiles.cleanupResidual': '清理残留', 'profiles.cleanupResidualTitle': '任务清理未确认；Manager 会再次确认 Worker 已退出且临时目录为空后再清理',
+    'profiles.deleteBusy': 'Profile 空闲后才能删除', 'profiles.deleteTitle': '删除这个 Profile',
+    'profileState.idle': '空闲', 'profileState.closed': '已关闭', 'profileState.open': '人工打开', 'profileState.leased': '任务占用',
+    'profileState.starting': '启动中', 'profileState.error': '需检查',
+    'assets.title': '执行器资产', 'assets.description': '看清每个 Task Pack 或脚本能做什么、Agent 能否发现、使用情况与清理风险；支持备注和批量管理。',
+    'assets.toolbar': '执行器资产筛选和批量操作', 'assets.search': '搜索资产', 'assets.searchPlaceholder': '名称、用途、备注或任务类型',
+    'assets.all': '全部资产', 'assets.discoverable': 'Agent 可发现', 'assets.deprecated': '已废弃', 'assets.history': '历史与孤立文件',
+    'assets.protected': '系统保护', 'assets.selectAll': '全选当前结果', 'assets.bulk': '批量管理', 'assets.note': '批量备注',
+    'assets.deprecate': '废弃', 'assets.restore': '恢复', 'assets.noneSelected': '尚未选择资产', 'assets.loading': '正在读取执行器资产…',
+    'assets.selected': '已选择 {count} 项 · 删除动作仍会由 Manager 重新检查任务与恢复状态',
+    'assets.authEmpty': '建立 Owner 会话后即可查看执行器资产。', 'assets.empty': '当前筛选没有匹配的执行器资产。',
+    'assets.selectAria': '选择 {title}', 'assets.agentVisible': 'Agent 可发现', 'assets.agentHidden': 'Agent 不可发现',
+    'assets.active': '使用中', 'assets.retired': '仅历史', 'assets.purposeMissing': '未填写用途说明；建议通过资产备注补充给后续维护者。',
+    'assets.version': '版本', 'assets.taskTypes': '任务类型', 'assets.runs': '运行次数', 'assets.successFailure': '成功 / 失败',
+    'assets.lastUsed': '最后使用', 'assets.size': '文件体积', 'assets.fileCount': '{count} 个 · {size}', 'assets.assetNote': '资产备注',
+    'assets.noNote': '暂无备注', 'assets.containsTypes': '包含 {count} 个任务类型', 'assets.blocked': '不可删除：{reasons}',
+    'assets.count': '{visible} / {total} 项资产',
+    'notifications.open': '打开通知', 'notifications.close': '关闭通知', 'notifications.title': '通知', 'notifications.loading': '正在读取通知…',
+    'notifications.markAll': '全部标为已读', 'notifications.none': '当前没有需要处理的通知。',
+    'notifications.summary': '{unread} 条未读 · {total} 条通知', 'notifications.reminders': '已提醒 {count} 次',
+    'notifications.takeOver': '我已接手', 'notifications.focus': '打开验证窗口', 'notifications.continue': '验证完成继续',
+    'notifications.read': '标为已读', 'notifications.claimed': '已标记为人工接手', 'notifications.focused': '正在打开验证窗口',
+    'notifications.continued': '已确认验证完成，原任务将继续', 'notifications.readDone': '通知已读',
+    'notifications.syncDegraded': '主任务操作已成功，但通知状态暂时同步失败；Manager 会自动重试。',
+    'notifications.allRead': '全部通知已标为已读', 'notifications.verification': '需要人工验证', 'notifications.notice': '任务通知',
+    'notifications.defaultTitle': '任务需要处理', 'notifications.defaultMessage': '请打开任务窗口完成必要操作。',
+    'settings.title': '通知设置', 'settings.system': '系统通知', 'settings.feishu': '飞书', 'settings.test': '发送测试',
+    'settings.telegramToken': 'Bot Token（留空保留原配置）', 'settings.telegramChat': 'Chat ID（留空保留原配置）',
+    'settings.feishuWebhook': 'Webhook（留空保留原配置）', 'settings.secretPlaceholder': '不会回填已保存密钥',
+    'settings.destinationPlaceholder': '不会回填已保存目标', 'settings.maskedNote': '已保存的密钥只显示掩码，面板永远不会回填原文。',
+    'settings.save': '保存通知设置', 'settings.configured': '已配置 {target}', 'settings.notConfigured': '尚未配置',
+    'settings.systemReady': '本机系统通知', 'settings.saved': '通知设置已保存', 'settings.testSent': '{channel} 测试通知已发送',
+    'settings.clearCredentials': '清除凭据', 'settings.cleared': '{channel} 凭据已清除',
+    'error.request': '请求失败 ({status})', 'error.timeout': '本机 Manager 10 秒内没有响应', 'error.network': '无法连接本机 Manager',
+    'error.read': '读取失败', 'error.operation': '操作失败', 'error.denied': '没有权限执行这项操作：{message}',
+    'error.profileName': 'Profile 名称已存在，请换一个名称。', 'error.revision': '状态已变化，已刷新最新状态。请确认后重试。',
+    'error.refreshed': '{message} 已刷新最新状态。', 'time.justNow': '刚刚', 'time.soon': '即将', 'time.days': '{days}天 {clock}',
+    'toast.profileCreated': 'Profile 已创建', 'toast.speedApplied': '操作速度已生效，运行中的任务无需重启',
+    'toast.profileSaved': 'Profile 设置已保存', 'toast.profileOpening': '正在打开独立登录窗口', 'toast.profileClosed': 'Profile 窗口已关闭',
+    'toast.profileResidualCleaned': '残留临时 Profile 已清理', 'toast.profileDeleted': 'Profile 已删除',
+    'toast.taskNotReady': '任务版本尚未就绪，正在刷新最新状态', 'toast.pauseSent': '暂停请求已发送',
+    'toast.resumeSent': '恢复请求已发送', 'toast.cancelSent': '取消请求已发送', 'toast.taskDeleted': '任务记录已删除',
+    'toast.noteSaved': '资产备注已保存', 'toast.assetsDeprecated': '所选资产已废弃，Agent 不再发现它们',
+    'toast.assetsRestored': '所选资产已恢复为可发现', 'toast.assetsDeleted': '所选执行器资产已安全删除',
+    'toast.loggedOut': '已退出；后台任务仍在继续', 'toast.logoutFailed': '退出失败', 'toast.ownerFailed': '无法建立 Owner 会话',
+    'prompt.renameProfile': '新的 Profile 名称', 'prompt.assetNote': '填写资产备注（留空可清除备注）',
+    'confirm.cleanupProfile': '确定清理异常临时 Profile“{name}”？Manager 只会在 Worker 已退出且目录为空时执行。',
+    'confirm.deleteProfile': '确定删除 Profile“{name}”及其{description}？此操作无法撤销。',
+    'confirm.ephemeralData': '临时任务设置', 'confirm.persistentData': '持久浏览器数据',
+    'confirm.cancelTask': '确定取消任务“{title}”？Manager 会先关闭任务窗口并释放 Profile。',
+    'confirm.deleteTask': '确定删除任务记录“{title}”？它会从面板消失且无法恢复，已生成的数据文件不会被删除。',
+    'confirm.assetSuffix': '等 {count} 项', 'confirm.deleteAssets': '确定删除 {names}{suffix}？Manager 会再次校验任务引用；删除后的执行器文件无法恢复。',
+    'confirm.logout': '退出这台浏览器的 Owner 会话？后台任务不会停止。',
+    'confirm.clearChannel': '确定清除 {channel} 的已保存凭据并关闭该通知通道？'
+  }),
+  en: Object.freeze({
+    'page.title': 'Eric Task Master · Local Task Panel', 'skip.main': 'Skip to main content', 'brand.home': 'Eric Task Master dashboard home',
+    'nav.primary': 'Primary navigation', 'nav.tasks': 'Tasks', 'nav.profiles': 'Profiles', 'nav.assets': 'Task Packs',
+    'common.loading': 'Loading', 'common.close': 'Close', 'common.delete': 'Delete', 'common.status': 'Status',
+    'connection.connecting': 'Connecting to local Manager', 'connection.online': 'Local Manager online', 'connection.ownerRequired': 'Owner session required',
+    'connection.stale': 'Connection lost · retrying', 'connection.never': 'Not refreshed yet', 'connection.refreshed': 'Refreshed {time}',
+    'refresh.aria': 'Refresh tasks, Profiles, Task Pack assets, and notifications', 'refresh.title': 'Refresh all dashboard data',
+    'auth.logout': 'Sign out', 'auth.requiredTitle': 'This browser does not have an Owner session',
+    'auth.requiredBody': 'Open the panel once from the deployment page. After the first trusted connection, this fixed address can be bookmarked.',
+    'auth.retry': 'Check connection again', 'stale.title': 'Live connection is temporarily unavailable',
+    'stale.body': 'The last successful state is preserved while automatic retries continue. Background tasks are not interrupted.', 'stale.retry': 'Retry now',
+    'tasks.title': 'Task progress', 'tasks.description': 'See what each Agent is doing, and pause, resume, cancel, or remove completed task records.',
+    'tasks.loading': 'Loading tasks…', 'tasks.authEmpty': 'Start an Owner session to view tasks.', 'tasks.empty': 'There are no tasks yet.',
+    'tasks.active': '{active} active · {total} tasks', 'tasks.inProgress': 'In progress', 'tasks.progressAria': '{title} progress',
+    'tasks.progressUnknown': 'Running without a known total', 'tasks.runTime': 'Run time', 'tasks.cooldownTime': 'Cooldown',
+    'tasks.totalTime': 'Total time', 'tasks.report': 'View final Agent report', 'tasks.lastFeedback': 'Last update {time}',
+    'tasks.targetMissing': 'The requested task record does not exist or was deleted', 'task.untitled': 'Untitled task', 'task.waitingFeedback': 'Waiting for feedback',
+    'state.queued': 'Queued', 'state.acquiringProfile': 'Preparing Profile', 'state.startingBrowser': 'Starting browser', 'state.running': 'Running',
+    'state.pauseRequested': 'Pausing', 'state.paused': 'Paused', 'state.waitingUser': 'Action required', 'state.coolingDown': 'Cooling down',
+    'state.recovering': 'Recovering', 'state.verifying': 'Verifying', 'state.cancelRequested': 'Cancelling', 'state.cancelling': 'Cancelling',
+    'state.completed': 'Completed', 'state.failed': 'Failed', 'state.cancelled': 'Cancelled',
+    'activity.queued': 'Waiting to be scheduled', 'activity.acquiringProfile': 'Preparing Profile', 'activity.startingBrowser': 'Starting browser',
+    'activity.navigating': 'Opening page', 'activity.clicking': 'Clicking', 'activity.typing': 'Typing', 'activity.hovering': 'Hovering',
+    'activity.scrolling': 'Scrolling page', 'activity.extracting': 'Extracting content', 'activity.analyzing': 'Analyzing',
+    'activity.working': 'Working', 'activity.running': 'Running task', 'activity.waitingUser': 'Waiting for Agent action',
+    'activity.coolingDown': 'Waiting for rate limit recovery', 'activity.recovering': 'Recovering from checkpoint', 'activity.verifying': 'Verifying results',
+    'activity.reporting': 'Wrapping up', 'activity.cleaningUp': 'Closing task window', 'activity.paused': 'Task paused',
+    'activity.completed': 'Task completed', 'activity.failed': 'Task failed', 'activity.cancelRequested': 'Cancelling task safely',
+    'activity.cancelling': 'Cancelling task safely', 'activity.cancelled': 'Task cancelled',
+    'behavior.fast': 'Fast', 'behavior.auto': 'Auto', 'behavior.autoBalanced': 'Auto balance', 'behavior.human': 'Deep human',
+    'behavior.fastPace': 'Fast pace', 'behavior.cautiousPace': 'Cautious pace', 'behavior.humanPace': 'Deep-human pace',
+    'behavior.unassigned': 'Unassigned', 'behavior.unapplied': 'Not applied', 'behavior.actual': 'Effective behavior',
+    'behavior.workerConfirmed': 'Worker confirmed · {time}', 'behavior.workerWaiting': 'Waiting for Worker',
+    'actions.pause': 'Pause', 'actions.resume': 'Resume', 'actions.cancel': 'Cancel', 'actions.deleteRecord': 'Delete record',
+    'actions.cleanupFirst': 'The record can be deleted after task cleanup finishes',
+    'profiles.title': 'Browser Profiles', 'profiles.description': 'Manage isolated browser environments. Tasks run serially per Profile and never compete for login state.',
+    'profiles.new': 'New Profile', 'profiles.createTitle': 'Create browser environment', 'profiles.name': 'Profile name',
+    'profiles.namePlaceholder': 'Example: Work account', 'profiles.kind': 'Type', 'profiles.persistent': 'Persistent login',
+    'profiles.ephemeral': 'Temporary, no login', 'profiles.browser': 'Browser', 'profiles.chrome': 'Stable local Chrome',
+    'profiles.chromium': 'Project-pinned Chromium', 'profiles.speed': 'Operation speed', 'profiles.background': 'Run tasks in background',
+    'profiles.create': 'Create Profile', 'profiles.formNote': 'Persistent Profiles use local Chrome and deep-human behavior by default. Temporary Profile browser state is destroyed after the task.',
+    'profiles.loading': 'Loading Profiles…', 'profiles.authEmpty': 'Start an Owner session to view Profiles.',
+    'profiles.empty': 'There are no Profiles. Create a browser environment to start.', 'profiles.browserFact': 'Browser',
+    'profiles.speedFact': 'Operation speed', 'profiles.recent': 'Last used', 'profiles.speedLive': 'Changes apply to the running task immediately, without a restart',
+    'profiles.speedChoose': 'Choose fast, auto balance, or deep human for this Profile', 'profiles.rename': 'Rename',
+    'profiles.closeWindow': 'Close window', 'profiles.openWindow': 'Open login window', 'profiles.taskOnly': 'Task launch only',
+    'profiles.openTitle': 'Open a separate visible Chrome window for manual login or inspection', 'profiles.taskOnlyTitle': 'Temporary Profiles only launch inside tasks',
+    'profiles.cleanupResidual': 'Clean residue', 'profiles.cleanupResidualTitle': 'Cleanup is unconfirmed. Manager will verify that the Worker exited and the temporary directory is empty.',
+    'profiles.deleteBusy': 'The Profile must be idle before deletion', 'profiles.deleteTitle': 'Delete this Profile',
+    'profileState.idle': 'Idle', 'profileState.closed': 'Closed', 'profileState.open': 'Open manually', 'profileState.leased': 'In use',
+    'profileState.starting': 'Starting', 'profileState.error': 'Needs attention',
+    'assets.title': 'Task Pack assets', 'assets.description': 'See what each Task Pack or script does, whether Agents can discover it, usage history, cleanup risk, notes, and batch actions.',
+    'assets.toolbar': 'Task Pack asset filters and batch actions', 'assets.search': 'Search assets', 'assets.searchPlaceholder': 'Name, purpose, note, or task type',
+    'assets.all': 'All assets', 'assets.discoverable': 'Agent discoverable', 'assets.deprecated': 'Deprecated', 'assets.history': 'History and orphan files',
+    'assets.protected': 'System protected', 'assets.selectAll': 'Select current results', 'assets.bulk': 'Batch management', 'assets.note': 'Batch note',
+    'assets.deprecate': 'Deprecate', 'assets.restore': 'Restore', 'assets.noneSelected': 'No assets selected', 'assets.loading': 'Loading Task Pack assets…',
+    'assets.selected': '{count} selected · Manager will recheck task and recovery references before deletion',
+    'assets.authEmpty': 'Start an Owner session to view Task Pack assets.', 'assets.empty': 'No Task Pack assets match the current filters.',
+    'assets.selectAria': 'Select {title}', 'assets.agentVisible': 'Agent discoverable', 'assets.agentHidden': 'Not Agent discoverable',
+    'assets.active': 'Active', 'assets.retired': 'History only', 'assets.purposeMissing': 'No purpose is documented. Add an asset note for future maintainers.',
+    'assets.version': 'Version', 'assets.taskTypes': 'Task types', 'assets.runs': 'Runs', 'assets.successFailure': 'Success / failure',
+    'assets.lastUsed': 'Last used', 'assets.size': 'File size', 'assets.fileCount': '{count} files · {size}', 'assets.assetNote': 'Asset note',
+    'assets.noNote': 'No note', 'assets.containsTypes': 'Contains {count} task types', 'assets.blocked': 'Cannot delete: {reasons}',
+    'assets.count': '{visible} / {total} assets',
+    'notifications.open': 'Open notifications', 'notifications.close': 'Close notifications', 'notifications.title': 'Notifications', 'notifications.loading': 'Loading notifications…',
+    'notifications.markAll': 'Mark all as read', 'notifications.none': 'There are no notifications requiring attention.',
+    'notifications.summary': '{unread} unread · {total} notifications', 'notifications.reminders': '{count} reminders',
+    'notifications.takeOver': 'Take over', 'notifications.focus': 'Open verification window', 'notifications.continue': 'Verification complete',
+    'notifications.read': 'Mark as read', 'notifications.claimed': 'Marked as taken over', 'notifications.focused': 'Opening verification window',
+    'notifications.continued': 'Verification completed; the original task will continue', 'notifications.readDone': 'Notification marked as read',
+    'notifications.syncDegraded': 'The task action succeeded, but notification-state sync is temporarily degraded. Manager will retry automatically.',
+    'notifications.allRead': 'All notifications marked as read', 'notifications.verification': 'Manual verification required', 'notifications.notice': 'Task notification',
+    'notifications.defaultTitle': 'Task action required', 'notifications.defaultMessage': 'Open the task window and complete the required action.',
+    'settings.title': 'Notification settings', 'settings.system': 'System notifications', 'settings.feishu': 'Feishu', 'settings.test': 'Send test',
+    'settings.telegramToken': 'Bot Token (leave blank to keep current)', 'settings.telegramChat': 'Chat ID (leave blank to keep current)',
+    'settings.feishuWebhook': 'Webhook (leave blank to keep current)', 'settings.secretPlaceholder': 'Saved secrets are never repopulated',
+    'settings.destinationPlaceholder': 'Saved destinations are never repopulated', 'settings.maskedNote': 'Saved secrets are shown only as masked values and are never repopulated in the panel.',
+    'settings.save': 'Save notification settings', 'settings.configured': 'Configured {target}', 'settings.notConfigured': 'Not configured',
+    'settings.systemReady': 'Local system notification', 'settings.saved': 'Notification settings saved', 'settings.testSent': '{channel} test notification sent',
+    'settings.clearCredentials': 'Clear credentials', 'settings.cleared': '{channel} credentials cleared',
+    'error.request': 'Request failed ({status})', 'error.timeout': 'Local Manager did not respond within 10 seconds', 'error.network': 'Cannot reach local Manager',
+    'error.read': 'Unable to load', 'error.operation': 'Operation failed', 'error.denied': 'You do not have permission: {message}',
+    'error.profileName': 'That Profile name already exists. Choose another name.', 'error.revision': 'State changed. The latest state was loaded; review it and retry.',
+    'error.refreshed': '{message} The latest state was loaded.', 'time.justNow': 'just now', 'time.soon': 'soon', 'time.days': '{days}d {clock}',
+    'toast.profileCreated': 'Profile created', 'toast.speedApplied': 'Operation speed applied to running tasks without a restart',
+    'toast.profileSaved': 'Profile settings saved', 'toast.profileOpening': 'Opening a separate login window', 'toast.profileClosed': 'Profile window closed',
+    'toast.profileResidualCleaned': 'Temporary Profile residue cleaned', 'toast.profileDeleted': 'Profile deleted',
+    'toast.taskNotReady': 'Task revision is not ready; loading the latest state', 'toast.pauseSent': 'Pause request sent',
+    'toast.resumeSent': 'Resume request sent', 'toast.cancelSent': 'Cancel request sent', 'toast.taskDeleted': 'Task record deleted',
+    'toast.noteSaved': 'Asset note saved', 'toast.assetsDeprecated': 'Selected assets deprecated and hidden from Agents',
+    'toast.assetsRestored': 'Selected assets restored for Agent discovery', 'toast.assetsDeleted': 'Selected Task Pack assets safely deleted',
+    'toast.loggedOut': 'Signed out; background tasks are still running', 'toast.logoutFailed': 'Sign-out failed', 'toast.ownerFailed': 'Unable to start Owner session',
+    'prompt.renameProfile': 'New Profile name', 'prompt.assetNote': 'Asset note (leave blank to clear)',
+    'confirm.cleanupProfile': 'Clean abnormal temporary Profile “{name}”? Manager will proceed only after the Worker exits and the directory is empty.',
+    'confirm.deleteProfile': 'Delete Profile “{name}” and its {description}? This cannot be undone.',
+    'confirm.ephemeralData': 'temporary task settings', 'confirm.persistentData': 'persistent browser data',
+    'confirm.cancelTask': 'Cancel task “{title}”? Manager will close the task window and release the Profile first.',
+    'confirm.deleteTask': 'Delete task record “{title}”? It will disappear permanently, but generated data files are preserved.',
+    'confirm.assetSuffix': ' and {count} total', 'confirm.deleteAssets': 'Delete {names}{suffix}? Manager will recheck task references. Deleted executor files cannot be recovered.',
+    'confirm.logout': 'Sign out this browser Owner session? Background tasks will continue.',
+    'confirm.clearChannel': 'Clear the saved {channel} credentials and disable this notification channel?'
+  })
+});
+
+function savedLanguage() {
+  try {
+    return localStorage.getItem(LANGUAGE_STORAGE_KEY) === 'en' ? 'en' : 'zh-CN';
+  } catch {
+    return 'zh-CN';
+  }
+}
+
+function t(key, values = {}) {
+  const language = state?.language || 'zh-CN';
+  const template = I18N[language]?.[key] ?? I18N['zh-CN'][key] ?? key;
+  return String(template).replace(/\{([A-Za-z0-9_]+)\}/g, (_, name) => String(values[name] ?? `{${name}}`));
+}
 
 const ui = Object.freeze({
   navLinks: [...document.querySelectorAll('[data-view]')],
@@ -58,6 +252,28 @@ const ui = Object.freeze({
   connectionDot: document.querySelector('#connection-dot'),
   connectionLabel: document.querySelector('#connection-label'),
   lastRefresh: document.querySelector('#last-refresh'),
+  languageToggle: document.querySelector('#language-toggle'),
+  notificationButton: document.querySelector('#notification-button'),
+  notificationBadge: document.querySelector('#notification-badge'),
+  notificationBackdrop: document.querySelector('#notification-backdrop'),
+  notificationDrawer: document.querySelector('#notification-drawer'),
+  notificationClose: document.querySelector('#notification-close'),
+  notificationSummary: document.querySelector('#notification-summary'),
+  notificationMarkAll: document.querySelector('#notification-mark-all'),
+  notifications: document.querySelector('#notifications'),
+  notificationsError: document.querySelector('#notifications-error'),
+  notificationSettingsForm: document.querySelector('#notification-settings-form'),
+  notificationSystemEnabled: document.querySelector('#notification-system-enabled'),
+  notificationTelegramEnabled: document.querySelector('#notification-telegram-enabled'),
+  notificationFeishuEnabled: document.querySelector('#notification-feishu-enabled'),
+  notificationSystemStatus: document.querySelector('#notification-system-status'),
+  notificationTelegramStatus: document.querySelector('#notification-telegram-status'),
+  notificationFeishuStatus: document.querySelector('#notification-feishu-status'),
+  notificationTelegramToken: document.querySelector('#notification-telegram-token'),
+  notificationTelegramChat: document.querySelector('#notification-telegram-chat'),
+  notificationFeishuWebhook: document.querySelector('#notification-feishu-webhook'),
+  notificationChannelTests: [...document.querySelectorAll('.channel-test')],
+  notificationChannelClears: [...document.querySelectorAll('.channel-clear')],
   refreshAll: document.querySelector('#refresh-all'),
   logoutButton: document.querySelector('#logout-button'),
   authBanner: document.querySelector('#auth-banner'),
@@ -93,12 +309,18 @@ const ui = Object.freeze({
 });
 
 const state = {
+  language: savedLanguage(),
   authenticated: null,
   stale: false,
+  connectionMode: 'pending',
+  lastRefreshAt: null,
   visibleView: 'tasks',
   profiles: [],
   tasks: [],
   assets: [],
+  notifications: [],
+  notificationSettings: null,
+  notificationDrawerOpen: false,
   selectedAssetIds: new Set(),
   openReportTaskIds: new Set(),
   taskReceivedAt: new Map(),
@@ -118,6 +340,33 @@ const state = {
   initialTaskId: new URL(location.href).searchParams.get('task') || '',
   initialTaskHandled: false
 };
+
+function applyStaticLanguage() {
+  document.documentElement.lang = state.language;
+  document.title = t('page.title');
+  for (const node of document.querySelectorAll('[data-i18n]')) node.textContent = t(node.dataset.i18n);
+  for (const node of document.querySelectorAll('[data-i18n-aria-label]')) node.setAttribute('aria-label', t(node.dataset.i18nAriaLabel));
+  for (const node of document.querySelectorAll('[data-i18n-title]')) node.title = t(node.dataset.i18nTitle);
+  for (const node of document.querySelectorAll('[data-i18n-placeholder]')) node.placeholder = t(node.dataset.i18nPlaceholder);
+  const switchToEnglish = state.language === 'zh-CN';
+  ui.languageToggle.textContent = switchToEnglish ? 'EN' : '中';
+  ui.languageToggle.setAttribute('aria-label', switchToEnglish ? 'Switch to English' : '切换到中文');
+  ui.languageToggle.title = ui.languageToggle.getAttribute('aria-label');
+}
+
+function setLanguage(language) {
+  state.language = language === 'en' ? 'en' : 'zh-CN';
+  try {
+    localStorage.setItem(LANGUAGE_STORAGE_KEY, state.language);
+  } catch {}
+  applyStaticLanguage();
+  setConnectionState(state.connectionMode);
+  if (state.lastRefreshAt) ui.lastRefresh.textContent = t('connection.refreshed', { time: formatTime(state.lastRefreshAt) });
+  state.renderSignatures.clear();
+  renderAll(true);
+  renderNotifications(true);
+  renderNotificationSettings();
+}
 
 class HttpError extends Error {
   constructor(message, status = 0, code = '') {
@@ -185,7 +434,7 @@ async function request(path, { method = 'GET', body } = {}) {
       const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
       if (response.ok) return payload;
       const error = new HttpError(
-        errorMessage(payload, `请求失败 (${response.status})`),
+        errorMessage(payload, t('error.request', { status: response.status })),
         response.status,
         payload?.error?.code || payload?.code || ''
       );
@@ -198,10 +447,10 @@ async function request(path, { method = 'GET', body } = {}) {
       throw error;
     } catch (error) {
       const normalized = error?.name === 'AbortError'
-        ? new HttpError('本机 Manager 10 秒内没有响应', 0, 'REQUEST_TIMEOUT')
+        ? new HttpError(t('error.timeout'), 0, 'REQUEST_TIMEOUT')
         : error instanceof HttpError
           ? error
-          : new HttpError('无法连接本机 Manager', 0, 'NETWORK_ERROR');
+          : new HttpError(t('error.network'), 0, 'NETWORK_ERROR');
       lastError = normalized;
       if (mayRetry && attempt === 0 && normalized.status === 0) {
         await sleep(READ_RETRY_DELAY_MS);
@@ -235,6 +484,8 @@ function markAuthorizationRequired() {
   state.profiles = [];
   state.tasks = [];
   state.assets = [];
+  state.notifications = [];
+  state.notificationSettings = null;
   state.selectedAssetIds.clear();
   state.taskReceivedAt.clear();
   state.sectionErrors = {};
@@ -245,6 +496,7 @@ function markAuthorizationRequired() {
   ui.authBanner.classList.remove('hidden');
   ui.staleBanner.classList.add('hidden');
   ui.logoutButton.classList.add('hidden');
+  setNotificationDrawer(false, { focus: false });
   setConnectionState('unauthorized');
   renderAll(true);
 }
@@ -266,17 +518,18 @@ function markStale() {
 }
 
 function setConnectionState(mode) {
+  state.connectionMode = mode;
   const dotClasses = ['npc-signal-dot'];
-  let label = '正在连接本机 Manager';
+  let label = t('connection.connecting');
   if (mode === 'connected') {
     dotClasses.push('is-online');
-    label = '本机 Manager 在线';
+    label = t('connection.online');
   } else if (mode === 'unauthorized') {
     dotClasses.push('is-offline');
-    label = '需要建立 Owner 会话';
+    label = t('connection.ownerRequired');
   } else if (mode === 'stale') {
     dotClasses.push('is-warning');
-    label = '连接中断 · 自动重试';
+    label = t('connection.stale');
   } else {
     dotClasses.push('is-pending');
   }
@@ -304,13 +557,13 @@ function formatTime(value, { relative = false } = {}) {
   if (relative) {
     const seconds = Math.round((date.valueOf() - Date.now()) / 1000);
     const absolute = Math.abs(seconds);
-    if (absolute < 60) return seconds <= 0 ? '刚刚' : '即将';
-    const formatter = new Intl.RelativeTimeFormat('zh-CN', { numeric: 'auto' });
+    if (absolute < 60) return seconds <= 0 ? t('time.justNow') : t('time.soon');
+    const formatter = new Intl.RelativeTimeFormat(state.language, { numeric: 'auto' });
     if (absolute < 3600) return formatter.format(Math.round(seconds / 60), 'minute');
     if (absolute < 86400) return formatter.format(Math.round(seconds / 3600), 'hour');
     return formatter.format(Math.round(seconds / 86400), 'day');
   }
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(state.language, {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
   }).format(date);
 }
@@ -323,7 +576,7 @@ function formatDuration(value) {
   const minutes = Math.floor((seconds % 3_600) / 60);
   const rest = seconds % 60;
   const clock = [hours, minutes, rest].map((part) => String(part).padStart(2, '0')).join(':');
-  return days ? `${days}天 ${clock}` : clock;
+  return days ? t('time.days', { days, clock }) : clock;
 }
 
 function formatBytes(value) {
@@ -340,16 +593,16 @@ function taskState(task) {
 
 function taskStateLabel(task) {
   const value = taskState(task);
-  return TASK_STATE_LABELS[value] || value;
+  return TASK_STATE_KEYS[value] ? t(TASK_STATE_KEYS[value]) : value;
 }
 
 function taskTitle(task) {
-  return task?.displayName || task?.name || task?.taskLabel || task?.title || task?.taskType || task?.id || '未命名任务';
+  return task?.displayName || task?.name || task?.taskLabel || task?.title || task?.taskType || task?.id || t('task.untitled');
 }
 
 function taskActivity(task) {
   const phase = task?.currentActivity?.phase || task?.activity?.phase || taskState(task);
-  const label = task?.currentActivity?.label || ACTIVITY_LABELS[phase] || ACTIVITY_LABELS[taskState(task)] || '等待反馈';
+  const label = task?.currentActivity?.label || (ACTIVITY_KEYS[phase] ? t(ACTIVITY_KEYS[phase]) : '') || (ACTIVITY_KEYS[taskState(task)] ? t(ACTIVITY_KEYS[taskState(task)]) : '') || t('task.waitingFeedback');
   const message = task?.progress?.message || task?.currentActivity?.message || task?.message || label;
   return { label, message, updatedAt: task?.progress?.updatedAt || task?.currentActivity?.updatedAt || task?.updatedAt };
 }
@@ -440,8 +693,8 @@ function taskBehaviorValue(task) {
   const effective = ['fast', 'cautious', 'human'].includes(task?.behaviorState?.effective)
     ? task.behaviorState.effective
     : configured === 'auto' ? 'fast' : configured;
-  const configuredLabel = ({ fast: '快速', auto: '自动', human: '深度拟人' })[configured] || '待分配';
-  const effectiveLabel = ({ fast: '快速节奏', cautious: '谨慎节奏', human: '深度拟人节奏' })[effective] || '待应用';
+  const configuredLabel = ({ fast: t('behavior.fast'), auto: t('behavior.auto'), human: t('behavior.human') })[configured] || t('behavior.unassigned');
+  const effectiveLabel = ({ fast: t('behavior.fastPace'), cautious: t('behavior.cautiousPace'), human: t('behavior.humanPace') })[effective] || t('behavior.unapplied');
   const confirmed = task?.behaviorState?.source === 'worker' && task?.behaviorState?.confirmed === true;
   return {
     configured,
@@ -449,8 +702,8 @@ function taskBehaviorValue(task) {
     confirmed,
     label: configured === 'auto' ? `${configuredLabel} · ${effectiveLabel}` : configuredLabel,
     receipt: confirmed
-      ? `Worker 已确认 · ${formatTime(task.behaviorState.at, { relative: true })}`
-      : '等待 Worker 应用'
+      ? t('behavior.workerConfirmed', { time: formatTime(task.behaviorState.at, { relative: true }) })
+      : t('behavior.workerWaiting')
   };
 }
 
@@ -524,7 +777,7 @@ function durationValue(task, kind, label) {
 
 function behaviorValue(task) {
   const behavior = taskBehaviorValue(task);
-  const group = labelledValue('实际行为', behavior.label, 'behavior-value');
+  const group = labelledValue(t('behavior.actual'), behavior.label, 'behavior-value');
   group.dataset.taskBehavior = behavior.configured || '';
   group.dataset.taskBehaviorEffective = behavior.effective || '';
   group.dataset.taskBehaviorConfirmed = String(behavior.confirmed);
@@ -546,24 +799,24 @@ function taskActionButtons(task) {
   const key = `task:${task.id}`;
   const pending = state.pendingMutations.has(key);
   if (PAUSABLE_TASK_STATES.has(status)) {
-    const pause = focusKey(button('暂停', 'npc-btn-secondary compact-button', () => void sendTaskAction(task, 'pause')), `${key}:pause`);
+    const pause = focusKey(button(t('actions.pause'), 'npc-btn-secondary compact-button', () => void sendTaskAction(task, 'pause')), `${key}:pause`);
     pause.disabled = pending;
     actions.append(pause);
   }
   if (status === 'paused') {
-    const resume = focusKey(button('恢复', 'npc-btn-primary compact-button', () => void sendTaskAction(task, 'resume')), `${key}:resume`);
+    const resume = focusKey(button(t('actions.resume'), 'npc-btn-primary compact-button', () => void sendTaskAction(task, 'resume')), `${key}:resume`);
     resume.disabled = pending;
     actions.append(resume);
   }
   if (!TERMINAL_TASK_STATES.has(status)) {
-    const cancel = focusKey(button('取消', 'npc-btn-danger compact-button', () => void sendTaskAction(task, 'cancel')), `${key}:cancel`);
+    const cancel = focusKey(button(t('actions.cancel'), 'npc-btn-danger compact-button', () => void sendTaskAction(task, 'cancel')), `${key}:cancel`);
     cancel.disabled = pending || ['cancel_requested', 'cancelling'].includes(status);
     actions.append(cancel);
   } else {
-    const remove = focusKey(button('删除记录', 'npc-btn-danger compact-button', () => void deleteTaskRecord(task)), `${key}:delete`);
+    const remove = focusKey(button(t('actions.deleteRecord'), 'npc-btn-danger compact-button', () => void deleteTaskRecord(task)), `${key}:delete`);
     const settled = task.cleanup?.settled === true;
     remove.disabled = pending || !settled;
-    if (!settled) remove.title = '任务清理完成后才能删除记录';
+    if (!settled) remove.title = t('actions.cleanupFirst');
     actions.append(remove);
   }
   return actions;
@@ -585,7 +838,7 @@ function renderTasks(force = false) {
   renderWhenChanged('tasks', { ordered, pending: [...state.pendingMutations].filter((key) => key.startsWith('task:')) }, ui.tasks, () => {
     ui.tasks.replaceChildren();
     if (!ordered.length) {
-      ui.tasks.append(element('p', 'empty-state', state.authenticated === false ? '建立 Owner 会话后即可查看任务。' : '当前还没有任务。'));
+      ui.tasks.append(element('p', 'empty-state', state.authenticated === false ? t('tasks.authEmpty') : t('tasks.empty')));
       return;
     }
     for (const task of ordered) {
@@ -604,13 +857,13 @@ function renderTasks(force = false) {
 
       const progressBlock = element('div', 'task-progress-block');
       const progressCopy = element('div', 'progress-copy');
-      progressCopy.append(element('strong', '', activity.message), element('span', 'npc-number', progress.amount || (progress.percent === null ? '进行中' : `${progress.percent}%`)));
+      progressCopy.append(element('strong', '', activity.message), element('span', 'npc-number', progress.amount || (progress.percent === null ? t('tasks.inProgress') : `${progress.percent}%`)));
       const track = element('div', 'progress-track');
       track.setAttribute('role', 'progressbar');
-      track.setAttribute('aria-label', `${taskTitle(task)}进度`);
+      track.setAttribute('aria-label', t('tasks.progressAria', { title: taskTitle(task) }));
       track.setAttribute('aria-valuemin', '0');
       track.setAttribute('aria-valuemax', '100');
-      if (progress.percent === null) track.setAttribute('aria-valuetext', '正在执行，尚无总量');
+      if (progress.percent === null) track.setAttribute('aria-valuetext', t('tasks.progressUnknown'));
       else track.setAttribute('aria-valuenow', String(progress.percent));
       const bar = element('span', 'progress-bar');
       bar.style.width = `${progress.percent ?? (TERMINAL_TASK_STATES.has(status) ? 100 : 4)}%`;
@@ -621,9 +874,9 @@ function renderTasks(force = false) {
       metadata.append(
         labelledValue('Profile', profileNameFor(task)),
         behaviorValue(task),
-        durationValue(task, 'run', '运行时间'),
-        durationValue(task, 'cooldown', '冷却时间'),
-        durationValue(task, 'total', '总时间')
+        durationValue(task, 'run', t('tasks.runTime')),
+        durationValue(task, 'cooldown', t('tasks.cooldownTime')),
+        durationValue(task, 'total', t('tasks.totalTime'))
       );
 
       let reportPanel = null;
@@ -634,7 +887,7 @@ function renderTasks(force = false) {
           if (reportPanel.open) state.openReportTaskIds.add(task.id);
           else state.openReportTaskIds.delete(task.id);
         });
-        const reportSummary = element('summary', '', '查看 Agent 最终报告');
+        const reportSummary = element('summary', '', t('tasks.report'));
         const reportBody = element('div', 'task-report-body');
         if (task.report.title) reportBody.append(element('strong', '', task.report.title));
         reportBody.append(element('p', '', task.report.summary));
@@ -650,7 +903,7 @@ function renderTasks(force = false) {
 
       const footer = element('div', 'task-card-footer');
       footer.append(
-        element('span', 'task-updated', `最近反馈 ${formatTime(activity.updatedAt, { relative: true })}`),
+        element('span', 'task-updated', t('tasks.lastFeedback', { time: formatTime(activity.updatedAt, { relative: true }) })),
         taskActionButtons(task)
       );
       card.append(heading, progressBlock, metadata);
@@ -660,7 +913,7 @@ function renderTasks(force = false) {
     }
   }, force);
   const active = state.tasks.filter((task) => !TERMINAL_TASK_STATES.has(taskState(task))).length;
-  ui.taskCountChip.textContent = `${active} 个进行中 · ${state.tasks.length} 个任务`;
+  ui.taskCountChip.textContent = t('tasks.active', { active, total: state.tasks.length });
   setInlineError(ui.tasksError, state.mutationErrors.tasks || state.sectionErrors.tasks || '');
 }
 
@@ -668,7 +921,7 @@ function renderProfiles(force = false) {
   renderWhenChanged('profiles', { profiles: state.profiles, pending: [...state.pendingMutations].filter((key) => key.startsWith('profile:')) }, ui.profiles, () => {
     ui.profiles.replaceChildren();
     if (!state.profiles.length) {
-      ui.profiles.append(element('p', 'empty-state span-all', state.authenticated === false ? '建立 Owner 会话后即可查看 Profiles。' : '还没有 Profile。创建一个浏览器环境开始任务。'));
+      ui.profiles.append(element('p', 'empty-state span-all', state.authenticated === false ? t('profiles.authEmpty') : t('profiles.empty')));
       return;
     }
     for (const profile of state.profiles) {
@@ -682,30 +935,33 @@ function renderProfiles(force = false) {
       const heading = element('div', 'card-heading');
       const title = element('div');
       title.append(element('p', 'npc-eyebrow', persistent ? 'PERSISTENT' : 'EPHEMERAL'), element('h2', '', profile.name || id));
-      const stateLabel = ({ idle: '空闲', closed: '已关闭', open: '人工打开', leased: '任务占用', starting: '启动中', error: '需检查' })[currentState] || currentState;
+      const stateLabel = ({
+        idle: t('profileState.idle'), closed: t('profileState.closed'), open: t('profileState.open'),
+        leased: t('profileState.leased'), starting: t('profileState.starting'), error: t('profileState.error')
+      })[currentState] || currentState;
       heading.append(title, element('span', `npc-chip profile-state-${currentState}`, stateLabel));
 
       const facts = element('div', 'profile-facts');
       facts.append(
-        labelledValue('浏览器', profileEngine(profile)),
-        labelledValue('操作速度', ({ human: '深度拟人', auto: '自动平衡', fast: '快速' })[profileMode(profile)] || profileMode(profile)),
-        labelledValue('最近使用', formatTime(profile.lastUsedAt, { relative: true }))
+        labelledValue(t('profiles.browserFact'), profileEngine(profile)),
+        labelledValue(t('profiles.speedFact'), ({ human: t('behavior.human'), auto: t('behavior.autoBalanced'), fast: t('behavior.fast') })[profileMode(profile)] || profileMode(profile)),
+        labelledValue(t('profiles.recent'), formatTime(profile.lastUsedAt, { relative: true }))
       );
 
       const settings = element('div', 'profile-settings');
       const modeLabel = element('label');
-      modeLabel.append(element('span', '', '操作速度'));
+      modeLabel.append(element('span', '', t('profiles.speed')));
       const mode = focusKey(element('select', 'npc-field compact-field'), `profile:${id}:mode`);
       for (const value of ['fast', 'auto', 'human']) {
-        const option = element('option', '', ({ fast: '快速', auto: '自动平衡', human: '深度拟人' })[value]);
+        const option = element('option', '', ({ fast: t('behavior.fast'), auto: t('behavior.autoBalanced'), human: t('behavior.human') })[value]);
         option.value = value;
         mode.append(option);
       }
       mode.value = profileMode(profile);
       mode.disabled = pending;
       mode.title = busy
-        ? '运行中切换会立即应用到当前任务，无需重启'
-        : '为这个 Profile 选择快速、自动平衡或深度拟人';
+        ? t('profiles.speedLive')
+        : t('profiles.speedChoose');
       mode.addEventListener('change', () => void updateProfile(profile, { defaultBehavior: mode.value }));
       modeLabel.append(mode);
       const headlessLabel = element('label', 'switch-field');
@@ -714,23 +970,23 @@ function renderProfiles(force = false) {
       headless.checked = Boolean(profile.headless);
       headless.disabled = pending;
       headless.addEventListener('change', () => void updateProfile(profile, { headless: headless.checked }));
-      headlessLabel.append(headless, element('span', '', '任务后台运行'));
+      headlessLabel.append(headless, element('span', '', t('profiles.background')));
       settings.append(modeLabel, headlessLabel);
 
       const actions = element('div', 'profile-actions');
-      const rename = focusKey(button('改名', 'npc-btn-ghost compact-button', () => void renameProfile(profile)), `profile:${id}:rename`);
-      const toggleLabel = persistent ? (busy ? '关闭窗口' : '打开登录窗口') : '仅任务启动';
+      const rename = focusKey(button(t('profiles.rename'), 'npc-btn-ghost compact-button', () => void renameProfile(profile)), `profile:${id}:rename`);
+      const toggleLabel = persistent ? (busy ? t('profiles.closeWindow') : t('profiles.openWindow')) : t('profiles.taskOnly');
       const toggle = focusKey(button(toggleLabel, 'npc-btn-secondary compact-button', () => void setProfileOpen(profile, !busy)), `profile:${id}:toggle`);
       toggle.disabled = !persistent || pending || currentState === 'starting';
-      toggle.title = persistent ? '打开独立可见 Chrome 窗口进行人工登录或检查' : '临时 Profile 只在任务中启动';
-      const remove = focusKey(button(quarantinedEphemeral ? '清理残留' : '删除', 'npc-btn-danger compact-button', () => void deleteProfile(profile)), `profile:${id}:delete`);
+      toggle.title = persistent ? t('profiles.openTitle') : t('profiles.taskOnlyTitle');
+      const remove = focusKey(button(quarantinedEphemeral ? t('profiles.cleanupResidual') : t('common.delete'), 'npc-btn-danger compact-button', () => void deleteProfile(profile)), `profile:${id}:delete`);
       rename.disabled = pending;
       remove.disabled = (busy && !quarantinedEphemeral) || pending;
       remove.title = quarantinedEphemeral
-        ? '任务清理未确认；Manager 会再次确认 Worker 已退出且临时目录为空后再清理'
+        ? t('profiles.cleanupResidualTitle')
         : busy
-          ? 'Profile 空闲后才能删除'
-          : '删除这个 Profile';
+          ? t('profiles.deleteBusy')
+          : t('profiles.deleteTitle');
       actions.append(rename, toggle, remove);
       card.append(heading, facts, settings, actions);
       ui.profiles.append(card);
@@ -740,7 +996,7 @@ function renderProfiles(force = false) {
 }
 
 function filteredAssets() {
-  const query = ui.assetSearch.value.trim().toLocaleLowerCase('zh-CN');
+  const query = ui.assetSearch.value.trim().toLocaleLowerCase(state.language);
   const filter = ui.assetFilter.value;
   return state.assets.filter((asset) => {
     if (filter === 'discoverable' && !asset.discoverable) return false;
@@ -751,7 +1007,7 @@ function filteredAssets() {
     const haystack = [
       asset.name, asset.title, asset.description, asset.note, asset.version,
       ...(asset.taskTypes || []).flatMap((item) => [item.name, item.title])
-    ].filter(Boolean).join(' ').toLocaleLowerCase('zh-CN');
+    ].filter(Boolean).join(' ').toLocaleLowerCase(state.language);
     return haystack.includes(query);
   });
 }
@@ -763,8 +1019,8 @@ function syncAssetBulkControls(visible = filteredAssets()) {
   ui.assetSelectAll.checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
   ui.assetSelectAll.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
   ui.assetSelectionSummary.textContent = selected.length
-    ? `已选择 ${selected.length} 项 · 删除动作仍会由 Manager 重新检查任务与恢复状态`
-    : '尚未选择资产';
+    ? t('assets.selected', { count: selected.length })
+    : t('assets.noneSelected');
   ui.assetNote.disabled = !selected.length || selected.some((asset) => !asset.canEditNote);
   ui.assetDeprecate.disabled = !selected.length || selected.some((asset) => !asset.canChangeLifecycle || asset.lifecycle !== 'active');
   ui.assetRestore.disabled = !selected.length || selected.some((asset) => !asset.canChangeLifecycle || asset.lifecycle !== 'deprecated');
@@ -783,8 +1039,8 @@ function renderAssets(force = false) {
     ui.assets.replaceChildren();
     if (!visible.length) {
       ui.assets.append(element('p', 'empty-state', state.authenticated === false
-        ? '建立 Owner 会话后即可查看执行器资产。'
-        : '当前筛选没有匹配的执行器资产。'));
+        ? t('assets.authEmpty')
+        : t('assets.empty')));
       return;
     }
     for (const asset of visible) {
@@ -795,7 +1051,7 @@ function renderAssets(force = false) {
       const checkbox = focusKey(element('input'), `asset:${asset.id}:select`);
       checkbox.type = 'checkbox';
       checkbox.checked = state.selectedAssetIds.has(asset.id);
-      checkbox.setAttribute('aria-label', `选择 ${asset.title}`);
+      checkbox.setAttribute('aria-label', t('assets.selectAria', { title: asset.title }));
       checkbox.addEventListener('change', () => {
         if (checkbox.checked) state.selectedAssetIds.add(asset.id);
         else state.selectedAssetIds.delete(asset.id);
@@ -811,25 +1067,25 @@ function renderAssets(force = false) {
         element('h2', '', asset.title || asset.name)
       );
       const chips = element('div', 'asset-chips');
-      chips.append(element('span', `npc-chip ${asset.discoverable ? 'npc-chip-success' : ''}`, asset.discoverable ? 'Agent 可发现' : 'Agent 不可发现'));
-      chips.append(element('span', `npc-chip ${asset.lifecycle === 'deprecated' ? 'npc-chip-warning' : ''}`, ({ active: '使用中', deprecated: '已废弃', retired: '仅历史' })[asset.lifecycle] || asset.lifecycle));
-      if (asset.protected) chips.append(element('span', 'npc-chip', '系统保护'));
+      chips.append(element('span', `npc-chip ${asset.discoverable ? 'npc-chip-success' : ''}`, asset.discoverable ? t('assets.agentVisible') : t('assets.agentHidden')));
+      chips.append(element('span', `npc-chip ${asset.lifecycle === 'deprecated' ? 'npc-chip-warning' : ''}`, ({ active: t('assets.active'), deprecated: t('assets.deprecated'), retired: t('assets.retired') })[asset.lifecycle] || asset.lifecycle));
+      if (asset.protected) chips.append(element('span', 'npc-chip', t('assets.protected')));
       heading.append(selector, copy, chips);
 
-      const purpose = element('p', 'asset-purpose', asset.description || '未填写用途说明；建议通过资产备注补充给后续维护者。');
+      const purpose = element('p', 'asset-purpose', asset.description || t('assets.purposeMissing'));
       const facts = element('div', 'asset-facts');
       facts.append(
-        labelledValue('版本', asset.version || '—'),
-        labelledValue('任务类型', String(asset.taskTypes?.length || 0)),
-        labelledValue('运行次数', String(asset.usage?.runCount || 0)),
-        labelledValue('成功 / 失败', `${asset.usage?.successCount || 0} / ${asset.usage?.failureCount || 0}`),
-        labelledValue('最后使用', formatTime(asset.usage?.lastUsedAt, { relative: true })),
-        labelledValue('文件体积', `${asset.fileCount || 0} 个 · ${formatBytes(asset.sizeBytes)}`)
+        labelledValue(t('assets.version'), asset.version || '—'),
+        labelledValue(t('assets.taskTypes'), String(asset.taskTypes?.length || 0)),
+        labelledValue(t('assets.runs'), String(asset.usage?.runCount || 0)),
+        labelledValue(t('assets.successFailure'), `${asset.usage?.successCount || 0} / ${asset.usage?.failureCount || 0}`),
+        labelledValue(t('assets.lastUsed'), formatTime(asset.usage?.lastUsedAt, { relative: true })),
+        labelledValue(t('assets.size'), t('assets.fileCount', { count: asset.fileCount || 0, size: formatBytes(asset.sizeBytes) }))
       );
       const note = element('div', 'asset-note');
-      note.append(element('strong', '', '资产备注'), element('p', '', asset.note || '暂无备注'));
+      note.append(element('strong', '', t('assets.assetNote')), element('p', '', asset.note || t('assets.noNote')));
       const details = element('details', 'asset-task-types');
-      details.append(element('summary', '', `包含 ${asset.taskTypes?.length || 0} 个任务类型`));
+      details.append(element('summary', '', t('assets.containsTypes', { count: asset.taskTypes?.length || 0 })));
       const typeList = element('ul');
       for (const item of asset.taskTypes || []) {
         typeList.append(element('li', '', `${item.name}${item.title && item.title !== item.name ? ` · ${item.title}` : ''}`));
@@ -837,14 +1093,282 @@ function renderAssets(force = false) {
       details.append(typeList);
       card.append(heading, purpose, facts, note, details);
       if (!asset.deletable && asset.deleteBlockers?.length) {
-        card.append(element('p', 'asset-blocker', `不可删除：${asset.deleteBlockers.join('；')}`));
+        card.append(element('p', 'asset-blocker', t('assets.blocked', { reasons: asset.deleteBlockers.join(state.language === 'en' ? '; ' : '；') })));
       }
       ui.assets.append(card);
     }
   }, force);
-  ui.assetCountChip.textContent = `${visible.length} / ${state.assets.length} 项资产`;
+  ui.assetCountChip.textContent = t('assets.count', { visible: visible.length, total: state.assets.length });
   syncAssetBulkControls(visible);
   setInlineError(ui.assetsError, state.mutationErrors.assets || state.sectionErrors.assets || '');
+}
+
+function notificationUnread(notification) {
+  return notification?.read !== true && !notification?.readAt && !['read', 'resolved', 'dismissed'].includes(notification?.status);
+}
+
+function notificationActive(notification) {
+  if (notification?.state) return notification.state === 'active';
+  return !notification?.resolvedAt && !['resolved', 'dismissed'].includes(notification?.status);
+}
+
+function verificationNotification(notification) {
+  return ['human_verification', 'waiting_user', 'verification', 'user_handoff', 'challenge'].includes(notification?.kind || notification?.type || notification?.eventType);
+}
+
+function notificationTaskTitle(notification) {
+  const task = state.tasks.find((item) => item.id === notification.taskId);
+  if (verificationNotification(notification)) return task ? taskTitle(task) : notification.taskTitle || t('notifications.defaultTitle');
+  return notification.taskTitle || notification.title || (task ? taskTitle(task) : t('notifications.defaultTitle'));
+}
+
+function notificationMessage(notification) {
+  if (verificationNotification(notification)) return t('notifications.defaultMessage');
+  return notification.message || notification.summary || notification.body || t('notifications.defaultMessage');
+}
+
+function notificationReminderCount(notification) {
+  const value = Number(notification.reminderCount ?? notification.reminders ?? notification.deliveryCount ?? 0);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function renderNotifications(force = false) {
+  const ordered = [...state.notifications].sort((left, right) => {
+    const activeDifference = Number(notificationActive(right)) - Number(notificationActive(left));
+    if (activeDifference) return activeDifference;
+    return Date.parse(right.createdAt || right.updatedAt || 0) - Date.parse(left.createdAt || left.updatedAt || 0);
+  });
+  const unread = ordered.filter(notificationUnread).length;
+  ui.notificationBadge.textContent = unread > 99 ? '99+' : String(unread);
+  ui.notificationBadge.classList.toggle('hidden', unread === 0);
+  ui.notificationButton.classList.toggle('has-unread', unread > 0);
+  ui.notificationSummary.textContent = t('notifications.summary', { unread, total: ordered.length });
+  ui.notificationMarkAll.disabled = unread === 0 || state.pendingMutations.has('notification:all');
+  renderWhenChanged('notifications', {
+    language: state.language,
+    ordered,
+    pending: [...state.pendingMutations].filter((key) => key.startsWith('notification:'))
+  }, ui.notifications, () => {
+    ui.notifications.replaceChildren();
+    if (!ordered.length) {
+      ui.notifications.append(element('p', 'empty-state notification-empty', t('notifications.none')));
+      return;
+    }
+    for (const notification of ordered.slice(0, 30)) {
+      const isVerification = verificationNotification(notification);
+      const active = notificationActive(notification);
+      const card = element('article', `notification-card${isVerification ? ' is-verification' : ''}${notificationUnread(notification) ? ' is-unread' : ''}`);
+      card.dataset.notificationId = notification.id;
+      const heading = element('div', 'notification-card-heading');
+      const copy = element('div');
+      copy.append(
+        element('p', 'npc-eyebrow', isVerification ? t('notifications.verification') : t('notifications.notice')),
+        element('h3', '', notificationTaskTitle(notification))
+      );
+      const reminderCount = notificationReminderCount(notification);
+      heading.append(copy, reminderCount ? element('span', 'npc-chip npc-chip-warning', t('notifications.reminders', { count: reminderCount })) : element('span', 'npc-chip', formatTime(notification.createdAt || notification.updatedAt, { relative: true })));
+      card.append(heading, element('p', 'notification-message', notificationMessage(notification)));
+      const actions = element('div', 'notification-actions');
+      const pending = state.pendingMutations.has(`notification:${notification.id}`);
+      const claimed = notification.state === 'claimed' || Boolean(notification.claimedAt) || notification.claimed === true;
+      if (isVerification && (active || claimed)) {
+        if (active) {
+          const claim = button(t('notifications.takeOver'), 'npc-btn-secondary compact-button', () => void runNotificationAction(notification, 'claim'));
+          claim.disabled = pending;
+          actions.append(claim);
+        }
+        if (claimed) {
+          const focus = button(t('notifications.focus'), 'npc-btn-secondary compact-button', () => void runNotificationAction(notification, 'focus'));
+          focus.disabled = pending;
+          const continueTask = button(t('notifications.continue'), 'npc-btn-primary compact-button', () => void runNotificationAction(notification, 'continue'));
+          continueTask.disabled = pending;
+          actions.append(focus, continueTask);
+        }
+      }
+      if (notificationUnread(notification)) {
+        const read = button(t('notifications.read'), 'npc-btn-ghost compact-button', () => void runNotificationAction(notification, 'read'));
+        read.disabled = pending;
+        actions.append(read);
+      }
+      if (actions.childElementCount) card.append(actions);
+      ui.notifications.append(card);
+    }
+  }, force);
+  setInlineError(ui.notificationsError, state.mutationErrors.notifications || state.sectionErrors.notifications || '');
+}
+
+function normalizeNotificationSettings(payload) {
+  const value = dataFrom(payload)?.settings || dataFrom(payload) || {};
+  const channels = value.channels || value;
+  const normalize = (channel) => ({
+    enabled: channels?.[channel]?.enabled === true,
+    configured: channels?.[channel]?.configured === true,
+    maskedTarget: channels?.[channel]?.maskedTarget || channels?.[channel]?.maskedDestination || ''
+  });
+  return { channels: { system: normalize('system'), telegram: normalize('telegram'), feishu: normalize('feishu') } };
+}
+
+function channelStatus(channel, label) {
+  if (!channel) return t('settings.notConfigured');
+  if (!channel.configured) return t('settings.notConfigured');
+  const target = channel.maskedTarget ? `· ${channel.maskedTarget}` : '';
+  return channel === state.notificationSettings?.channels?.system
+    ? t('settings.systemReady')
+    : t('settings.configured', { target: target || label });
+}
+
+function renderNotificationSettings() {
+  const settings = state.notificationSettings;
+  if (!settings) return;
+  const { system, telegram, feishu } = settings.channels;
+  ui.notificationSystemEnabled.checked = system.enabled;
+  ui.notificationTelegramEnabled.checked = telegram.enabled;
+  ui.notificationFeishuEnabled.checked = feishu.enabled;
+  ui.notificationSystemStatus.textContent = channelStatus(system, '');
+  ui.notificationTelegramStatus.textContent = channelStatus(telegram, 'Telegram');
+  ui.notificationFeishuStatus.textContent = channelStatus(feishu, t('settings.feishu'));
+  for (const buttonNode of ui.notificationChannelTests) {
+    buttonNode.disabled = settings.channels[buttonNode.dataset.channel]?.configured !== true;
+  }
+  for (const buttonNode of ui.notificationChannelClears) {
+    buttonNode.disabled = settings.channels[buttonNode.dataset.channel]?.configured !== true;
+  }
+}
+
+function setNotificationDrawer(open, { focus = true } = {}) {
+  state.notificationDrawerOpen = Boolean(open);
+  ui.notificationDrawer.classList.toggle('hidden', !open);
+  ui.notificationBackdrop.classList.toggle('hidden', !open);
+  ui.notificationDrawer.setAttribute('aria-hidden', String(!open));
+  ui.notificationButton.setAttribute('aria-expanded', String(open));
+  document.body.classList.toggle('notification-open', Boolean(open));
+  if (focus) (open ? ui.notificationClose : ui.notificationButton).focus();
+}
+
+async function runNotificationAction(notification, action) {
+  const key = `notification:${notification.id}`;
+  if (state.pendingMutations.has(key)) return;
+  state.pendingMutations.add(key);
+  renderNotifications(true);
+  try {
+    const result = await request(`/v1/notifications/${encodeURIComponent(notification.id)}/actions`, { method: 'POST', body: { action } });
+    const messages = {
+      read: t('notifications.readDone'), claim: t('notifications.claimed'), focus: t('notifications.focused'), continue: t('notifications.continued')
+    };
+    setToast(
+      result?.notificationSync?.ok === false ? t('notifications.syncDegraded') : messages[action],
+      result?.notificationSync?.ok === false ? 'warning' : 'success'
+    );
+    if (action === 'focus') setNotificationDrawer(false);
+    await refreshNotifications();
+  } catch (error) {
+    if (error.status !== 401) {
+      state.mutationErrors.notifications = error.message || t('error.operation');
+      setToast(state.mutationErrors.notifications, 'error');
+    }
+  } finally {
+    state.pendingMutations.delete(key);
+    renderNotifications(true);
+  }
+}
+
+async function markAllNotificationsRead() {
+  const unread = state.notifications.filter(notificationUnread);
+  if (!unread.length || state.pendingMutations.has('notification:all')) return;
+  state.pendingMutations.add('notification:all');
+  renderNotifications(true);
+  try {
+    await request('/v1/notifications/actions', { method: 'POST', body: { action: 'read_all' } });
+    setToast(t('notifications.allRead'), 'success');
+    await refreshNotifications();
+  } catch (error) {
+    if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
+  } finally {
+    state.pendingMutations.delete('notification:all');
+    renderNotifications(true);
+  }
+}
+
+async function refreshNotifications({ settings = false } = {}) {
+  const requests = [request('/v1/notifications')];
+  if (settings || !state.notificationSettings) requests.push(request('/v1/notification-settings'));
+  const results = await Promise.allSettled(requests);
+  if (results[0].status === 'fulfilled') {
+    state.notifications = listFrom(results[0].value, 'notifications');
+    state.sectionErrors.notifications = '';
+  } else if (results[0].reason?.status !== 401) state.sectionErrors.notifications = results[0].reason?.message || t('error.read');
+  if (results[1]?.status === 'fulfilled') state.notificationSettings = normalizeNotificationSettings(results[1].value);
+  else if (results[1]?.reason?.status !== 401) state.sectionErrors.notifications = results[1]?.reason?.message || t('error.read');
+  renderNotifications(true);
+  renderNotificationSettings();
+}
+
+function pendingChannelSecrets(channel) {
+  if (channel === 'telegram') {
+    return {
+      ...(ui.notificationTelegramToken.value.trim() ? { botToken: ui.notificationTelegramToken.value.trim() } : {}),
+      ...(ui.notificationTelegramChat.value.trim() ? { chatId: ui.notificationTelegramChat.value.trim() } : {})
+    };
+  }
+  if (channel === 'feishu') return ui.notificationFeishuWebhook.value.trim() ? { webhookUrl: ui.notificationFeishuWebhook.value.trim() } : {};
+  return {};
+}
+
+async function saveNotificationSettings(event) {
+  event.preventDefault();
+  const body = { channels: {
+    system: { enabled: ui.notificationSystemEnabled.checked },
+    telegram: { enabled: ui.notificationTelegramEnabled.checked, ...pendingChannelSecrets('telegram') },
+    feishu: { enabled: ui.notificationFeishuEnabled.checked, ...pendingChannelSecrets('feishu') }
+  } };
+  try {
+    const result = await request('/v1/notification-settings', { method: 'PATCH', body });
+    state.notificationSettings = normalizeNotificationSettings(result);
+    ui.notificationTelegramToken.value = '';
+    ui.notificationTelegramChat.value = '';
+    ui.notificationFeishuWebhook.value = '';
+    renderNotificationSettings();
+    setToast(t('settings.saved'), 'success');
+  } catch (error) {
+    if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
+  }
+}
+
+async function testNotificationChannel(channel, buttonNode) {
+  if (buttonNode.disabled) return;
+  buttonNode.disabled = true;
+  try {
+    await request('/v1/notification-settings/test', { method: 'POST', body: { channel } });
+    setToast(t('settings.testSent', { channel: channel === 'feishu' ? t('settings.feishu') : channel === 'system' ? t('settings.system') : 'Telegram' }), 'success');
+  } catch (error) {
+    if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
+  } finally {
+    buttonNode.disabled = false;
+    renderNotificationSettings();
+  }
+}
+
+async function clearNotificationChannel(channel, buttonNode) {
+  const label = channel === 'feishu' ? t('settings.feishu') : 'Telegram';
+  if (!confirm(t('confirm.clearChannel', { channel: label }))) return;
+  buttonNode.disabled = true;
+  const channels = channel === 'telegram'
+    ? { telegram: { enabled: false, botToken: null, chatId: null } }
+    : { feishu: { enabled: false, webhookUrl: null } };
+  try {
+    const result = await request('/v1/notification-settings', { method: 'PATCH', body: { channels } });
+    state.notificationSettings = normalizeNotificationSettings(result);
+    ui.notificationTelegramToken.value = '';
+    ui.notificationTelegramChat.value = '';
+    ui.notificationFeishuWebhook.value = '';
+    renderNotificationSettings();
+    setToast(t('settings.cleared', { channel: label }), 'success');
+  } catch (error) {
+    if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
+  } finally {
+    buttonNode.disabled = false;
+    renderNotificationSettings();
+  }
 }
 
 function renderAll(force = false) {
@@ -852,6 +1376,8 @@ function renderAll(force = false) {
   renderTasks(force);
   renderProfiles(force);
   renderAssets(force);
+  renderNotifications(force);
+  renderNotificationSettings();
   if (activeFocusKey && restoreFocus(activeFocusKey)) state.pendingFocusKey = '';
   focusInitialTask();
 }
@@ -861,6 +1387,8 @@ function applyRefreshResult(key, result, receivedAt) {
     state.sectionErrors[key] = '';
     if (key === 'profiles') state.profiles = listFrom(result.value, 'profiles');
     if (key === 'assets') state.assets = listFrom(result.value, 'assets');
+    if (key === 'notifications') state.notifications = listFrom(result.value, 'notifications');
+    if (key === 'notificationSettings') state.notificationSettings = normalizeNotificationSettings(result.value);
     if (key === 'tasks') {
       state.tasks = listFrom(result.value, 'tasks');
       state.taskReceivedAt = new Map(state.tasks.map((task) => [task.id, receivedAt]));
@@ -868,7 +1396,7 @@ function applyRefreshResult(key, result, receivedAt) {
     return true;
   }
   const error = result.reason;
-  if (error?.status !== 401) state.sectionErrors[key] = error?.message || '读取失败';
+  if (error?.status !== 401) state.sectionErrors[key] = error?.message || t('error.read');
   return false;
 }
 
@@ -884,18 +1412,23 @@ async function refreshAll({ force = false } = {}) {
     const results = await Promise.allSettled([
       request('/v1/profiles'),
       request('/v1/tasks'),
-      request('/v1/task-assets')
+      request('/v1/task-assets'),
+      request('/v1/notifications'),
+      force || !state.notificationSettings ? request('/v1/notification-settings') : Promise.resolve(state.notificationSettings)
     ]);
     if (sequence !== state.refreshSequence) return;
     const receivedAt = Date.now();
-    const keys = ['profiles', 'tasks', 'assets'];
-    const successCount = results.reduce((count, result, index) => count + Number(applyRefreshResult(keys[index], result, receivedAt)), 0);
+    const keys = ['profiles', 'tasks', 'assets', 'notifications', 'notificationSettings'];
+    const successCount = results.reduce((count, result, index) => count + Number(applyRefreshResult(keys[index], result, receivedAt) && index < 4), 0);
     const unauthorized = results.some((result) => result.status === 'rejected' && result.reason?.status === 401);
-    const connectivityFailure = results.every((result) => result.status === 'rejected' && (result.reason?.status === 0 || result.reason?.status >= 500));
+    const connectivityFailure = results.slice(0, 4).every((result) => result.status === 'rejected' && (result.reason?.status === 0 || result.reason?.status >= 500));
     if (unauthorized) markAuthorizationRequired();
     else if (successCount > 0) markConnected();
     else if (connectivityFailure) markStale();
-    if (successCount > 0) ui.lastRefresh.textContent = `刷新于 ${formatTime(receivedAt)}`;
+    if (successCount > 0) {
+      state.lastRefreshAt = receivedAt;
+      ui.lastRefresh.textContent = t('connection.refreshed', { time: formatTime(receivedAt) });
+    }
     renderAll(force);
   })();
   try {
@@ -954,7 +1487,7 @@ function focusInitialTask() {
     card.focus();
     card.scrollIntoView({ block: 'center' });
   } else {
-    setToast('指定的任务记录不存在或已删除', 'error');
+    setToast(t('tasks.targetMissing'), 'error');
     const url = new URL(location.href);
     url.searchParams.delete('task');
     history.replaceState(null, '', `${url.pathname}${url.search}`);
@@ -974,8 +1507,8 @@ function syncCreatePolicy() {
   ui.profileMode.value = persistent ? 'human' : 'auto';
   ui.profileEngine.disabled = persistent;
   ui.profileMode.disabled = false;
-  ui.profileEngine.title = persistent ? '持久 Profile 固定使用本机稳定版 Chrome' : '临时 Profile 使用项目锁定 Chromium';
-  ui.profileMode.title = persistent ? '默认深度拟人，可创建后随时切换' : '默认自动平衡，可创建后随时切换';
+  ui.profileEngine.title = persistent ? t('profiles.chrome') : t('profiles.chromium');
+  ui.profileMode.title = persistent ? t('behavior.human') : t('behavior.autoBalanced');
 }
 
 function mutationSection(key) {
@@ -1000,14 +1533,14 @@ async function runMutation(key, operation, successMessage, { focusAfter = '' } =
     return result;
   } catch (error) {
     const section = mutationSection(key);
-    let message = error.message || '操作失败';
-    if (error.status === 403) message = `没有权限执行这项操作：${message}`;
+    let message = error.message || t('error.operation');
+    if (error.status === 403) message = t('error.denied', { message });
     if (error.status === 409) {
       message = error.code === 'PROFILE_NAME_EXISTS'
-        ? 'Profile 名称已存在，请换一个名称。'
+        ? t('error.profileName')
         : error.code === 'TASK_REVISION_CONFLICT'
-          ? '状态已变化，已刷新最新状态。请确认后重试。'
-          : `${message} 已刷新最新状态。`;
+          ? t('error.revision')
+          : t('error.refreshed', { message });
     }
     if (error.status !== 401) {
       if (section) state.mutationErrors[section] = message;
@@ -1038,7 +1571,7 @@ async function createProfile(event) {
       defaultBehavior: ui.profileMode.value,
       headless: ui.profileHeadless.checked
     }
-  }), 'Profile 已创建');
+  }), t('toast.profileCreated'));
   if (result) {
     ui.createProfileForm.reset();
     syncCreatePolicy();
@@ -1050,12 +1583,12 @@ async function updateProfile(profile, patch) {
   await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
     method: 'PATCH', body: patch
   }), Object.hasOwn(patch, 'defaultBehavior')
-    ? '操作速度已生效，运行中的任务无需重启'
-    : 'Profile 设置已保存');
+    ? t('toast.speedApplied')
+    : t('toast.profileSaved'));
 }
 
 async function renameProfile(profile) {
-  const value = prompt('新的 Profile 名称', profile.name || '')?.trim();
+  const value = prompt(t('prompt.renameProfile'), profile.name || '')?.trim();
   if (value && value !== profile.name) await updateProfile(profile, { name: value });
 }
 
@@ -1063,30 +1596,30 @@ async function setProfileOpen(profile, shouldOpen) {
   const action = shouldOpen ? 'open' : 'close';
   await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}/${action}`, {
     method: 'POST'
-  }), shouldOpen ? '正在打开独立登录窗口' : 'Profile 窗口已关闭');
+  }), shouldOpen ? t('toast.profileOpening') : t('toast.profileClosed'));
 }
 
 async function deleteProfile(profile) {
   const quarantinedEphemeral = profile.kind === 'ephemeral' && profileState(profile) === 'error' && profile.cleanupRequired === true;
-  const description = profile.kind === 'ephemeral' ? '临时任务设置' : '持久浏览器数据';
+  const description = profile.kind === 'ephemeral' ? t('confirm.ephemeralData') : t('confirm.persistentData');
   const question = quarantinedEphemeral
-    ? `确定清理异常临时 Profile“${profile.name || profile.id}”？Manager 只会在 Worker 已退出且目录为空时执行。`
-    : `确定删除 Profile“${profile.name || profile.id}”及其${description}？此操作无法撤销。`;
+    ? t('confirm.cleanupProfile', { name: profile.name || profile.id })
+    : t('confirm.deleteProfile', { name: profile.name || profile.id, description });
   if (!confirm(question)) return;
   await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
     method: 'DELETE'
-  }), quarantinedEphemeral ? '残留临时 Profile 已清理' : 'Profile 已删除', { focusAfter: 'profiles-title' });
+  }), quarantinedEphemeral ? t('toast.profileResidualCleaned') : t('toast.profileDeleted'), { focusAfter: 'profiles-title' });
 }
 
 async function sendTaskAction(task, action) {
   if (state.pendingMutations.has(`task:${task.id}`)) return;
-  if (action === 'cancel' && !confirm(`确定取消任务“${taskTitle(task)}”？Manager 会先关闭任务窗口并释放 Profile。`)) return;
+  if (action === 'cancel' && !confirm(t('confirm.cancelTask', { title: taskTitle(task) }))) return;
   if (!Number.isSafeInteger(task.revision) || task.revision < 1) {
-    setToast('任务版本尚未就绪，正在刷新最新状态', 'error');
+    setToast(t('toast.taskNotReady'), 'error');
     await refreshAll({ force: true });
     return;
   }
-  const labels = { pause: '暂停请求已发送', resume: '恢复请求已发送', cancel: '取消请求已发送' };
+  const labels = { pause: t('toast.pauseSent'), resume: t('toast.resumeSent'), cancel: t('toast.cancelSent') };
   await runMutation(`task:${task.id}`, () => request(`/v1/tasks/${encodeURIComponent(task.id)}/actions`, {
     method: 'POST',
     body: { action, commandId: commandId(), expectedRevision: task.revision }
@@ -1095,9 +1628,9 @@ async function sendTaskAction(task, action) {
 
 async function deleteTaskRecord(task) {
   if (state.pendingMutations.has(`task:${task.id}`)) return;
-  if (!confirm(`确定删除任务记录“${taskTitle(task)}”？它会从面板消失且无法恢复，已生成的数据文件不会被删除。`)) return;
+  if (!confirm(t('confirm.deleteTask', { title: taskTitle(task) }))) return;
   if (!Number.isSafeInteger(task.revision) || task.revision < 1) {
-    setToast('任务版本尚未就绪，正在刷新最新状态', 'error');
+    setToast(t('toast.taskNotReady'), 'error');
     await refreshAll({ force: true });
     return;
   }
@@ -1108,7 +1641,7 @@ async function deleteTaskRecord(task) {
   await runMutation(`task:${task.id}`, () => request(`/v1/tasks/${encodeURIComponent(task.id)}`, {
     method: 'DELETE',
     body: { commandId: commandId(), expectedRevision: task.revision }
-  }), '任务记录已删除', { focusAfter });
+  }), t('toast.taskDeleted'), { focusAfter });
 }
 
 async function runAssetAction(action) {
@@ -1118,20 +1651,20 @@ async function runAssetAction(action) {
   let note;
   if (action === 'note') {
     const existing = selected.length === 1 ? selected[0].note || '' : '';
-    const value = prompt('填写资产备注（留空可清除备注）', existing);
+    const value = prompt(t('prompt.assetNote'), existing);
     if (value === null) return;
     note = value;
   }
   if (action === 'delete') {
     const names = selected.slice(0, 5).map((asset) => `“${asset.title}”`).join('、');
-    const suffix = selected.length > 5 ? `等 ${selected.length} 项` : '';
-    if (!confirm(`确定删除 ${names}${suffix}？Manager 会再次校验任务引用；删除后的执行器文件无法恢复。`)) return;
+    const suffix = selected.length > 5 ? t('confirm.assetSuffix', { count: selected.length }) : '';
+    if (!confirm(t('confirm.deleteAssets', { names, suffix }))) return;
   }
   const labels = {
-    note: '资产备注已保存',
-    deprecate: '所选资产已废弃，Agent 不再发现它们',
-    restore: '所选资产已恢复为可发现',
-    delete: '所选执行器资产已安全删除'
+    note: t('toast.noteSaved'),
+    deprecate: t('toast.assetsDeprecated'),
+    restore: t('toast.assetsRestored'),
+    delete: t('toast.assetsDeleted')
   };
   const result = await runMutation('asset:batch', () => request('/v1/task-assets/actions', {
     method: 'POST',
@@ -1144,17 +1677,29 @@ async function runAssetAction(action) {
 }
 
 async function logout() {
-  if (!confirm('退出这台浏览器的 Owner 会话？后台任务不会停止。')) return;
+  if (!confirm(t('confirm.logout'))) return;
   try {
     await request('/v1/dashboard/logout', { method: 'POST' });
     markAuthorizationRequired();
-    setToast('已退出；后台任务仍在继续', 'success');
+    setToast(t('toast.loggedOut'), 'success');
   } catch (error) {
-    if (error.status !== 401) setToast(error.message || '退出失败', 'error');
+    if (error.status !== 401) setToast(error.message || t('toast.logoutFailed'), 'error');
   }
 }
 
 for (const link of ui.navLinks) link.addEventListener('click', () => setView(link.dataset.view));
+ui.languageToggle.addEventListener('click', () => setLanguage(state.language === 'zh-CN' ? 'en' : 'zh-CN'));
+ui.notificationButton.addEventListener('click', () => setNotificationDrawer(!state.notificationDrawerOpen));
+ui.notificationClose.addEventListener('click', () => setNotificationDrawer(false));
+ui.notificationBackdrop.addEventListener('click', () => setNotificationDrawer(false));
+ui.notificationMarkAll.addEventListener('click', () => void markAllNotificationsRead());
+ui.notificationSettingsForm.addEventListener('submit', saveNotificationSettings);
+for (const testButton of ui.notificationChannelTests) {
+  testButton.addEventListener('click', () => void testNotificationChannel(testButton.dataset.channel, testButton));
+}
+for (const clearButton of ui.notificationChannelClears) {
+  clearButton.addEventListener('click', () => void clearNotificationChannel(clearButton.dataset.channel, clearButton));
+}
 ui.refreshAll.addEventListener('click', () => void refreshAll({ force: true }));
 ui.retryAuth.addEventListener('click', () => void refreshAll({ force: true }));
 ui.retryStale.addEventListener('click', () => void refreshAll({ force: true }));
@@ -1180,6 +1725,9 @@ document.addEventListener('visibilitychange', () => {
   scheduleRefresh();
   scheduleDurationTick();
 });
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && state.notificationDrawerOpen) setNotificationDrawer(false);
+});
 window.addEventListener('popstate', () => {
   const url = new URL(location.href);
   setView(url.searchParams.get('view') || 'tasks', { updateHistory: false, focus: false });
@@ -1198,11 +1746,12 @@ window.addEventListener('pageshow', () => {
 });
 
 const initialUrl = new URL(location.href);
+applyStaticLanguage();
 setView(initialUrl.searchParams.get('view') || 'tasks', { updateHistory: false, focus: false });
 syncCreatePolicy();
 void bootstrapOwnerSession()
   .catch((error) => {
-    if (error.status !== 401) setToast(error.message || '无法建立 Owner 会话', 'error');
+    if (error.status !== 401) setToast(error.message || t('toast.ownerFailed'), 'error');
   })
   .then(() => refreshAll({ force: true }))
   .finally(() => {

@@ -37,6 +37,7 @@ test('a short-lived inspector accepts a valid task module and bounded metadata',
     '  description: "A valid inspector fixture",',
     '  version: "1.2.3",',
     '  readOnly: true,',
+    '  externalCost: { currency: "USD", maxAmountPerRun: 12.5 },',
     '  inputSchema: { type: "object", additionalProperties: false, properties: { url: { type: "string", minLength: 8 } } }',
     '};',
     'export async function run() { return { summary: "ok", evidence: [] }; }',
@@ -48,8 +49,25 @@ test('a short-lived inspector accepts a valid task module and bounded metadata',
   assert.equal(installed.title, 'Readable task');
   assert.equal(installed.version, '1.2.3');
   assert.equal(installed.readOnly, true);
+  assert.deepEqual(installed.externalCost, { currency: 'USD', maxAmountPerRun: 12.5 });
   assert.equal(installed.inputSchema.properties.url.minLength, 8);
   assert.match(installed.sha256, /^[a-f0-9]{64}$/);
+});
+
+test('paid task metadata fails closed on malformed currency, ceiling, or extra fields', async (t) => {
+  const { allowed, registry } = await fixture(t);
+  for (const [name, externalCost] of [
+    ['lowercase-currency', '{ currency: "usd", maxAmountPerRun: 1 }'],
+    ['zero-ceiling', '{ currency: "USD", maxAmountPerRun: 0 }'],
+    ['extra-field', '{ currency: "USD", maxAmountPerRun: 1, providerToken: "no" }']
+  ]) {
+    const modulePath = await writeModule(allowed, `${name}.mjs`, [
+      `export const meta = { externalCost: ${externalCost} };`,
+      'export async function run() { return { summary: "unused", evidence: [] }; }',
+      ''
+    ].join('\n'));
+    await assert.rejects(registry.install({ name, modulePath }), { code: 'INVALID_TASK_METADATA' });
+  }
 });
 
 test('task modules cannot override Profile-owned behavior policy', async (t) => {
@@ -340,4 +358,32 @@ test('system seed assets are protected and omitted from ordinary Agent discovery
   await assert.rejects(registry.removeMany(['acceptance-system']), { code: 'TASK_ASSET_PROTECTED' });
   await assert.rejects(registry.setLifecycleMany(['acceptance-system'], 'deprecated'), { code: 'TASK_ASSET_PROTECTED' });
   assert.equal((await registry.resolve('acceptance-system')).name, 'acceptance-system');
+});
+
+test('an explicitly discoverable protected system seed can be found by probe and scale terms', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-discoverable-system-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const allowed = path.join(root, 'allowed');
+  await mkdir(allowed);
+  const modulePath = await writeModule(allowed, 'surface-probe.mjs', [
+    'export const meta = {',
+    '  title: "Surface probe", intents: ["preflight", "scale"], tags: ["probe", "surface"]',
+    '};',
+    'export async function run() { return { summary: "ok", evidence: [{ kind: "message", value: "ok" }] }; }',
+    ''
+  ].join('\n'));
+  const registry = new TaskTypeRegistry({
+    filePath: path.join(root, 'types.json'),
+    snapshotRoot: path.join(root, 'snapshots'),
+    allowedRoots: [allowed],
+    seedTypes: [{ name: 'surface-probe', modulePath, discoverable: true }]
+  });
+
+  const [summary] = await registry.listSummaries();
+  assert.equal(summary.name, 'surface-probe');
+  assert.deepEqual(summary.intents, ['preflight', 'scale']);
+  const [asset] = await registry.listManagement();
+  assert.equal(asset.protected, true);
+  assert.equal(asset.discoverable, true);
+  await assert.rejects(registry.removeMany(['surface-probe']), { code: 'TASK_ASSET_PROTECTED' });
 });

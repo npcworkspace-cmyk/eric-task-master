@@ -184,7 +184,10 @@ export function createSemanticObserver({ page, action, locatorTransform = (locat
     let frameErrors = 0;
     let remainingNodes = maxNodes;
     let remainingTextChars = maxTextChars;
-    const frames = page.frames().slice(0, MAX_FRAMES);
+    const allFrames = page.frames();
+    const frames = allFrames.slice(0, MAX_FRAMES);
+    let framesInspected = 0;
+    let truncatedFrames = 0;
     for (const [frameIndex, frame] of frames.entries()) {
       if (remainingNodes <= 0 && remainingTextChars <= 0) {
         truncated = true;
@@ -192,15 +195,18 @@ export function createSemanticObserver({ page, action, locatorTransform = (locat
       }
       let inspected;
       try {
+        const remainingFrames = frames.length - frameIndex;
         inspected = await inspectFrame(frame, {
           scope,
-          maxNodes: remainingNodes,
-          maxTextChars: remainingTextChars
+          maxNodes: remainingNodes > 0 ? Math.max(1, Math.floor(remainingNodes / remainingFrames)) : 0,
+          maxTextChars: remainingTextChars > 0 ? Math.max(1, Math.floor(remainingTextChars / remainingFrames)) : 0
         });
       } catch {
         frameErrors += 1;
         continue;
       }
+      framesInspected += 1;
+      if (inspected.truncated) truncatedFrames += 1;
       remainingNodes = Math.max(0, remainingNodes - inspected.nodes.length);
       remainingTextChars = Math.max(
         0,
@@ -247,7 +253,11 @@ export function createSemanticObserver({ page, action, locatorTransform = (locat
       content,
       refs: publicRefs,
       truncated,
-      frameErrors
+      frameErrors,
+      framesTotal: allFrames.length,
+      framesInspected,
+      truncatedFrames,
+      framesOmitted: Math.max(0, allFrames.length - frames.length)
     });
   }
 

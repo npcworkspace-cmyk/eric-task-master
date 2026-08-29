@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 const DEFAULT_WAIT_MS = 10 * 60_000;
 const MAX_WAIT_MS = 60 * 60_000;
+const HANDOFF_KINDS = new Set(['instruction', 'human_verification']);
 
 export class UserHandoffError extends Error {
   constructor(code, message) {
@@ -35,7 +36,7 @@ export function createUserHandoff({
     if (!pending) return false;
     const current = pending;
     pending = null;
-    clearTimeout(current.timer);
+    if (current.timer !== null) clearTimeout(current.timer);
     signal?.removeEventListener('abort', current.onAbort);
     current.reject(error);
     return true;
@@ -48,12 +49,19 @@ export function createUserHandoff({
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new UserHandoffError('INVALID_USER_HANDOFF', 'User handoff request must be an object');
     }
-    const unknown = Object.keys(input).filter((key) => !['reason', 'instructions', 'timeoutMs'].includes(key));
+    const unknown = Object.keys(input).filter((key) => !['kind', 'reason', 'instructions', 'timeoutMs'].includes(key));
     if (unknown.length) {
       throw new UserHandoffError('INVALID_USER_HANDOFF', `Unsupported handoff fields: ${unknown.join(', ')}`);
     }
     const reason = boundedText(input.reason, 'reason', 500, { required: true });
     const instructions = boundedText(input.instructions, 'instructions', 2_000);
+    const kind = input.kind === undefined ? 'instruction' : input.kind;
+    if (typeof kind !== 'string' || !HANDOFF_KINDS.has(kind)) {
+      throw new UserHandoffError(
+        'INVALID_USER_HANDOFF',
+        'kind must be instruction or human_verification'
+      );
+    }
     const timeoutMs = input.timeoutMs === undefined ? DEFAULT_WAIT_MS : Number(input.timeoutMs);
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > MAX_WAIT_MS) {
       throw new UserHandoffError('INVALID_USER_HANDOFF', 'timeoutMs must be an integer from 1000 to 3600000');
@@ -62,17 +70,18 @@ export function createUserHandoff({
 
     const requestId = `handoff_${randomUUID().replaceAll('-', '')}`;
     const requestedAt = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
+    const expiresAt = kind === 'human_verification' ? null : new Date(Date.now() + timeoutMs).toISOString();
     const diagnostics = await capture('waiting-user');
     const screenshotAvailable = typeof diagnostics === 'string'
       ? Boolean(diagnostics)
       : diagnostics === true || Boolean(diagnostics?.screenshotPath);
     const requestRecord = {
       id: requestId,
+      kind,
       reason,
       ...(instructions ? { instructions } : {}),
       requestedAt,
-      expiresAt,
+      ...(expiresAt ? { expiresAt } : {}),
       ...(screenshotAvailable ? { screenshotAvailable: true } : {})
     };
     let resolveWait;
@@ -87,11 +96,13 @@ export function createUserHandoff({
     const onAbort = () => failPending(
       signal.reason || new UserHandoffError('TASK_CANCELLED', 'Task was cancelled')
     );
-    const timer = setTimeout(() => failPending(new UserHandoffError(
-      'TASK_USER_HANDOFF_TIMEOUT',
-      'Task did not receive a new instruction before the handoff deadline'
-    )), timeoutMs);
-    timer.unref?.();
+    const timer = kind === 'human_verification'
+      ? null
+      : setTimeout(() => failPending(new UserHandoffError(
+          'TASK_USER_HANDOFF_TIMEOUT',
+          'Task did not receive a new instruction before the handoff deadline'
+        )), timeoutMs);
+    timer?.unref?.();
     pending = { requestRecord, resolve: resolveWait, reject: rejectWait, timer, onAbort };
     signal?.addEventListener('abort', onAbort, { once: true });
     waitPromise.catch(() => {});
@@ -119,7 +130,7 @@ export function createUserHandoff({
     const normalizedNote = boundedText(note, 'note', 2_000);
     const current = pending;
     pending = null;
-    clearTimeout(current.timer);
+    if (current.timer !== null) clearTimeout(current.timer);
     signal?.removeEventListener('abort', current.onAbort);
     await onState('recovering');
     await onProgress('New instruction received; verifying live page state');

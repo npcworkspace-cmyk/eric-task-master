@@ -10,6 +10,7 @@ import {
   publicProfile,
   publicStatus,
   publicTask,
+  publicTaskPack,
   publicTaskType
 } from './public-view.mjs';
 import { assertSafeTaskInput, assertTaskMasterClient } from './taskmaster-client.mjs';
@@ -105,6 +106,23 @@ const AgentSchema = z.strictObject({
   name: z.string()
 });
 
+const ExternalCostDeclarationSchema = z.strictObject({
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  maxAmountPerRun: z.number().positive().finite()
+});
+
+const ExternalCostBudgetSchema = z.strictObject({
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  maxAmount: z.number().positive().finite()
+});
+
+const ExternalCostUsageSchema = z.strictObject({
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  estimatedTotal: z.number().nonnegative().finite(),
+  actualTotal: z.number().nonnegative().finite(),
+  remainingAmount: z.number().nonnegative().finite()
+});
+
 const TaskCommandSchema = z.strictObject({
   commandId: IdentifierSchema,
   kind: z.enum(['ask', 'modify', 'pause', 'resume_pause', 'terminate', 'revise_input']),
@@ -142,6 +160,7 @@ const TaskSchema = z.strictObject({
   agent: AgentSchema.optional(),
   behavior: z.string().optional(),
   interactionContract: z.literal('full-human-v1').optional(),
+  externalCostUsage: ExternalCostUsageSchema.optional(),
   attempt: z.number().int().optional(),
   history: z.array(AttemptHistorySchema).optional(),
   state: z.string().optional(),
@@ -196,11 +215,13 @@ const TaskSchema = z.strictObject({
   observation: ObservationSchema.optional(),
   userRequest: z.strictObject({
     id: z.string(),
+    kind: z.enum(['instruction', 'human_verification']).optional(),
     reason: z.string().optional(),
     instructions: z.string().optional(),
     requestedAt: z.string().optional(),
     expiresAt: z.string().optional(),
     status: z.string().optional(),
+    claimedAt: z.string().optional(),
     screenshotAvailable: z.boolean().optional()
   }).optional(),
   checkpoint: z.strictObject({ available: z.literal(true), savedAt: z.string().optional() }).optional(),
@@ -226,12 +247,51 @@ const TaskTypeSchema = z.strictObject({
   lifecycle: z.enum(['active', 'deprecated']).optional(),
   deprecatedAt: z.string().optional(),
   replacedBy: z.string().optional(),
-  pack: z.strictObject({ name: z.string(), version: z.string() }).optional(),
+  externalCost: ExternalCostDeclarationSchema.optional(),
+  pack: z.strictObject({
+    name: z.string(),
+    version: z.string(),
+    title: z.string().optional(),
+    description: z.string().optional(),
+    lifecycle: z.enum(['active', 'deprecated']).optional(),
+    discoverable: z.boolean().optional(),
+    protected: z.boolean().optional(),
+    transient: z.boolean().optional()
+  }).optional(),
   interactionContract: z.literal('full-human-v1').optional(),
   supportsResume: z.boolean().optional(),
   inputSchema: z.record(z.string(), z.json()).optional()
 });
 const TaskTypeSummarySchema = TaskTypeSchema.omit({ inputSchema: true });
+
+const TaskPackSchema = z.strictObject({
+  id: z.string().max(240),
+  name: z.string().max(80),
+  version: z.string().max(64),
+  title: z.string().max(120),
+  description: z.string().max(2_000).optional(),
+  lifecycle: z.enum(['active', 'deprecated']),
+  discoverable: z.boolean(),
+  protected: z.boolean(),
+  transient: z.boolean(),
+  fileCount: z.number().int().nonnegative(),
+  sizeBytes: z.number().int().nonnegative(),
+  installedAt: z.string().optional(),
+  deprecatedAt: z.string().optional(),
+  usage: z.strictObject({
+    runCount: z.number().int().nonnegative(),
+    activeCount: z.number().int().nonnegative(),
+    lastUsedAt: z.string().optional()
+  }),
+  taskTypes: z.array(z.strictObject({
+    name: z.string().max(80),
+    title: z.string().max(120).optional(),
+    lifecycle: z.string().max(16).optional(),
+    discoverable: z.boolean().optional()
+  })).max(64),
+  deletable: z.boolean(),
+  deleteBlockerCodes: z.array(z.string().max(64)).max(8)
+});
 
 const ArtifactSchema = z.strictObject({
   id: z.string(),
@@ -259,6 +319,12 @@ const LOCAL_WRITE = Object.freeze({
   readOnlyHint: false,
   destructiveHint: false,
   idempotentHint: false,
+  openWorldHint: false
+});
+const LOCAL_IDEMPOTENT_WRITE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
   openWorldHint: false
 });
 const LOCAL_DESTRUCTIVE = Object.freeze({
@@ -524,6 +590,39 @@ export function createMcpServer({ client, version = VERSION } = {}) {
   });
 
   register(server, taskMaster, {
+    name: 'taskmaster_task_packs_list',
+    title: 'List installed Task Packs',
+    description: 'Read compact Task Pack lifecycle, usage, and deletion-blocker status. This tool never mutates or exposes task-instance names.',
+    inputSchema: z.strictObject({
+      cursor: z.string().min(1).max(256).optional(),
+      limit: z.number().int().min(1).max(100).optional()
+    }),
+    outputSchema: z.strictObject({
+      taskPacks: z.array(TaskPackSchema),
+      truncated: z.boolean(),
+      nextCursor: z.string().optional()
+    }),
+    annotations: READ_ONLY,
+    handler: async ({ cursor, limit = 100 }, _ctx, api) => {
+      const taskPacks = (await api.listTaskPacks())
+        .map(publicTaskPack)
+        .map((item) => requireId(item, 'Task Pack'))
+        .sort((left, right) => left.id.localeCompare(right.id));
+      const start = cursor === undefined
+        ? 0
+        : taskPacks.findIndex((item) => item.id.localeCompare(cursor) > 0);
+      const normalizedStart = start < 0 ? taskPacks.length : start;
+      const page = taskPacks.slice(normalizedStart, normalizedStart + limit);
+      const truncated = normalizedStart + page.length < taskPacks.length;
+      return success({
+        taskPacks: page,
+        truncated,
+        ...(truncated && page.length ? { nextCursor: page.at(-1).id } : {})
+      });
+    }
+  });
+
+  register(server, taskMaster, {
     name: 'taskmaster_task_types_describe',
     title: 'Describe registered task type',
     description: 'Read the full input contract only after selecting one compact task summary.',
@@ -576,6 +675,7 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       taskLabel: z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/u).optional(),
       input: JsonObjectSchema.default({}),
       timeoutMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).optional(),
+      externalCostBudget: ExternalCostBudgetSchema.optional(),
       idempotencyKey: IdempotencyKeySchema
     }),
     outputSchema: z.strictObject({ taskId: IdentifierSchema, dashboardUrl: z.string().url(), task: TaskSchema }),
@@ -713,6 +813,25 @@ export function createMcpServer({ client, version = VERSION } = {}) {
     handler: async (args, _ctx, api) => {
       const result = await api.publishTaskReport(args);
       return success({ task: requireId(publicTask(result.task), 'task') });
+    }
+  });
+
+  register(server, taskMaster, {
+    name: 'taskmaster_tasks_focus',
+    title: 'Focus a task browser page',
+    description: 'Bring the live browser page for one task to the foreground, for example before a human-verification handoff. Fails clearly when no live page exists.',
+    inputSchema: z.strictObject({ taskId: IdentifierSchema }),
+    outputSchema: z.strictObject({ task: TaskSchema, focusedAt: z.string() }),
+    annotations: LOCAL_IDEMPOTENT_WRITE,
+    handler: async ({ taskId }, _ctx, api) => {
+      const result = await api.focusTask(taskId);
+      if (typeof result?.focusedAt !== 'string' || !result.focusedAt) {
+        throw new TaskMasterClientError('INVALID_MANAGER_RESPONSE', 'Task Master did not confirm when browser focus was applied.');
+      }
+      return success({
+        task: requireId(publicTask(result.task, { includeResult: false }), 'task'),
+        focusedAt: result.focusedAt
+      });
     }
   });
 

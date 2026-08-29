@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const POLL_MS = 50;
 const INCOMPLETE_LOCK_GRACE_MS = 5_000;
+const WINDOWS_LOCK_CONTENTION_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -58,11 +59,11 @@ async function readLockFile(filePath) {
   return { metadata: after, identity: identity(after), source };
 }
 
-async function writeOwnerFile(filePath, owner) {
+async function writeOwnerFile(filePath, owner, { openFile = open, platform = process.platform } = {}) {
   let handle;
   let created = false;
   try {
-    handle = await open(filePath, 'wx', 0o600);
+    handle = await openFile(filePath, 'wx', 0o600);
     created = true;
     await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
     await handle.sync();
@@ -72,6 +73,11 @@ async function writeOwnerFile(filePath, owner) {
     await handle?.close().catch(() => {});
     if (created) await rm(filePath, { force: true }).catch(() => {});
     if (error?.code === 'EEXIST' && !created) return false;
+    // Windows can report a sharing collision as EPERM/EACCES/EBUSY instead of
+    // EEXIST while another process owns or releases the lock. Treat that as
+    // contention only: the acquire loop still verifies ownership and remains
+    // bounded by its deadline, so this never grants the lock optimistically.
+    if (platform === 'win32' && !created && WINDOWS_LOCK_CONTENTION_CODES.has(error?.code)) return false;
     throw error;
   }
 }
@@ -81,9 +87,16 @@ export class RegistrationLock {
   #recoveryPath;
   #timeoutMs;
   #removeFile;
+  #openFile;
+  #platform;
   #nonce = null;
 
-  constructor(filePath, { timeoutMs = DEFAULT_TIMEOUT_MS, removeFile = rm } = {}) {
+  constructor(filePath, {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    removeFile = rm,
+    openFile = open,
+    platform = process.platform
+  } = {}) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 5 * 60_000) {
       throw new TypeError('registration lock timeout must be from 0 to 300000 milliseconds');
     }
@@ -91,6 +104,8 @@ export class RegistrationLock {
     this.#recoveryPath = `${filePath}.recovery`;
     this.#timeoutMs = timeoutMs;
     this.#removeFile = removeFile;
+    this.#openFile = openFile;
+    this.#platform = platform;
   }
 
   async acquire() {
@@ -106,7 +121,10 @@ export class RegistrationLock {
 
       const nonce = randomUUID();
       const owner = { pid: process.pid, nonce, createdAt: new Date().toISOString() };
-      if (await writeOwnerFile(this.#filePath, owner)) {
+      if (await writeOwnerFile(this.#filePath, owner, {
+        openFile: this.#openFile,
+        platform: this.#platform
+      })) {
         this.#nonce = nonce;
         return;
       }
@@ -145,7 +163,10 @@ export class RegistrationLock {
       nonce: recoveryNonce,
       createdAt: new Date().toISOString()
     };
-    if (!await writeOwnerFile(this.#recoveryPath, recoveryOwner)) return false;
+    if (!await writeOwnerFile(this.#recoveryPath, recoveryOwner, {
+      openFile: this.#openFile,
+      platform: this.#platform
+    })) return false;
     try {
       const candidate = await readLockFile(this.#filePath);
       if (!candidate) return true;

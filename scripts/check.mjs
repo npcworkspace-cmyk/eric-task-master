@@ -62,7 +62,12 @@ async function staticChecks() {
     acceptance,
     mcpStdio,
     mcpServer,
-    mcpHostsDocument
+    mcpPublicView,
+    mcpHostsDocument,
+    notificationCenter,
+    systemNotifier,
+    externalCostLedger,
+    contracts
   ] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
@@ -85,7 +90,12 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'scripts', 'acceptance.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'server.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'docs', 'MCP-HOSTS.md'), 'utf8')
+    readFile(resolve(ROOT, 'src', 'mcp', 'public-view.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'docs', 'MCP-HOSTS.md'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'notification-center.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'system-notifier.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'external-cost-ledger.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'contracts.mjs'), 'utf8')
   ]);
   const releaseCreation = releaseWorkflow.indexOf('gh release create');
   const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
@@ -107,7 +117,7 @@ async function staticChecks() {
     'task scheduler or progress-health boundary drift'
   );
   invariant(
-    taskService.includes("{ name: 'surface-probe', modulePath: SURFACE_PROBE_TASK }") &&
+    taskService.includes("{ name: 'surface-probe', modulePath: SURFACE_PROBE_TASK, discoverable: true }") &&
       journey.includes("async survey(options = {})") && behavior.includes("async survey(options = {})") &&
       taskWorker.includes("survey: guardedAction('survey')"),
     'bounded surface probe or central page-survey boundary drift'
@@ -128,6 +138,31 @@ async function staticChecks() {
       !dashboard.includes("request('/v1/agents") && !dashboard.includes('/artifacts') &&
       !dashboard.includes('/timeline') && !dashboard.includes('/commands'),
     'Owner Console bootstrap, task timing, revision, deletion, or three-view asset contract drift'
+  );
+  invariant(
+    notificationCenter.includes('const DEFAULT_REMINDER_MS = 30_000') &&
+      notificationCenter.includes("task.userRequest?.kind === 'human_verification'") &&
+      notificationCenter.includes("task.userRequest?.status === 'pending'") &&
+      notificationCenter.includes('eligibilityCheck') && notificationCenter.includes('async claimTask(') &&
+      manager.includes("url.pathname === '/v1/notifications'") &&
+      manager.includes('listHumanVerificationRequests') && manager.includes('notificationEligibilityCheck') &&
+      taskService.includes('USER_HANDOFF_OWNER_CLAIM_REQUIRED') &&
+      dashboardHtml.includes('id="notification-drawer"') &&
+      dashboard.includes("request('/v1/notifications')") && dashboard.includes('clearNotificationChannel'),
+    'human-verification-only 30-second notification contract drift'
+  );
+  invariant(
+    systemNotifier.includes("platform === 'win32'") &&
+      systemNotifier.includes("platform === 'darwin'") &&
+      systemNotifier.includes("platform === 'linux'") &&
+      notificationCenter.includes("const CHANNELS = Object.freeze(['system', 'telegram', 'feishu'])"),
+    'native, Telegram, or Feishu notification channel drift'
+  );
+  invariant(
+    dashboard.includes("const LANGUAGE_STORAGE_KEY = 'eric-task-master-language'") &&
+      (dashboard.match(/localStorage\.setItem\(/gu) || []).length === 1 &&
+      dashboardHtml.includes('id="language-toggle"'),
+    'Owner Console bilingual preference boundary drift'
   );
   invariant(
     behavior.includes('transientNavigationFailure') && behavior.includes('navigationRetries') &&
@@ -185,6 +220,25 @@ async function staticChecks() {
       !/StreamableHTTPServerTransport|SSEServerTransport|createServer\s*\(/u.test(mcpStdio) &&
       !/StreamableHTTPServerTransport|SSEServerTransport/u.test(mcpServer),
     'Agent MCP must remain one per-host STDIO bridge; no HTTP/SSE MCP listener is allowed'
+  );
+  invariant(
+    mcpServer.includes("name: 'taskmaster_task_packs_list'") &&
+      mcpServer.includes('nextCursor') && mcpServer.includes('cursor: z.string()') &&
+      mcpServer.includes("name: 'taskmaster_tasks_focus'") &&
+      !mcpServer.includes('taskmaster_tasks_claim_user_request'),
+    'read-only Task Pack discovery, focus, or Owner-only verification claim boundary drift'
+  );
+  invariant(
+    externalCostLedger.includes('reserveExternalCost') && externalCostLedger.includes('settleExternalCost') &&
+    externalCostLedger.includes('EXTERNAL_COST_OPERATION_CONFLICT') &&
+      externalCostLedger.includes('execute: true') && externalCostLedger.includes('execute: false') &&
+      taskWorker.includes('reserve: async') && taskWorker.includes('settle: async') &&
+      taskWorker.includes("action: 'reserve'") && taskWorker.includes("action: 'settle'") &&
+      taskService.includes('externalCostTail') && taskService.includes('await persist(task)') &&
+      contracts.includes("'externalCostUsage'") && !contracts.includes("'externalCostBudget'") &&
+      mcpPublicView.includes("['externalCostUsage', publicExternalCostUsage(task?.externalCostUsage)]") &&
+      !mcpPublicView.includes('task?.externalCostBudget'),
+    'durable paid-operation ledger or public aggregate-only boundary drift'
   );
   invariant(
     workflow.includes('windows-latest') && workflow.includes('macos-latest') &&
@@ -340,7 +394,7 @@ async function staticChecks() {
       releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
     'release preflight, monotonic version, or standalone Skill archive proof drift'
   );
-  return { passed: 47, total: 47 };
+  return { passed: 53, total: 53 };
 }
 
 function run(command, args, env = {}) {

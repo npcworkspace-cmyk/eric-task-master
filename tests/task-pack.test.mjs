@@ -92,7 +92,10 @@ test('Task Pack batch install is all-or-nothing and exposes progressive discover
   assert.equal(installed.length, 2);
   const summaries = await registry.listSummaries();
   assert.equal('inputSchema' in summaries[0], false);
-  assert.deepEqual(summaries[0].pack, { name: 'sample-pack', version: '1.0.0' });
+  assert.deepEqual(summaries[0].pack, {
+    name: 'sample-pack', version: '1.0.0', lifecycle: 'active',
+    discoverable: true, protected: false, transient: false
+  });
   assert.equal(summaries[0].interactionContract, 'full-human-v1');
   assert.equal(summaries[0].supportsResume, true);
   const described = await registry.describe('pack.first');
@@ -127,10 +130,13 @@ test('Task Pack install attaches provenance to an identical standalone type with
   const [attached] = await registry.installBatch([
     { name: 'pack.shared', modulePath }
   ], { pack: { name: 'sample-pack', version: '1.0.0', interactionContract: 'full-human-v1' } });
-  assert.deepEqual(attached.pack, { name: 'sample-pack', version: '1.0.0' });
+  assert.deepEqual(attached.pack, {
+    name: 'sample-pack', version: '1.0.0', lifecycle: 'active',
+    discoverable: true, protected: false, transient: false
+  });
   assert.deepEqual((await registry.describe('pack.shared')).pack, {
-    name: 'sample-pack',
-    version: '1.0.0'
+    name: 'sample-pack', version: '1.0.0', lifecycle: 'active',
+    discoverable: true, protected: false, transient: false
   });
 
   await assert.rejects(
@@ -140,8 +146,8 @@ test('Task Pack install attaches provenance to an identical standalone type with
     { code: 'TASK_TYPE_PACK_CONFLICT', statusCode: 409 }
   );
   assert.deepEqual((await registry.describe('pack.shared')).pack, {
-    name: 'sample-pack',
-    version: '1.0.0'
+    name: 'sample-pack', version: '1.0.0', lifecycle: 'active',
+    discoverable: true, protected: false, transient: false
   });
 });
 

@@ -23,6 +23,8 @@ const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const ATOMIC_RENAME_RETRY_MS = Object.freeze([25, 50, 100, 200, 400]);
 const TRANSIENT_RENAME_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
 const PROGRESS_PHASE_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+const EXTERNAL_COST_ACK_TIMEOUT_MS = 30_000;
+const pendingExternalCostRequests = new Map();
 const EFFECT_ACTIVITY = Object.freeze({
   goto: 'navigating',
   click: 'clicking',
@@ -208,6 +210,45 @@ function safeSend(message) {
   } catch {
     // The parent owns crash detection when the IPC channel is already gone.
   }
+}
+
+function requestExternalCostThroughParent(request) {
+  return new Promise((resolve, reject) => {
+    if (typeof process.send !== 'function' || !process.connected) {
+      const error = new Error('Manager IPC is unavailable for external cost authorization');
+      error.code = 'TASK_EXTERNAL_COST_MANAGER_UNAVAILABLE';
+      reject(error);
+      return;
+    }
+    const requestId = `cost_${randomUUID().replaceAll('-', '')}`;
+    const timer = setTimeout(() => {
+      pendingExternalCostRequests.delete(requestId);
+      const error = new Error('Manager did not authorize the external cost operation in time');
+      error.code = 'TASK_EXTERNAL_COST_ACK_TIMEOUT';
+      reject(error);
+    }, EXTERNAL_COST_ACK_TIMEOUT_MS);
+    timer.unref?.();
+    pendingExternalCostRequests.set(requestId, { resolve, reject, timer });
+    try {
+      process.send({ type: 'external_cost_request', requestId, ...request }, undefined, undefined, (sendError) => {
+        if (!sendError) return;
+        const pending = pendingExternalCostRequests.get(requestId);
+        if (!pending) return;
+        pendingExternalCostRequests.delete(requestId);
+        clearTimeout(pending.timer);
+        const error = new Error('Manager rejected the external cost IPC request');
+        error.code = 'TASK_EXTERNAL_COST_MANAGER_UNAVAILABLE';
+        pending.reject(error);
+      });
+    } catch {
+      const pending = pendingExternalCostRequests.get(requestId);
+      pendingExternalCostRequests.delete(requestId);
+      clearTimeout(pending?.timer);
+      const error = new Error('Manager IPC is unavailable for external cost authorization');
+      error.code = 'TASK_EXTERNAL_COST_MANAGER_UNAVAILABLE';
+      reject(error);
+    }
+  });
 }
 
 function errorPayload(error, screenshot = null) {
@@ -532,6 +573,7 @@ function restrictedPackAction(action) {
 
 export async function runTaskWorker(config, {
   loadPlaywright = () => import('playwright'),
+  externalCostRequest = requestExternalCostThroughParent,
   signal
 } = {}) {
   if (
@@ -573,6 +615,7 @@ export async function runTaskWorker(config, {
   let effectJournal = null;
   let frozenResumeRecord = null;
   let resumeCheckpointConsumed = false;
+  let lastCheckpointReceipt = null;
   let stopBudgetChecks = () => {};
   let rejectBudget;
   let budgetFailure = null;
@@ -792,13 +835,16 @@ export async function runTaskWorker(config, {
       }
       await writeTextAtomic(config.checkpointPath, encoded);
       checkpointWrittenThisAttempt = true;
-      safeSend({
-        type: 'checkpoint',
-        path: config.checkpointPath,
+      lastCheckpointReceipt = {
         attempt: config.attempt,
         savedAt: record.savedAt,
         sha256: createHash('sha256').update(encoded).digest('hex'),
         sizeBytes: Buffer.byteLength(encoded)
+      };
+      safeSend({
+        type: 'checkpoint',
+        path: config.checkpointPath,
+        ...lastCheckpointReceipt
       });
       return record;
     };
@@ -974,10 +1020,25 @@ export async function runTaskWorker(config, {
     safeSend({ type: 'state', state: 'running', meta: taskModule.meta || null });
     await progress({ current: 0, total: null, message: 'Task started' });
 
+    const externalCost = config.externalCostBudget
+      ? Object.freeze({
+          reserve: async ({ operationId, estimatedAmount } = {}) => externalCostRequest({
+            action: 'reserve', operationId, amount: estimatedAmount
+          }),
+          settle: async ({ operationId, actualAmount } = {}) => externalCostRequest({
+            action: 'settle', operationId, amount: actualAmount
+          })
+        })
+      : null;
+
     const taskPromise = Promise.resolve().then(() => taskModule.run({
       page: taskPage,
       context: taskContext,
       input: config.input,
+      ...(config.externalCostBudget ? {
+        externalCostBudget: Object.freeze(structuredClone(config.externalCostBudget)),
+        externalCost
+      } : {}),
       outputDir: config.outputDir,
       action: taskAction,
       ...(journey ? { journey } : {}),
@@ -1066,7 +1127,8 @@ export async function runTaskWorker(config, {
         await writeCleanupReceipt(config.cleanupReceiptPath, {
           kind: 'task',
           taskId: config.taskId,
-          attempt: config.attempt
+          attempt: config.attempt,
+          checkpoint: lastCheckpointReceipt
         });
         cleanupReceiptWritten = true;
       } catch {
@@ -1099,6 +1161,20 @@ if (typeof process.send === 'function') {
   const controller = new AbortController();
 
   process.on('message', (message) => {
+    if (message?.type === 'external_cost_response' && typeof message.requestId === 'string') {
+      const pending = pendingExternalCostRequests.get(message.requestId);
+      if (!pending) return;
+      pendingExternalCostRequests.delete(message.requestId);
+      clearTimeout(pending.timer);
+      if (message.ok === true) {
+        pending.resolve(message.result);
+      } else {
+        const error = new Error(message.error?.message || 'Manager rejected the external cost operation');
+        error.code = message.error?.code || 'TASK_EXTERNAL_COST_REJECTED';
+        pending.reject(error);
+      }
+      return;
+    }
     if (message?.type === 'start' && !started) {
       started = true;
       void runTaskWorker(message.config, { signal: controller.signal }).finally(() => {
@@ -1158,6 +1234,20 @@ if (typeof process.send === 'function') {
     }
     if (message?.type === 'continue') {
       void activeHandoff?.continue({ requestId: message.requestId, note: message.note });
+    }
+    if (message?.type === 'focus') {
+      const requestId = typeof message.requestId === 'string' ? message.requestId : null;
+      void (async () => {
+        if (!activePage || activePage.isClosed()) {
+          const error = new Error('Task Worker has no live page to focus');
+          error.code = 'TASK_FOCUS_NO_LIVE_PAGE';
+          throw error;
+        }
+        await activePage.bringToFront();
+        safeSend({ type: 'focus_applied', requestId, at: new Date().toISOString() });
+      })().catch((error) => {
+        safeSend({ type: 'focus_control_error', requestId, error: errorPayload(error) });
+      });
     }
     if (message?.type === 'diagnose') {
       void captureFailure(activePage, message.outputDir, message.reason || 'diagnostic').finally(() => {

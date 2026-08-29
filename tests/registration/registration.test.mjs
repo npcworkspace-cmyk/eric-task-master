@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, open, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import test from 'node:test';
@@ -1186,6 +1186,29 @@ test('cross-process registration lock serializes the full transaction and preser
   const state = JSON.parse(await readFile(firstRegistrar.statePath, 'utf8'));
   assert.deepEqual(Object.keys(state.registrations).sort(), ['claude-desktop', 'codex']);
   assert.equal(state.transactions.length, 2);
+});
+
+test('Windows sharing collisions are retried as bounded registration lock contention', async () => {
+  const setup = await fixture();
+  const lockPath = join(setup.stateDir, '.registration.lock');
+  let transientFailures = 2;
+  const lock = new RegistrationLock(lockPath, {
+    timeoutMs: 1_000,
+    platform: 'win32',
+    async openFile(...args) {
+      if (transientFailures > 0) {
+        transientFailures -= 1;
+        throw Object.assign(new Error('simulated Windows sharing collision'), { code: 'EPERM' });
+      }
+      return open(...args);
+    }
+  });
+
+  await lock.acquire();
+  assert.equal(transientFailures, 0);
+  await lock.release();
+  await assert.rejects(lstat(lockPath), { code: 'ENOENT' });
+  await assert.rejects(lstat(`${lockPath}.recovery`), { code: 'ENOENT' });
 });
 
 test('two processes recovering the same stale lock never overlap their critical sections', async () => {

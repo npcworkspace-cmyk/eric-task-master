@@ -56,6 +56,7 @@ This is trusted-local-Agent coordination, not hostile multi-tenant security. Age
 - `taskmaster_profiles_close`
 - `taskmaster_task_types_list`
 - `taskmaster_task_types_describe`
+- `taskmaster_task_packs_list`
 - `taskmaster_scale_prepare`
 - `taskmaster_tasks_start`
 - `taskmaster_tasks_list`
@@ -64,6 +65,7 @@ This is trusted-local-Agent coordination, not hostile multi-tenant security. Age
 - `taskmaster_agent_inbox_claim`
 - `taskmaster_task_command_respond`
 - `taskmaster_task_report_publish`
+- `taskmaster_tasks_focus`
 - `taskmaster_tasks_continue`
 - `taskmaster_tasks_resume`
 - `taskmaster_tasks_cancel`
@@ -72,7 +74,7 @@ This is trusted-local-Agent coordination, not hostile multi-tenant security. Age
 
 Every tool publishes an input schema, output schema, and MCP annotations. Generic task start is conservatively marked destructive and open-world because the selected registered task type may interact with an external website. Task start requires an idempotency key; profile creation is explicitly marked non-idempotent because the current Manager profile API does not yet provide an idempotency contract.
 
-`taskmaster_scale_prepare` is the one-call preflight for unknown large work. It accepts one Profile, representative HTTP(S) URL, optional label, and idempotency key, then dispatches the registered read-only `surface-probe`. The Agent waits for that ordinary durable task and reads its declared artifact before authoring a bounded pilot; site-specific selectors and extraction still belong in a Task Pack.
+`taskmaster_scale_prepare` is the one-call preflight for unknown large work. It accepts one Profile, representative HTTP(S) URL, optional label, and idempotency key, then dispatches the registered read-only `surface-probe`. The same probe is discoverable through ordinary task-type search. The Agent waits for that durable task and reads its declared artifact before authoring a bounded pilot; site-specific selectors and extraction still belong in a Task Pack. CAPTCHA or press-and-hold signals produce a structured same-task human handoff, never automated solving or bypass, and keep scale blocked until an explicit continuation proves the challenge is gone.
 
 The MCP surface never accepts arbitrary module paths, JavaScript evaluation, cookie/session transfer, authorization headers, filesystem paths, or raw Playwright handles.
 
@@ -95,7 +97,7 @@ Task status separates liveness from advancement:
 
 Same-Profile work is FIFO queued. Different Profiles run concurrently up to the Manager budget. Queueing never requires a duplicate task submission.
 
-When state is `waiting_user`, list/read the task's `diagnostic-observation` and `diagnostic-screenshot` artifacts, then call `taskmaster_tasks_continue` with the live request ID and an optional bounded note. This keeps the same task ID, Worker, browser, output, checkpoint, and effect journal. It is intentionally non-idempotent and open-world because a new instruction may lead to an external browser action.
+When state is `waiting_user`, inspect `userRequest.kind`. Ordinary `instruction` requests use the existing diagnostic/read/continue path. A `human_verification` request is the only event that enters the durable notification center: enabled native, Telegram, and Feishu channels send immediately and every 30 seconds. It does not inherit the ordinary short handoff deadline. `taskmaster_tasks_focus` can bring the live page forward, but only the Owner Console may claim a human verification and stop reminders; the MCP surface intentionally has no human-claim tool, and Agent continuation is rejected until the Owner claim is durable. After the Owner finishes, `taskmaster_tasks_continue` revalidates and continues that same task ID, Worker, browser, output, checkpoint, and effect journal. Failures, stalls, cooldowns, cleanup, completion, login ambiguity, and ordinary instructions never generate these notifications.
 
 Cancelling or disconnecting a wait request stops only that wait. The browser task continues under Task Master. Only `taskmaster_tasks_cancel` requests task cancellation. This prevents a transient MCP host disconnect from destroying a long task.
 
@@ -105,9 +107,11 @@ If a failed task exposes a preserved checkpoint and settled cleanup, `taskmaster
 
 A Worker completion claim is provisional. Manager publishes `completed` only after validating the bounded result shape, all declared Agent-visible artifacts, browser closure, Worker exit, and Profile lease release. Otherwise the task is `failed` with `TASK_COMPLETION_GATE_FAILED`.
 
-Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow. Pack-backed types expose `interactionContract: "full-human-v1"`; Manager forces those tasks through Human Journey and publishes `interaction-audit.json` only after its ten checks pass.
+Task-type discovery is progressive. `taskmaster_task_types_list` accepts `query`, `domain`, and `intent` and omits input schemas. After choosing one summary, call `taskmaster_task_types_describe` to read only that task's full input contract. This keeps routine discovery output small as Task Packs grow. Pack-backed types expose Pack lifecycle/discoverability plus `interactionContract: "full-human-v1"`; Manager forces those tasks through Human Journey and publishes `interaction-audit.json` only after its ten checks pass. `taskmaster_task_packs_list` is a bounded read-only inventory of Pack version, lifecycle, usage, discoverability, size, and machine-readable deletion blockers; use its opaque `nextCursor` until absent when more than one page exists.
 
-Task Pack/executor asset administration is deliberately Owner-only and is not added to the ordinary Agent MCP surface. The same-origin Dashboard groups Packs, standalone/transient modules, protected system capabilities, history, and orphan snapshots; it exposes bounded purpose, notes, discovery state, lifecycle, usage, size, and backend-derived deletion blockers. Batch note/deprecate/restore/delete requests are revalidated by Manager and serialized against task creation, so the browser UI is never trusted to decide whether an executable file is safe to remove.
+Task Pack/executor mutation remains deliberately Owner-only. MCP exposes lifecycle visibility but no note, deprecate, restore, or delete operation. The same-origin Dashboard groups Packs, standalone/transient modules, protected system capabilities, history, and orphan snapshots; it exposes bounded purpose, notes, discovery state, lifecycle, usage, size, and backend-derived deletion blockers. Batch mutations are revalidated by Manager and serialized against task creation, so the browser UI is never trusted to decide whether an executable file is safe to remove. Logically deleted task history and unverified checkpoints do not block an asset; protected, live, cleanup-unsettled, and verified-resumable dependencies do.
+
+A task type that declares `externalCost` must receive an explicit `externalCostBudget` in `taskmaster_tasks_start`; the currency must match and the amount cannot exceed the type's per-task ceiling. Trusted Pack code receives a frozen budget plus `externalCost.reserve({ operationId, estimatedAmount })` and `externalCost.settle({ operationId, actualAmount })`. Reserve returns a private receipt: only `execute: true` authorizes one provider call; duplicate/concurrent/resume reservations return `execute: false` and must not be billed again. The actual settlement cannot exceed that operation's conservative reservation. Manager serializes and persists every ledger change before acknowledging it, and the balance survives every attempt of the same durable task. Reusing an ID with different values, exceeding the remaining or per-operation amount, completing with an outstanding reservation, or returning estimated/actual evidence that does not exactly match the ledger all fail closed. Public MCP task state exposes only aggregate currency, estimated total, actual total, and remaining amount—never operation IDs or provider/request detail. The gate governs Packs that use this facade; it cannot intercept arbitrary network calls made outside the contract.
 
 Errors stay actionable without exposing internals. `TASK_INPUT_SCHEMA_FAILED` retains Manager's redacted field-level message, bounded safe details, and the correlated `requestId`; its single recovery action is to describe the already-selected type and correct the named field. `AGENT_HOST_RELOAD_REQUIRED` is non-retryable inside the current host process: reload that Agent host once, call `taskmaster_status`, and only then submit work. Manager appends allowlisted events to `logs/manager-events.jsonl`, rotated at 5 MiB across three files with protected permissions; MCP returns the same request ID so the event can be correlated without a second file writer. `node scripts/taskmaster.mjs doctor --json` summarizes Manager status, MCP registration, and recent redacted errors without starting another Manager or browser; logs are diagnostics, never task output.
 

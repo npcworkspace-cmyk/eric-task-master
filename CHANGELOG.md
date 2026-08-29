@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.7.0 - 2026-08-29
+
+- Added durable human-verification alerts through the native operating-system channel, Telegram Bot, and Feishu/Lark webhook. Alerts are created only for an explicit `human_verification` handoff, fire immediately, repeat every 30 seconds, and stop after the Owner claims or resolves that exact request; ordinary failures, stalls, cooldowns, cleanup, completion, and login ambiguity never notify.
+- Added a compact bilingual notification drawer to the existing three-view Owner Console. Chinese/English switching is immediate and persists only the language preference; notification credentials stay write-only and server-side. Claiming a verification focuses the live task window without continuing it, while “verification complete” revalidates and continues the same task.
+- Revalidated persisted alerts against live task state before delivery, serialized claim/continue transitions, rejected Agent continuation before an Owner claim, removed the ordinary short handoff deadline from human verification, and added explicit Telegram/Feishu credential clearing. Temporary eligibility/storage failures retain the alert for the next cycle; TaskService remains authoritative if notification-state synchronization degrades after claim, continue, or cancel.
+- Hardened paid-Pack budgets into durable at-most-once execution grants, sealed the final checkpoint generation before Worker-exit cleanup becomes observable, carried that seal in crash-recovery receipts, fairly reserved semantic-observation capacity across frames, and paginated the MCP Task Pack inventory. Terminal reads and asset checks only verify the immutable seal and never adopt a backdated replacement.
+- Made the built-in `surface-probe` discoverable through normal task-type search and added structured CAPTCHA/press-and-hold detection with a bounded manual handoff. Truncated, omitted, or unreadable frame observations now block scale instead of silently passing. Task Master never solves, bypasses, or delegates the challenge to a third-party solver.
+- Exposed read-only Task Pack lifecycle, usage, discoverability, and deletion-blocker summaries through MCP, while keeping note/deprecate/restore/delete authority in the Owner Console.
+- Corrected guarded asset deletion so logically deleted history and failed tasks without a verified resumable checkpoint no longer block cleanup; live, cleanup-unsettled, protected, and genuinely resumable dependencies remain blocked.
+- Made Windows MCP registration tolerate transient `EPERM`/`EACCES`/`EBUSY` file-sharing collisions as bounded lock contention without ever granting ownership optimistically; permanent contention still fails closed at the registration deadline.
+- Added a durable external-cost ledger for paid Task Packs: the type declares currency and a per-task ceiling, task start requires a smaller explicit budget, trusted code must reserve and settle each paid operation through an idempotent runtime facade, every retry shares the same persisted balance, and completion fails on unresolved reservations or evidence that differs from the ledger. Public task state exposes aggregate usage only.
+- Expanded Manager, notification, handoff, Task Pack, MCP, budget, cross-language, desktop/mobile, and real Chromium acceptance coverage.
+
 ## 2.6.0 - 2026-08-29
 
 - Added a dedicated Owner Console Task Packs asset view for Pack, standalone, transient, protected system, historical, and orphan executors, with plain-language purpose, owner notes, Agent discovery/lifecycle state, usage, last use, file size, and deletion blockers.

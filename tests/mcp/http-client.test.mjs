@@ -166,6 +166,69 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
 });
 
+test('HTTP client forwards Task Pack visibility, paid budget input, and focus request contracts', async (t) => {
+  const requests = [];
+  const connection = await fixture(t, async (request, response) => {
+    const body = await readJson(request);
+    requests.push({ method: request.method, url: request.url, body });
+    if (request.url === '/v1/agents/issue') {
+      reply(response, 200, {
+        agentToken: scopedToken('contract-fixture', 'Contract fixture'),
+        agent: { clientId: 'contract-fixture', name: 'Contract fixture' }
+      });
+      return;
+    }
+    if (request.method === 'GET' && request.url === '/v1/task-packs') {
+      reply(response, 200, { taskPacks: [{ id: 'pack:paid@1.0.0', name: 'paid', version: '1.0.0' }] });
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/v1/tasks') {
+      reply(response, 202, {
+        taskId: 'task_paid',
+        dashboardUrl: `http://${request.headers.host}/dashboard?task=task_paid#code=${'d'.repeat(32)}`,
+        task: { id: 'task_paid', state: 'queued', externalCostBudget: body.externalCostBudget }
+      });
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/v1/tasks/task_paid/focus') {
+      reply(response, 200, { task: { id: 'task_paid', state: 'waiting_user' }, focusedAt: '2026-08-29T00:00:00.000Z' });
+      return;
+    }
+    reply(response, 404, { error: { code: 'NOT_FOUND' } });
+  });
+  const client = new HttpTaskMasterClient({
+    ...connection,
+    clientId: 'contract-fixture',
+    clientName: 'Contract fixture'
+  });
+
+  assert.equal((await client.listTaskPacks())[0].name, 'paid');
+  const started = await client.startTask({
+    taskType: 'fixture.paid',
+    profileId: 'profile_safe',
+    input: {},
+    externalCostBudget: { currency: 'USD', maxAmount: 3.25 },
+    idempotencyKey: 'paid-contract-0001'
+  });
+  assert.deepEqual(started.task.externalCostBudget, { currency: 'USD', maxAmount: 3.25 });
+  const focused = await client.focusTask(started.taskId);
+  assert.equal(focused.focusedAt, '2026-08-29T00:00:00.000Z');
+
+  assert.deepEqual(
+    requests.find((request) => request.url === '/v1/tasks' && request.method === 'POST').body.externalCostBudget,
+    { currency: 'USD', maxAmount: 3.25 }
+  );
+  assert.deepEqual(requests.find((request) => request.url.endsWith('/focus')).body, {});
+
+  await assert.rejects(client.startTask({
+    taskType: 'fixture.paid',
+    profileId: 'profile_safe',
+    input: {},
+    externalCostBudget: { currency: 'usd', maxAmount: 3.25 },
+    idempotencyKey: 'paid-contract-0002'
+  }), { code: 'INVALID_TASK_EXTERNAL_COST_BUDGET' });
+});
+
 test('HTTP client preserves redacted Manager errors, request IDs, and exact recovery actions', async (t) => {
   const requestId = 'req_1234567890abcdef12345678';
   const connection = await fixture(t, async (request, response) => {

@@ -8,6 +8,7 @@ import { createTaskService } from '../src/runtime/task-service.mjs';
 import { createCooperativePauseGate } from '../src/runtime/task-worker.mjs';
 
 const AGENT = Object.freeze({ role: 'agent', clientId: 'agent.control.test', agentName: 'Control Test' });
+const ADMIN = Object.freeze({ role: 'manager-admin', clientId: 'manager-admin' });
 let nextPid = 91_000;
 
 class ControlWorker extends EventEmitter {
@@ -34,6 +35,14 @@ class ControlWorker extends EventEmitter {
         this.emit('message', { type: 'state', state: 'recovering', commandId: message.commandId });
         this.emit('message', { type: 'state', state: 'running', commandId: message.commandId });
       });
+    } else if (message.type === 'continue') {
+      setTimeout(() => this.emit('message', { type: 'state', state: 'running' }), 10);
+    } else if (message.type === 'focus') {
+      setImmediate(() => this.emit('message', {
+        type: 'focus_applied',
+        requestId: message.requestId,
+        at: '2026-08-29T00:00:00.000Z'
+      }));
     } else if (message.type === 'cancel') {
       setImmediate(() => {
         this.emit('message', {
@@ -171,6 +180,70 @@ test('task controls are durable, revision-checked, idempotent, and cancellation 
   }, AGENT);
   await waitFor(async () => (await service.getInternal(created.id)).state === 'running');
 
+  const handoffId = 'handoff_0123456789abcdef0123456789abcdef';
+  workers[0].emit('message', {
+    type: 'waiting_user',
+    request: {
+      id: handoffId,
+      kind: 'human_verification',
+      reason: 'The site requires a human verification step',
+      instructions: 'Complete the visible verification in the same task page.',
+      requestedAt: '2026-08-29T00:00:00.000Z',
+      expiresAt: '2026-08-29T01:00:00.000Z',
+      screenshotAvailable: true
+    }
+  });
+  await waitFor(async () => (await service.getInternal(created.id)).state === 'waiting_user');
+  let visible = await service.get(created.id, AGENT);
+  assert.equal(visible.userRequest.kind, 'human_verification');
+  assert.equal(visible.userRequest.status, 'pending');
+  await assert.rejects(
+    service.claimUserRequest(created.id, {
+      requestId: 'handoff_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    }, AGENT),
+    { code: 'USER_HANDOFF_MISMATCH' }
+  );
+  await assert.rejects(
+    service.claimUserRequest(created.id, { requestId: handoffId }, AGENT),
+    { code: 'USER_HANDOFF_CLAIM_FORBIDDEN' }
+  );
+  await assert.rejects(
+    service.continueTask(created.id, { requestId: handoffId }, AGENT),
+    { code: 'USER_HANDOFF_OWNER_CLAIM_REQUIRED' }
+  );
+  visible = await service.claimUserRequest(created.id, { requestId: handoffId }, ADMIN);
+  assert.equal(visible.userRequest.status, 'claimed');
+  assert.ok(visible.userRequest.claimedAt);
+  const focused = await service.focusTask(created.id, AGENT);
+  assert.equal(focused.task.id, created.id);
+  assert.equal(focused.focusedAt, '2026-08-29T00:00:00.000Z');
+  assert.ok(workers[0].messages.some((message) => message.type === 'focus'));
+  const continued = await service.continueTask(created.id, {
+    requestId: handoffId,
+    note: 'Human verification is complete; revalidate before continuing.'
+  }, AGENT);
+  assert.equal(continued.id, created.id);
+  assert.equal(continued.userRequest.kind, 'human_verification');
+  assert.equal(continued.userRequest.status, 'continued');
+  await waitFor(async () => (await service.getInternal(created.id)).state === 'running');
+
+  const instructionId = 'handoff_fedcba9876543210fedcba9876543210';
+  workers[0].emit('message', {
+    type: 'waiting_user',
+    request: {
+      id: instructionId,
+      kind: 'instruction',
+      reason: 'The task needs a bounded instruction',
+      requestedAt: '2026-08-29T00:01:00.000Z'
+    }
+  });
+  await waitFor(async () => (await service.getInternal(created.id)).state === 'waiting_user');
+  visible = await service.claimUserRequest(created.id, { requestId: instructionId }, AGENT);
+  assert.equal(visible.userRequest.kind, 'instruction');
+  assert.equal(visible.userRequest.status, 'claimed');
+  await service.continueTask(created.id, { requestId: instructionId }, AGENT);
+  await waitFor(async () => (await service.getInternal(created.id)).state === 'running');
+
   await service.pauseTask(created.id, { commandId: 'pause-cmd-001', expectedRevision: 1 }, AGENT);
   await waitFor(async () => (await service.getInternal(created.id)).state === 'paused');
   let internal = await service.getInternal(created.id);
@@ -244,4 +317,5 @@ test('task controls are durable, revision-checked, idempotent, and cancellation 
   assert.equal(cancelled.cleanup.settled, true);
   assert.equal(cancelled.commands.find((item) => item.commandId === 'terminate-cmd-001').status, 'applied');
   assert.ok(cancelled.timeline.some((event) => event.type === 'task.cancelled'));
+  await assert.rejects(service.focusTask(created.id, AGENT), { code: 'TASK_FOCUS_UNAVAILABLE' });
 });

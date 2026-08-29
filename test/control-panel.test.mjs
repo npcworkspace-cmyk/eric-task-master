@@ -108,7 +108,13 @@ test('task panel keeps bounded same-origin reads, concurrency guards, task timin
   assert.match(source, /assetIds/);
 
   assert.doesNotMatch(source, /ownerAgentName|taskAgent\(|agentName\(/);
-  assert.doesNotMatch(source, /sessionStorage|localStorage|['"]Authorization['"]/i);
+  assert.doesNotMatch(source, /sessionStorage|['"]Authorization['"]/i);
+  assert.match(source, /const LANGUAGE_STORAGE_KEY = ['"]eric-task-master-language['"]/);
+  const localStorageUses = [...source.matchAll(/localStorage\.(?:getItem|setItem|removeItem|clear)\([^\n]+/g)]
+    .map((match) => match[0]);
+  assert.equal(localStorageUses.length, 2);
+  assert.ok(localStorageUses.every((usage) => usage.includes('LANGUAGE_STORAGE_KEY')));
+  assert.doesNotMatch(source, /localStorage\.(?:removeItem|clear)\(/);
   assert.doesNotMatch(source, /\.innerHTML\s*=|insertAdjacentHTML|eval\(|new Function/);
   assert.doesNotMatch(source, /fetch\(['"]https?:\/\//);
   assert.doesNotMatch(source, /setInterval/);

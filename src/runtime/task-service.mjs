@@ -8,8 +8,14 @@ import { normalizeAgentName } from '../lib/agent-token.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
 import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
-import { removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
+import { readCleanupReceipt, removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
+import {
+  createExternalCostLedger,
+  externalCostLedgerUsage,
+  reserveExternalCost,
+  settleExternalCost
+} from '../lib/external-cost-ledger.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
 const PROFILE_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
@@ -27,6 +33,7 @@ const PROGRESS_STALL_MS = 2 * 60_000;
 const PROGRESS_FAILURE_MS = 10 * 60_000;
 const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const BEHAVIOR_APPLY_TIMEOUT_MS = 5_000;
+const FOCUS_APPLY_TIMEOUT_MS = 5_000;
 const MAX_ARTIFACTS = 100;
 const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
@@ -36,6 +43,7 @@ const MAX_ATTEMPTS = 100;
 const MAX_DIAGNOSTIC_ATTEMPTS = 16;
 const RESUME_KEY_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 const HANDOFF_ID_PATTERN = /^handoff_[a-f0-9]{32}$/;
+const EXTERNAL_COST_CURRENCY = /^[A-Z]{3}$/;
 const PROFILE_CLEANUP_QUEUE_REASON = 'Waiting for confirmed Profile cleanup';
 const PROFILE_BUSY_QUEUE_REASON = 'Waiting for Profile to become idle';
 const CLEANUP_RECONCILE_INTERVAL_MS = 2_000;
@@ -440,6 +448,75 @@ function filterTaskTypes(taskTypes, filters = {}) {
   });
 }
 
+function validateExternalCostBudget(value, declaration) {
+  if (!declaration) {
+    if (value !== undefined) {
+      throw new TaskServiceError(
+        'TASK_EXTERNAL_COST_NOT_DECLARED',
+        'externalCostBudget is only allowed for a task type that declares externalCost'
+      );
+    }
+    return null;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TaskServiceError(
+      'TASK_EXTERNAL_COST_BUDGET_REQUIRED',
+      'This task type declares external cost; externalCostBudget is required'
+    );
+  }
+  const unknown = Object.keys(value).filter((key) => !['currency', 'maxAmount'].includes(key));
+  if (unknown.length) {
+    throw new TaskServiceError(
+      'INVALID_TASK_EXTERNAL_COST_BUDGET',
+      `Unsupported externalCostBudget fields: ${unknown.join(', ')}`
+    );
+  }
+  if (
+    typeof value.currency !== 'string' || !EXTERNAL_COST_CURRENCY.test(value.currency) ||
+    value.currency !== declaration.currency
+  ) {
+    throw new TaskServiceError(
+      'INVALID_TASK_EXTERNAL_COST_BUDGET',
+      `externalCostBudget.currency must be ${declaration.currency}`
+    );
+  }
+  if (typeof value.maxAmount !== 'number' || !Number.isFinite(value.maxAmount) || value.maxAmount <= 0) {
+    throw new TaskServiceError(
+      'INVALID_TASK_EXTERNAL_COST_BUDGET',
+      'externalCostBudget.maxAmount must be a finite number greater than 0'
+    );
+  }
+  const amountUnits = Math.round(value.maxAmount * 1_000_000);
+  if (
+    !Number.isSafeInteger(amountUnits) ||
+    Math.abs((amountUnits / 1_000_000) - value.maxAmount) > Number.EPSILON * 8
+  ) {
+    throw new TaskServiceError(
+      'INVALID_TASK_EXTERNAL_COST_BUDGET',
+      'externalCostBudget.maxAmount must contain at most 6 decimal places'
+    );
+  }
+  if (value.maxAmount > declaration.maxAmountPerRun) {
+    throw new TaskServiceError(
+      'TASK_EXTERNAL_COST_BUDGET_EXCEEDS_CEILING',
+      `externalCostBudget.maxAmount exceeds the declared per-run ceiling of ${declaration.maxAmountPerRun} ${declaration.currency}`,
+      409
+    );
+  }
+  return Object.freeze({ currency: value.currency, maxAmount: value.maxAmount });
+}
+
+function taskExternalCostUsage(task) {
+  if (!task.externalCostLedger) return null;
+  const usage = externalCostLedgerUsage(task.externalCostLedger);
+  return {
+    currency: usage.currency,
+    estimatedTotal: usage.estimatedTotal,
+    actualTotal: usage.actualTotal,
+    remainingAmount: usage.remainingAmount
+  };
+}
+
 function stableValue(value) {
   if (Array.isArray(value)) return value.map(stableValue);
   if (!value || typeof value !== 'object') return value;
@@ -713,7 +790,7 @@ export function createTaskService({
     { name: 'acceptance', modulePath: ACCEPTANCE_TASK },
     { name: 'read-page', modulePath: READ_PAGE_TASK },
     { name: 'observe-page', modulePath: OBSERVE_PAGE_TASK },
-    { name: 'surface-probe', modulePath: SURFACE_PROBE_TASK },
+    { name: 'surface-probe', modulePath: SURFACE_PROBE_TASK, discoverable: true },
     { name: 'handoff-acceptance', modulePath: HANDOFF_ACCEPTANCE_TASK },
     { name: 'durable-delay', modulePath: DURABLE_DELAY_TASK }
   ]
@@ -807,13 +884,17 @@ export function createTaskService({
     return path.join(cleanupReceiptsRoot, `session-${digest}.json`);
   }
 
-  async function verifyTaskCleanupReceipt(task) {
-    return verifyCleanupReceipt(taskCleanupReceiptPath(task), {
+  async function readTaskCleanupReceipt(task) {
+    return readCleanupReceipt(taskCleanupReceiptPath(task), {
       kind: 'task',
       taskId: task.id,
       attempt: task.attempt,
       workerPid: task.workerPid
     });
+  }
+
+  async function verifyTaskCleanupReceipt(task) {
+    return Boolean(await readTaskCleanupReceipt(task));
   }
 
   async function markCleanupUnknown(profileId, ownerId) {
@@ -1024,14 +1105,23 @@ export function createTaskService({
   async function reconcileTaskCleanupReceipt(task, { workerExitConfirmed = false } = {}) {
     if (task.cleanup?.settled === true) return true;
     if (!workerExitConfirmed && await processAlive(task.workerPid)) return false;
+    const receipt = await readTaskCleanupReceipt(task);
+    if (!receipt) {
+      await markCleanupUnknown(task.profileId, task.leaseOwner);
+      return false;
+    }
+    if (!task.checkpointSeal && task.supportsResume === true) {
+      await sealAttemptCheckpoint(task, {
+        expectedCheckpoint: Object.hasOwn(receipt, 'checkpoint')
+          ? receipt.checkpoint
+          : task.checkpoint,
+        checkpointKnownAbsent: Object.hasOwn(receipt, 'checkpoint') && receipt.checkpoint === null
+      });
+    }
     task.cleanup = {
       ...(task.cleanup || {}),
       workerExited: true
     };
-    if (!(await verifyTaskCleanupReceipt(task))) {
-      await markCleanupUnknown(task.profileId, task.leaseOwner);
-      return false;
-    }
     let profile;
     try {
       profile = await profileStore.get(task.profileId);
@@ -1106,6 +1196,12 @@ export function createTaskService({
       if (!task.displayName) task.displayName = buildTaskDisplayName(task);
       normalizeTaskTiming(task);
       task.supportsResume = task.supportsResume === true;
+      task.checkpointSeal = task.checkpointSeal &&
+        task.checkpointSeal.attempt === task.attempt &&
+        typeof task.checkpointSeal.sealedAt === 'string' &&
+        !Number.isNaN(Date.parse(task.checkpointSeal.sealedAt))
+        ? task.checkpointSeal
+        : null;
       task.cleanup = {
         browserClosed: false,
         leaseReleased: false,
@@ -1115,6 +1211,9 @@ export function createTaskService({
       };
       // Never trust a stale persisted `settled` bit on its own.
       refreshCleanupSettled(task);
+      const wasTerminallySettled = (
+        TERMINAL_TASK_STATES.has(task.state) && task.cleanup.settled === true
+      );
       const safelyQueued = (
         task.state === 'queued' ||
         (task.state === 'paused' && task.pauseContext?.previousState === 'queued')
@@ -1152,6 +1251,7 @@ export function createTaskService({
         } else if (claimedCompletion && task.result && task.cleanup.settled === true) {
           try {
             task.completion = await verifyCompletionGate(task);
+            task.externalCostUsage = taskExternalCostUsage(task);
             task.state = 'completed';
             task.error = null;
           } catch (error) {
@@ -1183,6 +1283,11 @@ export function createTaskService({
           task.health = { status: task.state, checkedAt: nowIso() };
           finishAttemptHistory(task);
         }
+      }
+      if (wasTerminallySettled && !task.checkpointSeal) {
+        // Legacy terminal records may migrate only an already-persisted exact
+        // pointer. A bare checkpoint file is never adopted after terminal.
+        await sealAttemptCheckpoint(task, { allowDiskRecovery: false });
       }
       await refreshResumeCheckpointState(task);
       task.currentActivity = lifecycleActivity(task.state);
@@ -1365,6 +1470,38 @@ export function createTaskService({
       .then(() => atomicJson(filePath, task));
     persistChains.set(task.id, next);
     return next;
+  }
+
+  async function applyExternalCostOperation(task, message) {
+    if (!task.externalCostBudget) {
+      throw new TaskServiceError(
+        'TASK_EXTERNAL_COST_NOT_DECLARED',
+        'This task does not declare an external cost budget',
+        409
+      );
+    }
+    task.externalCostLedger ||= createExternalCostLedger(task.externalCostBudget);
+    const input = {
+      operationId: message.operationId,
+      ...(message.action === 'reserve'
+        ? { estimatedAmount: message.amount }
+        : { actualAmount: message.amount }),
+      at: nowIso()
+    };
+    const outcome = message.action === 'reserve'
+      ? reserveExternalCost(task.externalCostLedger, input)
+      : message.action === 'settle'
+        ? settleExternalCost(task.externalCostLedger, input)
+        : (() => { throw new TaskServiceError('INVALID_EXTERNAL_COST_ACTION', 'Unsupported external cost action'); })();
+    if (outcome.changed) {
+      task.externalCostUsage = taskExternalCostUsage(task);
+      task.updatedAt = nowIso();
+      await persist(task);
+    }
+    return {
+      ...outcome.receipt,
+      usage: taskExternalCostUsage(task)
+    };
   }
 
   function update(task, patch) {
@@ -1551,6 +1688,36 @@ export function createTaskService({
     return required;
   }
 
+  function verifyExternalCostEvidence(task) {
+    if (!task.externalCostBudget) return;
+    if (!task.externalCostLedger) {
+      throw completionGateFailure('Paid task has no durable external cost ledger');
+    }
+    const ledgerUsage = externalCostLedgerUsage(task.externalCostLedger);
+    if (ledgerUsage.outstandingCount !== 0) {
+      throw completionGateFailure('Paid task cannot complete with outstanding external cost reservations');
+    }
+    const readAmount = (label) => {
+      const matches = task.result.evidence.filter((item) => item?.kind === 'count' && item.label === label);
+      if (matches.length !== 1) {
+        throw completionGateFailure(`Paid task result must contain exactly one ${label} count evidence item`);
+      }
+      const amount = matches[0].value;
+      if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) {
+        throw completionGateFailure(`${label} must be a non-negative finite amount`);
+      }
+      return amount;
+    };
+    const estimatedAmount = readAmount('external-cost-estimated');
+    const actualAmount = readAmount('external-cost-actual');
+    if (estimatedAmount !== ledgerUsage.estimatedTotal) {
+      throw completionGateFailure('Estimated external cost evidence does not match the durable ledger');
+    }
+    if (actualAmount !== ledgerUsage.actualTotal) {
+      throw completionGateFailure('Actual external cost evidence does not match the durable ledger');
+    }
+  }
+
   async function verifyCompletionGate(task) {
     if (!task.result || typeof task.result !== 'object' || Array.isArray(task.result)) {
       throw completionGateFailure('Task worker did not return a result object');
@@ -1564,6 +1731,7 @@ export function createTaskService({
     ) {
       throw completionGateFailure('Task result evidence must contain 1-32 verifiable items');
     }
+    verifyExternalCostEvidence(task);
     if (task.cleanup?.browserClosed !== true) {
       throw completionGateFailure('Task browser cleanup was not confirmed');
     }
@@ -1690,16 +1858,28 @@ export function createTaskService({
         ));
       }
       entry.behaviorRequests.clear();
+      for (const request of entry.focusRequests.values()) {
+        request.reject(new TaskServiceError(
+          'TASK_FOCUS_UNAVAILABLE',
+          'Task Worker exited before confirming browser focus',
+          409
+        ));
+      }
+      entry.focusRequests.clear();
     }
-    children.delete(task.id);
-    task.cleanup.workerExited = true;
-    task.cleanup.exitCode = exitCode;
-    task.cleanup.exitSignal = signal || null;
     // A heartbeat renewal that started before finalization may still be queued
     // inside ProfileStore. Drain it before the one authoritative release so a
     // late renewal cannot resurrect a completed task's lease.
     await entry?.leaseRenewalTail?.catch(() => {});
     await awaitTaskPersistence(task.id);
+    // Freeze the final checkpoint generation before workerExited or settled
+    // can become observable. IPC updates are drained above and no new Worker
+    // messages are accepted after entry.attached=false.
+    await sealAttemptCheckpoint(task, { allowDiskRecovery: true });
+    children.delete(task.id);
+    task.cleanup.workerExited = true;
+    task.cleanup.exitCode = exitCode;
+    task.cleanup.exitSignal = signal || null;
     const claimedCompletion = task.completionClaimed === true || task.state === 'verifying';
     const cancellationRequested = Boolean(task.cancelRequestedAt);
     if (!claimedCompletion && !cancellationRequested && !TERMINAL_TASK_STATES.has(task.state)) {
@@ -1716,6 +1896,7 @@ export function createTaskService({
     if (claimedCompletion && task.state === 'verifying') {
       try {
         task.completion = await verifyCompletionGate(task);
+        task.externalCostUsage = taskExternalCostUsage(task);
         task.state = 'completed';
         task.error = null;
       } catch (error) {
@@ -1750,6 +1931,7 @@ export function createTaskService({
     if (TERMINAL_TASK_STATES.has(task.state)) task.progress = terminalProgress(task, task.state);
     task.health = { status: task.state, checkedAt: nowIso() };
     finishAttemptHistory(task);
+    await refreshResumeCheckpointState(task);
     await update(task, {
       state: task.state,
       error: task.error,
@@ -1760,7 +1942,12 @@ export function createTaskService({
       commands: task.commands,
       timeline: task.timeline,
       timelineSequence: task.timelineSequence,
-      ...(task.completion ? { completion: task.completion } : {})
+      checkpoint: task.checkpoint,
+      checkpointSeal: task.checkpointSeal,
+      resumeCheckpointValid: task.resumeCheckpointValid,
+      resumeCheckpointError: task.resumeCheckpointError,
+      ...(task.completion ? { completion: task.completion } : {}),
+      ...(task.externalCostUsage ? { externalCostUsage: task.externalCostUsage } : {})
     });
     if (task.cleanup.settled === true) {
       await removeCleanupReceipt(taskCleanupReceiptPath(task)).catch(() => {});
@@ -1847,6 +2034,8 @@ export function createTaskService({
       resolveExit,
       leaseRenewalTail: Promise.resolve(),
       behaviorRequests: new Map(),
+      focusRequests: new Map(),
+      externalCostTail: Promise.resolve(),
       attached: false
     };
 
@@ -1971,6 +2160,7 @@ export function createTaskService({
           } : {}),
           userRequest: {
             id: request.id,
+            kind: request.kind === 'human_verification' ? 'human_verification' : 'instruction',
             reason: redactSensitiveText(request.reason).slice(0, 500),
             ...(typeof request.instructions === 'string'
               ? { instructions: redactSensitiveText(request.instructions).slice(0, 2_000) }
@@ -2130,6 +2320,42 @@ export function createTaskService({
           redactSensitiveText(message.error?.message || 'Task Worker rejected the live behavior change').slice(0, 500),
           409
         ));
+        return;
+      }
+      if (message.type === 'focus_applied' && typeof message.requestId === 'string') {
+        const request = entry.focusRequests.get(message.requestId);
+        if (!request) return;
+        entry.focusRequests.delete(message.requestId);
+        clearTimeout(request.timer);
+        request.resolve(typeof message.at === 'string' ? message.at : nowIso());
+        return;
+      }
+      if (message.type === 'focus_control_error' && typeof message.requestId === 'string') {
+        const request = entry.focusRequests.get(message.requestId);
+        if (!request) return;
+        entry.focusRequests.delete(message.requestId);
+        clearTimeout(request.timer);
+        request.reject(new TaskServiceError(
+          message.error?.code === 'TASK_FOCUS_NO_LIVE_PAGE' ? 'TASK_FOCUS_NO_LIVE_PAGE' : 'TASK_FOCUS_REJECTED',
+          redactSensitiveText(message.error?.message || 'Task Worker could not focus its browser page').slice(0, 500),
+          409
+        ));
+        return;
+      }
+      if (message.type === 'external_cost_request' && typeof message.requestId === 'string') {
+        const requestId = message.requestId;
+        const operation = entry.externalCostTail.then(async () => {
+          const result = await applyExternalCostOperation(task, message);
+          send(child, { type: 'external_cost_response', requestId, ok: true, result });
+        });
+        entry.externalCostTail = operation.catch((error) => {
+          send(child, {
+            type: 'external_cost_response',
+            requestId,
+            ok: false,
+            error: sanitizeError(error, 'TASK_EXTERNAL_COST_REJECTED')
+          });
+        });
         return;
       }
       if (message.type === 'cooldown' && message.cooldown) {
@@ -2394,6 +2620,7 @@ export function createTaskService({
           modulePath: task.modulePath,
           input: clone(task.input),
           behavior,
+          ...(task.externalCostBudget ? { externalCostBudget: clone(task.externalCostBudget) } : {}),
           ...(task.interactionContract ? { interactionContract: task.interactionContract } : {}),
           outputDir: task.outputDir,
           checkpointPath: path.join(root, task.id, 'checkpoint.json'),
@@ -2462,6 +2689,7 @@ export function createTaskService({
       'taskLabel',
       'input',
       'timeoutMs',
+      'externalCostBudget',
       'idempotencyKey'
     ]);
     const unknown = Object.keys(body).filter((key) => !allowed.has(key));
@@ -2499,6 +2727,7 @@ export function createTaskService({
     }
     const input = body.input ?? {};
     validateTaskInput(input, taskType.inputSchema);
+    const externalCostBudget = validateExternalCostBudget(body.externalCostBudget, taskType.externalCost);
     const hashInput = {
       profileId: body.profileId,
       taskType: body.taskType,
@@ -2507,6 +2736,7 @@ export function createTaskService({
       supportsResume: taskType.supportsResume === true,
       interactionContract,
       timeoutMs: body.timeoutMs ?? null,
+      ...(externalCostBudget ? { externalCostBudget } : {}),
       input
     };
     const hash = requestHash(hashInput);
@@ -2564,6 +2794,17 @@ export function createTaskService({
       taskTypeSha256: taskType.sha256,
       supportsResume: taskType.supportsResume === true,
       ...(interactionContract ? { interactionContract } : {}),
+      ...(taskType.externalCost ? { externalCost: clone(taskType.externalCost) } : {}),
+      ...(externalCostBudget ? { externalCostBudget: clone(externalCostBudget) } : {}),
+      ...(externalCostBudget ? {
+        externalCostLedger: createExternalCostLedger(externalCostBudget),
+        externalCostUsage: {
+          currency: externalCostBudget.currency,
+          estimatedTotal: 0,
+          actualTotal: 0,
+          remainingAmount: externalCostBudget.maxAmount
+        }
+      } : {}),
       modulePath: taskType.modulePath,
       ownerRole: caller.role,
       ownerClientId: caller.clientId,
@@ -2590,8 +2831,10 @@ export function createTaskService({
       timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
       outputDir,
       checkpoint: null,
+      checkpointSeal: null,
       resumeInput: null,
       resumeCheckpointValid: false,
+      resumeCheckpointError: null,
       result: null,
       error: null,
       cleanup: { browserClosed: false, leaseReleased: false, workerExited: false, settled: false },
@@ -2746,6 +2989,76 @@ export function createTaskService({
     return changed;
   }
 
+  async function sealAttemptCheckpoint(task, {
+    allowDiskRecovery = false,
+    expectedCheckpoint = task.checkpoint,
+    checkpointKnownAbsent = false
+  } = {}) {
+    if (task.supportsResume !== true) return false;
+    if (task.checkpointSeal?.attempt === task.attempt) return task.resumeCheckpointValid === true;
+    let pointer = null;
+    let checkpointError = null;
+    try {
+      if (checkpointKnownAbsent) {
+        throw new TaskServiceError(
+          'TASK_CHECKPOINT_REQUIRED',
+          'Task attempt closed without a checkpoint',
+          409
+        );
+      }
+      const checkpointPath = path.join(root, task.id, 'checkpoint.json');
+      const checkpointStats = await lstat(checkpointPath).catch((error) => {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (!checkpointStats) {
+        throw new TaskServiceError(
+          expectedCheckpoint ? 'TASK_CHECKPOINT_INVALID' : 'TASK_CHECKPOINT_REQUIRED',
+          expectedCheckpoint
+            ? 'Recorded task checkpoint is unavailable at terminal sealing'
+            : 'Task attempt closed without a checkpoint',
+          409
+        );
+      }
+      const current = await inspectResumeCheckpoint(task);
+      if (!allowDiskRecovery) {
+        const expected = expectedCheckpoint;
+        if (
+          expected?.attempt !== task.attempt ||
+          expected.savedAt !== current.savedAt ||
+          expected.sha256 !== current.sha256 ||
+          expected.sizeBytes !== current.sizeBytes
+        ) {
+          throw new TaskServiceError(
+            'TASK_CHECKPOINT_INVALID',
+            'Task checkpoint was not recorded before terminal sealing',
+            409
+          );
+        }
+      }
+      const { source: _source, ...verifiedPointer } = current;
+      pointer = verifiedPointer;
+    } catch (error) {
+      checkpointError = sanitizeError(error, 'TASK_CHECKPOINT_INVALID');
+    }
+    task.checkpoint = pointer;
+    task.checkpointSeal = {
+      attempt: task.attempt,
+      sealedAt: nowIso(),
+      status: pointer ? 'sealed' : 'unavailable'
+    };
+    task.resumeCheckpointValid = pointer !== null;
+    task.resumeCheckpointError = pointer ? null : checkpointError;
+    await update(task, {
+      checkpoint: task.checkpoint,
+      checkpointSeal: task.checkpointSeal,
+      resumeCheckpointValid: task.resumeCheckpointValid,
+      resumeCheckpointError: task.resumeCheckpointError
+    });
+    await awaitTaskPersistence(task.id);
+    return task.resumeCheckpointValid;
+  }
+
   async function refreshResumeCheckpointState(task) {
     if (
       task.supportsResume !== true || task.state !== 'failed' ||
@@ -2756,15 +3069,40 @@ export function createTaskService({
       return false;
     }
     try {
-      // A resumed attempt may durably replace checkpoint.json and then lose its
-      // IPC notification. An older pointer must not hide that newer, valid
-      // generation; inspectResumeCheckpoint still requires the current attempt.
-      const checkpoint = task.checkpoint === null || task.checkpoint === undefined ||
-        task.checkpoint.attempt !== task.attempt
-        ? await inspectResumeCheckpoint(task)
-        : await verifyResumeCheckpoint(task);
-      const { source: _source, ...pointer } = checkpoint;
-      task.checkpoint = pointer;
+      if (task.checkpointSeal?.attempt !== task.attempt) {
+        throw new TaskServiceError(
+          'TASK_CHECKPOINT_INVALID',
+          'Task checkpoint was not sealed at the Worker exit boundary',
+          409
+        );
+      }
+      if (task.checkpointSeal.status === 'unavailable') {
+        const unexpected = await lstat(path.join(root, task.id, 'checkpoint.json')).catch((error) => {
+          if (error?.code === 'ENOENT') return null;
+          throw error;
+        });
+        if (unexpected) {
+          throw new TaskServiceError(
+            'TASK_CHECKPOINT_INVALID',
+            'A checkpoint appeared after the attempt was sealed without one',
+            409
+          );
+        }
+        task.resumeCheckpointValid = false;
+        task.resumeCheckpointError ||= {
+          code: 'TASK_CHECKPOINT_REQUIRED',
+          message: 'Task attempt closed without a checkpoint'
+        };
+        return false;
+      }
+      if (task.checkpointSeal.status !== 'sealed') {
+        throw new TaskServiceError(
+          'TASK_CHECKPOINT_INVALID',
+          'Task checkpoint seal status is invalid',
+          409
+        );
+      }
+      await verifyResumeCheckpoint(task);
       task.resumeCheckpointValid = true;
       task.resumeCheckpointError = null;
       return true;
@@ -2773,21 +3111,6 @@ export function createTaskService({
       task.resumeCheckpointError = sanitizeError(error, 'TASK_CHECKPOINT_INVALID');
       return false;
     }
-  }
-
-  async function recoverResumeCheckpointPointer(task) {
-    if (task.checkpoint?.attempt === task.attempt) return false;
-    let checkpoint;
-    try {
-      checkpoint = await inspectResumeCheckpoint(task);
-    } catch {
-      return false;
-    }
-    const { source: _source, ...pointer } = checkpoint;
-    task.checkpoint = pointer;
-    task.resumeCheckpointValid = true;
-    await update(task, { checkpoint: task.checkpoint, resumeCheckpointValid: true });
-    return true;
   }
 
   async function verifyResumeCheckpoint(task) {
@@ -2921,9 +3244,19 @@ export function createTaskService({
     if (task.cleanup?.settled !== true) {
       throw new TaskServiceError('TASK_CLEANUP_NOT_SETTLED', 'Task cleanup must settle before resume', 409);
     }
-    await recoverResumeCheckpointPointer(task);
     if (!task.checkpoint) {
-      throw new TaskServiceError('TASK_CHECKPOINT_REQUIRED', 'Task has no checkpoint to resume', 409);
+      const sealedError = task.checkpointSeal?.attempt === task.attempt
+        ? task.resumeCheckpointError
+        : null;
+      throw new TaskServiceError(
+        sealedError?.code === 'TASK_CHECKPOINT_INVALID'
+          ? 'TASK_CHECKPOINT_INVALID'
+          : 'TASK_CHECKPOINT_REQUIRED',
+        sealedError?.code === 'TASK_CHECKPOINT_INVALID'
+          ? 'Task checkpoint failed terminal integrity verification'
+          : 'Task has no checkpoint to resume',
+        409
+      );
     }
     normalizeAttemptHistory(task);
     if (task.attempt >= MAX_ATTEMPTS) {
@@ -2952,6 +3285,8 @@ export function createTaskService({
     task.error = null;
     task.completion = null;
     task.completionClaimed = false;
+    task.checkpoint = null;
+    task.checkpointSeal = null;
     task.cleanup = { browserClosed: false, leaseReleased: false, workerExited: false, settled: false };
     task.startedAt = null;
     task.finishedAt = null;
@@ -2960,7 +3295,8 @@ export function createTaskService({
     task.lastScreenshot = null;
     task.lastObservation = null;
     await rm(path.join(root, task.id, 'diagnostics.json'), { force: true });
-    task.resumeCheckpointValid = true;
+    task.resumeCheckpointValid = false;
+    task.resumeCheckpointError = null;
     task.resumeInput = resumeInput;
     task.progressAt = nowIso();
     task.health = { status: 'healthy', checkedAt: nowIso() };
@@ -3994,7 +4330,56 @@ export function createTaskService({
     });
   }
 
+  async function claimUserRequest(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, async () => {
+      await ready;
+      requireServiceOpen();
+      const caller = callerIdentity(suppliedCaller);
+      const task = requireTaskAccess(id, caller);
+      const unknown = Object.keys(body).filter((key) => key !== 'requestId');
+      if (unknown.length) {
+        throw new TaskServiceError('INVALID_USER_REQUEST_CLAIM', `Unsupported claim fields: ${unknown.join(', ')}`);
+      }
+      if (typeof body.requestId !== 'string' || !HANDOFF_ID_PATTERN.test(body.requestId)) {
+        throw new TaskServiceError('INVALID_USER_REQUEST_CLAIM', 'requestId must identify the live handoff request');
+      }
+      if (task.state !== 'waiting_user' || !['pending', 'claimed'].includes(task.userRequest?.status)) {
+        throw new TaskServiceError('TASK_NOT_WAITING_USER', 'Task has no claimable user request', 409);
+      }
+      if (body.requestId !== task.userRequest.id) {
+        throw new TaskServiceError('USER_HANDOFF_MISMATCH', 'Handoff request ID does not match the live task', 409);
+      }
+      if (task.userRequest.kind === 'human_verification' && caller.role !== 'manager-admin') {
+        throw new TaskServiceError(
+          'USER_HANDOFF_CLAIM_FORBIDDEN',
+          'Only the Owner Dashboard can claim a human-verification handoff',
+          403
+        );
+      }
+      if (task.userRequest.status === 'claimed') return readPublicRecord(task);
+      task.userRequest = {
+        ...task.userRequest,
+        status: 'claimed',
+        claimedAt: nowIso()
+      };
+      appendTimeline(task, 'user_request.claimed', {
+        actor: taskActor(caller),
+        message: `User request ${task.userRequest.id} claimed`
+      });
+      await update(task, {
+        userRequest: task.userRequest,
+        timeline: task.timeline,
+        timelineSequence: task.timelineSequence
+      });
+      return publicRecord(task);
+    });
+  }
+
   async function continueTask(id, body = {}, suppliedCaller = {}) {
+    return serializeControl(id, () => continueTaskSerialized(id, body, suppliedCaller));
+  }
+
+  async function continueTaskSerialized(id, body = {}, suppliedCaller = {}) {
     await ready;
     requireServiceOpen();
     const caller = callerIdentity(suppliedCaller);
@@ -4007,8 +4392,15 @@ export function createTaskService({
     if (unknown.length) {
       throw new TaskServiceError('INVALID_TASK_CONTINUE', `Unsupported continue fields: ${unknown.join(', ')}`);
     }
-    if (task.state !== 'waiting_user' || task.userRequest?.status !== 'pending') {
+    if (task.state !== 'waiting_user' || !['pending', 'claimed'].includes(task.userRequest?.status)) {
       throw new TaskServiceError('TASK_NOT_WAITING_USER', 'Task is not waiting for a new instruction', 409);
+    }
+    if (task.userRequest.kind === 'human_verification' && task.userRequest.status !== 'claimed') {
+      throw new TaskServiceError(
+        'USER_HANDOFF_OWNER_CLAIM_REQUIRED',
+        'The Owner must claim the live human-verification request before this task can continue',
+        409
+      );
     }
     const requestId = body.requestId || task.userRequest.id;
     if (!HANDOFF_ID_PATTERN.test(requestId) || requestId !== task.userRequest.id) {
@@ -4184,6 +4576,24 @@ export function createTaskService({
   }
 
   async function buildTaskAssets() {
+    for (const task of tasks.values()) {
+      if (
+        task.deletedAt || task.state !== 'failed' || task.supportsResume !== true ||
+        task.cleanup?.settled !== true
+      ) continue;
+      const before = JSON.stringify({
+        checkpoint: task.checkpoint ?? null,
+        resumeCheckpointValid: task.resumeCheckpointValid === true,
+        resumeCheckpointError: task.resumeCheckpointError ?? null
+      });
+      await refreshResumeCheckpointState(task);
+      const after = JSON.stringify({
+        checkpoint: task.checkpoint ?? null,
+        resumeCheckpointValid: task.resumeCheckpointValid === true,
+        resumeCheckpointError: task.resumeCheckpointError ?? null
+      });
+      if (before !== after) await persist(task);
+    }
     const [records, snapshots] = await Promise.all([
       registry.listManagement(),
       registry.snapshotInventory()
@@ -4280,17 +4690,26 @@ export function createTaskService({
       const states = {};
       let lastUsedAt = null;
       const blockers = [];
+      const blockerCodes = [];
       for (const task of related) {
         states[task.state] = (states[task.state] || 0) + 1;
         const usedAt = task.updatedAt || task.createdAt;
         if (usedAt && (!lastUsedAt || usedAt > lastUsedAt)) lastUsedAt = usedAt;
         if (!TERMINAL_TASK_STATES.has(task.state) || task.cleanup?.settled !== true) {
           blockers.push(`任务 ${task.displayName || task.id} 尚未完成安全清理`);
-        } else if (task.state === 'failed' && task.supportsResume === true && task.checkpoint) {
+          blockerCodes.push(TERMINAL_TASK_STATES.has(task.state) ? 'cleanup_pending' : 'active_task');
+        } else if (
+          task.state === 'failed' && task.supportsResume === true && task.checkpoint &&
+          task.resumeCheckpointValid !== false
+        ) {
           blockers.push(`任务 ${task.displayName || task.id} 仍可从检查点恢复`);
+          blockerCodes.push('resume_available');
         }
       }
-      if (asset.protected) blockers.push('系统验收或基础能力受保护');
+      if (asset.protected) {
+        blockers.push('系统验收或基础能力受保护');
+        blockerCodes.push('protected');
+      }
       asset.usage = {
         runCount: related.length,
         successCount: states.completed || 0,
@@ -4303,6 +4722,7 @@ export function createTaskService({
       asset.canChangeLifecycle = asset.typeNames.length > 0 && !asset.protected;
       asset.deletable = blockers.length === 0;
       asset.deleteBlockers = [...new Set(blockers)].slice(0, 8);
+      asset.deleteBlockerCodes = [...new Set(blockerCodes)].slice(0, 8);
       asset.taskTypes.sort((left, right) => left.name.localeCompare(right.name));
       assets.push(asset);
     }
@@ -4322,6 +4742,37 @@ export function createTaskService({
     }
     const assets = (await buildTaskAssets()).map(publicTaskAsset);
     return { assets, total: assets.length };
+  }
+
+  async function listTaskPacks(suppliedCaller = {}) {
+    await ready;
+    callerIdentity(suppliedCaller);
+    const taskPacks = (await buildTaskAssets())
+      .filter((asset) => asset.kind === 'pack')
+      .map((asset) => ({
+        id: asset.id,
+        name: asset.name,
+        version: asset.version,
+        title: asset.title,
+        ...(asset.description ? { description: asset.description } : {}),
+        lifecycle: asset.lifecycle,
+        discoverable: asset.discoverable,
+        protected: asset.protected,
+        transient: asset.transient,
+        fileCount: asset.fileCount,
+        sizeBytes: asset.sizeBytes,
+        installedAt: asset.installedAt,
+        ...(asset.deprecatedAt ? { deprecatedAt: asset.deprecatedAt } : {}),
+        usage: {
+          runCount: asset.usage.runCount,
+          activeCount: asset.usage.activeCount,
+          ...(asset.usage.lastUsedAt ? { lastUsedAt: asset.usage.lastUsedAt } : {})
+        },
+        taskTypes: asset.taskTypes.map((taskType) => ({ ...taskType })),
+        deletable: asset.deletable,
+        deleteBlockerCodes: [...asset.deleteBlockerCodes]
+      }));
+    return { taskPacks, total: taskPacks.length };
   }
 
   function validateTaskAssetAction(input) {
@@ -4468,6 +4919,49 @@ export function createTaskService({
       ));
     });
     return receipt;
+  }
+
+  async function focusTask(id, suppliedCaller = {}) {
+    await ready;
+    requireServiceOpen();
+    const caller = callerIdentity(suppliedCaller);
+    const task = requireTaskAccess(id, caller);
+    if (TERMINAL_TASK_STATES.has(task.state)) {
+      throw new TaskServiceError('TASK_FOCUS_UNAVAILABLE', 'Terminal tasks have no live browser page to focus', 409);
+    }
+    const entry = children.get(task.id);
+    if (!entry?.attached || entry.finalized || !entry.child?.connected) {
+      throw new TaskServiceError('TASK_FOCUS_UNAVAILABLE', 'Task Worker has no live browser page to focus', 409);
+    }
+    const requestId = `focus_${randomUUID().replaceAll('-', '')}`;
+    let resolveReceipt;
+    let rejectReceipt;
+    const receipt = new Promise((resolve, reject) => {
+      resolveReceipt = resolve;
+      rejectReceipt = reject;
+    });
+    receipt.catch(() => {});
+    const timer = setTimeout(() => {
+      entry.focusRequests.delete(requestId);
+      rejectReceipt(new TaskServiceError(
+        'TASK_FOCUS_TIMEOUT',
+        'Task Worker did not confirm browser focus in time',
+        504
+      ));
+    }, FOCUS_APPLY_TIMEOUT_MS);
+    entry.focusRequests.set(requestId, { timer, resolve: resolveReceipt, reject: rejectReceipt });
+    void sendChildMessageConfirmed(entry.child, { type: 'focus', requestId }).then((delivered) => {
+      if (delivered) return;
+      entry.focusRequests.delete(requestId);
+      clearTimeout(timer);
+      rejectReceipt(new TaskServiceError(
+        'TASK_FOCUS_UNAVAILABLE',
+        'Task Worker did not accept the browser focus command',
+        503
+      ));
+    });
+    const focusedAt = await receipt;
+    return { task: await readPublicRecord(task), focusedAt };
   }
 
   async function applyProfileBehavior(profileId, requestedBehavior) {
@@ -5008,8 +5502,29 @@ export function createTaskService({
     };
   }
 
+  async function listHumanVerificationRequests(suppliedCaller = {}) {
+    await ready;
+    callerIdentity(suppliedCaller);
+    return [...tasks.values()]
+      .filter((task) => (
+        !task.deletedAt && task.state === 'waiting_user' &&
+        task.userRequest?.kind === 'human_verification' &&
+        ['pending', 'claimed'].includes(task.userRequest?.status)
+      ))
+      .map((task) => ({
+        id: task.id,
+        state: task.state,
+        userRequest: {
+          id: task.userRequest.id,
+          kind: 'human_verification',
+          status: task.userRequest.status
+        }
+      }));
+  }
+
   return Object.freeze({
     schedulerStatus,
+    listHumanVerificationRequests,
     list,
     create,
     get,
@@ -5028,7 +5543,9 @@ export function createTaskService({
     getTaskTimeline,
     reviseQueuedTask,
     publishTaskReport,
+    claimUserRequest,
     continueTask,
+    focusTask,
     resume,
     installTaskType,
     installTaskPack,
@@ -5036,6 +5553,7 @@ export function createTaskService({
     describeTaskType,
     deprecateTaskType,
     restoreTaskType,
+    listTaskPacks,
     listTaskAssets,
     applyTaskAssetAction,
     applyProfileBehavior,

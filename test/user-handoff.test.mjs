@@ -28,12 +28,15 @@ test('user handoff reports one bounded request and resumes only with its matchin
   });
 
   const waiting = handoff.request({
+    kind: 'human_verification',
     reason: 'Cookie panel requires a choice',
     instructions: 'Inspect the screenshot before continuing.',
     timeoutMs: 5_000
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.match(request.id, /^handoff_[a-f0-9]{32}$/u);
+  assert.equal(request.kind, 'human_verification');
+  assert.equal(request.expiresAt, undefined);
   assert.equal(request.screenshotAvailable, true);
   assert.equal(publishedDiagnostics, 'fixture.png');
   assert.equal(await handoff.continue({ requestId: 'handoff_wrong', note: '' }), false);
@@ -42,6 +45,15 @@ test('user handoff reports one bounded request and resumes only with its matchin
   assert.deepEqual(states, ['waiting_user', 'recovering', 'running']);
   assert.deepEqual(published.slice(0, 3), ['request', 'state:waiting_user', 'progress']);
   assert.match(progress[0], /Waiting/u);
+  assert.equal(handoff.pending, null);
+});
+
+test('user handoff rejects unknown request kinds without publishing a waiter', async () => {
+  const handoff = createUserHandoff();
+  await assert.rejects(
+    handoff.request({ kind: 'captcha_solver', reason: 'Unsupported automation request' }),
+    { code: 'INVALID_USER_HANDOFF' }
+  );
   assert.equal(handoff.pending, null);
 });
 

@@ -97,6 +97,28 @@ function createTaskHarness(profileStore, tasks, control) {
     async get(id) {
       return structuredClone(task(id));
     },
+    async focusTask(id) {
+      control.notificationActions.push({ id, action: 'focus' });
+      return structuredClone(task(id));
+    },
+    async claimUserRequest(id, { requestId }) {
+      const value = task(id);
+      assert.equal(value.userRequest?.id, requestId);
+      control.notificationActions.push({ id, action: 'claim' });
+      value.userRequest = { ...value.userRequest, claimedAt: now() };
+      return structuredClone(value);
+    },
+    async continueTask(id, { requestId }) {
+      const value = task(id);
+      assert.equal(value.userRequest?.id, requestId);
+      control.notificationActions.push({ id, action: 'continue' });
+      return revise(value, {
+        state: 'running',
+        userRequest: { ...value.userRequest, continuedAt: now() },
+        currentActivity: { phase: 'running', status: 'active', updatedAt: now() },
+        health: { status: 'healthy', checkedAt: now() }
+      });
+    },
     async openProfile(id) {
       const ownerId = `profile-open:dashboard-acceptance:${id}`;
       await profileStore.acquireLease(id, ownerId, { pid: process.pid, ttlMs: 60_000 });
@@ -192,6 +214,91 @@ function createTaskHarness(profileStore, tasks, control) {
   };
 }
 
+function createNotificationHarness(control) {
+  function publicSettings() {
+    const channels = control.notificationSettings.channels;
+    return {
+      channels: {
+        system: { enabled: channels.system.enabled, configured: true },
+        telegram: {
+          enabled: channels.telegram.enabled,
+          configured: Boolean(channels.telegram.botToken && channels.telegram.chatId),
+          ...(channels.telegram.chatId ? { maskedTarget: `••••${channels.telegram.chatId.slice(-4)}` } : {})
+        },
+        feishu: {
+          enabled: channels.feishu.enabled,
+          configured: Boolean(channels.feishu.webhookUrl),
+          ...(channels.feishu.webhookUrl ? { maskedTarget: 'open.feishu.cn/••••' } : {})
+        }
+      }
+    };
+  }
+
+  function record(id) {
+    return control.notifications.find((item) => item.id === id) || null;
+  }
+
+  return {
+    async init() {},
+    async observeTask() {},
+    async list() { return structuredClone(control.notifications); },
+    async get(id) { return structuredClone(record(id)); },
+    async markRead(id) {
+      const item = record(id);
+      if (item && !item.readAt) item.readAt = now();
+      return structuredClone(item);
+    },
+    async markAllRead() {
+      let updated = 0;
+      for (const item of control.notifications) {
+        if (item.readAt) continue;
+        item.readAt = now();
+        updated += 1;
+      }
+      return { updated, readAt: now() };
+    },
+    async claim(id) {
+      const item = record(id);
+      if (item?.state === 'active') {
+        item.state = 'claimed';
+        item.claimedAt = now();
+      }
+      if (control.degradeNextNotificationSync) {
+        control.degradeNextNotificationSync = false;
+        throw Object.assign(new Error('simulated notification sidecar persistence failure'), { code: 'EIO' });
+      }
+      return structuredClone(item);
+    },
+    async resolveTask(taskId, { requestId } = {}) {
+      let resolved = 0;
+      for (const item of control.notifications) {
+        if (item.taskId !== taskId || (requestId && item.requestId !== requestId) || item.state === 'resolved') continue;
+        item.state = 'resolved';
+        item.resolvedAt = now();
+        resolved += 1;
+      }
+      return { resolved };
+    },
+    async getSettings() { return publicSettings(); },
+    async updateSettings(body) {
+      control.notificationSettingPatches.push(structuredClone(body));
+      for (const name of ['system', 'telegram', 'feishu']) {
+        if (!body.channels?.[name]) continue;
+        control.notificationSettings.channels[name] = {
+          ...control.notificationSettings.channels[name],
+          ...body.channels[name]
+        };
+      }
+      return publicSettings();
+    },
+    async testChannel(channel, options = {}) {
+      control.notificationTests.push({ channel, ...structuredClone(options) });
+      return { ok: true, channel };
+    },
+    async close() {}
+  };
+}
+
 async function jsonRequest(baseUrl, pathname, { method = 'GET', token, body } = {}) {
   const response = await fetch(`${baseUrl}${pathname}`, {
     method,
@@ -216,6 +323,27 @@ const control = {
   deleteRequests: 0,
   behaviorChanges: [],
   assetActions: [],
+  notificationActions: [],
+  notificationSettingPatches: [],
+  notificationTests: [],
+  degradeNextNotificationSync: false,
+  notificationSettings: {
+    channels: {
+      system: { enabled: true },
+      telegram: { enabled: true, botToken: 'stored-token', chatId: '1234567890' },
+      feishu: { enabled: false, webhookUrl: '' }
+    }
+  },
+  notifications: [
+    {
+      id: 'notice_verify', taskId: 'task_waiting', requestId: 'request_verify', kind: 'human_verification', state: 'active',
+      title: '需要人工验证', message: '请完成页面验证', createdAt: ago(90_000), updatedAt: now(), deliveryCount: 3
+    },
+    {
+      id: 'notice_history', taskId: 'task_completed', requestId: 'request_history', kind: 'human_verification', state: 'resolved',
+      title: '历史人工验证', message: '用于验收全部标为已读', createdAt: ago(180_000), updatedAt: ago(120_000), deliveryCount: 1
+    }
+  ],
   assets: [
     {
       id: 'pack:news-pack@2.0.0', kind: 'pack', source: 'task-pack', name: 'news-pack', version: '2.0.0',
@@ -263,6 +391,7 @@ async function startManager(port = 0) {
     port,
     dataDir,
     dashboardDir: DASHBOARD,
+    notificationCenterFactory: () => createNotificationHarness(control),
     taskServiceFactory: ({ profileStore }) => createTaskHarness(profileStore, tasks, control)
   });
   await next.start();
@@ -369,6 +498,28 @@ try {
       sections: [{ heading: '结论', body: '没有发现需要人工处理的异常。' }]
     }
   });
+  tasks.set('task_waiting', {
+    id: 'task_waiting',
+    jobId: 'job_waiting',
+    revision: 3,
+    profileId: persistent.id,
+    taskType: 'account.verify.v1',
+    taskLabel: '账号验证',
+    displayName: 'Codex-账号验证-20260826-101545Z',
+    state: 'waiting_user',
+    behavior: 'human',
+    behaviorState: { configured: 'human', effective: 'human', source: 'worker', confirmed: true, at: now() },
+    createdAt: ago(96_000),
+    startedAt: ago(92_000),
+    updatedAt: now(),
+    currentActivity: { phase: 'waiting_user', status: 'waiting', updatedAt: now() },
+    progress: { current: 4, total: 10, message: '等待人工完成验证', updatedAt: now() },
+    userRequest: { id: 'request_verify', kind: 'human_verification', createdAt: ago(90_000) },
+    health: { status: 'waiting_user', checkedAt: now() },
+    timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
+    history: [{ attempt: 1, workerStartedAt: ago(92_000) }],
+    cleanup: { browserClosed: false, workerExited: false, leaseReleased: false, settled: false }
+  });
 
   control.listFailures = 1;
   const authorization = await jsonRequest(baseUrl, '/v1/dashboard/authorize', {
@@ -380,10 +531,14 @@ try {
   const page = await context.newPage();
   const pageErrors = [];
   const requestedApiPaths = [];
+  const notificationRequestBodies = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
   page.on('request', (request) => {
     const pathname = new URL(request.url()).pathname;
     if (pathname.startsWith('/v1/')) requestedApiPaths.push(pathname);
+    if (pathname === '/v1/notification-settings' || pathname === '/v1/notification-settings/test') {
+      try { notificationRequestBodies.push({ pathname, body: request.postDataJSON() }); } catch {}
+    }
   });
 
   await page.goto(authorization.dashboardUrl, { waitUntil: 'domcontentloaded' });
@@ -392,7 +547,7 @@ try {
   assert.equal(await page.locator('#auth-banner').isHidden(), true);
   assert.equal(await page.locator('[data-view-panel="tasks"]').isVisible(), true);
   assert.equal(await page.locator('.nav-link').count(), 3);
-  assert.equal(await page.locator('.task-card').count(), 3);
+  assert.equal(await page.locator('.task-card').count(), 4);
   await page.locator('[data-task-id="task_running"]').filter({ hasText: 'Codex-抓取新闻-20260826-101500Z' }).waitFor();
   assert.equal(await page.evaluate(() => document.activeElement?.dataset.taskId), 'task_running');
   checks.push('one-click Owner session, transient GET retry, Tasks default, and deep-link focus');
@@ -402,6 +557,84 @@ try {
   }
   assert.equal(await page.locator('.agent-card, dialog, [data-view-panel="agents"]').count(), 0);
   checks.push('Tasks, Profiles, and Task Pack assets are rendered without Agent or raw artifact APIs');
+
+  await page.locator('#notification-badge').filter({ hasText: '2' }).waitFor();
+  await page.getByRole('button', { name: '打开通知', exact: true }).click();
+  const verificationCard = page.locator('.notification-card[data-notification-id="notice_verify"]');
+  await verificationCard.getByText('已提醒 3 次', { exact: true }).waitFor();
+  await verificationCard.getByRole('button', { name: '标为已读', exact: true }).click();
+  await page.locator('#notification-badge').filter({ hasText: '1' }).waitFor();
+  await page.getByRole('button', { name: '全部标为已读', exact: true }).click();
+  await page.locator('#notification-badge').waitFor({ state: 'hidden' });
+  control.degradeNextNotificationSync = true;
+  await verificationCard.getByRole('button', { name: '我已接手', exact: true }).click();
+  const degradedToast = page.locator('#dashboard-message').filter({
+    hasText: '主任务操作已成功，但通知状态暂时同步失败；Manager 会自动重试。'
+  });
+  await degradedToast.waitFor();
+  assert.equal(await degradedToast.evaluate((node) => node.classList.contains('warning')), true);
+  await verificationCard.getByRole('button', { name: '我已接手', exact: true }).waitFor({ state: 'detached' });
+  assert.deepEqual(control.notificationActions.slice(-2).map((item) => item.action), ['claim', 'focus']);
+  await verificationCard.getByRole('button', { name: '打开验证窗口', exact: true }).click();
+  await page.locator('#notification-drawer').waitFor({ state: 'hidden' });
+  assert.equal(control.notificationActions.at(-1).action, 'focus');
+  await page.getByRole('button', { name: '打开通知', exact: true }).click();
+  await verificationCard.getByRole('button', { name: '验证完成继续', exact: true }).click();
+  await page.locator('[data-task-id="task_waiting"] .task-state-running').waitFor();
+  assert.equal(control.notificationActions.at(-1).action, 'continue');
+  checks.push('durable notification badge, reminder count, read-all, claim, focus, continue, and degraded-sync warning');
+
+  await page.locator('.notification-settings > summary').click();
+  await page.locator('#notification-telegram-status').filter({ hasText: '••••7890' }).waitFor();
+  assert.equal(await page.locator('#notification-telegram-token').inputValue(), '');
+  assert.equal(await page.locator('#notification-telegram-chat').inputValue(), '');
+  const feishuTest = page.locator('.notification-channel').filter({ hasText: '飞书' }).getByRole('button', { name: '发送测试' });
+  assert.equal(await feishuTest.isDisabled(), true);
+  await page.locator('#notification-telegram-token').fill('new-bot-token');
+  await page.locator('#notification-telegram-chat').fill('99887766');
+  await page.locator('#notification-feishu-enabled').check();
+  await page.locator('#notification-feishu-webhook').fill('https://open.feishu.cn/open-apis/bot/v2/hook/new-secret');
+  await page.getByRole('button', { name: '保存通知设置', exact: true }).click();
+  await page.locator('#dashboard-message').filter({ hasText: '通知设置已保存' }).waitFor();
+  assert.equal(await page.locator('#notification-telegram-token').inputValue(), '');
+  assert.equal(await page.locator('#notification-telegram-chat').inputValue(), '');
+  assert.equal(await page.locator('#notification-feishu-webhook').inputValue(), '');
+  assert.equal(control.notificationSettingPatches.at(-1).channels.telegram.botToken, 'new-bot-token');
+  assert.equal(control.notificationSettingPatches.at(-1).channels.feishu.webhookUrl.endsWith('new-secret'), true);
+  assert.equal(await feishuTest.isDisabled(), false);
+  await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' }).click();
+  await page.locator('#dashboard-message').filter({ hasText: 'Telegram 测试通知已发送' }).waitFor();
+  assert.deepEqual(notificationRequestBodies.at(-1).body, { channel: 'telegram' });
+  assert.equal(JSON.stringify(notificationRequestBodies.at(-1).body).includes('token'), false);
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).click();
+  await page.locator('#dashboard-message').filter({ hasText: 'Telegram 凭据已清除' }).waitFor();
+  const clearedTelegram = control.notificationSettingPatches.at(-1).channels.telegram;
+  assert.deepEqual(clearedTelegram, { enabled: false, botToken: null, chatId: null });
+  await page.locator('#notification-telegram-status').filter({ hasText: '未配置' }).waitFor();
+  assert.equal(await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' }).isDisabled(), true);
+  assert.equal(await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).isDisabled(), true);
+  checks.push('masked notification settings, write-only secrets, save-before-test, secret-free channel test, and explicit credential clearing');
+
+  await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
+  assert.equal(await page.getAttribute('html', 'lang'), 'en');
+  await page.getByRole('button', { name: 'Tasks', exact: true }).waitFor();
+  await page.getByText('Effective behavior', { exact: true }).first().waitFor();
+  await page.getByText('Run time', { exact: true }).first().waitFor();
+  await page.getByRole('button', { name: 'Profiles', exact: true }).click();
+  await page.getByRole('heading', { name: 'Browser Profiles', exact: true }).waitFor();
+  await page.locator('.profile-card').first().getByText('Operation speed', { exact: true }).first().waitFor();
+  await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
+  await page.getByRole('heading', { name: 'Task Pack assets', exact: true }).waitFor();
+  await page.locator('.asset-card').first().getByText('Agent discoverable', { exact: true }).waitFor();
+  await page.locator('#notification-drawer').waitFor({ state: 'visible' });
+  await page.getByRole('heading', { name: 'Notifications', exact: true }).waitFor();
+  await page.getByText('Notification settings', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '切换到中文', exact: true }).click();
+  assert.equal(await page.getAttribute('html', 'lang'), 'zh-CN');
+  await page.getByRole('button', { name: '关闭通知', exact: true }).click();
+  await page.getByRole('button', { name: '任务', exact: true }).click();
+  checks.push('complete runtime Chinese and English switching across all three views and notifications');
 
   const runningCard = page.locator('.task-card[data-task-id="task_running"]');
   await runningCard.getByText('正在提取第 3 批结果').waitFor();
@@ -413,7 +646,7 @@ try {
   assert.equal((await runningCard.locator('[data-task-duration="run"]').textContent()).includes('—'), false);
   assert.equal((await runningCard.locator('[data-task-duration="cooldown"]').textContent()).includes('—'), false);
   const totalBefore = await runningCard.locator('[data-task-duration="total"]').textContent();
-  await page.waitForTimeout(1_150);
+  await page.waitForTimeout(2_150);
   const totalAfter = await runningCard.locator('[data-task-duration="total"]').textContent();
   assert.notEqual(totalAfter, totalBefore);
   const coolingBefore = await page.locator('[data-task-id="task_cooling"] [data-task-duration="cooldown"]').textContent();
@@ -593,9 +826,27 @@ try {
   assert.equal(assetMobile.scrollWidth <= assetMobile.innerWidth, true);
   assert.equal(assetMobile.assetOverflow, false);
   assert.deepEqual(assetMobile.shortTargets, []);
+  await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
+  await page.getByRole('button', { name: 'Open notifications', exact: true }).click();
+  const englishMobile = await page.evaluate(() => ({
+    language: document.documentElement.lang,
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth,
+    drawerOverflow: document.querySelector('#notification-drawer').scrollWidth > document.querySelector('#notification-drawer').clientWidth,
+    shortTargets: [...document.querySelectorAll('#notification-drawer button, #notification-drawer input:not([type="checkbox"]), #notification-drawer summary')]
+      .filter((node) => !node.hidden && getComputedStyle(node).display !== 'none')
+      .map((node) => node.getBoundingClientRect().height)
+      .filter((height) => height > 0 && height < 44)
+  }));
+  assert.equal(englishMobile.language, 'en');
+  assert.equal(englishMobile.scrollWidth <= englishMobile.innerWidth, true);
+  assert.equal(englishMobile.drawerOverflow, false);
+  assert.deepEqual(englishMobile.shortTargets, []);
+  await page.getByRole('button', { name: 'Close notifications', exact: true }).click();
+  await page.getByRole('button', { name: '切换到中文', exact: true }).click();
   await page.keyboard.press('Tab');
   assert.notEqual(await page.evaluate(() => document.activeElement?.tagName), 'BODY');
-  checks.push('mobile layout, 44px targets, keyboard focus, and reduced motion');
+  checks.push('bilingual mobile layout, notification drawer, 44px targets, keyboard focus, and reduced motion');
 
   const unauthorizedContext = await browser.newContext({ viewport: { width: 1000, height: 700 } });
   const unauthorizedPage = await unauthorizedContext.newPage();

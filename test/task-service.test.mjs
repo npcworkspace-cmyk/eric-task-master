@@ -210,6 +210,27 @@ test('task service isolates work in a child, tracks progress, and releases its l
   await service.close();
 });
 
+test('the protected built-in surface probe is discoverable by probe, surface, preflight, and scale filters', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-surface-discovery-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: fakeProfileStore(root),
+    workerFactory() { throw new Error('discovery must not launch a Worker'); }
+  });
+  t.after(() => service.close());
+  for (const term of ['probe', 'surface', 'preflight', 'scale']) {
+    const byQuery = await service.listTaskTypes({ query: term }, ADMIN);
+    assert.ok(byQuery.taskTypes.some((taskType) => taskType.name === 'surface-probe'));
+    const byIntent = await service.listTaskTypes({ intent: term }, ADMIN);
+    assert.ok(byIntent.taskTypes.some((taskType) => taskType.name === 'surface-probe'));
+  }
+  const inventory = await service.listTaskAssets(ADMIN);
+  const surface = inventory.assets.find((asset) => asset.taskTypes.some((taskType) => taskType.name === 'surface-probe'));
+  assert.equal(surface.protected, true);
+  assert.equal(surface.discoverable, true);
+});
+
 test('task asset administration explains usage, blocks live deletion, retires transient modules, and removes them safely', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-assets-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -293,6 +314,244 @@ test('task asset administration explains usage, blocks live deletion, retires tr
   await service.applyTaskAssetAction({ action: 'delete', assetIds: [asset.id] }, ADMIN);
   inventory = await service.listTaskAssets(ADMIN);
   assert.equal(inventory.assets.some((item) => item.id === asset.id), false);
+});
+
+test('Task Pack deletion revalidates cached resume checkpoints and ignores a corrupted terminal checkpoint', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-asset-resume-blocker-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'resumable-task.mjs');
+  await writeFile(modulePath, [
+    'export const meta = { supportsResume: true };',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: fakeProfileStore(root),
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => void (async () => {
+          const savedAt = new Date().toISOString();
+          const encoded = `${JSON.stringify({
+            taskId: message.config.taskId,
+            attempt: 1,
+            savedAt,
+            data: { cursor: 10 }
+          })}\n`;
+          await writeFile(message.config.checkpointPath, encoded);
+          child.emit('message', {
+            type: 'checkpoint',
+            path: message.config.checkpointPath,
+            attempt: 1,
+            savedAt,
+            sha256: createHash('sha256').update(encoded).digest('hex'),
+            sizeBytes: Buffer.byteLength(encoded)
+          });
+          child.emit('message', {
+            type: 'error',
+            state: 'failed',
+            error: { code: 'PROBE_INTERRUPTED', message: 'Resume from the safe checkpoint' }
+          });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish(1);
+        })());
+      });
+    }
+  });
+  t.after(() => service.close());
+  await service.installTaskType({ name: 'resumable.asset.v1', modulePath, transient: true }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'resumable.asset.v1',
+    idempotencyKey: 'resumable-asset-blocker',
+    input: {}
+  }, ADMIN);
+  const failed = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.state === 'failed' && task.cleanup?.settled && task.resumeAvailable ? task : null;
+  });
+
+  let inventory = await service.listTaskAssets(ADMIN);
+  let asset = inventory.assets.find((item) => item.id === 'type:resumable.asset.v1');
+  assert.equal(asset.deletable, false);
+  assert.deepEqual(asset.deleteBlockerCodes, ['resume_available']);
+  await assert.rejects(service.applyTaskAssetAction({
+    action: 'delete', assetIds: [asset.id]
+  }, ADMIN), { code: 'TASK_ASSET_DELETE_BLOCKED' });
+
+  const sealed = await service.getInternal(created.id);
+  const sealedSha = sealed.checkpoint.sha256;
+  await writeFile(path.join(root, 'state', created.id, 'checkpoint.json'), `${JSON.stringify({
+    taskId: created.id,
+    attempt: sealed.attempt,
+    savedAt: new Date(Date.parse(sealed.finishedAt) - 1).toISOString(),
+    data: { cursor: 999, forgedAfterTerminal: true }
+  })}\n`);
+  inventory = await service.listTaskAssets(ADMIN);
+  asset = inventory.assets.find((item) => item.id === 'type:resumable.asset.v1');
+  assert.equal(asset.deletable, true);
+  assert.deepEqual(asset.deleteBlockerCodes, []);
+  const rejectedReplacement = await service.getInternal(created.id);
+  assert.equal(rejectedReplacement.checkpoint.sha256, sealedSha);
+  assert.equal(rejectedReplacement.resumeCheckpointValid, false);
+  await assert.rejects(
+    service.resume(created.id, { resumeKey: 'reject-forged-terminal-checkpoint' }, ADMIN),
+    { code: 'TASK_CHECKPOINT_INVALID' }
+  );
+
+  await service.deleteTask(created.id, {
+    commandId: 'delete-resumable-task-1',
+    expectedRevision: failed.revision
+  }, ADMIN);
+  inventory = await service.listTaskAssets(ADMIN);
+  asset = inventory.assets.find((item) => item.id === 'type:resumable.asset.v1');
+  assert.equal(asset.deletable, true);
+  assert.deepEqual(asset.deleteBlockerCodes, []);
+  await service.applyTaskAssetAction({ action: 'delete', assetIds: [asset.id] }, ADMIN);
+});
+
+test('terminal finalization seals a valid current-attempt checkpoint when checkpoint IPC was lost', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-asset-lost-checkpoint-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'lost-checkpoint-task.mjs');
+  await writeFile(modulePath, [
+    'export const meta = { supportsResume: true };',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: fakeProfileStore(root),
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => void (async () => {
+          const savedAt = new Date().toISOString();
+          await writeFile(message.config.checkpointPath, `${JSON.stringify({
+            taskId: message.config.taskId,
+            attempt: 1,
+            savedAt,
+            data: { cursor: 20 }
+          })}\n`);
+          // Deliberately omit the checkpoint IPC message to exercise durable
+          // filesystem recovery before deciding whether the asset is deletable.
+          child.emit('message', {
+            type: 'error',
+            state: 'failed',
+            error: { code: 'IPC_POINTER_LOST', message: 'Checkpoint write succeeded before IPC loss' }
+          });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish(1);
+        })());
+      });
+    }
+  });
+  t.after(() => service.close());
+  await service.installTaskType({ name: 'lost.checkpoint.asset.v1', modulePath, transient: true }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'lost.checkpoint.asset.v1',
+    idempotencyKey: 'lost-checkpoint-asset-blocker',
+    input: {}
+  }, ADMIN);
+  const failed = await waitFor(async () => {
+    const task = await service.getInternal(created.id);
+    return task.state === 'failed' && task.cleanup?.settled && task.resumeCheckpointValid
+      ? task
+      : null;
+  });
+  assert.equal(failed.checkpoint.attempt, 1);
+  assert.equal(failed.checkpointSeal.attempt, 1);
+  assert.equal(failed.checkpointSeal.status, 'sealed');
+  const sealedSha = failed.checkpoint.sha256;
+
+  const inventory = await service.listTaskAssets(ADMIN);
+  const asset = inventory.assets.find((item) => item.id === 'type:lost.checkpoint.asset.v1');
+  assert.equal(asset.deletable, false);
+  assert.deepEqual(asset.deleteBlockerCodes, ['resume_available']);
+  const refreshed = await service.getInternal(created.id);
+  assert.equal(refreshed.resumeCheckpointValid, true);
+  assert.equal(refreshed.checkpoint.attempt, 1);
+  assert.equal(refreshed.checkpoint.sha256, sealedSha);
+  const persisted = JSON.parse(await readFile(path.join(root, 'state', created.id, 'task.json'), 'utf8'));
+  assert.equal(persisted.resumeCheckpointValid, true);
+  assert.equal(persisted.checkpoint.attempt, 1);
+});
+
+test('terminal finalization seals the newest same-attempt checkpoint before asset reads', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-asset-newer-checkpoint-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'newer-checkpoint-task.mjs');
+  await writeFile(modulePath, [
+    'export const meta = { supportsResume: true };',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  let firstSha;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: fakeProfileStore(root),
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => void (async () => {
+          const firstSavedAt = new Date(Date.now() - 1_000).toISOString();
+          const first = `${JSON.stringify({
+            taskId: message.config.taskId, attempt: 1, savedAt: firstSavedAt, data: { cursor: 10 }
+          })}\n`;
+          await writeFile(message.config.checkpointPath, first);
+          firstSha = createHash('sha256').update(first).digest('hex');
+          child.emit('message', {
+            type: 'checkpoint', path: message.config.checkpointPath, attempt: 1, savedAt: firstSavedAt,
+            sha256: firstSha, sizeBytes: Buffer.byteLength(first)
+          });
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          const secondSavedAt = new Date().toISOString();
+          const second = `${JSON.stringify({
+            taskId: message.config.taskId, attempt: 1, savedAt: secondSavedAt, data: { cursor: 20 }
+          })}\n`;
+          await writeFile(message.config.checkpointPath, second);
+          child.emit('message', {
+            type: 'error', state: 'failed',
+            error: { code: 'LATEST_CHECKPOINT_IPC_LOST', message: 'Latest checkpoint committed before IPC loss' }
+          });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish(1);
+        })());
+      });
+    }
+  });
+  t.after(() => service.close());
+  await service.installTaskType({ name: 'newer.checkpoint.asset.v1', modulePath, transient: true }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test', taskType: 'newer.checkpoint.asset.v1',
+    idempotencyKey: 'newer-checkpoint-asset-blocker', input: {}
+  }, ADMIN);
+  const failed = await waitFor(async () => {
+    const task = await service.getInternal(created.id);
+    return task.state === 'failed' && task.cleanup?.settled && task.resumeCheckpointValid
+      ? task
+      : null;
+  });
+  assert.notEqual(failed.checkpoint.sha256, firstSha);
+  assert.equal(failed.checkpointSeal.attempt, 1);
+  assert.equal(failed.checkpointSeal.status, 'sealed');
+  const sealedSha = failed.checkpoint.sha256;
+
+  const inventory = await service.listTaskAssets(ADMIN);
+  const asset = inventory.assets.find((item) => item.id === 'type:newer.checkpoint.asset.v1');
+  assert.equal(asset.deletable, false);
+  assert.deepEqual(asset.deleteBlockerCodes, ['resume_available']);
+  const refreshed = await service.getInternal(created.id);
+  assert.equal(refreshed.checkpoint.sha256, sealedSha);
+  assert.equal(refreshed.resumeCheckpointValid, true);
 });
 
 test('task activity is redacted, phase-aware, durable, and independent from progress freshness', async (t) => {
@@ -1432,9 +1691,15 @@ test('direct resume recovers lost checkpoint and cleanup IPC before starting the
 
   await waitFor(async () => {
     const internal = await service.getInternal(created.id);
-    return internal.state === 'failed' && internal.cleanup.workerExited === true;
+    return internal.state === 'failed' && internal.cleanup.settled === true &&
+      internal.resumeCheckpointValid === true
+      ? internal
+      : null;
   }, 2_000);
-  assert.equal((await service.getInternal(created.id)).checkpoint, null);
+  const sealedFirstAttempt = await service.getInternal(created.id);
+  assert.equal(sealedFirstAttempt.checkpoint.attempt, 1);
+  assert.equal(sealedFirstAttempt.checkpointSeal.attempt, 1);
+  assert.equal(sealedFirstAttempt.checkpointSeal.status, 'sealed');
 
   const resumed = await service.resume(created.id, { resumeKey: 'direct-resume-attempt-2' }, ADMIN);
   assert.equal(resumed.id, created.id);
@@ -1452,6 +1717,181 @@ test('direct resume recovers lost checkpoint and cleanup IPC before starting the
   assert.equal(completed.cleanup.leaseReleased, true);
   assert.equal(store.profile.lease, null);
   await service.close();
+});
+
+test('external cost ledger is ACKed after persistence and remains cumulative across resume attempts', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cost-ledger-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'state');
+  const modulePath = path.join(root, 'paid-task.mjs');
+  await writeFile(modulePath, [
+    "export const meta = { supportsResume: true, externalCost: { currency: 'USD', maxAmountPerRun: 10 } };",
+    'export async function run() {}'
+  ].join('\n'));
+  const store = fakeProfileStore(root);
+  let starts = 0;
+  const service = createTaskService({
+    stateDir,
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      let config;
+      let phase = 0;
+      const child = new FakeWorker((message) => {
+        if (message.type === 'start') {
+          config = message.config;
+          starts += 1;
+          setImmediate(() => {
+            child.emit('message', { type: 'state', state: 'running' });
+            child.emit('message', {
+              type: 'external_cost_request', requestId: `cost_reserve_${config.attempt}`,
+              action: 'reserve', operationId: `attempt-${config.attempt}`, amount: config.attempt === 1 ? 3 : 8
+            });
+          });
+          return;
+        }
+        if (message.type !== 'external_cost_response' || message.ok !== true) return;
+        void (async () => {
+          const persisted = JSON.parse(await readFile(path.join(stateDir, config.taskId, 'task.json'), 'utf8'));
+          assert.ok(persisted.externalCostLedger.operations[`attempt-${config.attempt}`]);
+          if (phase === 0) {
+            assert.deepEqual(
+              { execute: message.result.execute, status: message.result.status },
+              { execute: true, status: 'reserved' }
+            );
+            phase = 1;
+            child.emit('message', {
+              type: 'external_cost_request', requestId: `cost_settle_${config.attempt}`,
+              action: 'settle', operationId: `attempt-${config.attempt}`, amount: config.attempt === 1 ? 2 : 8
+            });
+            return;
+          }
+          assert.deepEqual(
+            { execute: message.result.execute, status: message.result.status },
+            { execute: false, status: 'settled' }
+          );
+          if (config.attempt === 1) {
+            const savedAt = new Date().toISOString();
+            const source = Buffer.from(`${JSON.stringify({
+              taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
+            })}\n`);
+            await writeFile(config.checkpointPath, source);
+            child.emit('message', {
+              type: 'checkpoint', path: config.checkpointPath, attempt: 1, savedAt,
+              sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.length
+            });
+            child.emit('message', { type: 'error', error: { code: 'FIXTURE_RETRY', message: 'resume' } });
+          } else {
+            child.emit('message', {
+              type: 'result',
+              result: {
+                summary: 'Paid task completed within the task-wide budget',
+                evidence: [
+                  { kind: 'count', label: 'external-cost-estimated', value: 11 },
+                  { kind: 'count', label: 'external-cost-actual', value: 10 }
+                ]
+              }
+            });
+            child.emit('message', { type: 'state', state: 'completed' });
+          }
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish(0);
+        })();
+      });
+      return child;
+    }
+  });
+  t.after(() => service.close());
+  await service.installTaskType({ name: 'paid.fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'paid.fixture',
+    idempotencyKey: 'paid-ledger-across-resume',
+    externalCostBudget: { currency: 'USD', maxAmount: 10 }
+  }, ADMIN);
+  assert.equal('externalCostBudget' in created, false);
+  assert.deepEqual(created.externalCostUsage, {
+    currency: 'USD', estimatedTotal: 0, actualTotal: 0, remainingAmount: 10
+  });
+  await waitFor(async () => {
+    const current = await service.getInternal(created.id);
+    return current.state === 'failed' && current.cleanup.settled ? current : null;
+  }, 2_000);
+  const failed = await service.get(created.id, ADMIN);
+  assert.equal(failed.resumeAvailable, true);
+  assert.deepEqual(failed.externalCostUsage, {
+    currency: 'USD', estimatedTotal: 3, actualTotal: 2, remainingAmount: 8
+  });
+  await service.resume(created.id, { resumeKey: 'paid-ledger-attempt-2' }, ADMIN);
+  await waitFor(async () => {
+    const current = await service.getInternal(created.id);
+    return current.state === 'completed' && current.cleanup.settled ? current : null;
+  }, 2_000);
+  const completed = await service.get(created.id, ADMIN);
+  assert.equal(starts, 2);
+  assert.deepEqual(completed.externalCostUsage, {
+    currency: 'USD', estimatedTotal: 11, actualTotal: 10, remainingAmount: 0
+  });
+  const internal = await service.getInternal(created.id);
+  assert.deepEqual(Object.keys(internal.externalCostLedger.operations).sort(), ['attempt-1', 'attempt-2']);
+});
+
+test('paid task completion fails closed with an outstanding reservation', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cost-ledger-outstanding-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'paid-task.mjs');
+  await writeFile(modulePath, [
+    "export const meta = { externalCost: { currency: 'USD', maxAmountPerRun: 5 } };",
+    'export async function run() {}'
+  ].join('\n'));
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: fakeProfileStore(root),
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      const child = new FakeWorker((message) => {
+        if (message.type === 'start') {
+          setImmediate(() => child.emit('message', {
+            type: 'external_cost_request', requestId: 'cost_outstanding',
+            action: 'reserve', operationId: 'unsettled-call', amount: 1
+          }));
+          return;
+        }
+        if (message.type === 'external_cost_response' && message.ok === true) {
+          setImmediate(() => {
+            child.emit('message', {
+              type: 'result', result: {
+                summary: 'Must be rejected',
+                evidence: [
+                  { kind: 'count', label: 'external-cost-estimated', value: 1 },
+                  { kind: 'count', label: 'external-cost-actual', value: 0 }
+                ]
+              }
+            });
+            child.emit('message', { type: 'state', state: 'completed' });
+            child.emit('message', { type: 'cleanup', browserClosed: true });
+            child.finish(0);
+          });
+        }
+      });
+      return child;
+    }
+  });
+  t.after(() => service.close());
+  await service.installTaskType({ name: 'paid.outstanding', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test', taskType: 'paid.outstanding',
+    idempotencyKey: 'paid-ledger-outstanding',
+    externalCostBudget: { currency: 'USD', maxAmount: 5 }
+  }, ADMIN);
+  const failed = await waitFor(async () => {
+    const current = await service.get(created.id, ADMIN);
+    return current.state === 'failed' && current.cleanup.settled ? current : null;
+  }, 2_000);
+  assert.equal(failed.error.code, 'TASK_COMPLETION_GATE_FAILED');
+  assert.match(failed.error.message, /outstanding external cost reservations/i);
 });
 
 test('the first settled failed-task read publishes a verified resumable checkpoint', async (t) => {

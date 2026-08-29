@@ -5,6 +5,8 @@ import { randomUUID } from 'node:crypto';
 const MAX_RECEIPT_BYTES = 4 * 1024;
 const RECEIPT_VERSION = 1;
 const INTERNAL_ID = /^[a-zA-Z0-9._:-]{1,128}$/u;
+const CHECKPOINT_SHA256 = /^[a-f0-9]{64}$/u;
+const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 
 function validTimestamp(value) {
   return typeof value === 'string' && !Number.isNaN(Date.parse(value));
@@ -22,8 +24,19 @@ function validReceipt(receipt) {
   if (!Number.isSafeInteger(receipt.workerPid) || receipt.workerPid <= 0) return false;
   if (!validTimestamp(receipt.closedAt)) return false;
   if (receipt.kind === 'task') {
-    return INTERNAL_ID.test(receipt.taskId) &&
-      Number.isSafeInteger(receipt.attempt) && receipt.attempt >= 1;
+    if (!INTERNAL_ID.test(receipt.taskId) || !Number.isSafeInteger(receipt.attempt) || receipt.attempt < 1) {
+      return false;
+    }
+    if (!Object.hasOwn(receipt, 'checkpoint')) return true;
+    if (receipt.checkpoint === null) return true;
+    const checkpoint = receipt.checkpoint;
+    return Boolean(
+      checkpoint && typeof checkpoint === 'object' && !Array.isArray(checkpoint) &&
+      checkpoint.attempt === receipt.attempt && validTimestamp(checkpoint.savedAt) &&
+      CHECKPOINT_SHA256.test(checkpoint.sha256 || '') &&
+      Number.isSafeInteger(checkpoint.sizeBytes) && checkpoint.sizeBytes > 0 &&
+      checkpoint.sizeBytes <= MAX_CHECKPOINT_BYTES
+    );
   }
   if (receipt.kind === 'session') {
     return INTERNAL_ID.test(receipt.profileId) &&
@@ -54,7 +67,7 @@ export async function writeCleanupReceipt(filePath, receipt) {
   return value;
 }
 
-export async function verifyCleanupReceipt(filePath, expected) {
+export async function readCleanupReceipt(filePath, expected) {
   let handle;
   try {
     const before = await lstat(filePath, { bigint: true });
@@ -62,11 +75,11 @@ export async function verifyCleanupReceipt(filePath, expected) {
       !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.ino <= 0n ||
       before.size < 2n || before.size > BigInt(MAX_RECEIPT_BYTES)
     ) {
-      return false;
+      return null;
     }
     handle = await open(filePath, 'r');
     const opened = await handle.stat({ bigint: true });
-    if (!sameFile(before, opened)) return false;
+    if (!sameFile(before, opened)) return null;
     const source = await handle.readFile('utf8');
     const afterRead = await handle.stat({ bigint: true });
     const currentPath = await lstat(filePath, { bigint: true });
@@ -74,19 +87,23 @@ export async function verifyCleanupReceipt(filePath, expected) {
       !sameFile(opened, afterRead) || !sameFile(opened, currentPath) ||
       opened.size !== afterRead.size || opened.mtimeNs !== afterRead.mtimeNs
     ) {
-      return false;
+      return null;
     }
     const receipt = JSON.parse(source);
-    if (!validReceipt(receipt)) return false;
+    if (!validReceipt(receipt)) return null;
     for (const [key, value] of Object.entries(expected || {})) {
-      if (receipt[key] !== value) return false;
+      if (receipt[key] !== value) return null;
     }
-    return true;
+    return receipt;
   } catch {
-    return false;
+    return null;
   } finally {
     await handle?.close().catch(() => {});
   }
+}
+
+export async function verifyCleanupReceipt(filePath, expected) {
+  return Boolean(await readCleanupReceipt(filePath, expected));
 }
 
 export async function removeCleanupReceipt(filePath) {

@@ -18,6 +18,7 @@ import {
 } from './lib/dashboard-session-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import { OperationalJournal } from './lib/operational-journal.mjs';
+import { NotificationCenter } from './lib/notification-center.mjs';
 import {
   createManagerIdentityProof,
   generateManagerIdentity,
@@ -114,7 +115,15 @@ function validateTaskCreate(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new HttpError(400, 'INVALID_TASK_CREATE', 'Task request must be an object');
   }
-  const allowed = new Set(['profileId', 'taskType', 'taskLabel', 'input', 'timeoutMs', 'idempotencyKey']);
+  const allowed = new Set([
+    'profileId',
+    'taskType',
+    'taskLabel',
+    'input',
+    'timeoutMs',
+    'idempotencyKey',
+    'externalCostBudget'
+  ]);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_TASK_CREATE', `Unsupported task fields: ${unknown.join(', ')}`);
@@ -199,6 +208,17 @@ function requireTaskMethod(service, name) {
   return service[name].bind(service);
 }
 
+async function notificationOperation(operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new HttpError(400, 'INVALID_NOTIFICATION_REQUEST', error.message);
+    }
+    throw error;
+  }
+}
+
 function errorResponse(error, requestId) {
   if (error instanceof HttpError || error instanceof ProfileStoreError || error instanceof AgentRegistryError || error instanceof AgentTokenError) {
     const message = redactPublicText(error.message);
@@ -258,6 +278,9 @@ export async function createManager({
   dashboardDir = resolve(MODULE_DIRECTORY, '..', 'dashboard'),
   taskService: suppliedTaskService,
   taskServiceFactory,
+  notificationCenter: suppliedNotificationCenter,
+  notificationCenterFactory,
+  notificationScanIntervalMs = 1_000,
   now = () => Date.now(),
   profileProcessAlive,
   allowedTaskRoots = [resolve(MODULE_DIRECTORY, '..')]
@@ -265,6 +288,9 @@ export async function createManager({
   assertLoopbackHost(host);
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     throw new TypeError('port must be an integer from 0 to 65535');
+  }
+  if (!Number.isFinite(notificationScanIntervalMs) || notificationScanIntervalMs < 100) {
+    throw new TypeError('notificationScanIntervalMs must be at least 100');
   }
   const resolvedDataDir = resolve(dataDir);
   const operationalJournal = new OperationalJournal({ stateDir: resolvedDataDir, now });
@@ -334,6 +360,41 @@ export async function createManager({
     })
     : suppliedTaskService;
   const taskService = normalizeTaskService(createdTaskService);
+  const notificationEligibilityCheck = async ({ taskId, requestId }) => {
+    if (typeof taskService.listHumanVerificationRequests !== 'function') return 'absent';
+    const requests = await taskService.listHumanVerificationRequests({
+      role: 'manager-admin',
+      clientId: 'manager-admin'
+    });
+    const task = requests.find((candidate) => (
+      candidate.id === taskId && candidate.userRequest?.id === requestId
+    ));
+    return task?.userRequest?.status === 'claimed'
+      ? 'claimed'
+      : task?.userRequest?.status === 'pending'
+        ? 'pending'
+        : 'absent';
+  };
+  const notificationCenter = suppliedNotificationCenter ?? (
+    typeof notificationCenterFactory === 'function'
+      ? await notificationCenterFactory({
+          filePath: join(resolvedDataDir, 'notifications.json'),
+          now,
+          eligibilityCheck: notificationEligibilityCheck
+        })
+      : new NotificationCenter({
+          filePath: join(resolvedDataDir, 'notifications.json'),
+          now,
+          eligibilityCheck: notificationEligibilityCheck
+        })
+  );
+  if (
+    !notificationCenter || typeof notificationCenter.init !== 'function' ||
+    typeof notificationCenter.observeTask !== 'function'
+  ) {
+    throw new TypeError('notificationCenter must implement init and observeTask');
+  }
+  await notificationCenter.init();
   const dashboardApprovals = new Map();
   const dashboardSessions = new DashboardSessionStore({
     filePath: join(resolvedDataDir, 'dashboard-sessions.json'),
@@ -351,6 +412,11 @@ export async function createManager({
   let acceptedShutdownRequest;
   let shutdownRequestPublished = false;
   let resolveShutdownRequested;
+  let notificationScanTimer = null;
+  let notificationScanPromise = null;
+  let lastNotificationScanErrorAt = 0;
+  let lastNotificationScanErrorCode = null;
+  let notificationLifecycleTail = Promise.resolve();
   const shutdownRequested = new Promise((resolveShutdown) => {
     resolveShutdownRequested = resolveShutdown;
   });
@@ -359,6 +425,107 @@ export async function createManager({
     if (shutdownRequestPublished) return;
     shutdownRequestPublished = true;
     resolveShutdownRequested(request);
+  }
+
+  function serializeNotificationLifecycle(operation) {
+    const result = notificationLifecycleTail.then(operation, operation);
+    notificationLifecycleTail = result.catch(() => {});
+    return result;
+  }
+
+  async function scanTaskNotificationsUnserialized() {
+    if (stopping || stopped) return;
+    if (typeof taskService.listHumanVerificationRequests === 'function') {
+      const candidates = await taskService.listHumanVerificationRequests({
+        role: 'manager-admin',
+        clientId: 'manager-admin'
+      });
+      const activeKeys = new Set();
+      for (const task of candidates) {
+        activeKeys.add(`${task.id}\0${task.userRequest.id}`);
+        if (task.userRequest.status === 'pending') {
+          await notificationCenter.observeTask(task);
+        } else if (task.userRequest.status === 'claimed' && typeof notificationCenter.claimTask === 'function') {
+          await notificationCenter.claimTask(task.id, { requestId: task.userRequest.id });
+        }
+      }
+      const existing = (await notificationCenter.list({ limit: 500 }))
+        .filter((notice) => notice.state === 'active' || notice.state === 'claimed');
+      for (const notice of existing) {
+        if (!activeKeys.has(`${notice.taskId}\0${notice.requestId}`)) {
+          await notificationCenter.resolveTask(notice.taskId, { requestId: notice.requestId });
+        }
+      }
+      return;
+    }
+    if (typeof taskService.list !== 'function') return;
+    let cursor = null;
+    do {
+      const page = await taskService.list({
+        caller: { role: 'manager-admin', clientId: 'manager-admin' },
+        limit: 100,
+        cursor
+      });
+      const tasks = Array.isArray(page) ? page : page?.tasks ?? [];
+      for (const task of tasks) await notificationCenter.observeTask(task);
+      cursor = Array.isArray(page) ? null : page?.nextCursor ?? null;
+    } while (cursor && !stopping && !stopped);
+  }
+
+  function scanTaskNotifications() {
+    return serializeNotificationLifecycle(scanTaskNotificationsUnserialized);
+  }
+
+  async function recordNotificationScanFailure(error) {
+    const code = redactPublicText(error?.code || 'NOTIFICATION_SCAN_FAILED').slice(0, 64);
+    const timestamp = now();
+    if (code === lastNotificationScanErrorCode && timestamp - lastNotificationScanErrorAt < 60_000) return;
+    lastNotificationScanErrorCode = code;
+    lastNotificationScanErrorAt = timestamp;
+    await operationalJournal.append({
+      level: 'warn',
+      component: 'notifications',
+      event: 'notification.scan_failed',
+      code,
+      state: 'degraded'
+    }).catch(() => {});
+  }
+
+  function scheduleTaskNotificationScan(delay = notificationScanIntervalMs) {
+    if (stopping || stopped || notificationScanTimer !== null) return;
+    notificationScanTimer = setTimeout(() => {
+      notificationScanTimer = null;
+      const operation = scanTaskNotifications();
+      notificationScanPromise = operation;
+      void operation.catch(recordNotificationScanFailure).finally(() => {
+        if (notificationScanPromise === operation) notificationScanPromise = null;
+        scheduleTaskNotificationScan();
+      });
+    }, delay);
+    notificationScanTimer.unref?.();
+  }
+
+  function requestImmediateNotificationScan() {
+    if (notificationScanTimer !== null) clearTimeout(notificationScanTimer);
+    notificationScanTimer = null;
+    scheduleTaskNotificationScan(0);
+  }
+
+  async function syncNotificationState(operation) {
+    try {
+      return { ok: true, value: await notificationOperation(operation) };
+    } catch (error) {
+      const code = redactPublicText(error?.code || 'NOTIFICATION_STATE_SYNC_FAILED').slice(0, 64);
+      await operationalJournal.append({
+        level: 'warn',
+        component: 'notifications',
+        event: 'notification.state_sync_failed',
+        code,
+        state: 'degraded'
+      }).catch(() => {});
+      requestImmediateNotificationScan();
+      return { ok: false, value: null, code: 'NOTIFICATION_STATE_SYNC_DEGRADED' };
+    }
   }
 
   function managerOrigin() {
@@ -691,6 +858,155 @@ export async function createManager({
     const taskReportMatch = /^\/v1\/tasks\/([^/]+)\/report$/.exec(url.pathname);
     const taskArtifactsMatch = /^\/v1\/tasks\/([^/]+)\/artifacts$/.exec(url.pathname);
     const taskArtifactMatch = /^\/v1\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname);
+    const taskUserRequestClaimMatch = /^\/v1\/tasks\/([^/]+)\/user-request\/claim$/.exec(url.pathname);
+    const taskFocusMatch = /^\/v1\/tasks\/([^/]+)\/focus$/.exec(url.pathname);
+    const notificationMatch = /^\/v1\/notifications\/([^/]+)\/actions$/.exec(url.pathname);
+
+    if (request.method === 'GET' && url.pathname === '/v1/notifications') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const notifications = await notificationOperation(() => notificationCenter.list({ limit: 100 }));
+      sendJson(response, 200, {
+        notifications,
+        activeCount: notifications.filter((item) => item.state === 'active').length,
+        unreadCount: notifications.filter((item) => !item.readAt).length
+      }, cors);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/notifications/actions') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      if (body.action !== 'read_all') {
+        throw new HttpError(400, 'INVALID_NOTIFICATION_ACTION', 'Notification action must be read_all');
+      }
+      const result = await notificationOperation(() => notificationCenter.markAllRead());
+      sendJson(response, 200, result, cors);
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/v1/notification-settings') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      sendJson(response, 200, { settings: await notificationOperation(() => notificationCenter.getSettings()) }, cors);
+      return;
+    }
+    if (request.method === 'PATCH' && url.pathname === '/v1/notification-settings') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const body = await readJson(request, { maxBytes: 8 * 1024 });
+      const settings = await notificationOperation(() => notificationCenter.updateSettings(body));
+      sendJson(response, 200, { settings }, cors);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/notification-settings/test') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const body = await readJson(request, { maxBytes: 4 * 1024 });
+      const result = await notificationOperation(() => notificationCenter.testChannel(body.channel));
+      sendJson(response, result.ok ? 200 : 502, { result }, cors);
+      return;
+    }
+    if (notificationMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const notificationId = decodeURIComponent(notificationMatch[1]);
+      const body = await readJson(request, { maxBytes: 8 * 1024 });
+      const notification = await notificationOperation(() => notificationCenter.get(notificationId));
+      if (!notification) throw new HttpError(404, 'NOTIFICATION_NOT_FOUND', 'Notification was not found');
+      if (body.action === 'read') {
+        const updated = await notificationOperation(() => notificationCenter.markRead(notificationId));
+        sendJson(response, 200, { notification: updated }, cors);
+        return;
+      }
+      if (body.action === 'focus') {
+        const focused = await requireTaskMethod(taskService, 'focusTask')(
+          notification.taskId,
+          serviceCaller(auth)
+        );
+        sendJson(response, 200, {
+          notification,
+          task: publicTask(focused.task ?? focused),
+          ...(focused.focusedAt ? { focusedAt: focused.focusedAt } : {})
+        }, cors);
+        return;
+      }
+      if (body.action === 'claim') {
+        const { claimedTask, updated, notificationSync } = await serializeNotificationLifecycle(async () => {
+          const task = await requireTaskMethod(taskService, 'claimUserRequest')(
+            notification.taskId,
+            { requestId: notification.requestId },
+            serviceCaller(auth)
+          );
+          const sync = await syncNotificationState(() => notificationCenter.claim(notificationId));
+          const updatedNotice = sync.value || {
+            ...notification,
+            state: 'claimed',
+            claimedAt: task.userRequest?.claimedAt || new Date(now()).toISOString(),
+            nextDueAt: null
+          };
+          return { claimedTask: task, updated: updatedNotice, notificationSync: sync };
+        });
+        let focused = null;
+        let focusError = null;
+        try {
+          focused = await requireTaskMethod(taskService, 'focusTask')(
+            notification.taskId,
+            serviceCaller(auth)
+          );
+        } catch (error) {
+          focusError = {
+            code: redactPublicText(error?.code || 'TASK_FOCUS_UNAVAILABLE').slice(0, 64),
+            message: 'Verification was claimed, but the browser window could not be focused automatically.'
+          };
+        }
+        sendJson(response, 200, {
+          notification: updated,
+          task: publicTask(claimedTask),
+          notificationSync: notificationSync.ok
+            ? { ok: true }
+            : { ok: false, code: notificationSync.code },
+          focus: focused
+            ? { ok: true, ...(focused.focusedAt ? { focusedAt: focused.focusedAt } : {}) }
+            : { ok: false, error: focusError }
+        }, cors);
+        return;
+      }
+      if (body.action === 'continue') {
+        const { task, notificationSync } = await serializeNotificationLifecycle(async () => {
+          const continued = await requireTaskMethod(taskService, 'continueTask')(
+            notification.taskId,
+            {
+              requestId: notification.requestId,
+              note: typeof body.note === 'string' ? body.note : 'Human verification completed in Owner Console'
+            },
+            serviceCaller(auth)
+          );
+          const sync = await syncNotificationState(() => notificationCenter.resolveTask(
+            notification.taskId,
+            { requestId: notification.requestId }
+          ));
+          return { task: continued, notificationSync: sync };
+        });
+        sendJson(response, 200, {
+          notification: {
+            ...notification,
+            state: 'resolved',
+            resolvedAt: new Date(now()).toISOString(),
+            nextDueAt: null
+          },
+          task: publicTask(task),
+          notificationSync: notificationSync.ok
+            ? { ok: true }
+            : { ok: false, code: notificationSync.code }
+        }, cors);
+        return;
+      }
+      throw new HttpError(
+        400,
+        'INVALID_NOTIFICATION_ACTION',
+        'Notification action must be read, focus, claim, or continue'
+      );
+    }
 
     if (request.method === 'GET' && url.pathname === '/v1/agents') {
       const auth = await authenticate(request);
@@ -868,6 +1184,13 @@ export async function createManager({
       sendJson(response, 201, { taskPack: installed }, cors);
       return;
     }
+    if (request.method === 'GET' && url.pathname === '/v1/task-packs') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const taskPacks = await requireTaskMethod(taskService, 'listTaskPacks')(serviceCaller(auth));
+      sendJson(response, 200, taskPacks, cors);
+      return;
+    }
 
     if (request.method === 'GET' && url.pathname === '/v1/tasks') {
       const auth = await authenticate(request);
@@ -938,6 +1261,47 @@ export async function createManager({
         serviceCaller(auth)
       );
       sendJson(response, 200, { deleted }, cors);
+      return;
+    }
+    if (taskUserRequestClaimMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const taskId = decodeURIComponent(taskUserRequestClaimMatch[1]);
+      const claimInput = await readJson(request, { maxBytes: 4 * 1024 });
+      const { task, notificationSync } = await serializeNotificationLifecycle(async () => {
+        const claimed = await requireTaskMethod(taskService, 'claimUserRequest')(
+          taskId,
+          claimInput,
+          serviceCaller(auth)
+        );
+        let sync = { ok: true, value: null };
+        if (claimed.userRequest?.kind === 'human_verification' && typeof notificationCenter.claimTask === 'function') {
+          sync = await syncNotificationState(() => notificationCenter.claimTask(
+            taskId,
+            { requestId: claimed.userRequest.id }
+          ));
+        }
+        return { task: claimed, notificationSync: sync };
+      });
+      sendJson(response, 200, {
+        task: publicTask(task),
+        notificationSync: notificationSync.ok
+          ? { ok: true }
+          : { ok: false, code: notificationSync.code }
+      }, cors);
+      return;
+    }
+    if (taskFocusMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'agent', 'dashboard');
+      const focused = await requireTaskMethod(taskService, 'focusTask')(
+        decodeURIComponent(taskFocusMatch[1]),
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, {
+        task: publicTask(focused.task ?? focused),
+        ...(focused.focusedAt ? { focusedAt: focused.focusedAt } : {})
+      }, cors);
       return;
     }
     if (taskTimelineMatch && request.method === 'GET') {
@@ -1050,17 +1414,38 @@ export async function createManager({
       }
       if (taskActionMatch[2] === 'continue') {
         requireRole(auth, 'manager-admin', 'agent', 'dashboard');
-        const task = await requireTaskMethod(taskService, 'continueTask')(
-          taskId,
-          await readJson(request, { maxBytes: 4 * 1024 }),
-          serviceCaller(auth)
-        );
-        sendJson(response, 202, { task: publicTask(task) }, cors);
+        const continueInput = await readJson(request, { maxBytes: 4 * 1024 });
+        const { task, notificationSync } = await serializeNotificationLifecycle(async () => {
+          const continued = await requireTaskMethod(taskService, 'continueTask')(
+            taskId,
+            continueInput,
+            serviceCaller(auth)
+          );
+          const sync = await syncNotificationState(() => notificationCenter.resolveTask(taskId, {
+            requestId: continueInput.requestId
+          }));
+          return { task: continued, notificationSync: sync };
+        });
+        sendJson(response, 202, {
+          task: publicTask(task),
+          notificationSync: notificationSync.ok
+            ? { ok: true }
+            : { ok: false, code: notificationSync.code }
+        }, cors);
         return;
       }
       requireRole(auth, 'manager-admin', 'agent', 'dashboard');
-      const task = await requireTaskMethod(taskService, 'cancel')(taskId, serviceCaller(auth));
-      sendJson(response, 200, { task: publicTask(task) }, cors);
+      const { task, notificationSync } = await serializeNotificationLifecycle(async () => {
+        const cancelled = await requireTaskMethod(taskService, 'cancel')(taskId, serviceCaller(auth));
+        const sync = await syncNotificationState(() => notificationCenter.resolveTask(taskId));
+        return { task: cancelled, notificationSync: sync };
+      });
+      sendJson(response, 200, {
+        task: publicTask(task),
+        notificationSync: notificationSync.ok
+          ? { ok: true }
+          : { ok: false, code: notificationSync.code }
+      }, cors);
       return;
     }
 
@@ -1181,6 +1566,8 @@ export async function createManager({
       port: listeningAddress.port,
       state: 'ready'
     }).catch(() => {});
+    await scanTaskNotifications().catch(recordNotificationScanFailure);
+    scheduleTaskNotificationScan();
     return api;
   }
 
@@ -1188,11 +1575,15 @@ export async function createManager({
     if (stopped) return;
     if (stopPromise) return stopPromise;
     stopping = true;
+    if (notificationScanTimer !== null) clearTimeout(notificationScanTimer);
+    notificationScanTimer = null;
     stopPromise = (async () => {
       let serviceError;
       let serverError;
       try {
         await waitForActiveOperations();
+        await notificationScanPromise?.catch(() => {});
+        await notificationCenter.close?.();
         await taskService.close?.();
       } catch (error) {
         serviceError = error;
@@ -1235,6 +1626,7 @@ export async function createManager({
     profileStore,
     configStore,
     taskService,
+    notificationCenter,
     operationalJournal,
     stateDir,
     start,

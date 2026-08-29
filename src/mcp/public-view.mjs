@@ -22,6 +22,31 @@ function booleanValue(value) {
   return typeof value === 'boolean' ? value : undefined;
 }
 
+function currencyValue(value) {
+  return typeof value === 'string' && /^[A-Z]{3}$/.test(value) ? value : undefined;
+}
+
+function publicExternalCostDeclaration(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const currency = currencyValue(value.currency);
+  const maxAmountPerRun = numberValue(value.maxAmountPerRun);
+  if (!currency || maxAmountPerRun === undefined || maxAmountPerRun <= 0) return undefined;
+  return { currency, maxAmountPerRun };
+}
+
+function publicExternalCostUsage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const currency = currencyValue(value.currency);
+  const estimatedTotal = numberValue(value.estimatedTotal);
+  const actualTotal = numberValue(value.actualTotal);
+  const remainingAmount = numberValue(value.remainingAmount);
+  if (
+    !currency || estimatedTotal === undefined || actualTotal === undefined || remainingAmount === undefined ||
+    estimatedTotal < 0 || actualTotal < 0 || remainingAmount < 0
+  ) return undefined;
+  return { currency, estimatedTotal, actualTotal, remainingAmount };
+}
+
 function definedEntries(entries) {
   return Object.fromEntries(entries.filter(([, value]) => value !== undefined));
 }
@@ -216,11 +241,15 @@ export function publicTask(task, { includeResult = true } = {}) {
   const userRequest = task?.userRequest && typeof task.userRequest === 'object'
     ? definedEntries([
       ['id', stringValue(task.userRequest.id, 128)],
+      ['kind', ['instruction', 'human_verification'].includes(task.userRequest.kind)
+        ? task.userRequest.kind
+        : undefined],
       ['reason', stringValue(task.userRequest.reason, 500)],
       ['instructions', stringValue(task.userRequest.instructions, 2_000)],
       ['requestedAt', stringValue(task.userRequest.requestedAt, 64)],
       ['expiresAt', stringValue(task.userRequest.expiresAt, 64)],
       ['status', stringValue(task.userRequest.status, 32)],
+      ['claimedAt', stringValue(task.userRequest.claimedAt, 64)],
       ['screenshotAvailable', booleanValue(task.userRequest.screenshotAvailable)]
     ])
     : undefined;
@@ -291,6 +320,7 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['agent', agent?.clientId && agent?.name ? agent : undefined],
     ['behavior', stringValue(task?.behavior, 32)],
     ['interactionContract', stringValue(task?.interactionContract, 32)],
+    ['externalCostUsage', publicExternalCostUsage(task?.externalCostUsage)],
     ['attempt', Number.isSafeInteger(task?.attempt) ? task.attempt : undefined],
     ['history', publicAttemptHistory(task?.history)],
     ['state', stringValue(task?.state, 64)],
@@ -344,13 +374,64 @@ export function publicTaskType(taskType, { includeSchema = true } = {}) {
     ['lifecycle', stringValue(taskType?.lifecycle, 16)],
     ['deprecatedAt', stringValue(taskType?.deprecatedAt, 64)],
     ['replacedBy', stringValue(taskType?.replacedBy, 128)],
+    ['externalCost', publicExternalCostDeclaration(taskType?.externalCost)],
     ['pack', taskType?.pack && typeof taskType.pack === 'object' ? definedEntries([
       ['name', stringValue(taskType.pack.name, 80)],
-      ['version', stringValue(taskType.pack.version, 64)]
+      ['version', stringValue(taskType.pack.version, 64)],
+      ['title', stringValue(taskType.pack.title, 120)],
+      ['description', stringValue(taskType.pack.description, 2_000)],
+      ['lifecycle', stringValue(taskType.pack.lifecycle, 16)],
+      ['discoverable', booleanValue(taskType.pack.discoverable)],
+      ['protected', booleanValue(taskType.pack.protected)],
+      ['transient', booleanValue(taskType.pack.transient)]
     ]) : undefined],
     ['interactionContract', stringValue(taskType?.interactionContract, 32)],
     ['supportsResume', booleanValue(taskType?.supportsResume)],
     ['inputSchema', schema && typeof schema === 'object' && !Array.isArray(schema) ? schema : undefined]
+  ]);
+}
+
+export function publicTaskPack(taskPack) {
+  if (!taskPack || typeof taskPack !== 'object' || Array.isArray(taskPack)) return {};
+  const taskTypes = Array.isArray(taskPack.taskTypes)
+    ? taskPack.taskTypes.slice(0, 64).map((taskType) => definedEntries([
+      ['name', stringValue(taskType?.name, 80)],
+      ['title', stringValue(taskType?.title, 120)],
+      ['lifecycle', stringValue(taskType?.lifecycle, 16)],
+      ['discoverable', booleanValue(taskType?.discoverable)]
+    ])).filter((taskType) => taskType.name)
+    : [];
+  const usage = taskPack.usage && typeof taskPack.usage === 'object'
+    ? definedEntries([
+      ['runCount', numberValue(taskPack.usage.runCount)],
+      ['activeCount', numberValue(taskPack.usage.activeCount)],
+      ['lastUsedAt', stringValue(taskPack.usage.lastUsedAt, 64)]
+    ])
+    : undefined;
+  const deleteBlockerCodes = Array.isArray(taskPack.deleteBlockerCodes ?? taskPack.deleteBlockers)
+    ? (taskPack.deleteBlockerCodes ?? taskPack.deleteBlockers)
+      .slice(0, 8)
+      .map((code) => stringValue(code, 64))
+      .filter(Boolean)
+    : [];
+  return definedEntries([
+    ['id', stringValue(taskPack.id, 240)],
+    ['name', stringValue(taskPack.name, 80)],
+    ['version', stringValue(taskPack.version, 64)],
+    ['title', stringValue(taskPack.title, 120)],
+    ['description', stringValue(taskPack.description, 2_000)],
+    ['lifecycle', stringValue(taskPack.lifecycle, 16)],
+    ['discoverable', booleanValue(taskPack.discoverable)],
+    ['protected', booleanValue(taskPack.protected)],
+    ['transient', booleanValue(taskPack.transient)],
+    ['fileCount', numberValue(taskPack.fileCount)],
+    ['sizeBytes', numberValue(taskPack.sizeBytes)],
+    ['installedAt', stringValue(taskPack.installedAt, 64)],
+    ['deprecatedAt', stringValue(taskPack.deprecatedAt, 64)],
+    ['usage', usage],
+    ['taskTypes', taskTypes],
+    ['deletable', booleanValue(taskPack.deletable)],
+    ['deleteBlockerCodes', deleteBlockerCodes]
   ]);
 }
 

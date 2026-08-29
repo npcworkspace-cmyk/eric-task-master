@@ -51,3 +51,20 @@ test('semantic observer creates bounded refs across frames and rejects stale nav
     { code: 'SEMANTIC_SNAPSHOT_STALE' }
   );
 });
+
+test('semantic observer reserves budget for a challenge iframe after a dense main frame', {
+  skip: process.env.TASKMASTER_REAL_BROWSER !== '1',
+  timeout: 30_000
+}, async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  const dense = Array.from({ length: 150 }, (_, index) => `<button>Main ${index}</button><p>${'body '.repeat(80)}</p>`).join('');
+  await page.setContent(`<!doctype html><title>Dense fixture</title>${dense}<iframe srcdoc="<button>Press and hold to verify you are human</button>"></iframe>`);
+  const semantic = createSemanticObserver({ page, action: createActionHelper({ page, mode: 'fast' }) });
+  const snapshot = await semantic.snapshot({ scope: 'full_page', maxNodes: 120, maxTextChars: 30_000 });
+  assert.equal(snapshot.framesTotal, 2);
+  assert.equal(snapshot.framesInspected, 2);
+  assert.equal(snapshot.framesOmitted, 0);
+  assert.equal(snapshot.refs.some((item) => item.frame === 1 && /Press and hold/u.test(item.name)), true);
+});

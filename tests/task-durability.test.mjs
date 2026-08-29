@@ -225,7 +225,13 @@ test('Manager restart recovers a durable checkpoint without its lost IPC pointer
     taskId: id,
     attempt: 1,
     workerPid: 999_999,
-    closedAt: new Date().toISOString()
+    closedAt: new Date().toISOString(),
+    checkpoint: {
+      attempt: 1,
+      savedAt,
+      sha256: createHash('sha256').update(await readFile(checkpointPath)).digest('hex'),
+      sizeBytes: (await readFile(checkpointPath)).byteLength
+    }
   })}\n`);
 
   const [first, replay] = await Promise.all([
@@ -252,13 +258,11 @@ test('Manager restart recovers a durable checkpoint without its lost IPC pointer
   assert.equal(completed.cleanup.browserClosed, true);
   assert.equal(completed.cleanup.leaseReleased, true);
   assert.equal(profiles.profile.lease, null);
-  assert.deepEqual((await service.getInternal(id)).checkpoint, {
-    path: checkpointPath,
-    attempt: 1,
-    savedAt,
-    sha256: createHash('sha256').update(await readFile(checkpointPath)).digest('hex'),
-    sizeBytes: (await readFile(checkpointPath)).byteLength
-  });
+  const completedInternal = await service.getInternal(id);
+  assert.equal(completedInternal.checkpoint, null);
+  assert.equal(completedInternal.checkpointSeal.attempt, 2);
+  assert.equal(completedInternal.checkpointSeal.status, 'unavailable');
+  assert.equal(typeof completedInternal.checkpointSeal.sealedAt, 'string');
   const artifacts = await service.listArtifacts(id, AGENT_A);
   assert.deepEqual(artifacts.map((item) => item.name), ['resumed.json']);
   await assert.rejects(
@@ -515,6 +519,21 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
     service.resume(noCheckpoint.id, { resumeKey: 'resume-no-checkpoint' }, AGENT_A),
     { code: 'TASK_CHECKPOINT_REQUIRED' }
   );
+  const sealedWithoutCheckpoint = await service.getInternal(noCheckpoint.id);
+  assert.equal(sealedWithoutCheckpoint.checkpoint, null);
+  assert.equal(sealedWithoutCheckpoint.checkpointSeal.status, 'unavailable');
+  await writeFile(path.join(root, 'state', 'tasks', noCheckpoint.id, 'checkpoint.json'), `${JSON.stringify({
+    taskId: noCheckpoint.id,
+    attempt: sealedWithoutCheckpoint.attempt,
+    savedAt: new Date(Date.parse(sealedWithoutCheckpoint.finishedAt) - 1).toISOString(),
+    data: { forgedAfterTerminal: true }
+  })}\n`);
+  await service.get(noCheckpoint.id, AGENT_A);
+  assert.equal((await service.getInternal(noCheckpoint.id)).checkpoint, null);
+  await assert.rejects(
+    service.resume(noCheckpoint.id, { resumeKey: 'resume-forged-no-checkpoint' }, AGENT_A),
+    { code: 'TASK_CHECKPOINT_INVALID' }
+  );
 
   const invalidOrphan = await service.create({
     profileId: profiles.profile.id,
@@ -525,7 +544,7 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
   await waitFor(async () => (await service.get(invalidOrphan.id, AGENT_A)).cleanup.settled);
   await assert.rejects(
     service.resume(invalidOrphan.id, { resumeKey: 'resume-invalid-orphan' }, AGENT_A),
-    { code: 'TASK_CHECKPOINT_REQUIRED' }
+    { code: 'TASK_CHECKPOINT_INVALID' }
   );
   assert.equal((await service.getInternal(invalidOrphan.id)).checkpoint, null);
 
@@ -552,7 +571,8 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
   await writeFile(replacedInternal.checkpoint.path, `${JSON.stringify({
     taskId: replacedCheckpoint.id,
     attempt: replacedInternal.attempt,
-    savedAt: new Date().toISOString(),
+    // Backdating content must not bypass the immutable terminal seal.
+    savedAt: new Date(Date.parse(replacedInternal.finishedAt) - 1).toISOString(),
     data: { mode: 'replacement' }
   })}\n`);
   await assert.rejects(

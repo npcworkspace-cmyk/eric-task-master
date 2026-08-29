@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.6.0**
+Version: **2.7.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -40,7 +40,7 @@ Task Master does not replace Agent reasoning. It gives that reasoning a dependab
 ## The three-layer model
 
 1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, cleanup, and a central Human Journey engine for visible browser interaction.
-2. **Owner Console** — one fixed local web address keeps human control simple: shared Profile management, task progress and lifecycle controls, bounded final reports, plus a Task Pack asset catalog with purpose, notes, usage, discovery state, batch lifecycle actions, and guarded deletion. Users sign in directly inside isolated persistent Playwright Profiles.
+2. **Owner Console** — one fixed local web address keeps human control simple: shared Profile management, task progress and lifecycle controls, bounded final reports, a Task Pack asset catalog, Chinese/English switching, and a compact human-verification inbox. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
 This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
@@ -89,6 +89,8 @@ The Agent then uses one durable loop: discover a task type, start once with an i
 
 Connection and task errors remain machine-readable. A stale Agent bridge is stopped before task routing with one host-reload action; a task-input error keeps the exact rejected field, safe details, and a request ID instead of collapsing into a generic Manager rejection.
 
+Task Master notifies the Owner only when a live task explicitly requires a human verification click. The native system notification fires immediately and repeats every 30 seconds until the Owner claims the request; optional Telegram Bot and Feishu/Lark channels follow the same rule. Failures, stalls, cooldowns, cleanup, completion, login ambiguity, and ordinary instructions do not generate alerts. Claiming brings the live task page forward but does not continue it; after the Owner completes the visible verification, the same task is revalidated and continued.
+
 Every task start returns a clickable Owner Console link focused on that task. The first link silently establishes the local Owner cookie; later visits can use the fixed bookmarked address. If the user says “启动任务面板”, use MCP `taskmaster_dashboard_open` or CLI `node scripts/taskmaster.mjs dashboard-open [TASK_ID] --agent-id STABLE_ID --agent-name AGENT_NAME --json`, then return the link. Task Master does not automatically open an operating-system browser.
 
 ### Profiles
@@ -110,10 +112,10 @@ All three modes use smooth minimum-jerk pointer acceleration, one continuous lon
 ### Multi-Agent workbench
 
 - Profiles are shared by all trusted local Agents; there is no meaningless “Profile creator” field. A Profile still has one live lease, so two Agents cannot corrupt the same login state.
-- The Console has three focused work areas: Tasks, Profiles, and Task Packs. It does not expose a confusing Agent registry, raw files, diagnostics, or a second messaging workbench.
+- The Console keeps three focused work areas—Tasks, Profiles, and Task Packs—plus a compact verification drawer in the header. It does not expose a confusing Agent registry, raw files, diagnostics, or a second messaging workbench.
 - Every task gets a stable `Agent-specific task-created time` name and shows its current action, Worker-confirmed runtime behavior, visual progress, execution time, cumulative cooldown time, and total time.
 - Pause, resume, cancel, and record deletion are revision-checked. Deletion hides only terminal records with confirmed cleanup and never makes an executed action replayable.
-- The Task Packs catalog explains what each executor does, whether Agents can discover it, when it was last used, and why it cannot yet be deleted. Owners can add notes and batch deprecate, restore, or safely remove stale assets; system assets and modules needed by live, uncleaned, or resumable tasks remain protected.
+- The Task Packs catalog explains what each executor does, whether Agents can discover it, when it was last used, and why it cannot yet be deleted. Owners can add notes and batch deprecate, restore, or safely remove stale assets. Deleted task history and invalid checkpoints do not create phantom blockers; system assets and modules needed by live, uncleaned, or verified-resumable tasks remain protected.
 
 ## Build specialized production workers
 
@@ -126,6 +128,10 @@ node scripts/taskmaster.mjs task-packs install ./my-pack --json
 ```
 
 A Task Pack defines reusable task types. It specifies the target, sequence, selectors, platform rate limits, extraction, checkpoints, outputs, and proof—not custom mouse or scrolling code. The central Human Journey engine handles rendered-page state changes, while read-only Playwright locators and `evaluate` remain a fast, unpaced path for bulk DOM extraction. Reading values and attributes is allowed; mutation hidden in `evaluate` is rejected. Five production scaffolds—single page, paginated list, list/detail, resumable batch, and form workflow—remove most boilerplate, while preflight validates modules before registration. When no specialized capability covers a large request, one high-level `taskmaster_scale_prepare` call launches the built-in read-only `surface-probe`: it samples one representative surface, performs a bounded survey/backtrack, identifies blockers, and recommends a recipe; one bounded pilot must pass before scale. A specialized Skill teaches the Agent when to use the resulting type, how to interpret results, and which platform rules apply.
+
+The built-in probe is also visible in ordinary task-type discovery. If it detects CAPTCHA or press-and-hold verification, it requests a human handoff and waits on the same task; it never solves, bypasses, or sends the challenge to a third-party service. After the Owner continues, it samples again and allows scale only when the blocker is gone.
+
+Paid Task Packs may declare an external currency and maximum per-task cost. Starting one requires an explicit budget at or below that ceiling. Trusted Pack code must reserve each paid operation through the runtime before making it, then settle the same stable operation ID with the actual amount. The durable ledger is shared by every retry/resume attempt, is persisted before authorization is acknowledged, and completion fails if a reservation is unresolved or the final estimated/actual evidence differs from the ledger. Public task state exposes only aggregate currency, estimated total, actual total, and remaining amount. This is a hard gate for Packs that use the provided cost facade, not a network firewall around arbitrary third-party code.
 
 The CLI treats a one-off standalone module as transient by default: after its first safely settled task it retires from Agent discovery, then becomes eligible for guarded cleanup after a seven-day recovery window. Use `--persistent` only for a deliberately reusable standalone module; prefer a versioned Task Pack for reusable production capability. A direct initial/independent GET navigation automatically retries a small set of transient connection failures and 429/502/503/504 responses with bounded backoff and visible cooldown state. Clicks, form submissions, uploads, and other potentially mutating actions are never auto-replayed.
 

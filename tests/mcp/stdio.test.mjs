@@ -51,11 +51,13 @@ for (const [label, mode] of [
       'taskmaster_scale_prepare',
       'taskmaster_status',
       'taskmaster_task_command_respond',
+      'taskmaster_task_packs_list',
       'taskmaster_task_report_publish',
       'taskmaster_task_types_describe',
       'taskmaster_task_types_list',
       'taskmaster_tasks_cancel',
       'taskmaster_tasks_continue',
+      'taskmaster_tasks_focus',
       'taskmaster_tasks_get',
       'taskmaster_tasks_list',
       'taskmaster_tasks_resume',
@@ -158,6 +160,90 @@ test('MCP prepares unknown large work through one bounded built-in surface probe
   assert.equal(result.structuredContent.data.taskId, 'task_fixture');
   assert.equal(result.structuredContent.data.task.taskType, 'surface-probe');
   assert.match(result.content[0].text, /bounded surface probe/u);
+});
+
+test('MCP discovery exposes the built-in surface probe and compact Task Pack lifecycle state', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const taskTypes = await connection.client.callTool({
+    name: 'taskmaster_task_types_list',
+    arguments: { query: 'surface', intent: 'preflight' }
+  });
+  const surface = taskTypes.structuredContent.data.taskTypes.find((item) => item.id === 'surface-probe');
+  assert.ok(surface);
+  assert.ok(surface.tags.includes('probe'));
+  assert.ok(surface.intents.includes('scale'));
+
+  const taskPacks = await connection.client.callTool({
+    name: 'taskmaster_task_packs_list',
+    arguments: {}
+  });
+  const pack = taskPacks.structuredContent.data.taskPacks.find((item) => item.name === 'fixture-pack');
+  assert.ok(pack);
+  assert.equal(pack.name, 'fixture-pack');
+  assert.equal(pack.lifecycle, 'active');
+  assert.equal(pack.usage.runCount, 3);
+  assert.deepEqual(pack.deleteBlockerCodes, ['active_task']);
+  assert.equal(JSON.stringify(taskPacks).includes('must-not-leak'), false);
+
+  const firstPackPage = await connection.client.callTool({
+    name: 'taskmaster_task_packs_list',
+    arguments: { limit: 1 }
+  });
+  assert.equal(firstPackPage.structuredContent.data.taskPacks.length, 1);
+  assert.equal(firstPackPage.structuredContent.data.truncated, true);
+  assert.equal(typeof firstPackPage.structuredContent.data.nextCursor, 'string');
+  const secondPackPage = await connection.client.callTool({
+    name: 'taskmaster_task_packs_list',
+    arguments: { limit: 1, cursor: firstPackPage.structuredContent.data.nextCursor }
+  });
+  assert.equal(secondPackPage.structuredContent.data.taskPacks.length, 1);
+  assert.equal(secondPackPage.structuredContent.data.truncated, false);
+  assert.equal('nextCursor' in secondPackPage.structuredContent.data, false);
+  assert.notEqual(
+    firstPackPage.structuredContent.data.taskPacks[0].id,
+    secondPackPage.structuredContent.data.taskPacks[0].id
+  );
+
+  const described = await connection.client.callTool({
+    name: 'taskmaster_task_types_describe',
+    arguments: { taskType: 'fixture.paid' }
+  });
+  assert.deepEqual(described.structuredContent.data.taskType.externalCost, {
+    currency: 'USD', maxAmountPerRun: 5
+  });
+  assert.equal(described.structuredContent.data.taskType.pack.lifecycle, 'active');
+  assert.equal(described.structuredContent.data.taskType.pack.discoverable, true);
+});
+
+test('MCP exposes aggregate paid-task usage and same-task human verification focus without low-level data', async (t) => {
+  const connection = await connectedClient('legacy');
+  t.after(() => connection.client.close());
+
+  const started = await connection.client.callTool({
+    name: 'taskmaster_tasks_start',
+    arguments: {
+      taskType: 'fixture.paid',
+      profileId: 'profile_fixture',
+      input: {},
+      externalCostBudget: { currency: 'USD', maxAmount: 2.5 },
+      idempotencyKey: 'paid-task-fixture-0001'
+    }
+  });
+  assert.deepEqual(started.structuredContent.data.task.externalCostUsage, {
+    currency: 'USD', estimatedTotal: 0, actualTotal: 0, remainingAmount: 2.5
+  });
+  assert.equal('externalCostBudget' in started.structuredContent.data.task, false);
+
+  const focused = await connection.client.callTool({
+    name: 'taskmaster_tasks_focus',
+    arguments: { taskId: 'task_fixture' }
+  });
+  assert.equal(focused.structuredContent.data.task.id, 'task_fixture');
+  assert.equal(focused.structuredContent.data.task.userRequest.kind, 'human_verification');
+  assert.equal(focused.structuredContent.data.task.userRequest.status, 'pending');
+  assert.equal(focused.structuredContent.data.focusedAt, '2026-08-24T00:00:02.000Z');
 });
 
 test('MCP preserves actionable Manager field errors and request correlation', async (t) => {
