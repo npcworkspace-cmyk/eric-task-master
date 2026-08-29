@@ -100,6 +100,7 @@ const state = {
   tasks: [],
   assets: [],
   selectedAssetIds: new Set(),
+  openReportTaskIds: new Set(),
   taskReceivedAt: new Map(),
   sectionErrors: {},
   mutationErrors: {},
@@ -575,6 +576,12 @@ function renderTasks(force = false) {
     if (leftTerminal !== rightTerminal) return leftTerminal ? 1 : -1;
     return Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0);
   });
+  const reportTaskIds = new Set(ordered
+    .filter((task) => task.report?.status === 'final' && task.report.summary)
+    .map((task) => task.id));
+  for (const id of state.openReportTaskIds) {
+    if (!reportTaskIds.has(id)) state.openReportTaskIds.delete(id);
+  }
   renderWhenChanged('tasks', { ordered, pending: [...state.pendingMutations].filter((key) => key.startsWith('task:')) }, ui.tasks, () => {
     ui.tasks.replaceChildren();
     if (!ordered.length) {
@@ -622,6 +629,11 @@ function renderTasks(force = false) {
       let reportPanel = null;
       if (task.report?.status === 'final' && task.report.summary) {
         reportPanel = element('details', 'task-report');
+        reportPanel.open = state.openReportTaskIds.has(task.id);
+        reportPanel.addEventListener('toggle', () => {
+          if (reportPanel.open) state.openReportTaskIds.add(task.id);
+          else state.openReportTaskIds.delete(task.id);
+        });
         const reportSummary = element('summary', '', '查看 Agent 最终报告');
         const reportBody = element('div', 'task-report-body');
         if (task.report.title) reportBody.append(element('strong', '', task.report.title));

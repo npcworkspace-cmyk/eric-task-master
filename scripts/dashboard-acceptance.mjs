@@ -456,6 +456,8 @@ try {
   await completedCard.getByText('查看 Agent 最终报告', { exact: true }).click();
   await completedCard.getByText('表单验收报告', { exact: true }).waitFor();
   await completedCard.getByText('5 项表单检查全部通过。', { exact: true }).waitFor();
+  await page.waitForTimeout(2_500);
+  assert.equal(await completedCard.locator('details.task-report').getAttribute('open'), '');
   await completedCard.getByRole('heading', { name: '结论', exact: true }).waitFor();
   await completedCard.getByText('没有发现需要人工处理的异常。', { exact: true }).waitFor();
   checks.push('bounded final Agent report renders as readable owner content');
