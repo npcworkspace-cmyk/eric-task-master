@@ -78,7 +78,19 @@ async function waitForTask(baseUrl, token, id, timeoutMs = 120_000) {
     ) return task;
     await new Promise((resolveWait) => setTimeout(resolveWait, 250));
   }
-  throw Object.assign(new Error(`Task ${id} did not finish cleanup`), { code: 'ACCEPTANCE_TASK_TIMEOUT', task });
+  const lastState = task?.state || 'unobserved';
+  const health = task?.health?.status || 'unknown';
+  const handoff = task?.userRequest?.status || 'none';
+  const cleanup = task?.cleanup
+    ? Object.entries(task.cleanup)
+        .filter(([, value]) => typeof value === 'boolean')
+        .map(([key, value]) => `${key}=${value}`)
+        .join(',')
+    : 'missing';
+  const lastError = task?.error?.code || 'none';
+  throw Object.assign(new Error(
+    `Task ${id} did not finish cleanup (state=${lastState}, health=${health}, handoff=${handoff}, cleanup=${cleanup}, error=${lastError})`
+  ), { code: 'ACCEPTANCE_TASK_TIMEOUT', task });
 }
 
 async function waitForTaskState(

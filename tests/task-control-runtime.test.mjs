@@ -36,7 +36,14 @@ class ControlWorker extends EventEmitter {
         this.emit('message', { type: 'state', state: 'running', commandId: message.commandId });
       });
     } else if (message.type === 'continue') {
-      setTimeout(() => this.emit('message', { type: 'state', state: 'running' }), 10);
+      setTimeout(() => {
+        this.emit('message', {
+          type: 'continue_applied',
+          requestId: message.requestId,
+          at: new Date().toISOString()
+        });
+        this.emit('message', { type: 'state', state: 'running' });
+      }, 10);
     } else if (message.type === 'focus') {
       setImmediate(() => this.emit('message', {
         type: 'focus_applied',

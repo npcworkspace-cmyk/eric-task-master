@@ -132,14 +132,22 @@ export function createUserHandoff({
     pending = null;
     if (current.timer !== null) clearTimeout(current.timer);
     signal?.removeEventListener('abort', current.onAbort);
-    await onState('recovering');
-    await onProgress('New instruction received; verifying live page state');
-    current.resolve(Object.freeze({
+    const receipt = Object.freeze({
       requestId,
       ...(normalizedNote ? { note: normalizedNote } : {}),
       continuedAt: new Date().toISOString()
-    }));
-    await onState('running');
+    });
+    // Resolving the live task waiter is the authoritative continuation. State
+    // and progress publication are observability sidecars: a wedged output
+    // budget, closed IPC channel, or slow persistence must never consume the
+    // handoff while leaving the task blocked forever.
+    const reporting = (async () => {
+      await onState('recovering');
+      await onProgress('New instruction received; verifying live page state');
+      await onState('running');
+    })();
+    reporting.catch(() => {});
+    current.resolve(receipt);
     return true;
   }
 

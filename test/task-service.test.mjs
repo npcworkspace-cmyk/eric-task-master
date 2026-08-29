@@ -2287,13 +2287,14 @@ test('waiting_user keeps the same live task and continues only through its match
   await writeFile(modulePath, 'export async function run() {}\n');
   const store = fakeProfileStore(root);
   const requestId = `handoff_${'a'.repeat(32)}`;
+  let worker;
   const service = createTaskService({
     stateDir: path.join(root, 'state'),
     profileStore: store,
     allowedTaskRoots: [root],
     seedTaskTypes: [],
     workerFactory() {
-      return new FakeWorker((message, child) => {
+      worker = new FakeWorker((message, child) => {
         if (message.type === 'start') {
           setImmediate(() => {
             child.emit('message', { type: 'heartbeat', at: new Date().toISOString() });
@@ -2324,17 +2325,14 @@ test('waiting_user keeps the same live task and continues only through its match
           setImmediate(() => {
             child.emit('message', { type: 'state', state: 'running' });
             child.emit('message', {
-              type: 'progress',
-              at: new Date().toISOString(),
-              progress: { current: 2, total: 2, message: 'Instruction verified' }
+              type: 'continue_applied',
+              requestId: message.requestId,
+              at: new Date().toISOString()
             });
-            child.emit('message', { type: 'result', result: { summary: 'Continued safely', evidence: [{ kind: 'message', value: 'handoff verified' }] } });
-            child.emit('message', { type: 'state', state: 'completed' });
-            child.emit('message', { type: 'cleanup', browserClosed: true });
-            child.finish(0);
           });
         }
       });
+      return worker;
     }
   });
   await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
@@ -2357,7 +2355,16 @@ test('waiting_user keeps the same live task and continues only through its match
     { code: 'USER_HANDOFF_MISMATCH', statusCode: 409 }
   );
   const recovering = await service.continueTask(created.id, { requestId, note: 'Page checked' }, ADMIN);
-  assert.notEqual(recovering.state, 'waiting_user');
+  assert.equal(recovering.state, 'running');
+  worker.emit('message', {
+    type: 'progress',
+    at: new Date().toISOString(),
+    progress: { current: 2, total: 2, message: 'Instruction verified' }
+  });
+  worker.emit('message', { type: 'result', result: { summary: 'Continued safely', evidence: [{ kind: 'message', value: 'handoff verified' }] } });
+  worker.emit('message', { type: 'state', state: 'completed' });
+  worker.emit('message', { type: 'cleanup', browserClosed: true });
+  worker.finish(0);
   const completed = await waitFor(async () => {
     const task = await service.get(created.id, ADMIN);
     return task.cleanup.settled ? task : null;
@@ -2366,6 +2373,71 @@ test('waiting_user keeps the same live task and continues only through its match
   assert.equal(completed.id, created.id);
   assert.equal(completed.userRequest.status, 'continued');
   assert.equal(store.profile.state, 'idle');
+  await service.close();
+});
+
+test('waiting_user continuation remains pending when the Worker never acknowledges it', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-handoff-ack-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const requestId = `handoff_${'c'.repeat(32)}`;
+  let worker;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: fakeProfileStore(root),
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    handoffContinueTimeoutMs: 100,
+    workerFactory() {
+      worker = new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => {
+          child.emit('message', {
+            type: 'waiting_user',
+            request: {
+              id: requestId,
+              reason: 'Confirm the live page',
+              requestedAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 60_000).toISOString()
+            }
+          });
+        });
+      });
+      return worker;
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'task-service-handoff-ack-timeout'
+  }, ADMIN);
+  const waiting = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.state === 'waiting_user' ? task : null;
+  });
+  await assert.rejects(
+    service.continueTask(created.id, { requestId }, ADMIN),
+    { code: 'USER_HANDOFF_CONTINUE_TIMEOUT', statusCode: 504 }
+  );
+  worker.onSend = (message, child) => {
+    if (message.type !== 'continue') return;
+    setImmediate(() => child.emit('message', {
+      type: 'continue_control_error',
+      requestId: message.requestId,
+      error: { code: 'USER_HANDOFF_MISMATCH', message: 'Worker handoff mismatch' }
+    }));
+  };
+  await assert.rejects(
+    service.continueTask(created.id, { requestId }, ADMIN),
+    { code: 'USER_HANDOFF_CONTINUE_REJECTED', statusCode: 409 }
+  );
+  const unchanged = await service.get(created.id, ADMIN);
+  assert.equal(unchanged.state, 'waiting_user');
+  assert.equal(unchanged.userRequest.status, 'pending');
+  worker.emit('message', { type: 'cleanup', browserClosed: true });
+  worker.finish(1);
   await service.close();
 });
 

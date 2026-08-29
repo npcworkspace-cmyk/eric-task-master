@@ -34,6 +34,7 @@ const PROGRESS_FAILURE_MS = 10 * 60_000;
 const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const BEHAVIOR_APPLY_TIMEOUT_MS = 5_000;
 const FOCUS_APPLY_TIMEOUT_MS = 5_000;
+const HANDOFF_CONTINUE_TIMEOUT_MS = 5_000;
 const MAX_ARTIFACTS = 100;
 const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
@@ -776,6 +777,7 @@ export function createTaskService({
   progressStallMs = PROGRESS_STALL_MS,
   progressFailureMs = PROGRESS_FAILURE_MS,
   behaviorApplyTimeoutMs = BEHAVIOR_APPLY_TIMEOUT_MS,
+  handoffContinueTimeoutMs = HANDOFF_CONTINUE_TIMEOUT_MS,
   maxConcurrentTasks = 4,
   maxQueuedTasks = 100,
   cleanupReconcileIntervalMs = CLEANUP_RECONCILE_INTERVAL_MS,
@@ -820,6 +822,9 @@ export function createTaskService({
   }
   if (!Number.isFinite(behaviorApplyTimeoutMs) || behaviorApplyTimeoutMs < 100 || behaviorApplyTimeoutMs > 30_000) {
     throw new TypeError('behaviorApplyTimeoutMs must be between 100 and 30000');
+  }
+  if (!Number.isFinite(handoffContinueTimeoutMs) || handoffContinueTimeoutMs < 100 || handoffContinueTimeoutMs > 30_000) {
+    throw new TypeError('handoffContinueTimeoutMs must be between 100 and 30000');
   }
   if (!Number.isSafeInteger(maxConcurrentTasks) || maxConcurrentTasks < 1 || maxConcurrentTasks > 32) {
     throw new TypeError('maxConcurrentTasks must be an integer from 1 to 32');
@@ -1851,6 +1856,7 @@ export function createTaskService({
       clearTimeout(entry.forceKillTimer);
       clearTimeout(entry.hardKillTimer);
       for (const request of entry.behaviorRequests.values()) {
+        clearTimeout(request.timer);
         request.reject(new TaskServiceError(
           'BEHAVIOR_LIVE_APPLY_UNCONFIRMED',
           'Task Worker exited before confirming the live behavior change',
@@ -1859,6 +1865,7 @@ export function createTaskService({
       }
       entry.behaviorRequests.clear();
       for (const request of entry.focusRequests.values()) {
+        clearTimeout(request.timer);
         request.reject(new TaskServiceError(
           'TASK_FOCUS_UNAVAILABLE',
           'Task Worker exited before confirming browser focus',
@@ -1866,6 +1873,15 @@ export function createTaskService({
         ));
       }
       entry.focusRequests.clear();
+      for (const request of entry.continueRequests.values()) {
+        clearTimeout(request.timer);
+        request.reject(new TaskServiceError(
+          'TASK_WORKER_UNAVAILABLE',
+          'Task Worker exited before confirming the user handoff',
+          409
+        ));
+      }
+      entry.continueRequests.clear();
     }
     // A heartbeat renewal that started before finalization may still be queued
     // inside ProfileStore. Drain it before the one authoritative release so a
@@ -2035,6 +2051,7 @@ export function createTaskService({
       leaseRenewalTail: Promise.resolve(),
       behaviorRequests: new Map(),
       focusRequests: new Map(),
+      continueRequests: new Map(),
       externalCostTail: Promise.resolve(),
       attached: false
     };
@@ -2338,6 +2355,26 @@ export function createTaskService({
         request.reject(new TaskServiceError(
           message.error?.code === 'TASK_FOCUS_NO_LIVE_PAGE' ? 'TASK_FOCUS_NO_LIVE_PAGE' : 'TASK_FOCUS_REJECTED',
           redactSensitiveText(message.error?.message || 'Task Worker could not focus its browser page').slice(0, 500),
+          409
+        ));
+        return;
+      }
+      if (message.type === 'continue_applied' && typeof message.requestId === 'string') {
+        const request = entry.continueRequests.get(message.requestId);
+        if (!request) return;
+        entry.continueRequests.delete(message.requestId);
+        clearTimeout(request.timer);
+        request.resolve(typeof message.at === 'string' ? message.at : nowIso());
+        return;
+      }
+      if (message.type === 'continue_control_error' && typeof message.requestId === 'string') {
+        const request = entry.continueRequests.get(message.requestId);
+        if (!request) return;
+        entry.continueRequests.delete(message.requestId);
+        clearTimeout(request.timer);
+        request.reject(new TaskServiceError(
+          'USER_HANDOFF_CONTINUE_REJECTED',
+          redactSensitiveText(message.error?.message || 'Task Worker rejected the user handoff').slice(0, 500),
           409
         ));
         return;
@@ -4410,23 +4447,53 @@ export function createTaskService({
       throw new TaskServiceError('INVALID_TASK_CONTINUE', 'note must contain at most 2000 characters');
     }
     const entry = children.get(id);
-    if (!entry || !(await sendChildMessageConfirmed(entry.child, {
-      type: 'continue', requestId, note: body.note || ''
-    }))) {
+    if (!entry?.attached || entry.finalized || !entry.child?.connected) {
       throw new TaskServiceError('TASK_WORKER_UNAVAILABLE', 'Task worker is unavailable for continuation', 409);
     }
+    let resolveReceipt;
+    let rejectReceipt;
+    const receipt = new Promise((resolve, reject) => {
+      resolveReceipt = resolve;
+      rejectReceipt = reject;
+    });
+    receipt.catch(() => {});
+    const timer = setTimeout(() => {
+      entry.continueRequests.delete(requestId);
+      rejectReceipt(new TaskServiceError(
+        'USER_HANDOFF_CONTINUE_TIMEOUT',
+        'Task Worker did not confirm the user handoff in time',
+        504
+      ));
+    }, handoffContinueTimeoutMs);
+    entry.continueRequests.set(requestId, { timer, resolve: resolveReceipt, reject: rejectReceipt });
+    void sendChildMessageConfirmed(entry.child, {
+      type: 'continue', requestId, note: body.note || ''
+    }).then((delivered) => {
+      if (delivered) return;
+      entry.continueRequests.delete(requestId);
+      clearTimeout(timer);
+      rejectReceipt(new TaskServiceError(
+        'TASK_WORKER_UNAVAILABLE',
+        'Task Worker did not accept the user handoff command',
+        503
+      ));
+    });
+    await receipt;
     task.userRequest = {
       ...task.userRequest,
       status: 'continued',
       continuedAt: nowIso(),
       ...(body.note?.trim() ? { note: redactSensitiveText(body.note).slice(0, 2_000) } : {})
     };
+    const workerAdvanced = task.state !== 'waiting_user';
     await update(task, {
-      state: 'recovering',
+      state: workerAdvanced ? task.state : 'recovering',
       userRequest: task.userRequest,
-      progress: { ...task.progress, message: 'New instruction received; verifying live page state' },
-      progressAt: nowIso(),
-      health: { status: 'healthy', checkedAt: nowIso() }
+      ...(workerAdvanced ? {} : {
+        progress: { ...task.progress, message: 'New instruction received; verifying live page state' },
+        progressAt: nowIso(),
+        health: { status: 'healthy', checkedAt: nowIso() }
+      })
     });
     return publicRecord(task);
   }

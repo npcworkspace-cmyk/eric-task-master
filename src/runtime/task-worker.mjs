@@ -1233,7 +1233,23 @@ if (typeof process.send === 'function') {
       }
     }
     if (message?.type === 'continue') {
-      void activeHandoff?.continue({ requestId: message.requestId, note: message.note });
+      const requestId = typeof message.requestId === 'string' ? message.requestId : null;
+      void (async () => {
+        if (!activeHandoff) {
+          const error = new Error('Task Worker has no active user handoff');
+          error.code = 'USER_HANDOFF_NOT_ACTIVE';
+          throw error;
+        }
+        const applied = await activeHandoff.continue({ requestId, note: message.note });
+        if (!applied) {
+          const error = new Error('User handoff does not match the active Worker request');
+          error.code = 'USER_HANDOFF_MISMATCH';
+          throw error;
+        }
+        safeSend({ type: 'continue_applied', requestId, at: new Date().toISOString() });
+      })().catch((error) => {
+        safeSend({ type: 'continue_control_error', requestId, error: errorPayload(error) });
+      });
     }
     if (message?.type === 'focus') {
       const requestId = typeof message.requestId === 'string' ? message.requestId : null;

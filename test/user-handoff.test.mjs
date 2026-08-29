@@ -66,3 +66,29 @@ test('user handoff aborts without leaving a pending waiter', async () => {
   await assert.rejects(waiting, { code: 'TASK_CANCELLED' });
   assert.equal(handoff.pending, null);
 });
+
+test('continuation resolves the live waiter even when progress reporting stalls', async () => {
+  let progressCalls = 0;
+  const handoff = createUserHandoff({
+    onRequest: async () => {},
+    onState: async () => {},
+    onProgress: async () => {
+      progressCalls += 1;
+      if (progressCalls > 1) await new Promise(() => {});
+    }
+  });
+  const waiting = handoff.request({ reason: 'Check the page', timeoutMs: 5_000 });
+  while (!handoff.pending) await new Promise((resolve) => setImmediate(resolve));
+  const requestId = handoff.pending.id;
+  const applied = await Promise.race([
+    handoff.continue({ requestId }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('continuation stalled')), 250))
+  ]);
+  assert.equal(applied, true);
+  const receipt = await Promise.race([
+    waiting,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('waiter stayed blocked')), 250))
+  ]);
+  assert.equal(receipt.requestId, requestId);
+  assert.equal(handoff.pending, null);
+});
