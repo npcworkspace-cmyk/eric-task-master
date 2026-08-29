@@ -190,6 +190,26 @@ test('Manager public task projection is idempotent for verified resume state', (
   assert.deepEqual(publicManagerTask(once), once);
 });
 
+test('public task projection removes retired external-cost evidence without hiding other history', () => {
+  const view = publicManagerTask({
+    id: 'task_legacy_paid',
+    state: 'completed',
+    completion: { verifiedAt: '2026-08-24T00:00:01.000Z', integrity: 'verified' },
+    result: {
+      summary: 'Historical task remains readable.',
+      evidence: [
+        { kind: 'count', label: 'external-cost-estimated', value: 12.5 },
+        { kind: 'message', value: 'business evidence preserved' },
+        { kind: 'count', label: 'external-cost-actual', value: 9.75 }
+      ]
+    }
+  });
+  assert.equal(view.result.summary, 'Historical task remains readable.');
+  assert.deepEqual(view.result.evidence, [
+    { kind: 'message', value: 'business evidence preserved' }
+  ]);
+});
+
 test('declared Agent-visible artifact bytes are preserved exactly', () => {
   const chunk = '{"token":"ordinary-business-value","count":1}\n';
   const result = publicArtifactRead({

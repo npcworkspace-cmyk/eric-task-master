@@ -289,6 +289,18 @@ test('task asset administration explains usage, blocks live deletion, retires tr
   assert.equal(asset.usage.activeCount, 1);
   assert.equal(asset.deletable, false);
   assert.match(asset.deleteBlockers.join(' '), /安全清理/u);
+  assert.equal(asset.blockingTaskCount, 1);
+  assert.deepEqual(asset.blockingTasks.map((item) => ({
+    taskId: item.taskId,
+    blockerCode: item.blockerCode,
+    cleanupSettled: item.cleanupSettled,
+    canDeleteRecord: item.canDeleteRecord
+  })), [{
+    taskId: task.id,
+    blockerCode: 'active_task',
+    cleanupSettled: false,
+    canDeleteRecord: false
+  }]);
   await assert.rejects(service.applyTaskAssetAction({
     action: 'delete', assetIds: [asset.id]
   }, ADMIN), { code: 'TASK_ASSET_DELETE_BLOCKED' });
@@ -378,6 +390,19 @@ test('Task Pack deletion revalidates cached resume checkpoints and ignores a cor
   let asset = inventory.assets.find((item) => item.id === 'type:resumable.asset.v1');
   assert.equal(asset.deletable, false);
   assert.deepEqual(asset.deleteBlockerCodes, ['resume_available']);
+  assert.equal(asset.blockingTaskCount, 1);
+  assert.deepEqual(asset.blockingTasks.map((item) => ({
+    taskId: item.taskId,
+    blockerCode: item.blockerCode,
+    cleanupSettled: item.cleanupSettled,
+    canDeleteRecord: item.canDeleteRecord
+  })), [{
+    taskId: created.id,
+    blockerCode: 'resume_available',
+    cleanupSettled: true,
+    canDeleteRecord: true
+  }]);
+  assert.equal(asset.usage.lastUsedAt, failed.finishedAt);
   await assert.rejects(service.applyTaskAssetAction({
     action: 'delete', assetIds: [asset.id]
   }, ADMIN), { code: 'TASK_ASSET_DELETE_BLOCKED' });
@@ -1719,179 +1744,133 @@ test('direct resume recovers lost checkpoint and cleanup IPC before starting the
   await service.close();
 });
 
-test('external cost ledger is ACKed after persistence and remains cumulative across resume attempts', async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cost-ledger-resume-'));
+test('startup removes free legacy null cost state and fails closed for legacy paid tasks', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-legacy-cost-removal-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const stateDir = path.join(root, 'state');
-  const modulePath = path.join(root, 'paid-task.mjs');
-  await writeFile(modulePath, [
-    "export const meta = { supportsResume: true, externalCost: { currency: 'USD', maxAmountPerRun: 10 } };",
-    'export async function run() {}'
-  ].join('\n'));
-  const store = fakeProfileStore(root);
-  let starts = 0;
+  const timestamp = '2026-01-01T00:00:00.000Z';
+  const baseTask = (id, state) => ({
+    id,
+    profileId: 'profile_test',
+    taskType: 'legacy.fixture',
+    taskLabel: 'Legacy fixture',
+    ownerRole: 'manager-admin',
+    ownerClientId: 'manager-admin',
+    state,
+    attempt: 1,
+    progress: state === 'completed'
+      ? { current: 1, total: 1, message: 'Completed' }
+      : { current: 0, total: null, message: 'Queued' },
+    health: { status: state, checkedAt: timestamp },
+    cleanup: state === 'completed'
+      ? { browserClosed: true, leaseReleased: true, workerExited: true, settled: true }
+      : { browserClosed: false, leaseReleased: false, workerExited: false, settled: false },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    finishedAt: state === 'completed' ? timestamp : null,
+    leaseHeld: false,
+    leaseOwner: `task:${id}`,
+    supportsResume: false
+  });
+  const free = {
+    ...baseTask('task_legacy_free', 'completed'),
+    completionClaimed: true,
+    result: {
+      summary: 'Free task completed before upgrade',
+      evidence: [{ kind: 'message', value: 'legacy free completion remains readable' }]
+    },
+    externalCostUsage: null
+  };
+  const paidQueued = {
+    ...baseTask('task_legacy_paid_queued', 'queued'),
+    supportsResume: true,
+    input: {},
+    externalCost: { currency: 'USD', maxAmountPerRun: 5 },
+    externalCostBudget: { currency: 'USD', maxAmount: 5 },
+    externalCostLedger: {
+      version: 1,
+      currency: 'USD',
+      maxAmount: 5,
+      operations: {}
+    },
+    externalCostUsage: {
+      currency: 'USD',
+      estimatedTotal: 0,
+      actualTotal: 0,
+      remainingAmount: 5
+    }
+  };
+  const paidCompleted = {
+    ...baseTask('task_legacy_paid_completed', 'completed'),
+    completionClaimed: true,
+    result: {
+      summary: 'Paid history remains readable after runtime removal',
+      evidence: [
+        { kind: 'message', value: 'terminal history preserved' },
+        { kind: 'count', label: 'external-cost-estimated', value: 2 },
+        { kind: 'count', label: 'external-cost-actual', value: 2 }
+      ]
+    },
+    externalCostBudget: { currency: 'USD', maxAmount: 2 },
+    externalCostUsage: {
+      currency: 'USD',
+      estimatedTotal: 2,
+      actualTotal: 2,
+      remainingAmount: 0
+    }
+  };
+  for (const task of [free, paidQueued, paidCompleted]) {
+    const taskRoot = path.join(stateDir, task.id);
+    await mkdir(taskRoot, { recursive: true });
+    await writeFile(path.join(taskRoot, 'task.json'), `${JSON.stringify(task)}\n`);
+  }
+
   const service = createTaskService({
     stateDir,
-    profileStore: store,
-    allowedTaskRoots: [root],
-    seedTaskTypes: [],
-    workerFactory() {
-      let config;
-      let phase = 0;
-      const child = new FakeWorker((message) => {
-        if (message.type === 'start') {
-          config = message.config;
-          starts += 1;
-          setImmediate(() => {
-            child.emit('message', { type: 'state', state: 'running' });
-            child.emit('message', {
-              type: 'external_cost_request', requestId: `cost_reserve_${config.attempt}`,
-              action: 'reserve', operationId: `attempt-${config.attempt}`, amount: config.attempt === 1 ? 3 : 8
-            });
-          });
-          return;
-        }
-        if (message.type !== 'external_cost_response' || message.ok !== true) return;
-        void (async () => {
-          const persisted = JSON.parse(await readFile(path.join(stateDir, config.taskId, 'task.json'), 'utf8'));
-          assert.ok(persisted.externalCostLedger.operations[`attempt-${config.attempt}`]);
-          if (phase === 0) {
-            assert.deepEqual(
-              { execute: message.result.execute, status: message.result.status },
-              { execute: true, status: 'reserved' }
-            );
-            phase = 1;
-            child.emit('message', {
-              type: 'external_cost_request', requestId: `cost_settle_${config.attempt}`,
-              action: 'settle', operationId: `attempt-${config.attempt}`, amount: config.attempt === 1 ? 2 : 8
-            });
-            return;
-          }
-          assert.deepEqual(
-            { execute: message.result.execute, status: message.result.status },
-            { execute: false, status: 'settled' }
-          );
-          if (config.attempt === 1) {
-            const savedAt = new Date().toISOString();
-            const source = Buffer.from(`${JSON.stringify({
-              taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
-            })}\n`);
-            await writeFile(config.checkpointPath, source);
-            child.emit('message', {
-              type: 'checkpoint', path: config.checkpointPath, attempt: 1, savedAt,
-              sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.length
-            });
-            child.emit('message', { type: 'error', error: { code: 'FIXTURE_RETRY', message: 'resume' } });
-          } else {
-            child.emit('message', {
-              type: 'result',
-              result: {
-                summary: 'Paid task completed within the task-wide budget',
-                evidence: [
-                  { kind: 'count', label: 'external-cost-estimated', value: 11 },
-                  { kind: 'count', label: 'external-cost-actual', value: 10 }
-                ]
-              }
-            });
-            child.emit('message', { type: 'state', state: 'completed' });
-          }
-          child.emit('message', { type: 'cleanup', browserClosed: true });
-          child.finish(0);
-        })();
-      });
-      return child;
-    }
-  });
-  t.after(() => service.close());
-  await service.installTaskType({ name: 'paid.fixture', modulePath }, ADMIN);
-  const created = await service.create({
-    profileId: 'profile_test',
-    taskType: 'paid.fixture',
-    idempotencyKey: 'paid-ledger-across-resume',
-    externalCostBudget: { currency: 'USD', maxAmount: 10 }
-  }, ADMIN);
-  assert.equal('externalCostBudget' in created, false);
-  assert.deepEqual(created.externalCostUsage, {
-    currency: 'USD', estimatedTotal: 0, actualTotal: 0, remainingAmount: 10
-  });
-  await waitFor(async () => {
-    const current = await service.getInternal(created.id);
-    return current.state === 'failed' && current.cleanup.settled ? current : null;
-  }, 2_000);
-  const failed = await service.get(created.id, ADMIN);
-  assert.equal(failed.resumeAvailable, true);
-  assert.deepEqual(failed.externalCostUsage, {
-    currency: 'USD', estimatedTotal: 3, actualTotal: 2, remainingAmount: 8
-  });
-  await service.resume(created.id, { resumeKey: 'paid-ledger-attempt-2' }, ADMIN);
-  await waitFor(async () => {
-    const current = await service.getInternal(created.id);
-    return current.state === 'completed' && current.cleanup.settled ? current : null;
-  }, 2_000);
-  const completed = await service.get(created.id, ADMIN);
-  assert.equal(starts, 2);
-  assert.deepEqual(completed.externalCostUsage, {
-    currency: 'USD', estimatedTotal: 11, actualTotal: 10, remainingAmount: 0
-  });
-  const internal = await service.getInternal(created.id);
-  assert.deepEqual(Object.keys(internal.externalCostLedger.operations).sort(), ['attempt-1', 'attempt-2']);
-});
-
-test('paid task completion fails closed with an outstanding reservation', async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cost-ledger-outstanding-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const modulePath = path.join(root, 'paid-task.mjs');
-  await writeFile(modulePath, [
-    "export const meta = { externalCost: { currency: 'USD', maxAmountPerRun: 5 } };",
-    'export async function run() {}'
-  ].join('\n'));
-  const service = createTaskService({
-    stateDir: path.join(root, 'state'),
     profileStore: fakeProfileStore(root),
     allowedTaskRoots: [root],
-    seedTaskTypes: [],
-    workerFactory() {
-      const child = new FakeWorker((message) => {
-        if (message.type === 'start') {
-          setImmediate(() => child.emit('message', {
-            type: 'external_cost_request', requestId: 'cost_outstanding',
-            action: 'reserve', operationId: 'unsettled-call', amount: 1
-          }));
-          return;
-        }
-        if (message.type === 'external_cost_response' && message.ok === true) {
-          setImmediate(() => {
-            child.emit('message', {
-              type: 'result', result: {
-                summary: 'Must be rejected',
-                evidence: [
-                  { kind: 'count', label: 'external-cost-estimated', value: 1 },
-                  { kind: 'count', label: 'external-cost-actual', value: 0 }
-                ]
-              }
-            });
-            child.emit('message', { type: 'state', state: 'completed' });
-            child.emit('message', { type: 'cleanup', browserClosed: true });
-            child.finish(0);
-          });
-        }
-      });
-      return child;
-    }
+    seedTaskTypes: []
   });
   t.after(() => service.close());
-  await service.installTaskType({ name: 'paid.outstanding', modulePath }, ADMIN);
-  const created = await service.create({
-    profileId: 'profile_test', taskType: 'paid.outstanding',
-    idempotencyKey: 'paid-ledger-outstanding',
-    externalCostBudget: { currency: 'USD', maxAmount: 5 }
-  }, ADMIN);
-  const failed = await waitFor(async () => {
-    const current = await service.get(created.id, ADMIN);
-    return current.state === 'failed' && current.cleanup.settled ? current : null;
-  }, 2_000);
-  assert.equal(failed.error.code, 'TASK_COMPLETION_GATE_FAILED');
-  assert.match(failed.error.message, /outstanding external cost reservations/i);
+
+  const freePublic = await service.get(free.id, ADMIN);
+  assert.equal(freePublic.state, 'completed');
+  assert.equal(Object.hasOwn(freePublic, 'externalCostUsage'), false);
+  const freePersisted = JSON.parse(await readFile(path.join(stateDir, free.id, 'task.json'), 'utf8'));
+  assert.equal(Object.hasOwn(freePersisted, 'externalCostUsage'), false);
+  assert.equal(Object.hasOwn(freePersisted, 'legacyPaidRuntime'), false);
+
+  const queuedPublic = await service.get(paidQueued.id, ADMIN);
+  assert.equal(queuedPublic.state, 'failed');
+  assert.equal(queuedPublic.error.code, 'TASK_EXTERNAL_COST_UNSUPPORTED');
+  assert.equal(queuedPublic.resumeAvailable, false);
+  const queuedInternal = await service.getInternal(paidQueued.id);
+  assert.equal(queuedInternal.legacyPaidRuntime, true);
+  assert.equal(queuedInternal.supportsResume, false);
+  for (const field of ['externalCost', 'externalCostBudget', 'externalCostLedger', 'externalCostUsage']) {
+    assert.equal(Object.hasOwn(queuedInternal, field), false);
+  }
+  assert.equal(queuedInternal.cleanup.settled, true);
+  await assert.rejects(
+    service.resume(paidQueued.id, { resumeKey: 'legacy-paid-resume' }, ADMIN),
+    { code: 'TASK_EXTERNAL_COST_UNSUPPORTED' }
+  );
+
+  const paidHistory = await service.get(paidCompleted.id, ADMIN);
+  assert.equal(paidHistory.state, 'completed');
+  assert.equal(paidHistory.result.summary, 'Paid history remains readable after runtime removal');
+  assert.deepEqual(paidHistory.result.evidence, [
+    { kind: 'message', value: 'terminal history preserved' }
+  ]);
+  assert.equal(Object.hasOwn(paidHistory, 'externalCostUsage'), false);
+  const paidPersisted = JSON.parse(
+    await readFile(path.join(stateDir, paidCompleted.id, 'task.json'), 'utf8')
+  );
+  assert.equal(paidPersisted.legacyPaidRuntime, true);
+  assert.equal(Object.hasOwn(paidPersisted, 'externalCostBudget'), false);
+  assert.equal(Object.hasOwn(paidPersisted, 'externalCostUsage'), false);
+
+  await service.close();
 });
 
 test('the first settled failed-task read publishes a verified resumable checkpoint', async (t) => {

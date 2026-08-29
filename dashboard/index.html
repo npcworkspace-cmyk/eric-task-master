@@ -20,6 +20,7 @@
         <button class="nav-link is-active" type="button" data-view="tasks" aria-current="page" data-i18n="nav.tasks">任务</button>
         <button class="nav-link" type="button" data-view="profiles" data-i18n="nav.profiles">Profiles</button>
         <button class="nav-link" type="button" data-view="assets" data-i18n="nav.assets">Task Packs</button>
+        <button class="nav-link" type="button" data-view="settings" data-i18n="nav.settings">设置</button>
       </nav>
 
       <div class="header-actions">
@@ -40,7 +41,7 @@
     </header>
 
     <div id="notification-backdrop" class="notification-backdrop hidden" aria-hidden="true"></div>
-    <aside id="notification-drawer" class="notification-drawer npc-glass-light hidden" aria-labelledby="notification-title" aria-hidden="true">
+    <aside id="notification-drawer" class="notification-drawer npc-glass-light hidden" role="dialog" aria-modal="true" aria-labelledby="notification-title" aria-hidden="true" tabindex="-1">
       <div class="notification-drawer-heading">
         <div><p class="npc-eyebrow">NOTIFICATIONS</p><h2 id="notification-title" data-i18n="notifications.title">通知</h2><p id="notification-summary" data-i18n="notifications.loading">正在读取通知…</p></div>
         <button id="notification-close" class="npc-btn npc-btn-ghost icon-button" type="button" aria-label="关闭通知" title="关闭通知" data-i18n-aria-label="notifications.close" data-i18n-title="notifications.close">×</button>
@@ -50,34 +51,6 @@
       </div>
       <div id="notifications" class="notification-list" aria-live="polite"><p class="empty-state" data-i18n="notifications.loading">正在读取通知…</p></div>
       <p id="notifications-error" class="inline-error hidden" role="status"></p>
-
-      <details class="notification-settings">
-        <summary data-i18n="settings.title">通知设置</summary>
-        <form id="notification-settings-form">
-          <div class="notification-channel">
-            <label class="switch-field"><input id="notification-system-enabled" type="checkbox"><span data-i18n="settings.system">系统通知</span></label>
-            <span id="notification-system-status" class="channel-status"></span>
-            <button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="system" data-i18n="settings.test">发送测试</button>
-          </div>
-          <div class="notification-channel">
-            <label class="switch-field"><input id="notification-telegram-enabled" type="checkbox"><span>Telegram</span></label>
-            <span id="notification-telegram-status" class="channel-status"></span>
-            <label><span data-i18n="settings.telegramToken">Bot Token（留空保留原配置）</span><input id="notification-telegram-token" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
-            <label><span data-i18n="settings.telegramChat">Chat ID（留空保留原配置）</span><input id="notification-telegram-chat" class="npc-field" type="text" autocomplete="off" data-i18n-placeholder="settings.destinationPlaceholder" placeholder="不会回填已保存目标"></label>
-            <button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="telegram" data-i18n="settings.test">发送测试</button>
-            <button class="npc-btn npc-btn-ghost compact-button channel-clear" type="button" data-channel="telegram" data-i18n="settings.clearCredentials">清除凭据</button>
-          </div>
-          <div class="notification-channel">
-            <label class="switch-field"><input id="notification-feishu-enabled" type="checkbox"><span data-i18n="settings.feishu">飞书</span></label>
-            <span id="notification-feishu-status" class="channel-status"></span>
-            <label><span data-i18n="settings.feishuWebhook">Webhook（留空保留原配置）</span><input id="notification-feishu-webhook" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
-            <button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="feishu" data-i18n="settings.test">发送测试</button>
-            <button class="npc-btn npc-btn-ghost compact-button channel-clear" type="button" data-channel="feishu" data-i18n="settings.clearCredentials">清除凭据</button>
-          </div>
-          <p class="form-note" data-i18n="settings.maskedNote">已保存的密钥只显示掩码，面板永远不会回填原文。</p>
-          <button id="notification-settings-save" class="npc-btn npc-btn-primary" type="submit" data-i18n="settings.save">保存通知设置</button>
-        </form>
-      </details>
     </aside>
 
     <div id="auth-banner" class="system-banner auth-banner hidden" role="alert">
@@ -96,7 +69,22 @@
           <div><p class="npc-eyebrow">TASKS</p><h1 id="tasks-title" tabindex="-1" data-i18n="tasks.title">任务进度</h1><p data-i18n="tasks.description">查看 Agent 正在做什么，并可暂停、恢复、取消或删除已结束的任务记录。</p></div>
           <span id="task-count-chip" class="npc-chip npc-chip-info" aria-live="polite" data-i18n="common.loading">读取中</span>
         </div>
+        <div class="task-toolbar surface-card" aria-label="任务批量管理" data-i18n-aria-label="tasks.bulk">
+          <label class="check-field task-select-all"><input id="task-select-all" type="checkbox"><span data-i18n="tasks.selectAll">全选已加载任务</span></label>
+          <div class="task-bulk-actions" role="group" aria-label="任务批量操作" data-i18n-aria-label="tasks.bulkActions">
+            <button id="task-bulk-pause" class="npc-btn npc-btn-secondary compact-button" type="button" disabled data-i18n="tasks.bulkPause">批量暂停</button>
+            <button id="task-bulk-resume" class="npc-btn npc-btn-secondary compact-button" type="button" disabled data-i18n="tasks.bulkResume">批量恢复</button>
+            <button id="task-bulk-cancel" class="npc-btn npc-btn-danger compact-button" type="button" disabled data-i18n="tasks.bulkCancel">批量取消</button>
+            <button id="task-bulk-delete" class="npc-btn npc-btn-danger compact-button" type="button" disabled data-i18n="tasks.bulkDelete">批量删除记录</button>
+          </div>
+        </div>
+        <p id="task-selection-summary" class="task-selection-summary" aria-live="polite" data-i18n="tasks.noneSelected">尚未选择任务</p>
+        <div id="task-batch-feedback" class="task-batch-feedback hidden" role="status" aria-live="polite"></div>
         <div id="tasks" class="task-list" aria-live="polite"><p class="empty-state" data-i18n="tasks.loading">正在读取任务…</p></div>
+        <div class="task-pagination">
+          <button id="task-load-more" class="npc-btn npc-btn-secondary" type="button" hidden data-i18n="tasks.loadMore">加载更多任务</button>
+          <span id="task-page-status" class="task-page-status" aria-live="polite"></span>
+        </div>
         <p id="tasks-error" class="inline-error hidden" role="status"></p>
       </section>
 
@@ -143,6 +131,46 @@
         <p id="asset-selection-summary" class="asset-selection-summary" aria-live="polite" data-i18n="assets.noneSelected">尚未选择资产</p>
         <div id="assets" class="asset-list" aria-live="polite"><p class="empty-state" data-i18n="assets.loading">正在读取执行器资产…</p></div>
         <p id="assets-error" class="inline-error hidden" role="status"></p>
+      </section>
+
+      <section id="view-settings" class="view" data-view-panel="settings" aria-labelledby="settings-title" hidden>
+        <div class="section-heading page-heading">
+          <div><p class="npc-eyebrow">SETTINGS</p><h1 id="settings-title" tabindex="-1" data-i18n="settings.title">通知设置</h1><p data-i18n="settings.description">只管理需要人工验证时的三种通知方式。</p></div>
+        </div>
+
+        <form id="notification-settings-form" class="settings-form">
+          <div class="settings-grid">
+            <section class="setting-card" data-channel-card="system" aria-labelledby="settings-system-title">
+              <div class="setting-card-heading"><div><p class="npc-eyebrow">SYSTEM</p><h2 id="settings-system-title" data-i18n="settings.system">系统通知</h2></div><label class="switch-field"><input id="notification-system-enabled" type="checkbox"><span data-i18n="settings.enable">启用</span></label></div>
+              <p class="setting-description" data-i18n="settings.systemDescription">通过本机系统弹窗提醒人工接手验证。</p>
+              <span id="notification-system-status" class="channel-status"></span>
+              <div class="setting-card-actions"><button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="system" data-i18n="settings.test">发送测试</button><button id="notification-system-settings" class="npc-btn npc-btn-ghost compact-button" type="button" data-i18n="settings.openSystem">打开系统设置</button></div>
+            </section>
+
+            <section class="setting-card" data-channel-card="telegram" aria-labelledby="settings-telegram-title">
+              <div class="setting-card-heading"><div><p class="npc-eyebrow">TELEGRAM</p><h2 id="settings-telegram-title">Telegram</h2></div><label class="switch-field"><input id="notification-telegram-enabled" type="checkbox"><span data-i18n="settings.enable">启用</span></label></div>
+              <p class="setting-description" data-i18n="settings.telegramDescription">将人工验证提醒发送到指定 Telegram 会话。</p>
+              <span id="notification-telegram-status" class="channel-status"></span>
+              <label><span data-i18n="settings.telegramToken">Bot Token（留空保留原配置）</span><input id="notification-telegram-token" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
+              <label><span data-i18n="settings.telegramChat">Chat ID（留空保留原配置）</span><input id="notification-telegram-chat" class="npc-field" type="text" autocomplete="off" data-i18n-placeholder="settings.destinationPlaceholder" placeholder="不会回填已保存目标"></label>
+              <div class="setting-card-actions"><button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="telegram" data-i18n="settings.test">发送测试</button><button class="npc-btn npc-btn-ghost compact-button channel-clear" type="button" data-channel="telegram" data-i18n="settings.clearCredentials">清除凭据</button></div>
+            </section>
+
+            <section class="setting-card" data-channel-card="feishu" aria-labelledby="settings-feishu-title">
+              <div class="setting-card-heading"><div><p class="npc-eyebrow">FEISHU / LARK</p><h2 id="settings-feishu-title" data-i18n="settings.feishu">飞书</h2></div><label class="switch-field"><input id="notification-feishu-enabled" type="checkbox"><span data-i18n="settings.enable">启用</span></label></div>
+              <p class="setting-description" data-i18n="settings.feishuDescription">通过飞书或 Lark Webhook 提醒人工接手验证。</p>
+              <span id="notification-feishu-status" class="channel-status"></span>
+              <label><span data-i18n="settings.feishuWebhook">Webhook（留空保留原配置）</span><input id="notification-feishu-webhook" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
+              <label><span data-i18n="settings.feishuSigningSecret">签名密钥（可选，留空保留原配置）</span><input id="notification-feishu-signing-secret" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
+              <div class="setting-card-actions"><button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="feishu" data-i18n="settings.test">发送测试</button><button class="npc-btn npc-btn-ghost compact-button channel-clear" type="button" data-channel="feishu" data-i18n="settings.clearCredentials">清除凭据</button></div>
+            </section>
+          </div>
+          <div class="settings-footer">
+            <p class="form-note" data-i18n="settings.maskedNote">已保存的密钥只显示掩码，面板永远不会回填原文。</p>
+            <button id="notification-settings-save" class="npc-btn npc-btn-primary" type="submit" data-i18n="settings.save">保存通知设置</button>
+          </div>
+        </form>
+        <p id="settings-error" class="inline-error hidden" role="status"></p>
       </section>
 
       <p id="dashboard-message" class="toast hidden" role="status" aria-live="polite"></p>

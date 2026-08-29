@@ -208,33 +208,27 @@ test('MCP discovery exposes the built-in surface probe and compact Task Pack lif
 
   const described = await connection.client.callTool({
     name: 'taskmaster_task_types_describe',
-    arguments: { taskType: 'fixture.paid' }
+    arguments: { taskType: 'fixture.asset' }
   });
-  assert.deepEqual(described.structuredContent.data.taskType.externalCost, {
-    currency: 'USD', maxAmountPerRun: 5
-  });
+  assert.equal(Object.hasOwn(described.structuredContent.data.taskType, 'externalCost'), false);
   assert.equal(described.structuredContent.data.taskType.pack.lifecycle, 'active');
   assert.equal(described.structuredContent.data.taskType.pack.discoverable, true);
 });
 
-test('MCP exposes aggregate paid-task usage and same-task human verification focus without low-level data', async (t) => {
+test('MCP starts a task and exposes same-task human verification focus without low-level data', async (t) => {
   const connection = await connectedClient('legacy');
   t.after(() => connection.client.close());
 
   const started = await connection.client.callTool({
     name: 'taskmaster_tasks_start',
     arguments: {
-      taskType: 'fixture.paid',
+      taskType: 'fixture.asset',
       profileId: 'profile_fixture',
       input: {},
-      externalCostBudget: { currency: 'USD', maxAmount: 2.5 },
-      idempotencyKey: 'paid-task-fixture-0001'
+      idempotencyKey: 'task-fixture-0001'
     }
   });
-  assert.deepEqual(started.structuredContent.data.task.externalCostUsage, {
-    currency: 'USD', estimatedTotal: 0, actualTotal: 0, remainingAmount: 2.5
-  });
-  assert.equal('externalCostBudget' in started.structuredContent.data.task, false);
+  assert.equal(started.structuredContent.data.task.id, 'task_fixture');
 
   const focused = await connection.client.callTool({
     name: 'taskmaster_tasks_focus',

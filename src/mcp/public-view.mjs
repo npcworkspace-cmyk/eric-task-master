@@ -1,6 +1,7 @@
 import { basename } from 'node:path';
 import { publicProfile as publicManagerProfile } from '../contracts.mjs';
 import { redactPublicText } from '../lib/redaction.mjs';
+import { projectPublicTaskFailure } from '../lib/public-task-failure.mjs';
 import { TaskMasterClientError } from './errors.mjs';
 
 export const MAX_TOOL_RESULT_BYTES = 256 * 1024;
@@ -20,31 +21,6 @@ function numberValue(value) {
 
 function booleanValue(value) {
   return typeof value === 'boolean' ? value : undefined;
-}
-
-function currencyValue(value) {
-  return typeof value === 'string' && /^[A-Z]{3}$/.test(value) ? value : undefined;
-}
-
-function publicExternalCostDeclaration(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const currency = currencyValue(value.currency);
-  const maxAmountPerRun = numberValue(value.maxAmountPerRun);
-  if (!currency || maxAmountPerRun === undefined || maxAmountPerRun <= 0) return undefined;
-  return { currency, maxAmountPerRun };
-}
-
-function publicExternalCostUsage(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const currency = currencyValue(value.currency);
-  const estimatedTotal = numberValue(value.estimatedTotal);
-  const actualTotal = numberValue(value.actualTotal);
-  const remainingAmount = numberValue(value.remainingAmount);
-  if (
-    !currency || estimatedTotal === undefined || actualTotal === undefined || remainingAmount === undefined ||
-    estimatedTotal < 0 || actualTotal < 0 || remainingAmount < 0
-  ) return undefined;
-  return { currency, estimatedTotal, actualTotal, remainingAmount };
 }
 
 function definedEntries(entries) {
@@ -68,15 +44,6 @@ function safeUrl(value) {
   } catch {
     return undefined;
   }
-}
-
-function publicTaskErrorMessage(code) {
-  if (/TIMEOUT|HEARTBEAT/.test(code)) return 'Task timed out or stopped reporting progress; inspect diagnostic artifacts before retrying.';
-  if (/PROFILE_(?:IN_USE|LEASED|LEASE_FAILED)/.test(code)) return 'The selected Profile is already in use; choose another Profile or wait for cleanup to settle.';
-  if (/ACTION|NAVIGATION|PLAYWRIGHT|BROWSER/.test(code)) return 'A browser action failed; inspect the latest diagnostic screenshot and live task state.';
-  if (/INPUT|SCHEMA/.test(code)) return 'Task input does not match the installed task type contract.';
-  if (/INTERRUPTED|MANAGER_RESTART/.test(code)) return 'Manager restarted during the task; inspect the preserved checkpoint before resuming.';
-  return 'Task failed; inspect its state, progress, checkpoint, and diagnostic artifacts.';
 }
 
 function safeJson(value, { depth = 0, seen = new Set() } = {}) {
@@ -320,7 +287,6 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['agent', agent?.clientId && agent?.name ? agent : undefined],
     ['behavior', stringValue(task?.behavior, 32)],
     ['interactionContract', stringValue(task?.interactionContract, 32)],
-    ['externalCostUsage', publicExternalCostUsage(task?.externalCostUsage)],
     ['attempt', Number.isSafeInteger(task?.attempt) ? task.attempt : undefined],
     ['history', publicAttemptHistory(task?.history)],
     ['state', stringValue(task?.state, 64)],
@@ -351,7 +317,9 @@ export function publicTask(task, { includeResult = true } = {}) {
     ['report', publicTaskReport(task?.report)],
     ['summary', includeResult ? stringValue(result?.summary ?? task?.summary, 4096) : undefined],
     ['evidence', evidence?.length ? evidence : undefined],
-    ['error', errorCode ? { code: errorCode, message: publicTaskErrorMessage(errorCode) } : undefined]
+    ['error', projectPublicTaskFailure(task?.error) ?? (errorCode
+      ? projectPublicTaskFailure({ code: errorCode })
+      : undefined)]
   ]);
 }
 
@@ -374,7 +342,6 @@ export function publicTaskType(taskType, { includeSchema = true } = {}) {
     ['lifecycle', stringValue(taskType?.lifecycle, 16)],
     ['deprecatedAt', stringValue(taskType?.deprecatedAt, 64)],
     ['replacedBy', stringValue(taskType?.replacedBy, 128)],
-    ['externalCost', publicExternalCostDeclaration(taskType?.externalCost)],
     ['pack', taskType?.pack && typeof taskType.pack === 'object' ? definedEntries([
       ['name', stringValue(taskType.pack.name, 80)],
       ['version', stringValue(taskType.pack.version, 64)],

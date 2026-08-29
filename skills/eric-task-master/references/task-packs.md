@@ -5,9 +5,9 @@ Read this reference when capability should be reusable across tasks or Agents. A
 ## Create and install
 
 ```bash
-node scripts/taskmaster.mjs task-packs scaffold ./reddit-comments --name reddit-comments --recipe paginated-list --json
-node scripts/taskmaster.mjs task-packs validate ./reddit-comments --json
-node scripts/taskmaster.mjs task-packs install ./reddit-comments --json
+node scripts/taskmaster.mjs task-packs scaffold ./catalog-monitor --name catalog-monitor --recipe paginated-list --json
+node scripts/taskmaster.mjs task-packs validate ./catalog-monitor --json
+node scripts/taskmaster.mjs task-packs install ./catalog-monitor --json
 ```
 
 Choose exactly one built-in recipe: `single-page`, `paginated-list`, `list-detail`, `resumable-batch`, or `form-workflow`. Each recipe already contains the approved lifecycle, bounded progress, output persistence, completion evidence, cleanup-compatible control flow, checkpoint pattern, and mandatory `full-human-v1` journey contract. Start from the closest recipe instead of rewriting infrastructure. `task-packs validate` performs isolated module preflight without registering anything and reports every detected module error in one pass.
@@ -16,23 +16,23 @@ The manifest is named `taskpack.json`:
 
 ```json
 {
-  "name": "reddit-comments",
+  "name": "catalog-monitor",
   "version": "1.0.0",
-  "title": "Reddit Comments",
+  "title": "Catalog Monitor",
   "description": "One bounded workflow family.",
   "interactionContract": "full-human-v1",
   "tasks": [
-    { "name": "reddit-comments.collect.v1", "module": "tasks/collect-v1.mjs" }
+    { "name": "catalog-monitor.collect.v1", "module": "tasks/collect-v1.mjs" }
   ]
 }
 ```
 
 ## Minimal conventions
 
-- Use one lowercase capability slug `<domain>-<capability>`, such as `reddit-comments`. Give the specialized Skill and its Task Pack that same slug; do not append `-skill` or `-eric-task-master-skill`.
-- Name a task type `<pack>.<verb>.vN` and its module `tasks/<verb>-vN.mjs`, for example `reddit-comments.collect.v1` and `tasks/collect-v1.mjs`. A task type is immutable after registration. Use `.v2` only when its executable input, output, or meaning becomes incompatible.
+- Use one lowercase capability slug `<domain>-<capability>`, such as `catalog-monitor`. Give the specialized Skill and its Task Pack that same slug; do not append `-skill` or `-eric-task-master-skill`.
+- Name a task type `<pack>.<verb>.vN` and its module `tasks/<verb>-vN.mjs`, for example `catalog-monitor.collect.v1` and `tasks/collect-v1.mjs`. A task type is immutable after registration. Use `.v2` only when its executable input, output, or meaning becomes incompatible.
 - The Pack's semantic version describes the distributed Pack release and is independent of the task type's `.vN`. A Pack may move from `1.0.0` to `1.1.0` while retaining an unchanged `.v1` task type.
-- At task start, supply a concise `taskLabel` as action + object + scope, such as `采集-Reddit评论-5帖`. Do not put the Agent name or a timestamp in it; Manager adds stable Agent identity and creation time to the display name.
+- At task start, supply a concise `taskLabel` as action + object + scope, such as `采集-目录条目-5页`. Do not put the Agent name or a timestamp in it; Manager adds stable Agent identity and creation time to the display name.
 - Use bounded `camelCase` input fields that describe only business intent. Do not put runtime controls, Profile IDs, behavior modes, Agent IDs, cookies, tokens, or other credentials in task input.
 - Keep applicable output names stable within one task type, preferring `result.json`, `records.jsonl`, `summary.json`, and `manifest.json`. A Pack need not emit every file, but it must not rename equivalent outputs between runs.
 
@@ -40,7 +40,7 @@ The manifest is named `taskpack.json`:
 
 When no specialized Skill or registered task type covers a large request, first call MCP `taskmaster_scale_prepare` or CLI `task prepare-scale` against one representative entry URL. The runtime starts the built-in `surface-probe`; task authors do not recreate or vary that probe contract. Large means at least 20 independent pages/items, pagination or recursive expansion, an expected run above ten minutes, or unattended batch execution. Read its declared `surface-probe.json` artifact before authoring the Task Pack. Probe at most three URLs only when the site has materially different list/detail/account surfaces.
 
-The probe is read-only and bounded. It samples headings, links, controls, page length, stable locator hints, pagination candidates, challenge signals, and a central rapid survey/backtrack journey, then recommends the closest recipe. It does not prove full-site coverage, grant permission, or defeat a login, CAPTCHA, press-and-hold challenge, or rate limit. A detected human-verification challenge creates a same-task `human_verification` handoff and waits for the Owner; no solver or bypass is used. After an explicit continuation, the probe observes again. CAPTCHA, rate-limit, unreadable-frame, omitted-frame, and any truncated observation keep `scaleAllowed` false. After the probe, customize the recommended recipe and run one bounded pilot whose result schema, checkpoints, rate policy, and completion evidence pass before raising the scale.
+The probe is read-only and bounded. It samples headings, links, controls, page length, stable locator hints, pagination candidates, challenge signals, and a central rapid survey/backtrack journey, then recommends the closest recipe. It does not prove full-site coverage, grant permission, or defeat a login, CAPTCHA, press-and-hold challenge, or rate limit. A detected human-verification challenge creates a same-task `human_verification` handoff and waits for the Owner; no solver or bypass is used. After an explicit continuation, the probe observes again. CAPTCHA, rate limits, unreadable or omitted relevant frames, and challenge signals found by a bounded secondary frame scan keep `scaleAllowed` false. A dense main document or a hidden/decorative child frame that merely reaches the observation budget is reported as a warning instead of being mistaken for a site blocker. After the probe, customize the recommended recipe and run one bounded pilot whose result schema, checkpoints, rate policy, and completion evidence pass before raising the scale.
 
 ## Mandatory Human Journey contract
 
@@ -69,7 +69,7 @@ Do not overwrite a registered task type with divergent source. Install a new ver
 
 Task modules are trusted code, not an untrusted-code sandbox. Install only reviewed local Packs.
 
-For a Pack that calls a paid external API, declare `meta.externalCost = { currency: 'USD', maxAmountPerRun: N }` on every affected task type. Task start must include `externalCostBudget = { currency: 'USD', maxAmount: M }` with `M <= N`; the Worker receives that object frozen together with an `externalCost` facade. Before a paid request, call `const grant = await externalCost.reserve({ operationId, estimatedAmount })` and call the provider only when `grant.execute === true`. An identical concurrent/resume replay receives `execute: false` plus `status: 'reserved'` or `'settled'`; recover its durable result or stop, but never bill it again. Reserve a conservative upper bound: `await externalCost.settle({ operationId, actualAmount })` rejects actual cost above that operation's reservation. Manager serializes requests and persists the task-wide ledger before each acknowledgement, so retries and resume attempts consume the same balance. Changed values, missing reservations, zero reservations, or amounts beyond the task/per-operation limit are rejected. Completion requires no outstanding reservations plus exactly one `{ kind: 'count', label: 'external-cost-estimated', value }` and one `{ kind: 'count', label: 'external-cost-actual', value }` matching the ledger totals. Public task state exposes aggregate usage only. This is a hard gate for reviewed Pack code using the facade, not a firewall around arbitrary provider traffic.
+Task Master does not price, authorize, meter, or reimburse external providers. If a specialized workflow can incur charges, its own reviewed Pack and Skill must define provider authorization, an explicit business budget, idempotency, receipts, and stop conditions outside the base runtime. Keep provider credentials out of task input, progress, evidence, and public errors. The base project deliberately supplies no generic paid-call facade: a partial accounting abstraction cannot guarantee what a third-party provider actually bills.
 
 ## Composition boundary
 

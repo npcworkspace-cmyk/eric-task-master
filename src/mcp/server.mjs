@@ -106,23 +106,6 @@ const AgentSchema = z.strictObject({
   name: z.string()
 });
 
-const ExternalCostDeclarationSchema = z.strictObject({
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  maxAmountPerRun: z.number().positive().finite()
-});
-
-const ExternalCostBudgetSchema = z.strictObject({
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  maxAmount: z.number().positive().finite()
-});
-
-const ExternalCostUsageSchema = z.strictObject({
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  estimatedTotal: z.number().nonnegative().finite(),
-  actualTotal: z.number().nonnegative().finite(),
-  remainingAmount: z.number().nonnegative().finite()
-});
-
 const TaskCommandSchema = z.strictObject({
   commandId: IdentifierSchema,
   kind: z.enum(['ask', 'modify', 'pause', 'resume_pause', 'terminate', 'revise_input']),
@@ -147,6 +130,19 @@ const InboxEntrySchema = z.strictObject({
   revision: z.number().int().positive(),
   command: TaskCommandSchema
 });
+const TaskFailureFieldSchema = z.strictObject({
+  path: z.string().max(128),
+  reason: z.string().max(300),
+  expectedType: z.string().max(64).optional(),
+  receivedType: z.string().max(64).optional()
+});
+const TaskFailureSchema = z.strictObject({
+  code: z.string(),
+  message: z.string().optional(),
+  category: z.enum(['input', 'precondition', 'provider', 'navigation', 'data', 'runtime']).optional(),
+  fields: z.array(TaskFailureFieldSchema).max(8).optional(),
+  nextAction: z.string().max(500).optional()
+});
 
 const TaskSchema = z.strictObject({
   id: z.string(),
@@ -160,7 +156,6 @@ const TaskSchema = z.strictObject({
   agent: AgentSchema.optional(),
   behavior: z.string().optional(),
   interactionContract: z.literal('full-human-v1').optional(),
-  externalCostUsage: ExternalCostUsageSchema.optional(),
   attempt: z.number().int().optional(),
   history: z.array(AttemptHistorySchema).optional(),
   state: z.string().optional(),
@@ -230,7 +225,7 @@ const TaskSchema = z.strictObject({
   report: TaskReportSchema.optional(),
   summary: z.string().optional(),
   evidence: z.array(EvidenceSchema).optional(),
-  error: z.strictObject({ code: z.string(), message: z.string().optional() }).optional()
+  error: TaskFailureSchema.optional()
 });
 
 const TaskTypeSchema = z.strictObject({
@@ -247,7 +242,6 @@ const TaskTypeSchema = z.strictObject({
   lifecycle: z.enum(['active', 'deprecated']).optional(),
   deprecatedAt: z.string().optional(),
   replacedBy: z.string().optional(),
-  externalCost: ExternalCostDeclarationSchema.optional(),
   pack: z.strictObject({
     name: z.string(),
     version: z.string(),
@@ -675,7 +669,6 @@ export function createMcpServer({ client, version = VERSION } = {}) {
       taskLabel: z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/u).optional(),
       input: JsonObjectSchema.default({}),
       timeoutMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).optional(),
-      externalCostBudget: ExternalCostBudgetSchema.optional(),
       idempotencyKey: IdempotencyKeySchema
     }),
     outputSchema: z.strictObject({ taskId: IdentifierSchema, dashboardUrl: z.string().url(), task: TaskSchema }),

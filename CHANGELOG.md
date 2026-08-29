@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.8.0 - 2026-08-29
+
+- Added bounded cursor pagination and revision-checked batch pause, resume, cancel, and safe task-record deletion to the Owner Console. Task Pack deletion blockers now identify the exact retained task to Owner clients and can load, select, and highlight that task without exposing cross-owner task IDs through Agent MCP inventory.
+- Added a dedicated bilingual Settings view for native operating-system, Telegram Bot, and Feishu/Lark human-verification notifications. Settings drafts survive background polling, all save/test/clear operations are serialized, capability and last-test states remain visible, Feishu signing is optional and write-only, and supported hosts can open their system notification settings.
+- Hardened native Windows notifications with a registered application identity and protocol activation back to the exact task. Registration-only setup now exits before probing the Windows toast runtime, preventing hidden initialization from stalling the Manager or its acceptance suite. Human-verification alerts remain the only automatic notification class, fire immediately, repeat every 30 seconds, and stop after the Owner claims or resolves the matching request.
+- Added a bounded public Task Pack failure contract with stable categories, codes, safe field details, type diagnostics, and one recovery action. MCP preserves this allowlisted contract and correlated request IDs while arbitrary exception text, paths, credentials, and provider payloads remain private.
+- Refined semantic frame evidence so visible unreadable or omitted frames still block scaling, while a dense main document or hidden/decorative child that merely reaches the observation budget becomes a warning after a bounded challenge scan. This removes false blockers without weakening challenge detection.
+- Removed the generic paid-provider budget, ledger, runtime facade, Worker IPC, and MCP/HTTP inputs. New declarations fail closed; legacy paid task history remains readable after private migration but cannot start or resume. Provider authorization and cost governance now remain wholly outside the site-agnostic core.
+- Expanded static, migration, notification, cross-language, task-history pagination, batch-control, blocker-navigation, responsive, accessibility, real Chromium, and red-team acceptance coverage for the four-view Console and the 2.8.0 protocol surface.
+
 ## 2.7.0 - 2026-08-29
 
 - Added durable human-verification alerts through the native operating-system channel, Telegram Bot, and Feishu/Lark webhook. Alerts are created only for an explicit `human_verification` handoff, fire immediately, repeat every 30 seconds, and stop after the Owner claims or resolves that exact request; ordinary failures, stalls, cooldowns, cleanup, completion, and login ambiguity never notify.

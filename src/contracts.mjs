@@ -1,7 +1,8 @@
 import { isSensitiveKey, redactPublicText } from './lib/redaction.mjs';
 import { normalizeAgentName, validateAgentClientId } from './lib/agent-token.mjs';
+import { projectPublicTaskFailure } from './lib/public-task-failure.mjs';
 
-export const VERSION = '2.7.0';
+export const VERSION = '2.8.0';
 export const API_VERSION = 1;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -136,7 +137,6 @@ export function publicTask(task) {
     'displayName',
     'supportsResume',
     'interactionContract',
-    'externalCostUsage',
     'behavior',
     'attempt',
     'history',
@@ -150,7 +150,6 @@ export function publicTask(task) {
     'queuePosition',
     'queueReason',
     'result',
-    'error',
     'cleanup',
     'createdAt',
     'updatedAt',
@@ -165,6 +164,14 @@ export function publicTask(task) {
       !(task.state === 'completed' && task.completion?.integrity !== 'invalid' && task.completion?.verifiedAt)
     ) continue;
     if (task?.[key] !== undefined) safe[key] = redactLocalPaths(task[key]);
+  }
+  const projectedError = projectPublicTaskFailure(task?.error);
+  if (projectedError) safe.error = projectedError;
+  if (Array.isArray(safe.result?.evidence)) {
+    safe.result.evidence = safe.result.evidence.filter((item) => !(
+      item?.kind === 'count' &&
+      ['external-cost-estimated', 'external-cost-actual'].includes(item?.label)
+    ));
   }
   safe.timing = publicTaskTiming(task);
   if (Array.isArray(task?.timeline)) {

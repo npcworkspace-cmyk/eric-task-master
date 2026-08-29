@@ -166,6 +166,43 @@ async function inspectFrame(frame, { scope, maxNodes, maxTextChars }) {
   }, { requestedScope: scope, requestedNodes: maxNodes, requestedText: maxTextChars });
 }
 
+async function inspectFrameOwner(frame, mainFrame) {
+  if (frame === mainFrame) {
+    return Object.freeze({ main: true, visible: true, decorative: false, ownerInspectionFailed: false });
+  }
+  let handle = null;
+  try {
+    handle = await frame.frameElement();
+    const owner = await handle.evaluate((element) => {
+      const style = getComputedStyle(element);
+      const box = element.getBoundingClientRect();
+      const label = [
+        element.getAttribute('title'),
+        element.getAttribute('name'),
+        element.getAttribute('aria-label'),
+        element.getAttribute('id'),
+        element.getAttribute('class')
+      ].filter(Boolean).join(' ').slice(0, 500);
+      const hidden = element.getAttribute('aria-hidden') === 'true' ||
+        style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0 ||
+        box.width <= 0 || box.height <= 0;
+      const decorative = hidden || ['none', 'presentation'].includes(element.getAttribute('role') || '') ||
+        /(?:advert(?:isement|ising)?|\bad[\s_-]?(?:slot|frame)\b|tracking|analytics|pixel)/iu.test(label);
+      return {
+        visible: !hidden,
+        decorative,
+        width: Math.max(0, Math.round(box.width)),
+        height: Math.max(0, Math.round(box.height))
+      };
+    });
+    return Object.freeze({ main: false, ...owner, ownerInspectionFailed: false });
+  } catch {
+    return Object.freeze({ main: false, visible: true, decorative: false, ownerInspectionFailed: true });
+  } finally {
+    await handle?.dispose().catch(() => {});
+  }
+}
+
 export function createSemanticObserver({ page, action, locatorTransform = (locator) => locator } = {}) {
   if (!page) throw new TypeError('page is required');
   let current = null;
@@ -184,15 +221,24 @@ export function createSemanticObserver({ page, action, locatorTransform = (locat
     let frameErrors = 0;
     let remainingNodes = maxNodes;
     let remainingTextChars = maxTextChars;
-    const allFrames = page.frames();
+    const mainFrame = page.mainFrame();
+    const discoveredFrames = page.frames();
+    const allFrames = [mainFrame, ...discoveredFrames.filter((frame) => frame !== mainFrame)];
     const frames = allFrames.slice(0, MAX_FRAMES);
     let framesInspected = 0;
     let truncatedFrames = 0;
+    let mainFrameTruncated = false;
+    let visibleChildFrameErrors = 0;
+    let hiddenChildFrameErrors = 0;
+    let visibleChildFramesTruncated = 0;
+    let hiddenChildFramesTruncated = 0;
+    const frameDetails = [];
     for (const [frameIndex, frame] of frames.entries()) {
       if (remainingNodes <= 0 && remainingTextChars <= 0) {
         truncated = true;
         break;
       }
+      const owner = await inspectFrameOwner(frame, mainFrame);
       let inspected;
       try {
         const remainingFrames = frames.length - frameIndex;
@@ -203,10 +249,39 @@ export function createSemanticObserver({ page, action, locatorTransform = (locat
         });
       } catch {
         frameErrors += 1;
+        if (!owner.main) {
+          if (owner.visible && !owner.decorative) visibleChildFrameErrors += 1;
+          else hiddenChildFrameErrors += 1;
+        }
+        frameDetails.push(Object.freeze({
+          frame: frameIndex,
+          main: owner.main,
+          visible: owner.visible,
+          decorative: owner.decorative,
+          ownerInspectionFailed: owner.ownerInspectionFailed,
+          inspected: false,
+          truncated: false,
+          error: true
+        }));
         continue;
       }
       framesInspected += 1;
-      if (inspected.truncated) truncatedFrames += 1;
+      if (inspected.truncated) {
+        truncatedFrames += 1;
+        if (owner.main) mainFrameTruncated = true;
+        else if (owner.visible && !owner.decorative) visibleChildFramesTruncated += 1;
+        else hiddenChildFramesTruncated += 1;
+      }
+      frameDetails.push(Object.freeze({
+        frame: frameIndex,
+        main: owner.main,
+        visible: owner.visible,
+        decorative: owner.decorative,
+        ownerInspectionFailed: owner.ownerInspectionFailed,
+        inspected: true,
+        truncated: Boolean(inspected.truncated),
+        error: false
+      }));
       remainingNodes = Math.max(0, remainingNodes - inspected.nodes.length);
       remainingTextChars = Math.max(
         0,
@@ -243,6 +318,15 @@ export function createSemanticObserver({ page, action, locatorTransform = (locat
         for (const block of inspected.blocks) lines.push(`- ${safeText(block, 1_000)}`);
       }
     }
+    let visibleFramesOmitted = 0;
+    let hiddenFramesOmitted = 0;
+    let unknownFramesOmitted = 0;
+    for (const frame of allFrames.slice(MAX_FRAMES)) {
+      const owner = await inspectFrameOwner(frame, mainFrame);
+      if (owner.ownerInspectionFailed) unknownFramesOmitted += 1;
+      else if (owner.visible && !owner.decorative) visibleFramesOmitted += 1;
+      else hiddenFramesOmitted += 1;
+    }
     const id = `snapshot_${randomUUID().replaceAll('-', '')}`;
     const content = lines.join('\n').slice(0, maxTextChars + maxNodes * 500);
     current = { id, pageUrl: page.url(), refs };
@@ -257,7 +341,16 @@ export function createSemanticObserver({ page, action, locatorTransform = (locat
       framesTotal: allFrames.length,
       framesInspected,
       truncatedFrames,
-      framesOmitted: Math.max(0, allFrames.length - frames.length)
+      mainFrameTruncated,
+      visibleChildFrameErrors,
+      hiddenChildFrameErrors,
+      visibleChildFramesTruncated,
+      hiddenChildFramesTruncated,
+      framesOmitted: Math.max(0, allFrames.length - frames.length),
+      visibleFramesOmitted,
+      hiddenFramesOmitted,
+      unknownFramesOmitted,
+      frameDetails
     });
   }
 

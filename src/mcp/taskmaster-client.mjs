@@ -441,7 +441,7 @@ export class HttpTaskMasterClient {
 
   async startTask(input) {
     assertAllowedKeys(input, new Set([
-      'taskType', 'profileId', 'taskLabel', 'input', 'timeoutMs', 'externalCostBudget', 'idempotencyKey'
+      'taskType', 'profileId', 'taskLabel', 'input', 'timeoutMs', 'idempotencyKey'
     ]), 'Task request');
     assertIdentifier(input.taskType, 'taskType');
     assertIdentifier(input.profileId, 'profileId');
@@ -457,20 +457,6 @@ export class HttpTaskMasterClient {
       throw clientError('INVALID_TASK_LABEL', 'taskLabel must be 1-80 characters without control characters.');
     }
     assertSafeTaskInput(input.input);
-    if (input.externalCostBudget !== undefined) {
-      assertAllowedKeys(input.externalCostBudget, new Set(['currency', 'maxAmount']), 'externalCostBudget');
-      if (
-        typeof input.externalCostBudget.currency !== 'string' ||
-        !/^[A-Z]{3}$/.test(input.externalCostBudget.currency) ||
-        typeof input.externalCostBudget.maxAmount !== 'number' ||
-        !Number.isFinite(input.externalCostBudget.maxAmount) || input.externalCostBudget.maxAmount <= 0
-      ) {
-        throw clientError(
-          'INVALID_TASK_EXTERNAL_COST_BUDGET',
-          'externalCostBudget requires a three-letter uppercase currency and a positive finite maxAmount.'
-        );
-      }
-    }
     const payload = await this.#request('/v1/tasks', { method: 'POST', body: input });
     if (
       typeof payload.taskId !== 'string' || !IDENTIFIER.test(payload.taskId) ||

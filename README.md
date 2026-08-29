@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.7.0**
+Version: **2.8.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -40,7 +40,7 @@ Task Master does not replace Agent reasoning. It gives that reasoning a dependab
 ## The three-layer model
 
 1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, cleanup, and a central Human Journey engine for visible browser interaction.
-2. **Owner Console** — one fixed local web address keeps human control simple: shared Profile management, task progress and lifecycle controls, bounded final reports, a Task Pack asset catalog, Chinese/English switching, and a compact human-verification inbox. Users sign in directly inside isolated persistent Playwright Profiles.
+2. **Owner Console** — one fixed local web address keeps human control simple: paginated task progress and batch controls, shared Profile management, a Task Pack asset catalog with direct blocker-to-task navigation, dedicated notification settings, Chinese/English switching, and a compact human-verification inbox. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
 This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
@@ -112,10 +112,11 @@ All three modes use smooth minimum-jerk pointer acceleration, one continuous lon
 ### Multi-Agent workbench
 
 - Profiles are shared by all trusted local Agents; there is no meaningless “Profile creator” field. A Profile still has one live lease, so two Agents cannot corrupt the same login state.
-- The Console keeps three focused work areas—Tasks, Profiles, and Task Packs—plus a compact verification drawer in the header. It does not expose a confusing Agent registry, raw files, diagnostics, or a second messaging workbench.
+- The Console keeps four focused work areas—Tasks, Profiles, Task Packs, and Settings—plus a compact verification drawer in the header. Task history is cursor-paginated, selected task records can be paused, resumed, cancelled, or safely deleted in bounded batches, and every Pack deletion blocker can jump to the exact retained task. It does not expose a confusing Agent registry, raw files, diagnostics, or a second messaging workbench.
 - Every task gets a stable `Agent-specific task-created time` name and shows its current action, Worker-confirmed runtime behavior, visual progress, execution time, cumulative cooldown time, and total time.
 - Pause, resume, cancel, and record deletion are revision-checked. Deletion hides only terminal records with confirmed cleanup and never makes an executed action replayable.
 - The Task Packs catalog explains what each executor does, whether Agents can discover it, when it was last used, and why it cannot yet be deleted. Owners can add notes and batch deprecate, restore, or safely remove stale assets. Deleted task history and invalid checkpoints do not create phantom blockers; system assets and modules needed by live, uncleaned, or verified-resumable tasks remain protected.
+- The Console renders only the Agent's bounded final report; raw artifacts, logs, and specialized deliverables remain scoped protocol outputs that the originating Agent must interpret.
 
 ## Build specialized production workers
 
@@ -131,7 +132,7 @@ A Task Pack defines reusable task types. It specifies the target, sequence, sele
 
 The built-in probe is also visible in ordinary task-type discovery. If it detects CAPTCHA or press-and-hold verification, it requests a human handoff and waits on the same task; it never solves, bypasses, or sends the challenge to a third-party service. After the Owner continues, it samples again and allows scale only when the blocker is gone.
 
-Paid Task Packs may declare an external currency and maximum per-task cost. Starting one requires an explicit budget at or below that ceiling. Trusted Pack code must reserve each paid operation through the runtime before making it, then settle the same stable operation ID with the actual amount. The durable ledger is shared by every retry/resume attempt, is persisted before authorization is acknowledged, and completion fails if a reservation is unresolved or the final estimated/actual evidence differs from the ledger. Public task state exposes only aggregate currency, estimated total, actual total, and remaining amount. This is a hard gate for Packs that use the provided cost facade, not a network firewall around arbitrary third-party code.
+Task Master deliberately does not expose a generic paid-provider budget or billing facade. A base browser runtime cannot prove what an external provider ultimately charges. If a specialized workflow uses a paid service, its reviewed Pack, Skill, and business orchestration must own authorization, budget, idempotency, receipts, and stop conditions outside the core. Legacy tasks that depended on the removed runtime contract remain readable as history but cannot be started or resumed.
 
 The CLI treats a one-off standalone module as transient by default: after its first safely settled task it retires from Agent discovery, then becomes eligible for guarded cleanup after a seven-day recovery window. Use `--persistent` only for a deliberately reusable standalone module; prefer a versioned Task Pack for reusable production capability. A direct initial/independent GET navigation automatically retries a small set of transient connection failures and 429/502/503/504 responses with bounded backoff and visible cooldown state. Clicks, form submissions, uploads, and other potentially mutating actions are never auto-replayed.
 

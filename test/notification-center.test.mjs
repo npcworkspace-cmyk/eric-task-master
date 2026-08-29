@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -104,6 +105,7 @@ test('human-verification alerts persist, deliver immediately, and resume at the 
   assert.equal(created.kind, 'human_verification');
   await deliverDue(setup.center, setup.clock);
   assert.equal(setup.systemCalls.length, 1);
+  assert.match(setup.systemCalls[0].targetUrl, /[?&]task=task_verification_1(?:&|$)/u);
 
   const first = (await setup.center.list())[0];
   assert.equal(first.state, 'active');
@@ -147,6 +149,27 @@ test('repeated observations keep one record and one immediate delivery for the a
   await deliverDue(center, clock);
   assert.equal((await center.list()).length, 1);
   assert.equal(systemCalls.length, 1);
+});
+
+test('deliveries resolve the current Dashboard origin instead of retaining a stale port', async (t) => {
+  let dashboardUrl = 'http://127.0.0.1:21001/dashboard';
+  const { center, clock, systemCalls } = await fixture(t, {
+    center: { dashboardUrl: () => dashboardUrl }
+  });
+  await center.observeTask(verificationTask());
+  await deliverDue(center, clock);
+  dashboardUrl = 'http://127.0.0.1:21002/dashboard';
+  await center.observeTask(verificationTask({
+    id: 'task_verification_2',
+    userRequest: {
+      ...verificationTask().userRequest,
+      id: 'handoff_22222222222222222222222222222222'
+    }
+  }));
+  await deliverDue(center, clock);
+  assert.equal(new URL(systemCalls[0].targetUrl).port, '21001');
+  assert.equal(new URL(systemCalls[1].targetUrl).port, '21002');
+  assert.equal(new URL(systemCalls[1].targetUrl).searchParams.get('task'), 'task_verification_2');
 });
 
 test('claim and task-state resolution stop reminders, while non-verification attention states never alert', async (t) => {
@@ -326,6 +349,7 @@ test('channel settings remain private and public records exclude request secrets
   assert.equal(publicSource.includes('telegram-super-secret'), false);
   assert.equal(publicSource.includes('feishu-super-secret'), false);
   assert.equal(settings.channels.telegram.maskedTarget, '••••7766');
+  assert.equal(settings.channels.telegram.status, 'needs_setup', 'configured remote channels are not ready until tested');
   assert.equal(settings.channels.feishu.maskedTarget, 'open.feishu.cn/••••');
 
   const raw = await readFile(filePath, 'utf8');
@@ -542,9 +566,9 @@ test('Telegram and Feishu reject HTTP 200 responses whose provider body reports 
   assert.deepEqual(calls, { telegram: 1, feishu: 1 });
   const delivery = (await center.list())[0].lastDelivery;
   assert.equal(delivery.telegram.ok, false);
-  assert.equal(delivery.telegram.code, 'NOTIFICATION_DELIVERY_REJECTED');
+  assert.equal(delivery.telegram.code, 'TELEGRAM_PROVIDER_REJECTED');
   assert.equal(delivery.feishu.ok, false);
-  assert.equal(delivery.feishu.code, 'NOTIFICATION_DELIVERY_REJECTED');
+  assert.equal(delivery.feishu.code, 'FEISHU_PROVIDER_REJECTED');
   assert.equal(JSON.stringify(delivery).includes('private provider detail'), false);
 });
 
@@ -565,4 +589,91 @@ test('testChannel uses configured delivery without persisting a notification rec
     { channel: 'telegram', ok: true, attempts: 1 }
   );
   assert.deepEqual(await center.list(), []);
+  const settings = await center.getSettings();
+  assert.equal(settings.channels.telegram.status, 'ready');
+  assert.equal(settings.channels.telegram.lastTest.ok, true);
+  assert.equal(settings.channels.telegram.lastTest.testedAt, result.testedAt);
+});
+
+test('failed provider tests persist a redacted actionable status', async (t) => {
+  const { center } = await fixture(t, {
+    center: { fetchImpl: async () => ({ ok: false, status: 401 }) }
+  });
+  await center.updateSettings({
+    channels: {
+      telegram: { enabled: true, botToken: 'private-token', chatId: 'private-chat' }
+    }
+  });
+  const result = await center.testChannel('telegram');
+  assert.deepEqual(
+    { ok: result.ok, code: result.code, statusCode: result.statusCode },
+    { ok: false, code: 'TELEGRAM_AUTH_REJECTED', statusCode: 401 }
+  );
+  const settings = await center.getSettings();
+  assert.equal(settings.channels.telegram.status, 'test_failed');
+  assert.equal(settings.channels.telegram.lastTest.code, 'TELEGRAM_AUTH_REJECTED');
+  assert.equal(JSON.stringify(settings).includes('private-token'), false);
+  assert.equal(JSON.stringify(settings).includes('private-chat'), false);
+});
+
+test('Feishu signing and channel test state persist without exposing credentials', async (t) => {
+  let requestBody;
+  const { center, filePath, clock } = await fixture(t, {
+    center: {
+      fetchImpl: async (_url, options) => {
+        requestBody = JSON.parse(options.body);
+        return { ok: true, status: 200, async json() { return { code: 0 }; } };
+      }
+    }
+  });
+  await center.updateSettings({
+    channels: {
+      feishu: {
+        enabled: true,
+        webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/private-hook',
+        signingSecret: 'private-signing-secret'
+      }
+    }
+  });
+  const result = await center.testChannel('feishu');
+  const timestamp = String(Math.floor(clock.value / 1_000));
+  assert.equal(requestBody.timestamp, timestamp);
+  assert.equal(
+    requestBody.sign,
+    createHmac('sha256', `${timestamp}\nprivate-signing-secret`).digest('base64')
+  );
+  assert.equal(result.ok, true);
+  const settings = await center.getSettings();
+  assert.equal(settings.channels.feishu.signingConfigured, true);
+  assert.equal(settings.channels.feishu.lastTest.ok, true);
+  assert.equal(JSON.stringify(settings).includes('private-signing-secret'), false);
+  assert.match(await readFile(filePath, 'utf8'), /private-signing-secret/u);
+});
+
+test('system capability state and open-settings delegation are stable public settings', async (t) => {
+  let opened = 0;
+  let initialized = 0;
+  const notifier = async () => {};
+  notifier.status = () => ({
+    state: 'permission_blocked',
+    supported: true,
+    configured: true,
+    canOpenSettings: true,
+    code: 'SYSTEM_NOTIFICATION_PERMISSION_BLOCKED'
+  });
+  notifier.initialize = async () => { initialized += 1; };
+  notifier.openSettings = async () => { opened += 1; };
+  const { center } = await fixture(t, { center: { systemNotifier: notifier } });
+  const settings = await center.getSettings();
+  assert.equal(initialized, 1);
+  assert.deepEqual(settings.channels.system, {
+    enabled: true,
+    configured: true,
+    status: 'permission_blocked',
+    canOpenSettings: true,
+    lastTest: null,
+    code: 'SYSTEM_NOTIFICATION_PERMISSION_BLOCKED'
+  });
+  await center.openSystemSettings();
+  assert.equal(opened, 1);
 });

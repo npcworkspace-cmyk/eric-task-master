@@ -47,9 +47,9 @@ function fakeNotificationCenter() {
   };
   let settings = {
     channels: {
-      system: { enabled: true, configured: true },
-      telegram: { enabled: false, configured: false },
-      feishu: { enabled: false, configured: false }
+      system: { enabled: true, configured: true, status: 'ready', canOpenSettings: true, lastTest: null },
+      telegram: { enabled: false, configured: false, status: 'needs_setup', lastTest: null },
+      feishu: { enabled: false, configured: false, status: 'needs_setup', signingConfigured: false, lastTest: null }
     }
   };
   return {
@@ -91,14 +91,31 @@ function fakeNotificationCenter() {
           ...settings.channels,
           system: { ...settings.channels.system, ...patch.channels?.system },
           telegram: patch.channels?.telegram
-            ? { enabled: patch.channels.telegram.enabled === true, configured: Boolean(patch.channels.telegram.botToken) }
+            ? {
+                enabled: patch.channels.telegram.enabled === true,
+                configured: Boolean(patch.channels.telegram.botToken),
+                status: 'needs_setup',
+                lastTest: null
+              }
             : settings.channels.telegram,
-          feishu: settings.channels.feishu
+          feishu: patch.channels?.feishu
+            ? {
+                enabled: patch.channels.feishu.enabled === true,
+                configured: Boolean(patch.channels.feishu.webhookUrl),
+                status: 'needs_setup',
+                signingConfigured: Boolean(patch.channels.feishu.signingSecret),
+                lastTest: null
+              }
+            : settings.channels.feishu
         }
       };
       return structuredClone(settings);
     },
     async testChannel(channel) { return { channel, ok: true, attempts: 1 }; },
+    async openSystemSettings() {
+      this.calls.push(['open-system-settings']);
+      return structuredClone(settings);
+    },
     async close() { this.calls.push(['close']); }
   };
 }
@@ -170,13 +187,38 @@ test('Manager exposes durable verification notifications without returning chann
   assert.equal(listed.body.activeCount, 1);
   assert.equal(listed.body.notifications[0].kind, 'human_verification');
 
+  const initialSettings = await jsonRequest(manager.baseUrl, '/v1/notification-settings', manager.token);
+  assert.equal(initialSettings.response.status, 200);
+  assert.equal(initialSettings.body.settings.channels.telegram.lastTest, null);
+  assert.equal(initialSettings.body.settings.channels.feishu.signingConfigured, false);
+
   const saved = await jsonRequest(manager.baseUrl, '/v1/notification-settings', manager.token, {
     method: 'PATCH',
-    body: { channels: { telegram: { enabled: true, botToken: 'secret-value', chatId: '12345' } } }
+    body: {
+      channels: {
+        telegram: { enabled: true, botToken: 'secret-value', chatId: '12345' },
+        feishu: {
+          enabled: true,
+          webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/private-hook',
+          signingSecret: 'private-signing-secret'
+        }
+      }
+    }
   });
   assert.equal(saved.response.status, 200);
   assert.equal(saved.body.settings.channels.telegram.configured, true);
+  assert.equal(saved.body.settings.channels.telegram.lastTest, null);
+  assert.equal(saved.body.settings.channels.feishu.signingConfigured, true);
   assert.equal(JSON.stringify(saved.body).includes('secret-value'), false);
+  assert.equal(JSON.stringify(saved.body).includes('private-hook'), false);
+  assert.equal(JSON.stringify(saved.body).includes('private-signing-secret'), false);
+
+  const opened = await jsonRequest(manager.baseUrl, '/v1/notification-settings/open-system-settings', manager.token, {
+    method: 'POST'
+  });
+  assert.equal(opened.response.status, 200);
+  assert.equal(opened.body.settings.channels.system.status, 'ready');
+  assert.equal(center.calls.some((entry) => entry[0] === 'open-system-settings'), true);
 
   const bypass = await jsonRequest(manager.baseUrl, '/v1/tasks/task_verify/continue', manager.token, {
     method: 'POST', body: { requestId: current.userRequest.id }
@@ -224,6 +266,7 @@ test('Manager revalidates persisted notifications before arming delivery after r
   await seed.close();
 
   let sends = 0;
+  let notificationDashboardUrl;
   const taskService = {
     async schedulerStatus() { return {}; },
     async listHumanVerificationRequests() { return []; },
@@ -234,11 +277,14 @@ test('Manager revalidates persisted notifications before arming delivery after r
     dataDir: root,
     taskService,
     notificationScanIntervalMs: 60_000,
-    notificationCenterFactory: async (options) => new NotificationCenter({
-      ...options,
-      systemNotifier: async () => { sends += 1; },
-      fetchImpl: async () => ({ ok: true, status: 200 })
-    })
+    notificationCenterFactory: async (options) => {
+      notificationDashboardUrl = options.dashboardUrl;
+      return new NotificationCenter({
+        ...options,
+        systemNotifier: async () => { sends += 1; },
+        fetchImpl: async () => ({ ok: true, status: 200 })
+      });
+    }
   });
   t.after(async () => {
     await manager.stop().catch(() => {});
@@ -246,6 +292,8 @@ test('Manager revalidates persisted notifications before arming delivery after r
   });
   assert.equal(sends, 0);
   await manager.start();
+  assert.equal(typeof notificationDashboardUrl, 'function');
+  assert.equal(notificationDashboardUrl(), manager.dashboardUrl);
   await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(sends, 0);
   const listed = await jsonRequest(manager.baseUrl, '/v1/notifications', manager.token);

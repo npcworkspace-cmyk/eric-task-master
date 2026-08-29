@@ -121,8 +121,7 @@ function validateTaskCreate(body) {
     'taskLabel',
     'input',
     'timeoutMs',
-    'idempotencyKey',
-    'externalCostBudget'
+    'idempotencyKey'
   ]);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
@@ -214,6 +213,9 @@ async function notificationOperation(operation) {
   } catch (error) {
     if (error instanceof TypeError) {
       throw new HttpError(400, 'INVALID_NOTIFICATION_REQUEST', error.message);
+    }
+    if (/^SYSTEM_NOTIFICATION_[A-Z0-9_]+$/u.test(error?.code || '')) {
+      throw new HttpError(409, error.code, error.message);
     }
     throw error;
   }
@@ -375,17 +377,21 @@ export async function createManager({
         ? 'pending'
         : 'absent';
   };
+  let listeningAddress;
+  const notificationDashboardUrl = () => `http://${host}:${listeningAddress?.port || port || DEFAULT_PORT}/dashboard`;
   const notificationCenter = suppliedNotificationCenter ?? (
     typeof notificationCenterFactory === 'function'
       ? await notificationCenterFactory({
           filePath: join(resolvedDataDir, 'notifications.json'),
           now,
-          eligibilityCheck: notificationEligibilityCheck
+          eligibilityCheck: notificationEligibilityCheck,
+          dashboardUrl: notificationDashboardUrl
         })
       : new NotificationCenter({
           filePath: join(resolvedDataDir, 'notifications.json'),
           now,
-          eligibilityCheck: notificationEligibilityCheck
+          eligibilityCheck: notificationEligibilityCheck,
+          dashboardUrl: notificationDashboardUrl
         })
   );
   if (
@@ -403,7 +409,6 @@ export async function createManager({
   await dashboardSessions.init();
   let server;
   let startedAt;
-  let listeningAddress;
   let stopped = false;
   let stopping = false;
   let stopPromise;
@@ -904,6 +909,13 @@ export async function createManager({
       const body = await readJson(request, { maxBytes: 4 * 1024 });
       const result = await notificationOperation(() => notificationCenter.testChannel(body.channel));
       sendJson(response, result.ok ? 200 : 502, { result }, cors);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/notification-settings/open-system-settings') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const settings = await notificationOperation(() => notificationCenter.openSystemSettings());
+      sendJson(response, 200, { settings }, cors);
       return;
     }
     if (notificationMatch && request.method === 'POST') {

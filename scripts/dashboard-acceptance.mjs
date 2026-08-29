@@ -60,12 +60,22 @@ function createTaskHarness(profileStore, tasks, control) {
         total: values.length
       };
     },
-    async list() {
+    async list({ limit = 50, cursor = null } = {}) {
       if (control.listFailures > 0) {
         control.listFailures -= 1;
         throw serviceError(503, 'FIXTURE_TRANSIENT', 'Transient fixture read failure');
       }
-      return [...tasks.values()].map((value) => structuredClone(value));
+      const visible = [...tasks.values()].sort((left, right) => (
+        String(right.createdAt || '').localeCompare(String(left.createdAt || '')) || right.id.localeCompare(left.id)
+      ));
+      const cursorIndex = cursor ? visible.findIndex((value) => value.id === cursor) : -1;
+      if (cursor && cursorIndex < 0) throw serviceError(400, 'INVALID_TASK_CURSOR', 'Task cursor is invalid');
+      const start = cursorIndex + 1;
+      const page = visible.slice(start, start + limit);
+      return {
+        tasks: page.map((value) => structuredClone(value)),
+        nextCursor: start + page.length < visible.length ? page.at(-1).id : null
+      };
     },
     async listTaskAssets() {
       return { assets: structuredClone(control.assets), total: control.assets.length };
@@ -219,15 +229,30 @@ function createNotificationHarness(control) {
     const channels = control.notificationSettings.channels;
     return {
       channels: {
-        system: { enabled: channels.system.enabled, configured: true },
+        system: {
+          enabled: channels.system.enabled,
+          configured: true,
+          status: channels.system.lastTest?.ok === false ? 'test_failed' : 'ready',
+          canOpenSettings: true,
+          lastTest: channels.system.lastTest || null
+        },
         telegram: {
           enabled: channels.telegram.enabled,
           configured: Boolean(channels.telegram.botToken && channels.telegram.chatId),
+          status: channels.telegram.botToken && channels.telegram.chatId
+            ? channels.telegram.lastTest?.ok === true ? 'ready' : channels.telegram.lastTest?.ok === false ? 'test_failed' : 'needs_setup'
+            : 'needs_setup',
+          lastTest: channels.telegram.lastTest || null,
           ...(channels.telegram.chatId ? { maskedTarget: `••••${channels.telegram.chatId.slice(-4)}` } : {})
         },
         feishu: {
           enabled: channels.feishu.enabled,
           configured: Boolean(channels.feishu.webhookUrl),
+          status: channels.feishu.webhookUrl
+            ? channels.feishu.lastTest?.ok === true ? 'ready' : channels.feishu.lastTest?.ok === false ? 'test_failed' : 'needs_setup'
+            : 'needs_setup',
+          signingConfigured: Boolean(channels.feishu.signingSecret),
+          lastTest: channels.feishu.lastTest || null,
           ...(channels.feishu.webhookUrl ? { maskedTarget: 'open.feishu.cn/••••' } : {})
         }
       }
@@ -293,7 +318,14 @@ function createNotificationHarness(control) {
     },
     async testChannel(channel, options = {}) {
       control.notificationTests.push({ channel, ...structuredClone(options) });
-      return { ok: true, channel };
+      if (control.notificationTestDelayMs) await new Promise((resolve) => setTimeout(resolve, control.notificationTestDelayMs));
+      const result = { ok: true, channel, attempts: 1, testedAt: now() };
+      control.notificationSettings.channels[channel].lastTest = structuredClone(result);
+      return result;
+    },
+    async openSystemSettings() {
+      control.notificationSystemOpens += 1;
+      return publicSettings();
     },
     async close() {}
   };
@@ -326,12 +358,14 @@ const control = {
   notificationActions: [],
   notificationSettingPatches: [],
   notificationTests: [],
+  notificationTestDelayMs: 0,
+  notificationSystemOpens: 0,
   degradeNextNotificationSync: false,
   notificationSettings: {
     channels: {
-      system: { enabled: true },
+      system: { enabled: true, lastTest: null },
       telegram: { enabled: true, botToken: 'stored-token', chatId: '1234567890' },
-      feishu: { enabled: false, webhookUrl: '' }
+      feishu: { enabled: false, webhookUrl: '', signingSecret: '' }
     }
   },
   notifications: [
@@ -352,7 +386,13 @@ const control = {
       taskTypes: [{ name: 'news.collect.v2', title: '新闻采集', lifecycle: 'active', discoverable: true }],
       fileCount: 1, sizeBytes: 4_096, installedAt: ago(86_400_000),
       usage: { runCount: 12, successCount: 10, failureCount: 2, activeCount: 1, states: { completed: 10, failed: 2 }, lastUsedAt: now() },
-      canEditNote: true, canChangeLifecycle: true, deletable: false, deleteBlockers: ['任务 Codex-抓取新闻 尚未完成安全清理']
+      canEditNote: true, canChangeLifecycle: true, deletable: false,
+      deleteBlockers: ['任务 历史新闻采集 仍可从检查点恢复'],
+      blockingTaskCount: 1,
+      blockingTasks: [{
+        taskId: 'task_pack_blocker', title: '历史新闻采集', state: 'failed',
+        blockerCode: 'resume_available', cleanupSettled: true, canDeleteRecord: true
+      }]
     },
     {
       id: 'type:campaign-once.v1', kind: 'standalone', source: 'standalone', name: 'campaign-once.v1', version: '1.0.0',
@@ -521,6 +561,46 @@ try {
     cleanup: { browserClosed: false, workerExited: false, leaseReleased: false, settled: false }
   });
 
+  tasks.set('task_batch_active', {
+    id: 'task_batch_active', jobId: 'job_batch_active', revision: 1,
+    profileId: ephemeral.id, taskType: 'batch.fixture.v1', taskLabel: '批量取消验收',
+    displayName: 'Codex-批量取消验收-20260826-101600Z', state: 'queued', behavior: 'auto',
+    createdAt: ago(30_000), updatedAt: now(),
+    currentActivity: { phase: 'queued', status: 'waiting', updatedAt: now() },
+    progress: { current: 0, total: 1, message: '等待批量操作', updatedAt: now() },
+    timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null }, history: [],
+    cleanup: { browserClosed: false, workerExited: false, leaseReleased: false, settled: false }
+  });
+
+  for (let index = 0; index < 102; index += 1) {
+    const id = `task_history_${String(index).padStart(2, '0')}`;
+    tasks.set(id, {
+      id, jobId: `job_history_${index}`, revision: 1,
+      profileId: ephemeral.id, taskType: 'history.fixture.v1', taskLabel: `历史任务 ${index + 1}`,
+      displayName: `Codex-历史任务-${String(index + 1).padStart(2, '0')}`, state: 'completed', behavior: 'auto',
+      createdAt: ago(86_400_000 + index * 60_000), startedAt: ago(86_390_000 + index * 60_000),
+      finishedAt: ago(86_380_000 + index * 60_000), updatedAt: ago(86_380_000 + index * 60_000),
+      currentActivity: { phase: 'completed', status: 'succeeded', updatedAt: ago(86_380_000 + index * 60_000) },
+      progress: { current: 1, total: 1, message: '历史任务已完成', updatedAt: ago(86_380_000 + index * 60_000) },
+      timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
+      history: [{ attempt: 1, workerStartedAt: ago(86_390_000 + index * 60_000), finishedAt: ago(86_380_000 + index * 60_000) }],
+      cleanup: { browserClosed: true, workerExited: true, leaseReleased: true, settled: true }
+    });
+  }
+  tasks.set('task_pack_blocker', {
+    id: 'task_pack_blocker', jobId: 'job_pack_blocker', revision: 2,
+    profileId: persistent.id, taskType: 'news.collect.v2', taskLabel: '历史新闻采集',
+    displayName: 'Codex-历史新闻采集-20260818-080000Z', state: 'failed', behavior: 'human',
+    createdAt: ago(8 * 86_400_000), startedAt: ago(8 * 86_400_000 - 10_000),
+    finishedAt: ago(8 * 86_400_000 - 20_000), updatedAt: ago(8 * 86_400_000 - 20_000),
+    currentActivity: { phase: 'failed', status: 'failed', updatedAt: ago(8 * 86_400_000 - 20_000) },
+    progress: { current: 20, total: 50, message: '可从检查点恢复', updatedAt: ago(8 * 86_400_000 - 20_000) },
+    timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
+    history: [{ attempt: 1, workerStartedAt: ago(8 * 86_400_000 - 10_000), finishedAt: ago(8 * 86_400_000 - 20_000) }],
+    cleanup: { browserClosed: true, workerExited: true, leaseReleased: true, settled: true },
+    supportsResume: true, resumeAvailable: true
+  });
+
   control.listFailures = 1;
   const authorization = await jsonRequest(baseUrl, '/v1/dashboard/authorize', {
     method: 'POST', token: manager.token, body: { focusTaskId: 'task_running' }
@@ -546,8 +626,9 @@ try {
   assert.equal(await page.evaluate(() => location.hash), '');
   assert.equal(await page.locator('#auth-banner').isHidden(), true);
   assert.equal(await page.locator('[data-view-panel="tasks"]').isVisible(), true);
-  assert.equal(await page.locator('.nav-link').count(), 3);
-  assert.equal(await page.locator('.task-card').count(), 4);
+  assert.equal(await page.locator('.nav-link').count(), 4);
+  assert.equal(await page.locator('.task-card').count(), 50);
+  assert.equal(await page.locator('#task-load-more').isVisible(), true);
   await page.locator('[data-task-id="task_running"]').filter({ hasText: 'Codex-抓取新闻-20260826-101500Z' }).waitFor();
   assert.equal(await page.evaluate(() => document.activeElement?.dataset.taskId), 'task_running');
   checks.push('one-click Owner session, transient GET retry, Tasks default, and deep-link focus');
@@ -556,10 +637,20 @@ try {
     assert.equal(requestedApiPaths.some((value) => value.includes(forbidden)), false, `Unexpected Dashboard request: ${forbidden}`);
   }
   assert.equal(await page.locator('.agent-card, dialog, [data-view-panel="agents"]').count(), 0);
-  checks.push('Tasks, Profiles, and Task Pack assets are rendered without Agent or raw artifact APIs');
+  checks.push('Tasks, Profiles, Task Pack assets, and minimal Settings render without Agent or raw artifact APIs');
 
   await page.locator('#notification-badge').filter({ hasText: '2' }).waitFor();
   await page.getByRole('button', { name: '打开通知', exact: true }).click();
+  await page.getByRole('dialog', { name: '通知', exact: true }).waitFor();
+  assert.equal(await page.locator('.skip-link').getAttribute('inert'), '');
+  assert.equal(await page.locator('.app-header').getAttribute('inert'), '');
+  assert.equal(await page.locator('.workspace').getAttribute('inert'), '');
+  await page.keyboard.press('Shift+Tab');
+  assert.equal(await page.evaluate(() => document.querySelector('#notification-drawer')?.contains(document.activeElement)), true);
+  for (let index = 0; index < 12; index += 1) {
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(() => document.querySelector('#notification-drawer')?.contains(document.activeElement)), true);
+  }
   const verificationCard = page.locator('.notification-card[data-notification-id="notice_verify"]');
   await verificationCard.getByText('已提醒 3 次', { exact: true }).waitFor();
   await verificationCard.getByRole('button', { name: '标为已读', exact: true }).click();
@@ -577,48 +668,83 @@ try {
   assert.deepEqual(control.notificationActions.slice(-2).map((item) => item.action), ['claim', 'focus']);
   await verificationCard.getByRole('button', { name: '打开验证窗口', exact: true }).click();
   await page.locator('#notification-drawer').waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('.skip-link').getAttribute('inert'), null);
+  assert.equal(await page.locator('.app-header').getAttribute('inert'), null);
   assert.equal(control.notificationActions.at(-1).action, 'focus');
   await page.getByRole('button', { name: '打开通知', exact: true }).click();
   await verificationCard.getByRole('button', { name: '验证完成继续', exact: true }).click();
   await page.locator('[data-task-id="task_waiting"] .task-state-running').waitFor();
   assert.equal(control.notificationActions.at(-1).action, 'continue');
+  await page.getByRole('button', { name: '关闭通知', exact: true }).click();
+  await page.locator('#notification-drawer').waitFor({ state: 'hidden' });
   checks.push('durable notification badge, reminder count, read-all, claim, focus, continue, and degraded-sync warning');
 
-  await page.locator('.notification-settings > summary').click();
+  assert.equal(await page.locator('#notification-drawer #notification-settings-form').count(), 0);
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('heading', { name: '通知设置', exact: true }).waitFor();
+  assert.equal(await page.locator('.setting-card').count(), 3);
+  await page.locator('#notification-system-status').filter({ hasText: '已就绪' }).waitFor();
+  await page.locator('#notification-telegram-status').filter({ hasText: '待配置或测试' }).waitFor();
   await page.locator('#notification-telegram-status').filter({ hasText: '••••7890' }).waitFor();
+  await page.locator('#notification-feishu-status').filter({ hasText: '待配置或测试' }).waitFor();
   assert.equal(await page.locator('#notification-telegram-token').inputValue(), '');
   assert.equal(await page.locator('#notification-telegram-chat').inputValue(), '');
-  const feishuTest = page.locator('.notification-channel').filter({ hasText: '飞书' }).getByRole('button', { name: '发送测试' });
+  await page.getByRole('button', { name: '打开系统设置', exact: true }).click();
+  await page.locator('#dashboard-message').filter({ hasText: '已打开系统通知设置' }).waitFor();
+  assert.equal(control.notificationSystemOpens, 1);
+  const feishuTest = page.locator('.setting-card').filter({ hasText: '飞书' }).getByRole('button', { name: '发送测试' });
   assert.equal(await feishuTest.isDisabled(), true);
   await page.locator('#notification-telegram-token').fill('new-bot-token');
   await page.locator('#notification-telegram-chat').fill('99887766');
   await page.locator('#notification-feishu-enabled').check();
   await page.locator('#notification-feishu-webhook').fill('https://open.feishu.cn/open-apis/bot/v2/hook/new-secret');
+  await page.locator('#notification-feishu-signing-secret').fill('feishu-signing-secret');
+  await new Promise((resolve) => setTimeout(resolve, 2_200));
+  assert.equal(await page.locator('#notification-feishu-enabled').isChecked(), true);
+  assert.equal(await page.locator('#notification-feishu-webhook').inputValue(), 'https://open.feishu.cn/open-apis/bot/v2/hook/new-secret');
   await page.getByRole('button', { name: '保存通知设置', exact: true }).click();
   await page.locator('#dashboard-message').filter({ hasText: '通知设置已保存' }).waitFor();
   assert.equal(await page.locator('#notification-telegram-token').inputValue(), '');
   assert.equal(await page.locator('#notification-telegram-chat').inputValue(), '');
   assert.equal(await page.locator('#notification-feishu-webhook').inputValue(), '');
+  assert.equal(await page.locator('#notification-feishu-signing-secret').inputValue(), '');
   assert.equal(control.notificationSettingPatches.at(-1).channels.telegram.botToken, 'new-bot-token');
   assert.equal(control.notificationSettingPatches.at(-1).channels.feishu.webhookUrl.endsWith('new-secret'), true);
+  assert.equal(control.notificationSettingPatches.at(-1).channels.feishu.signingSecret, 'feishu-signing-secret');
+  await page.locator('#notification-feishu-status').filter({ hasText: '已启用签名' }).waitFor();
   assert.equal(await feishuTest.isDisabled(), false);
-  await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' }).click();
+  control.notificationTestDelayMs = 2_400;
+  const telegramTest = page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' });
+  await telegramTest.click();
+  await new Promise((resolve) => setTimeout(resolve, 2_100));
+  assert.equal(await telegramTest.isDisabled(), true);
+  assert.equal(await page.locator('#notification-settings-save').isDisabled(), true);
+  assert.equal(await page.locator('#notification-system-settings').isDisabled(), true);
+  assert.equal(await feishuTest.isDisabled(), true);
+  assert.equal(await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).isDisabled(), true);
+  assert.equal(control.notificationTests.filter((item) => item.channel === 'telegram').length, 1);
   await page.locator('#dashboard-message').filter({ hasText: 'Telegram 测试通知已发送' }).waitFor();
-  assert.deepEqual(notificationRequestBodies.at(-1).body, { channel: 'telegram' });
-  assert.equal(JSON.stringify(notificationRequestBodies.at(-1).body).includes('token'), false);
+  await page.locator('#notification-telegram-status').filter({ hasText: '已就绪' }).waitFor();
+  await page.locator('#notification-telegram-status').filter({ hasText: '最近测试通过' }).waitFor();
+  control.notificationTestDelayMs = 0;
+  const telegramTestRequest = notificationRequestBodies
+    .filter((entry) => entry.pathname === '/v1/notification-settings/test' && entry.body)
+    .at(-1);
+  assert.deepEqual(telegramTestRequest.body, { channel: 'telegram' });
+  assert.equal(JSON.stringify(telegramTestRequest.body).includes('token'), false);
   page.once('dialog', (dialog) => dialog.accept());
-  await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).click();
+  await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).click();
   await page.locator('#dashboard-message').filter({ hasText: 'Telegram 凭据已清除' }).waitFor();
   const clearedTelegram = control.notificationSettingPatches.at(-1).channels.telegram;
   assert.deepEqual(clearedTelegram, { enabled: false, botToken: null, chatId: null });
-  await page.locator('#notification-telegram-status').filter({ hasText: '未配置' }).waitFor();
-  assert.equal(await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' }).isDisabled(), true);
-  assert.equal(await page.locator('.notification-channel').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).isDisabled(), true);
-  checks.push('masked notification settings, write-only secrets, save-before-test, secret-free channel test, and explicit credential clearing');
+  await page.locator('#notification-telegram-status').filter({ hasText: '待配置或测试' }).waitFor();
+  assert.equal(await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' }).isDisabled(), true);
+  assert.equal(await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).isDisabled(), true);
+  checks.push('bell-only notification drawer plus three-card masked settings, dirty-state protection, channel status, system settings, signed Feishu, serialized tests, and explicit credential clearing');
 
   await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
   assert.equal(await page.getAttribute('html', 'lang'), 'en');
-  await page.getByRole('button', { name: 'Tasks', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Tasks', exact: true }).click();
   await page.getByText('Effective behavior', { exact: true }).first().waitFor();
   await page.getByText('Run time', { exact: true }).first().waitFor();
   await page.getByRole('button', { name: 'Profiles', exact: true }).click();
@@ -627,14 +753,16 @@ try {
   await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
   await page.getByRole('heading', { name: 'Task Pack assets', exact: true }).waitFor();
   await page.locator('.asset-card').first().getByText('Agent discoverable', { exact: true }).waitFor();
-  await page.locator('#notification-drawer').waitFor({ state: 'visible' });
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('heading', { name: 'Notification settings', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Open notifications', exact: true }).click();
   await page.getByRole('heading', { name: 'Notifications', exact: true }).waitFor();
-  await page.getByText('Notification settings', { exact: true }).waitFor();
+  assert.equal(await page.locator('#notification-drawer').getByText('Notification settings', { exact: true }).count(), 0);
+  await page.getByRole('button', { name: 'Close notifications', exact: true }).click();
   await page.getByRole('button', { name: '切换到中文', exact: true }).click();
   assert.equal(await page.getAttribute('html', 'lang'), 'zh-CN');
-  await page.getByRole('button', { name: '关闭通知', exact: true }).click();
   await page.getByRole('button', { name: '任务', exact: true }).click();
-  checks.push('complete runtime Chinese and English switching across all three views and notifications');
+  checks.push('complete runtime Chinese and English switching across all four views and notifications');
 
   const runningCard = page.locator('.task-card[data-task-id="task_running"]');
   await runningCard.getByText('正在提取第 3 批结果').waitFor();
@@ -650,10 +778,48 @@ try {
   const totalAfter = await runningCard.locator('[data-task-duration="total"]').textContent();
   assert.notEqual(totalAfter, totalBefore);
   const coolingBefore = await page.locator('[data-task-id="task_cooling"] [data-task-duration="cooldown"]').textContent();
-  await page.waitForTimeout(1_050);
+  await page.waitForFunction((before) => (
+    document.querySelector('[data-task-id="task_cooling"] [data-task-duration="cooldown"]')?.textContent !== before
+  ), coolingBefore, { timeout: 3_000 });
   const coolingAfter = await page.locator('[data-task-id="task_cooling"] [data-task-duration="cooldown"]').textContent();
   assert.notEqual(coolingAfter, coolingBefore);
   checks.push('progress plus live run, cooldown, and total timers');
+
+  const coolingCard = page.locator('.task-card[data-task-id="task_cooling"]');
+  const skippedHistoryCard = page.locator('.task-card[data-task-id="task_history_02"]');
+  await runningCard.locator('.task-selector input').check();
+  await coolingCard.locator('.task-selector input').check();
+  await skippedHistoryCard.locator('.task-selector input').check();
+  await page.getByRole('button', { name: '批量暂停', exact: true }).click();
+  await page.locator('#task-batch-feedback .is-success').first().waitFor();
+  assert.equal(await page.locator('#task-batch-feedback .is-success').count(), 2);
+  assert.equal(await page.locator('#task-batch-feedback .is-skipped').count(), 1);
+  assert.equal(tasks.get('task_running').state, 'paused');
+  assert.equal(tasks.get('task_cooling').state, 'paused');
+  await skippedHistoryCard.locator('.task-selector input').uncheck();
+  await page.getByRole('button', { name: '批量恢复', exact: true }).click();
+  await page.locator('#task-batch-feedback .is-success').first().waitFor();
+  assert.equal(tasks.get('task_running').state, 'running');
+  assert.equal(tasks.get('task_cooling').state, 'running');
+  await runningCard.locator('.task-selector input').uncheck();
+  await coolingCard.locator('.task-selector input').uncheck();
+
+  const batchActiveCard = page.locator('.task-card[data-task-id="task_batch_active"]');
+  await batchActiveCard.locator('.task-selector input').check();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '批量取消', exact: true }).click();
+  await batchActiveCard.getByRole('button', { name: '删除记录', exact: true }).waitFor();
+  assert.equal(tasks.get('task_batch_active').state, 'cancelled');
+  await batchActiveCard.locator('.task-selector input').uncheck();
+
+  const batchDeleteCards = ['task_history_00', 'task_history_01'].map((id) => page.locator(`.task-card[data-task-id="${id}"]`));
+  for (const card of batchDeleteCards) await card.locator('.task-selector input').check();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '批量删除记录', exact: true }).click();
+  for (const card of batchDeleteCards) await card.waitFor({ state: 'detached' });
+  assert.equal(tasks.has('task_history_00'), false);
+  assert.equal(tasks.has('task_history_01'), false);
+  checks.push('task checkboxes plus bounded batch pause, resume, cancel, delete, and per-item success/skip feedback');
 
   await page.getByRole('button', { name: 'Profiles', exact: true }).click();
   const liveAccountCard = page.locator('.profile-card').filter({ hasText: '验收账号' });
@@ -667,6 +833,12 @@ try {
   await runningCard.getByRole('button', { name: '暂停', exact: true }).click();
   await page.locator('#dashboard-message').filter({ hasText: '状态已变化' }).waitFor();
   assert.equal(tasks.get('task_running').state, 'running');
+
+  await page.waitForFunction(() => {
+    const button = [...document.querySelectorAll('[data-task-id="task_running"] button')]
+      .find((node) => node.textContent?.trim() === '暂停');
+    return Boolean(button && !button.disabled);
+  });
 
   const pauseRequestsBefore = control.taskActions.filter((value) => value.action === 'pause').length;
   await page.locator('[data-task-id="task_running"] button').filter({ hasText: '暂停' }).evaluate((node) => {
@@ -698,7 +870,7 @@ try {
   await completedCard.getByRole('button', { name: '删除记录' }).click();
   await completedCard.waitFor({ state: 'detached' });
   assert.equal(tasks.has('task_completed'), false);
-  assert.equal(control.deleteRequests, 1);
+  assert.equal(control.deleteRequests, 3);
   assert.match(await page.evaluate(() => document.activeElement?.dataset.focusKey || document.activeElement?.id || ''), /^(?:task:|tasks-title)/u);
   checks.push('settled task record deletion and deterministic focus recovery');
 
@@ -747,9 +919,35 @@ try {
   await packCard.getByText('生产使用', { exact: true }).waitFor();
   await packCard.getByText('12', { exact: true }).waitFor();
   await packCard.getByText(/不可删除/u).waitFor();
-  await packCard.locator('input[type="checkbox"]').check();
+  await packCard.getByText('任务仍可从检查点恢复', { exact: true }).waitFor();
+  await packCard.getByRole('button', { name: '查看关联任务', exact: true }).click();
+  const blockerCard = page.locator('.task-card[data-task-id="task_pack_blocker"]');
+  await blockerCard.waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.taskId), 'task_pack_blocker');
+  assert.equal(new URL(page.url()).searchParams.get('task'), 'task_pack_blocker');
+  assert.equal(await page.locator('.task-card').count(), 51);
+  const loadMoreTasks = page.getByRole('button', { name: '加载更多任务', exact: true });
+  while (await loadMoreTasks.isVisible()) {
+    await loadMoreTasks.click();
+    await page.waitForFunction(() => {
+      const node = document.querySelector('#task-load-more');
+      return node?.hidden === true || node?.disabled === false;
+    });
+  }
+  await page.locator('#task-load-more').waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('.task-card').count(), tasks.size);
+  assert.equal(await page.locator('.task-card[data-task-id="task_pack_blocker"]').count(), 1);
+  const externallyDeletedHistory = page.locator('.task-card[data-task-id="task_history_03"]');
+  tasks.delete('task_history_03');
+  await page.locator('#refresh-all').click();
+  await externallyDeletedHistory.waitFor({ state: 'detached' });
+  assert.equal(await page.locator('.task-card').count(), tasks.size);
+  checks.push('Pack blocker deep-link loads and highlights an off-page task; three-page cursors merge without duplicates and explicit refresh reconciles history');
+  await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
+  const refreshedPackCard = page.locator('.asset-card').filter({ hasText: '新闻采集 Pack' });
+  await refreshedPackCard.locator('input[type="checkbox"]').check();
   assert.equal(await page.getByRole('button', { name: '删除', exact: true }).isDisabled(), true);
-  await packCard.locator('input[type="checkbox"]').uncheck();
+  await refreshedPackCard.locator('input[type="checkbox"]').uncheck();
 
   await page.locator('#asset-search').fill('活动');
   assert.equal(await page.locator('.asset-card').count(), 1);
@@ -827,6 +1025,21 @@ try {
   assert.equal(assetMobile.assetOverflow, false);
   assert.deepEqual(assetMobile.shortTargets, []);
   await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settingsMobile = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth,
+    cardCount: document.querySelectorAll('.setting-card').length,
+    cardOverflow: [...document.querySelectorAll('.setting-card')].some((node) => node.scrollWidth > node.clientWidth),
+    shortTargets: [...document.querySelectorAll('#view-settings button, #view-settings input:not([type="checkbox"])')]
+      .filter((node) => !node.hidden && getComputedStyle(node).display !== 'none')
+      .map((node) => node.getBoundingClientRect().height)
+      .filter((height) => height > 0 && height < 44)
+  }));
+  assert.equal(settingsMobile.scrollWidth <= settingsMobile.innerWidth, true);
+  assert.equal(settingsMobile.cardCount, 3);
+  assert.equal(settingsMobile.cardOverflow, false);
+  assert.deepEqual(settingsMobile.shortTargets, []);
   await page.getByRole('button', { name: 'Open notifications', exact: true }).click();
   const englishMobile = await page.evaluate(() => ({
     language: document.documentElement.lang,
@@ -846,7 +1059,7 @@ try {
   await page.getByRole('button', { name: '切换到中文', exact: true }).click();
   await page.keyboard.press('Tab');
   assert.notEqual(await page.evaluate(() => document.activeElement?.tagName), 'BODY');
-  checks.push('bilingual mobile layout, notification drawer, 44px targets, keyboard focus, and reduced motion');
+  checks.push('bilingual mobile tasks, assets, three-card settings, notification drawer, 44px targets, keyboard focus, and reduced motion');
 
   const unauthorizedContext = await browser.newContext({ viewport: { width: 1000, height: 700 } });
   const unauthorizedPage = await unauthorizedContext.newPage();

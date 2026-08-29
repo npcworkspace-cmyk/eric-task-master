@@ -1,54 +1,64 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
+const WINDOWS_APP_ID = 'NPC.EricTaskMaster';
+const DEFAULT_DASHBOARD_URL = 'http://127.0.0.1:19946/dashboard';
+const WINDOWS_HELPER = fileURLToPath(new URL('./windows-notification.ps1', import.meta.url));
+const STATES = new Set(['ready', 'needs_setup', 'permission_blocked', 'unavailable', 'test_failed']);
 
 function boundedText(value, maximum) {
   return String(value ?? '').replace(/[\u0000-\u001f\u007f]/gu, ' ').trim().slice(0, maximum);
 }
 
-function xmlEscape(value) {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
+function boundedHttpUrl(value, fallback = DEFAULT_DASHBOARD_URL) {
+  try {
+    const url = new URL(String(value || fallback));
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return fallback;
+    return url.href.slice(0, 2_048);
+  } catch {
+    return fallback;
+  }
 }
 
-function windowsCommand(title, message, environment) {
-  const xml = `<toast><visual><binding template="ToastGeneric"><text>${xmlEscape(title)}</text><text>${xmlEscape(message)}</text></binding></visual></toast>`;
-  const encodedXml = Buffer.from(xml, 'utf8').toString('base64');
-  const script = [
-    '$ErrorActionPreference = \'Stop\'',
-    '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null',
-    '[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null',
-    '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null',
-    '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument',
-    `$xml.LoadXml([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedXml}')))`,
-    `$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)`,
-    `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Eric Task Master').Show($toast)`
-  ].join('; ');
-  const executable = environment.SystemRoot
+function base64(value) {
+  return Buffer.from(String(value ?? ''), 'utf8').toString('base64');
+}
+
+function windowsExecutable(environment) {
+  return environment.SystemRoot
     ? `${environment.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
     : 'powershell.exe';
-  return {
-    executable,
-    args: [
-      '-NoLogo',
-      '-NoProfile',
-      '-NonInteractive',
-      '-WindowStyle',
-      'Hidden',
-      '-Command',
-      script
-    ]
-  };
 }
 
-function commandFor(platform, title, message, environment) {
-  if (platform === 'win32') return windowsCommand(title, message, environment);
+function windowsCommand(mode, { title = '', message = '', targetUrl = '', dashboardUrl = DEFAULT_DASHBOARD_URL } = {}, environment) {
+  const args = [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
+    '-ExecutionPolicy', 'Bypass', '-File', WINDOWS_HELPER,
+    '-Mode', mode,
+    '-AppId', WINDOWS_APP_ID,
+    '-DashboardUrlB64', base64(boundedHttpUrl(dashboardUrl))
+  ];
+  if (mode === 'show') {
+    args.push(
+      '-TitleB64', base64(boundedText(title || 'Eric Task Master', 120)),
+      '-MessageB64', base64(boundedText(message || 'A browser task needs attention.', 300)),
+      '-TargetUrlB64', base64(boundedHttpUrl(targetUrl || dashboardUrl))
+    );
+  }
+  return { executable: windowsExecutable(environment), args };
+}
+
+function commandFor(platform, operation, payload, environment) {
+  if (platform === 'win32') return windowsCommand(operation, payload, environment);
+  if (operation === 'open-settings' && platform === 'darwin') {
+    return { executable: 'open', args: ['x-apple.systempreferences:com.apple.Notifications-Settings.extension'] };
+  }
+  if (operation !== 'show') return null;
+  const title = boundedText(payload.title || 'Eric Task Master', 120);
+  const message = boundedText(payload.message || 'A browser task needs attention.', 300);
   if (platform === 'darwin') {
     return {
       executable: 'osascript',
@@ -56,40 +66,41 @@ function commandFor(platform, title, message, environment) {
     };
   }
   if (platform === 'linux') {
-    return {
-      executable: 'notify-send',
-      args: ['--app-name=Eric Task Master', title, message]
-    };
+    return { executable: 'notify-send', args: ['--app-name=Eric Task Master', title, message] };
   }
   return null;
 }
 
-function executableExists(executable, environment) {
+function executableExists(executable, environment, platform) {
   if (executable.includes('/') || executable.includes('\\')) return existsSync(executable);
   return String(environment.PATH || environment.Path || '')
     .split(delimiter)
     .filter(Boolean)
     .some((directory) => existsSync(join(directory, executable)) || (
-      process.platform === 'win32' && existsSync(join(directory, `${executable}.exe`))
+      platform === 'win32' && existsSync(join(directory, `${executable}.exe`))
     ));
 }
 
-function defaultConfigured(platform, environment) {
-  if (platform === 'win32') {
-    const executable = environment.SystemRoot
-      ? `${environment.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
-      : 'powershell.exe';
-    return executableExists(executable, environment);
-  }
-  if (platform === 'darwin') return executableExists('/usr/bin/osascript', environment);
+function defaultPrerequisite(platform, environment) {
+  if (platform === 'win32') return existsSync(WINDOWS_HELPER) && executableExists(windowsExecutable(environment), environment, platform);
+  if (platform === 'darwin') return executableExists('/usr/bin/osascript', environment, platform);
   if (platform === 'linux') {
     const graphicalSession = Boolean(environment.DISPLAY || environment.WAYLAND_DISPLAY);
-    return graphicalSession && executableExists('notify-send', environment);
+    return graphicalSession && executableExists('notify-send', environment, platform);
   }
   return false;
 }
 
-function run(command, { spawnImpl, timeoutMs }) {
+function commandError(exitCode) {
+  const error = new Error('System notification command failed');
+  if (exitCode === 20) error.code = 'SYSTEM_NOTIFICATION_NEEDS_SETUP';
+  else if (exitCode === 21) error.code = 'SYSTEM_NOTIFICATION_PERMISSION_BLOCKED';
+  else error.code = 'SYSTEM_NOTIFICATION_FAILED';
+  error.exitCode = exitCode;
+  return error;
+}
+
+function run(command, { spawnImpl, timeoutMs, signal }) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let child;
@@ -97,8 +108,15 @@ function run(command, { spawnImpl, timeoutMs }) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
       if (error) reject(error);
       else resolve();
+    };
+    const onAbort = () => {
+      child?.kill?.();
+      const error = new Error('System notification was aborted');
+      error.code = 'SYSTEM_NOTIFICATION_ABORTED';
+      finish(error);
     };
     const timer = setTimeout(() => {
       child?.kill?.();
@@ -107,6 +125,11 @@ function run(command, { spawnImpl, timeoutMs }) {
       finish(error);
     }, timeoutMs);
     timer.unref?.();
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
     try {
       child = spawnImpl(command.executable, command.args, {
         stdio: 'ignore',
@@ -118,15 +141,15 @@ function run(command, { spawnImpl, timeoutMs }) {
       return;
     }
     child.once('error', finish);
-    child.once('exit', (code) => {
-      if (code === 0) finish();
-      else {
-        const error = new Error('System notification command failed');
-        error.code = 'SYSTEM_NOTIFICATION_FAILED';
-        finish(error);
-      }
-    });
+    child.once('exit', (code) => code === 0 ? finish() : finish(commandError(code)));
   });
+}
+
+function stateFromError(error, { setup = false } = {}) {
+  if (error?.code === 'SYSTEM_NOTIFICATION_PERMISSION_BLOCKED') return 'permission_blocked';
+  if (error?.code === 'SYSTEM_NOTIFICATION_NEEDS_SETUP') return 'needs_setup';
+  if (error?.code === 'SYSTEM_NOTIFICATION_NOT_CONFIGURED' || error?.code === 'SYSTEM_NOTIFICATION_UNSUPPORTED') return 'unavailable';
+  return setup ? 'needs_setup' : 'test_failed';
 }
 
 export function createSystemNotifier({
@@ -134,38 +157,123 @@ export function createSystemNotifier({
   environment = process.env,
   spawnImpl = spawn,
   probe,
-  timeoutMs = DEFAULT_TIMEOUT_MS
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  dashboardUrl = DEFAULT_DASHBOARD_URL
 } = {}) {
   if (typeof spawnImpl !== 'function') throw new TypeError('spawnImpl must be a function');
   if (probe !== undefined && typeof probe !== 'function') throw new TypeError('probe must be a function');
   if (!Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000) {
     throw new TypeError('timeoutMs must be between 100 and 30000');
   }
-  const supported = ['win32', 'darwin', 'linux'].includes(platform);
-  const configured = supported && (probe ? probe({ platform, environment }) === true : defaultConfigured(platform, environment));
-  const notify = async ({ title, message } = {}) => {
-    if (!configured) {
-      const error = new Error(supported
-        ? 'System notification command or graphical session is unavailable'
-        : 'System notifications are unsupported on this platform');
-      error.code = supported ? 'SYSTEM_NOTIFICATION_NOT_CONFIGURED' : 'SYSTEM_NOTIFICATION_UNSUPPORTED';
-      throw error;
+  if (typeof dashboardUrl !== 'string' && typeof dashboardUrl !== 'function') {
+    throw new TypeError('dashboardUrl must be a string or function');
+  }
+  const currentDashboardUrl = () => {
+    try {
+      return boundedHttpUrl(typeof dashboardUrl === 'function' ? dashboardUrl() : dashboardUrl);
+    } catch {
+      return DEFAULT_DASHBOARD_URL;
     }
-    const safeTitle = boundedText(title || 'Eric Task Master', 120);
-    const safeMessage = boundedText(message || 'A browser task needs attention.', 300);
-    const command = commandFor(platform, safeTitle, safeMessage, environment);
-    if (!command) {
+  };
+  const supported = ['win32', 'darwin', 'linux'].includes(platform);
+  const prerequisite = supported && (probe ? probe({ platform, environment }) === true : defaultPrerequisite(platform, environment));
+  let state = !supported || !prerequisite
+    ? 'unavailable'
+    : platform === 'win32'
+      ? 'needs_setup'
+      : 'ready';
+  let initialized = platform !== 'win32' || !prerequisite;
+  let lastErrorCode = null;
+
+  const status = () => Object.freeze({
+    state: STATES.has(state) ? state : 'unavailable',
+    supported,
+    configured: ['ready', 'permission_blocked', 'test_failed'].includes(state),
+    canOpenSettings: platform === 'win32' || platform === 'darwin',
+    ...(lastErrorCode ? { code: lastErrorCode } : {})
+  });
+
+  const initialize = async ({ force = false } = {}) => {
+    if (!supported || !prerequisite) return status();
+    if (initialized && !force) return status();
+    if (platform !== 'win32') {
+      initialized = true;
+      state = 'ready';
+      lastErrorCode = null;
+      return status();
+    }
+    try {
+      await run(commandFor(platform, 'setup', { dashboardUrl: currentDashboardUrl() }, environment), { spawnImpl, timeoutMs });
+      state = 'ready';
+      lastErrorCode = null;
+    } catch (error) {
+      state = stateFromError(error, { setup: true });
+      lastErrorCode = boundedText(error?.code, 64) || 'SYSTEM_NOTIFICATION_FAILED';
+    }
+    initialized = true;
+    return status();
+  };
+
+  const notify = async ({ title, message, targetUrl, signal } = {}) => {
+    if (!supported) {
       const error = new Error('System notifications are unsupported on this platform');
       error.code = 'SYSTEM_NOTIFICATION_UNSUPPORTED';
       throw error;
     }
-    await run(command, { spawnImpl, timeoutMs });
+    if (!prerequisite) {
+      const error = new Error('System notification command or graphical session is unavailable');
+      error.code = 'SYSTEM_NOTIFICATION_NOT_CONFIGURED';
+      throw error;
+    }
+    await initialize({ force: state === 'permission_blocked' });
+    if (!['ready', 'test_failed'].includes(state)) {
+      const error = new Error('System notifications are not ready');
+      error.code = lastErrorCode || (state === 'permission_blocked'
+        ? 'SYSTEM_NOTIFICATION_PERMISSION_BLOCKED'
+        : 'SYSTEM_NOTIFICATION_NEEDS_SETUP');
+      throw error;
+    }
+    const command = commandFor(platform, 'show', {
+      title,
+      message,
+      targetUrl,
+      dashboardUrl: currentDashboardUrl()
+    }, environment);
+    try {
+      await run(command, { spawnImpl, timeoutMs, signal });
+      state = 'ready';
+      lastErrorCode = null;
+      return status();
+    } catch (error) {
+      state = stateFromError(error);
+      lastErrorCode = boundedText(error?.code, 64) || 'SYSTEM_NOTIFICATION_FAILED';
+      throw error;
+    }
   };
+
+  const openSettings = async () => {
+    const command = commandFor(platform, 'open-settings', { dashboardUrl: currentDashboardUrl() }, environment);
+    if (!command) {
+      const error = new Error('System notification settings cannot be opened on this platform');
+      error.code = 'SYSTEM_NOTIFICATION_SETTINGS_UNAVAILABLE';
+      throw error;
+    }
+    await run(command, { spawnImpl, timeoutMs });
+    return status();
+  };
+
   Object.defineProperties(notify, {
-    supported: { value: supported, enumerable: true },
-    configured: { value: configured, enumerable: true }
+    supported: { get: () => supported, enumerable: true },
+    configured: { get: () => status().configured, enumerable: true },
+    status: { value: status, enumerable: true },
+    initialize: { value: initialize, enumerable: true },
+    openSettings: { value: openSettings, enumerable: true }
   });
   return notify;
 }
 
-export const SYSTEM_NOTIFICATION_DEFAULTS = Object.freeze({ timeoutMs: DEFAULT_TIMEOUT_MS });
+export const SYSTEM_NOTIFICATION_DEFAULTS = Object.freeze({
+  timeoutMs: DEFAULT_TIMEOUT_MS,
+  appId: WINDOWS_APP_ID,
+  dashboardUrl: DEFAULT_DASHBOARD_URL
+});

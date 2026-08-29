@@ -10,12 +10,7 @@ import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
 import { readCleanupReceipt, removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
-import {
-  createExternalCostLedger,
-  externalCostLedgerUsage,
-  reserveExternalCost,
-  settleExternalCost
-} from '../lib/external-cost-ledger.mjs';
+import { sanitizePublicTaskFailure } from '../lib/public-task-failure.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
 const PROFILE_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
@@ -44,7 +39,12 @@ const MAX_ATTEMPTS = 100;
 const MAX_DIAGNOSTIC_ATTEMPTS = 16;
 const RESUME_KEY_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 const HANDOFF_ID_PATTERN = /^handoff_[a-f0-9]{32}$/;
-const EXTERNAL_COST_CURRENCY = /^[A-Z]{3}$/;
+const LEGACY_EXTERNAL_COST_FIELDS = Object.freeze([
+  'externalCost',
+  'externalCostBudget',
+  'externalCostLedger',
+  'externalCostUsage'
+]);
 const PROFILE_CLEANUP_QUEUE_REASON = 'Waiting for confirmed Profile cleanup';
 const PROFILE_BUSY_QUEUE_REASON = 'Waiting for Profile to become idle';
 const CLEANUP_RECONCILE_INTERVAL_MS = 2_000;
@@ -58,6 +58,7 @@ const TASK_LABEL_MAX_LENGTH = 80;
 const MAX_TASK_COMMANDS = 200;
 const MAX_TASK_TIMELINE = 500;
 const MAX_TASK_ASSET_BATCH = 100;
+const MAX_TASK_ASSET_BLOCKING_TASKS = 8;
 const TRANSIENT_ASSET_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const COMMAND_STATUSES = new Set(['pending', 'delivered', 'acknowledged', 'applied', 'rejected']);
 const AGENT_COMMAND_KINDS = new Set(['ask', 'modify']);
@@ -449,72 +450,29 @@ function filterTaskTypes(taskTypes, filters = {}) {
   });
 }
 
-function validateExternalCostBudget(value, declaration) {
-  if (!declaration) {
-    if (value !== undefined) {
-      throw new TaskServiceError(
-        'TASK_EXTERNAL_COST_NOT_DECLARED',
-        'externalCostBudget is only allowed for a task type that declares externalCost'
-      );
+function migrateLegacyExternalCostState(task) {
+  const wasResumable = task.supportsResume === true || task.resumeCheckpointValid === true || Boolean(task.checkpoint);
+  const paid = task.legacyPaidRuntime === true || LEGACY_EXTERNAL_COST_FIELDS.some((field) => (
+    Object.hasOwn(task, field) && task[field] !== null && task[field] !== undefined
+  ));
+  for (const field of LEGACY_EXTERNAL_COST_FIELDS) delete task[field];
+  if (paid) {
+    task.legacyPaidRuntime = true;
+    task.supportsResume = false;
+    if (Array.isArray(task.result?.evidence)) {
+      task.result.evidence = task.result.evidence.filter((item) => !(
+        item?.kind === 'count' &&
+        ['external-cost-estimated', 'external-cost-actual'].includes(item?.label)
+      ));
     }
-    return null;
   }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TaskServiceError(
-      'TASK_EXTERNAL_COST_BUDGET_REQUIRED',
-      'This task type declares external cost; externalCostBudget is required'
-    );
-  }
-  const unknown = Object.keys(value).filter((key) => !['currency', 'maxAmount'].includes(key));
-  if (unknown.length) {
-    throw new TaskServiceError(
-      'INVALID_TASK_EXTERNAL_COST_BUDGET',
-      `Unsupported externalCostBudget fields: ${unknown.join(', ')}`
-    );
-  }
-  if (
-    typeof value.currency !== 'string' || !EXTERNAL_COST_CURRENCY.test(value.currency) ||
-    value.currency !== declaration.currency
-  ) {
-    throw new TaskServiceError(
-      'INVALID_TASK_EXTERNAL_COST_BUDGET',
-      `externalCostBudget.currency must be ${declaration.currency}`
-    );
-  }
-  if (typeof value.maxAmount !== 'number' || !Number.isFinite(value.maxAmount) || value.maxAmount <= 0) {
-    throw new TaskServiceError(
-      'INVALID_TASK_EXTERNAL_COST_BUDGET',
-      'externalCostBudget.maxAmount must be a finite number greater than 0'
-    );
-  }
-  const amountUnits = Math.round(value.maxAmount * 1_000_000);
-  if (
-    !Number.isSafeInteger(amountUnits) ||
-    Math.abs((amountUnits / 1_000_000) - value.maxAmount) > Number.EPSILON * 8
-  ) {
-    throw new TaskServiceError(
-      'INVALID_TASK_EXTERNAL_COST_BUDGET',
-      'externalCostBudget.maxAmount must contain at most 6 decimal places'
-    );
-  }
-  if (value.maxAmount > declaration.maxAmountPerRun) {
-    throw new TaskServiceError(
-      'TASK_EXTERNAL_COST_BUDGET_EXCEEDS_CEILING',
-      `externalCostBudget.maxAmount exceeds the declared per-run ceiling of ${declaration.maxAmountPerRun} ${declaration.currency}`,
-      409
-    );
-  }
-  return Object.freeze({ currency: value.currency, maxAmount: value.maxAmount });
+  return { paid, wasResumable };
 }
 
-function taskExternalCostUsage(task) {
-  if (!task.externalCostLedger) return null;
-  const usage = externalCostLedgerUsage(task.externalCostLedger);
+function legacyExternalCostUnsupportedError() {
   return {
-    currency: usage.currency,
-    estimatedTotal: usage.estimatedTotal,
-    actualTotal: usage.actualTotal,
-    remainingAmount: usage.remainingAmount
+    code: 'TASK_EXTERNAL_COST_UNSUPPORTED',
+    message: 'This task used the external-cost runtime removed in Task Master 2.8.0 and cannot run or resume.'
   };
 }
 
@@ -526,13 +484,26 @@ function stableValue(value) {
   );
 }
 
-function inputSchemaError(location, message) {
+function inputSchemaError(location, message, { expectedType, receivedType } = {}) {
   throw new TaskServiceError(
     'TASK_INPUT_SCHEMA_FAILED',
     `Task input ${location} ${message}`,
     400,
-    { field: location, reason: message }
+    {
+      field: location,
+      reason: message,
+      ...(expectedType ? { expectedType } : {}),
+      ...(receivedType ? { receivedType } : {})
+    }
   );
+}
+
+function jsonValueType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (Number.isInteger(value)) return 'integer';
+  if (typeof value === 'number') return 'number';
+  return typeof value;
 }
 
 function validateTaskInput(value, schema, location = '$', depth = 0) {
@@ -543,17 +514,12 @@ function validateTaskInput(value, schema, location = '$', depth = 0) {
   }
   const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
   if (types.length) {
-    const actual = value === null
-      ? 'null'
-      : Array.isArray(value)
-        ? 'array'
-        : Number.isInteger(value)
-          ? 'integer'
-          : typeof value === 'number'
-            ? 'number'
-            : typeof value;
+    const actual = jsonValueType(value);
     const matches = types.includes(actual) || (actual === 'integer' && types.includes('number'));
-    if (!matches) inputSchemaError(location, `must be ${types.join(' or ')}`);
+    if (!matches) inputSchemaError(location, `must be ${types.join(' or ')}`, {
+      expectedType: types.join(' | '),
+      receivedType: actual
+    });
   }
   if (typeof value === 'string') {
     if (Number.isSafeInteger(schema.minLength) && value.length < schema.minLength) {
@@ -667,9 +633,11 @@ function isTextMimeType(mimeType) {
 }
 
 function sanitizeError(error, fallbackCode = 'TASK_FAILED') {
+  const publicFailure = sanitizePublicTaskFailure(error?.publicFailure);
   return {
     code: redactSensitiveText(error?.code || fallbackCode).slice(0, 200),
     message: redactSensitiveText(error?.message || 'Task failed').slice(0, 2_000),
+    ...(publicFailure ? { publicFailure } : {}),
     ...(error?.screenshot ? { screenshot: redactSensitiveText(error.screenshot) } : {})
   };
 }
@@ -1201,6 +1169,7 @@ export function createTaskService({
       if (!task.displayName) task.displayName = buildTaskDisplayName(task);
       normalizeTaskTiming(task);
       task.supportsResume = task.supportsResume === true;
+      const legacyExternalCost = migrateLegacyExternalCostState(task);
       task.checkpointSeal = task.checkpointSeal &&
         task.checkpointSeal.attempt === task.attempt &&
         typeof task.checkpointSeal.sealedAt === 'string' &&
@@ -1225,6 +1194,45 @@ export function createTaskService({
       ) && !task.startedAt && !task.workerPid && task.leaseHeld !== true;
       tasks.set(task.id, task);
       await recoverDiagnosticsPointers(task);
+      if (
+        legacyExternalCost.paid && (
+          !TERMINAL_TASK_STATES.has(task.state) ||
+          (task.state === 'failed' && legacyExternalCost.wasResumable)
+        )
+      ) {
+        if (safelyQueued) {
+          task.leaseHeld = false;
+          task.cleanup = {
+            browserClosed: true,
+            leaseReleased: true,
+            workerExited: true,
+            settled: true
+          };
+        } else if (task.cleanup.settled !== true) {
+          task.cleanup.managerRestartObserved = true;
+          await reconcileTaskCleanupReceipt(task);
+          refreshCleanupSettled(task);
+        }
+        if (!TERMINAL_TASK_STATES.has(task.state)) {
+          task.state = 'failed';
+          task.result = null;
+          task.completion = null;
+          task.completionClaimed = false;
+        }
+        task.error = legacyExternalCostUnsupportedError();
+        task.progress = terminalProgress(task, 'failed');
+        task.finishedAt ||= nowIso();
+        task.health = { status: 'failed', checkedAt: nowIso() };
+        finishAttemptHistory(task);
+        await refreshResumeCheckpointState(task);
+        task.currentActivity = lifecycleActivity('failed');
+        task.updatedAt = nowIso();
+        await atomicJson(filePath, task);
+        if (task.cleanup.settled === true) {
+          await removeCleanupReceipt(taskCleanupReceiptPath(task)).catch(() => {});
+        }
+        continue;
+      }
       if (!safelyQueued) {
         if (task.cleanup.settled !== true) {
           task.cleanup.managerRestartObserved = true;
@@ -1256,7 +1264,6 @@ export function createTaskService({
         } else if (claimedCompletion && task.result && task.cleanup.settled === true) {
           try {
             task.completion = await verifyCompletionGate(task);
-            task.externalCostUsage = taskExternalCostUsage(task);
             task.state = 'completed';
             task.error = null;
           } catch (error) {
@@ -1477,38 +1484,6 @@ export function createTaskService({
     return next;
   }
 
-  async function applyExternalCostOperation(task, message) {
-    if (!task.externalCostBudget) {
-      throw new TaskServiceError(
-        'TASK_EXTERNAL_COST_NOT_DECLARED',
-        'This task does not declare an external cost budget',
-        409
-      );
-    }
-    task.externalCostLedger ||= createExternalCostLedger(task.externalCostBudget);
-    const input = {
-      operationId: message.operationId,
-      ...(message.action === 'reserve'
-        ? { estimatedAmount: message.amount }
-        : { actualAmount: message.amount }),
-      at: nowIso()
-    };
-    const outcome = message.action === 'reserve'
-      ? reserveExternalCost(task.externalCostLedger, input)
-      : message.action === 'settle'
-        ? settleExternalCost(task.externalCostLedger, input)
-        : (() => { throw new TaskServiceError('INVALID_EXTERNAL_COST_ACTION', 'Unsupported external cost action'); })();
-    if (outcome.changed) {
-      task.externalCostUsage = taskExternalCostUsage(task);
-      task.updatedAt = nowIso();
-      await persist(task);
-    }
-    return {
-      ...outcome.receipt,
-      usage: taskExternalCostUsage(task)
-    };
-  }
-
   function update(task, patch) {
     const activity = Object.hasOwn(patch, 'currentActivity') || typeof patch.state !== 'string'
       ? null
@@ -1693,36 +1668,6 @@ export function createTaskService({
     return required;
   }
 
-  function verifyExternalCostEvidence(task) {
-    if (!task.externalCostBudget) return;
-    if (!task.externalCostLedger) {
-      throw completionGateFailure('Paid task has no durable external cost ledger');
-    }
-    const ledgerUsage = externalCostLedgerUsage(task.externalCostLedger);
-    if (ledgerUsage.outstandingCount !== 0) {
-      throw completionGateFailure('Paid task cannot complete with outstanding external cost reservations');
-    }
-    const readAmount = (label) => {
-      const matches = task.result.evidence.filter((item) => item?.kind === 'count' && item.label === label);
-      if (matches.length !== 1) {
-        throw completionGateFailure(`Paid task result must contain exactly one ${label} count evidence item`);
-      }
-      const amount = matches[0].value;
-      if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) {
-        throw completionGateFailure(`${label} must be a non-negative finite amount`);
-      }
-      return amount;
-    };
-    const estimatedAmount = readAmount('external-cost-estimated');
-    const actualAmount = readAmount('external-cost-actual');
-    if (estimatedAmount !== ledgerUsage.estimatedTotal) {
-      throw completionGateFailure('Estimated external cost evidence does not match the durable ledger');
-    }
-    if (actualAmount !== ledgerUsage.actualTotal) {
-      throw completionGateFailure('Actual external cost evidence does not match the durable ledger');
-    }
-  }
-
   async function verifyCompletionGate(task) {
     if (!task.result || typeof task.result !== 'object' || Array.isArray(task.result)) {
       throw completionGateFailure('Task worker did not return a result object');
@@ -1736,7 +1681,6 @@ export function createTaskService({
     ) {
       throw completionGateFailure('Task result evidence must contain 1-32 verifiable items');
     }
-    verifyExternalCostEvidence(task);
     if (task.cleanup?.browserClosed !== true) {
       throw completionGateFailure('Task browser cleanup was not confirmed');
     }
@@ -1912,7 +1856,6 @@ export function createTaskService({
     if (claimedCompletion && task.state === 'verifying') {
       try {
         task.completion = await verifyCompletionGate(task);
-        task.externalCostUsage = taskExternalCostUsage(task);
         task.state = 'completed';
         task.error = null;
       } catch (error) {
@@ -1962,8 +1905,7 @@ export function createTaskService({
       checkpointSeal: task.checkpointSeal,
       resumeCheckpointValid: task.resumeCheckpointValid,
       resumeCheckpointError: task.resumeCheckpointError,
-      ...(task.completion ? { completion: task.completion } : {}),
-      ...(task.externalCostUsage ? { externalCostUsage: task.externalCostUsage } : {})
+      ...(task.completion ? { completion: task.completion } : {})
     });
     if (task.cleanup.settled === true) {
       await removeCleanupReceipt(taskCleanupReceiptPath(task)).catch(() => {});
@@ -2052,7 +1994,6 @@ export function createTaskService({
       behaviorRequests: new Map(),
       focusRequests: new Map(),
       continueRequests: new Map(),
-      externalCostTail: Promise.resolve(),
       attached: false
     };
 
@@ -2379,22 +2320,6 @@ export function createTaskService({
         ));
         return;
       }
-      if (message.type === 'external_cost_request' && typeof message.requestId === 'string') {
-        const requestId = message.requestId;
-        const operation = entry.externalCostTail.then(async () => {
-          const result = await applyExternalCostOperation(task, message);
-          send(child, { type: 'external_cost_response', requestId, ok: true, result });
-        });
-        entry.externalCostTail = operation.catch((error) => {
-          send(child, {
-            type: 'external_cost_response',
-            requestId,
-            ok: false,
-            error: sanitizeError(error, 'TASK_EXTERNAL_COST_REJECTED')
-          });
-        });
-        return;
-      }
       if (message.type === 'cooldown' && message.cooldown) {
         const record = message.cooldown;
         if (
@@ -2657,7 +2582,6 @@ export function createTaskService({
           modulePath: task.modulePath,
           input: clone(task.input),
           behavior,
-          ...(task.externalCostBudget ? { externalCostBudget: clone(task.externalCostBudget) } : {}),
           ...(task.interactionContract ? { interactionContract: task.interactionContract } : {}),
           outputDir: task.outputDir,
           checkpointPath: path.join(root, task.id, 'checkpoint.json'),
@@ -2726,10 +2650,15 @@ export function createTaskService({
       'taskLabel',
       'input',
       'timeoutMs',
-      'externalCostBudget',
       'idempotencyKey'
     ]);
     const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+    if (Object.hasOwn(body, 'externalCostBudget')) {
+      throw new TaskServiceError(
+        'TASK_EXTERNAL_COST_UNSUPPORTED',
+        'externalCostBudget was removed in Task Master 2.8.0; govern paid provider calls outside Task Master'
+      );
+    }
     if (unknown.length) {
       throw new TaskServiceError('INVALID_TASK_CREATE', `Unsupported task fields: ${unknown.join(', ')}`);
     }
@@ -2764,7 +2693,6 @@ export function createTaskService({
     }
     const input = body.input ?? {};
     validateTaskInput(input, taskType.inputSchema);
-    const externalCostBudget = validateExternalCostBudget(body.externalCostBudget, taskType.externalCost);
     const hashInput = {
       profileId: body.profileId,
       taskType: body.taskType,
@@ -2773,7 +2701,6 @@ export function createTaskService({
       supportsResume: taskType.supportsResume === true,
       interactionContract,
       timeoutMs: body.timeoutMs ?? null,
-      ...(externalCostBudget ? { externalCostBudget } : {}),
       input
     };
     const hash = requestHash(hashInput);
@@ -2831,17 +2758,6 @@ export function createTaskService({
       taskTypeSha256: taskType.sha256,
       supportsResume: taskType.supportsResume === true,
       ...(interactionContract ? { interactionContract } : {}),
-      ...(taskType.externalCost ? { externalCost: clone(taskType.externalCost) } : {}),
-      ...(externalCostBudget ? { externalCostBudget: clone(externalCostBudget) } : {}),
-      ...(externalCostBudget ? {
-        externalCostLedger: createExternalCostLedger(externalCostBudget),
-        externalCostUsage: {
-          currency: externalCostBudget.currency,
-          estimatedTotal: 0,
-          actualTotal: 0,
-          remainingAmount: externalCostBudget.maxAmount
-        }
-      } : {}),
       modulePath: taskType.modulePath,
       ownerRole: caller.role,
       ownerClientId: caller.clientId,
@@ -3260,6 +3176,13 @@ export function createTaskService({
       throw new TaskServiceError(
         'RESUME_KEY_REQUIRED',
         'resumeKey must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
+      );
+    }
+    if (task.legacyPaidRuntime === true) {
+      throw new TaskServiceError(
+        'TASK_EXTERNAL_COST_UNSUPPORTED',
+        'This task used the external-cost runtime removed in Task Master 2.8.0 and cannot be resumed.',
+        409
       );
     }
     const keyHash = requestHash({
@@ -4642,6 +4565,34 @@ export function createTaskService({
     return clone(safe);
   }
 
+  function taskLastUsedAt(task) {
+    const timestamps = [task.createdAt, task.startedAt, task.finishedAt];
+    for (const attempt of Array.isArray(task.history) ? task.history : []) {
+      timestamps.push(attempt?.startedAt, attempt?.workerStartedAt, attempt?.finishedAt);
+    }
+    let latest = null;
+    let latestTime = -1;
+    for (const value of timestamps) {
+      const time = Date.parse(value);
+      if (!Number.isFinite(time) || time <= latestTime) continue;
+      latest = value;
+      latestTime = time;
+    }
+    return latest;
+  }
+
+  function taskAssetBlocker(task, blockerCode) {
+    return {
+      taskId: task.id,
+      title: redactSensitiveText(task.displayName || task.taskLabel || task.id).slice(0, 200),
+      state: task.state,
+      blockerCode,
+      cleanupSettled: task.cleanup?.settled === true,
+      canDeleteRecord: TERMINAL_TASK_STATES.has(task.state) && task.cleanup?.settled === true &&
+        !children.has(task.id) && task.leaseHeld !== true && !finalizationFailures.has(task.id)
+    };
+  }
+
   async function buildTaskAssets() {
     for (const task of tasks.values()) {
       if (
@@ -4758,19 +4709,23 @@ export function createTaskService({
       let lastUsedAt = null;
       const blockers = [];
       const blockerCodes = [];
+      const blockingTasks = [];
       for (const task of related) {
         states[task.state] = (states[task.state] || 0) + 1;
-        const usedAt = task.updatedAt || task.createdAt;
-        if (usedAt && (!lastUsedAt || usedAt > lastUsedAt)) lastUsedAt = usedAt;
+        const usedAt = taskLastUsedAt(task);
+        if (usedAt && (!lastUsedAt || Date.parse(usedAt) > Date.parse(lastUsedAt))) lastUsedAt = usedAt;
         if (!TERMINAL_TASK_STATES.has(task.state) || task.cleanup?.settled !== true) {
           blockers.push(`任务 ${task.displayName || task.id} 尚未完成安全清理`);
-          blockerCodes.push(TERMINAL_TASK_STATES.has(task.state) ? 'cleanup_pending' : 'active_task');
+          const blockerCode = TERMINAL_TASK_STATES.has(task.state) ? 'cleanup_pending' : 'active_task';
+          blockerCodes.push(blockerCode);
+          blockingTasks.push(taskAssetBlocker(task, blockerCode));
         } else if (
           task.state === 'failed' && task.supportsResume === true && task.checkpoint &&
           task.resumeCheckpointValid !== false
         ) {
           blockers.push(`任务 ${task.displayName || task.id} 仍可从检查点恢复`);
           blockerCodes.push('resume_available');
+          blockingTasks.push(taskAssetBlocker(task, 'resume_available'));
         }
       }
       if (asset.protected) {
@@ -4790,6 +4745,8 @@ export function createTaskService({
       asset.deletable = blockers.length === 0;
       asset.deleteBlockers = [...new Set(blockers)].slice(0, 8);
       asset.deleteBlockerCodes = [...new Set(blockerCodes)].slice(0, 8);
+      asset.blockingTaskCount = blockingTasks.length;
+      asset.blockingTasks = blockingTasks.slice(0, MAX_TASK_ASSET_BLOCKING_TASKS);
       asset.taskTypes.sort((left, right) => left.name.localeCompare(right.name));
       assets.push(asset);
     }

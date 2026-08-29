@@ -171,6 +171,57 @@ async function issueAgent(baseUrl, managerToken, clientId, name = clientId) {
   return result.body.agentToken;
 }
 
+test('Owner HTTP task responses never expose internal provider failure payloads', async (t) => {
+  const { manager, baseUrl, taskService } = await managerFixture(t);
+  const unknownSecret = 'opaque-provider-secret-DoNotExpose-246813579';
+  const typed = await taskService.create({}, { role: 'manager-admin', clientId: 'manager-admin' });
+  typed.state = 'failed';
+  typed.error = {
+    code: 'SOURCE_LIMIT_INVALID',
+    message: `raw typed provider response ${unknownSecret}`,
+    stack: `Error at C:\\private\\worker.mjs:7 ${unknownSecret}`,
+    providerPayload: { raw: unknownSecret },
+    publicFailure: {
+      category: 'input',
+      code: 'SOURCE_LIMIT_INVALID',
+      publicMessage: 'The requested item count is invalid.',
+      fields: [{ path: 'input.itemCount', reason: 'Must be an integer.' }],
+      nextAction: 'Correct itemCount and retry once.'
+    }
+  };
+  const typedResponse = await json(await fetch(`${baseUrl}/v1/tasks/${typed.id}`, {
+    headers: headers(manager.token)
+  }));
+  assert.equal(typedResponse.response.status, 200);
+  assert.deepEqual(typedResponse.body.task.error, {
+    code: 'SOURCE_LIMIT_INVALID',
+    category: 'input',
+    message: 'The requested item count is invalid.',
+    fields: [{ path: 'input.itemCount', reason: 'Must be an integer.' }],
+    nextAction: 'Correct itemCount and retry once.'
+  });
+  assert.equal(JSON.stringify(typedResponse.body).includes(unknownSecret), false);
+
+  const generic = await taskService.create({}, { role: 'manager-admin', clientId: 'manager-admin' });
+  generic.state = 'failed';
+  generic.error = {
+    code: 'PROVIDER_PRIVATE_FAILURE',
+    message: `raw generic provider response ${unknownSecret}`,
+    stack: `Error at /home/private/worker.mjs ${unknownSecret}`,
+    details: { response: unknownSecret },
+    providerPayload: { raw: unknownSecret }
+  };
+  const genericResponse = await json(await fetch(`${baseUrl}/v1/tasks/${generic.id}`, {
+    headers: headers(manager.token)
+  }));
+  assert.equal(genericResponse.response.status, 200);
+  assert.deepEqual(genericResponse.body.task.error, {
+    code: 'PROVIDER_PRIVATE_FAILURE',
+    message: 'Task failed; inspect its state, progress, checkpoint, and diagnostic artifacts.'
+  });
+  assert.equal(JSON.stringify(genericResponse.body).includes(unknownSecret), false);
+});
+
 test('Manager rejects stale Agent runtimes before task routing and correlates redacted logs', async (t) => {
   const { manager, baseUrl } = await managerFixture(t);
   const stale = await json(await fetch(`${baseUrl}/v1/agents/issue`, {

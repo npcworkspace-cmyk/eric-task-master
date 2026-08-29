@@ -61,7 +61,7 @@ export const meta = {
 export async function run({
   page, context, input, outputDir,
   journey, cooldown, effects, semantic, handoff,
-  progress, checkpoint, signal
+  progress, checkpoint, failure, signal
 }) {
   const target = new URL(input.url);
   if (!['http:', 'https:'].includes(target.protocol)) throw new TypeError('url must use HTTP(S)');
@@ -100,6 +100,22 @@ The completion claim must contain a non-empty `summary` of at most 4,000 charact
 - `{ kind: 'artifact', file: 'relative/output.json', agentVisible: true }` for a regular file below `outputDir`.
 
 An optional non-empty `label` may be at most 128 characters. Manager hashes and size-anchors every declared artifact before publishing the result. A result and its result artifacts are not Agent-visible until the task reaches verified `completed`; later mutation changes the task to `failed` and blocks artifact access.
+
+When trusted task code can explain a failure safely, use the bounded public failure facade instead of throwing provider text or relying on a generic exception:
+
+```js
+failure.raise({
+  category: 'precondition',
+  code: 'TARGET_NOT_READY',
+  publicMessage: 'The requested target is not ready for collection.',
+  fields: [
+    { path: '$.url', reason: 'The loaded page did not expose the expected public surface.' }
+  ],
+  nextAction: 'Check the target URL or sign in through the selected persistent Profile, then resume once.'
+});
+```
+
+Allowed categories are `input`, `precondition`, `provider`, `navigation`, `data`, and `runtime`. Codes are stable uppercase machine identifiers. A public failure may contain at most eight bounded field entries; `expectedType` and `receivedType` are optional. The runtime redacts the contract again before it crosses the Worker boundary. Any arbitrary exception, stack, local path, credential, provider payload, or unsupported shape remains private and is exposed only as a generic task failure.
 
 ## Semantic observation and visual fallback
 

@@ -133,8 +133,7 @@ const client = {
       id: name,
       title: 'Fixture reader',
       readOnly: true,
-      ...(name === 'fixture.paid' ? {
-        externalCost: { currency: 'USD', maxAmountPerRun: 5 },
+      ...(name === 'fixture.asset' ? {
         pack: {
           name: 'fixture-pack', version: '1.2.3', title: 'Fixture Pack',
           description: 'Fixture lifecycle visibility', lifecycle: 'active',
@@ -162,15 +161,7 @@ const client = {
     const startedTask = {
       ...task,
       taskType: input.taskType,
-      profileId: input.profileId,
-      ...(input.externalCostBudget ? {
-        externalCostUsage: {
-          currency: input.externalCostBudget.currency,
-          estimatedTotal: 0,
-          actualTotal: 0,
-          remainingAmount: input.externalCostBudget.maxAmount
-        }
-      } : {})
+      profileId: input.profileId
     };
     return {
       taskId: startedTask.id,

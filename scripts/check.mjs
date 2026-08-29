@@ -42,6 +42,7 @@ async function staticChecks() {
   await access(resolve(ROOT, 'scripts', 'taskmaster.mjs'));
   const [
     launcher,
+    cli,
     bootstrapPolicy,
     manager,
     taskWorker,
@@ -54,6 +55,7 @@ async function staticChecks() {
     dashboardSessions,
     taskRecipes,
     taskPack,
+    taskTypeRegistry,
     interactionContract,
     journey,
     behavior,
@@ -63,13 +65,18 @@ async function staticChecks() {
     mcpStdio,
     mcpServer,
     mcpPublicView,
+    mcpClient,
     mcpHostsDocument,
     notificationCenter,
     systemNotifier,
-    externalCostLedger,
-    contracts
+    contracts,
+    architecture,
+    releaseGate,
+    baseSkill,
+    taskPacksReference
   ] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'cli.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'manager.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8'),
@@ -82,6 +89,7 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'src', 'lib', 'dashboard-session-store.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'task-recipes.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'task-pack.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'task-type-registry.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'interaction-contract.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'journey.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'behavior.mjs'), 'utf8'),
@@ -91,11 +99,15 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'server.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'public-view.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'mcp', 'taskmaster-client.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'docs', 'MCP-HOSTS.md'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'notification-center.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'system-notifier.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'src', 'lib', 'external-cost-ledger.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'src', 'contracts.mjs'), 'utf8')
+    readFile(resolve(ROOT, 'src', 'contracts.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'ARCHITECTURE.md'), 'utf8'),
+    readFile(resolve(ROOT, 'docs', 'RELEASE-GATE.md'), 'utf8'),
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8'),
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-packs.md'), 'utf8')
   ]);
   const releaseCreation = releaseWorkflow.indexOf('gh release create');
   const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
@@ -228,17 +240,66 @@ async function staticChecks() {
       !mcpServer.includes('taskmaster_tasks_claim_user_request'),
     'read-only Task Pack discovery, focus, or Owner-only verification claim boundary drift'
   );
+  const removedExternalCostSurface = /external(?:Cost|_cost|-cost)/iu;
+  for (const [label, source] of [
+    ['CLI', cli],
+    ['launcher', launcher],
+    ['Manager', manager],
+    ['Worker', taskWorker],
+    ['Task Pack runtime', taskPack],
+    ['Task recipe runtime', taskRecipes],
+    ['MCP STDIO', mcpStdio],
+    ['MCP server', mcpServer],
+    ['MCP public view', mcpPublicView],
+    ['MCP client', mcpClient]
+  ]) {
+    invariant(!removedExternalCostSurface.test(source), `${label} still exposes the removed external-cost capability`);
+  }
   invariant(
-    externalCostLedger.includes('reserveExternalCost') && externalCostLedger.includes('settleExternalCost') &&
-    externalCostLedger.includes('EXTERNAL_COST_OPERATION_CONFLICT') &&
-      externalCostLedger.includes('execute: true') && externalCostLedger.includes('execute: false') &&
-      taskWorker.includes('reserve: async') && taskWorker.includes('settle: async') &&
-      taskWorker.includes("action: 'reserve'") && taskWorker.includes("action: 'settle'") &&
-      taskService.includes('externalCostTail') && taskService.includes('await persist(task)') &&
-      contracts.includes("'externalCostUsage'") && !contracts.includes("'externalCostBudget'") &&
-      mcpPublicView.includes("['externalCostUsage', publicExternalCostUsage(task?.externalCostUsage)]") &&
-      !mcpPublicView.includes('task?.externalCostBudget'),
-    'durable paid-operation ledger or public aggregate-only boundary drift'
+    contracts.includes("['external-cost-estimated', 'external-cost-actual'].includes(item?.label)") &&
+      (contracts.match(/external(?:Cost|_cost|-cost)/giu) || []).length === 2 &&
+      !/external(?:Cost|_cost)/u.test(contracts),
+    'public task contracts must only retain the two legacy cost-evidence removal labels'
+  );
+  invariant(
+    taskService.includes('const LEGACY_EXTERNAL_COST_FIELDS') &&
+      taskService.includes('function migrateLegacyExternalCostState') &&
+      taskService.includes("Object.hasOwn(body, 'externalCostBudget')") &&
+      (taskService.match(/externalCost/gu) || []).length === 6 &&
+      (taskService.match(/TASK_EXTERNAL_COST_UNSUPPORTED/gu) || []).length === 3 &&
+      !/createExternalCostLedger|externalCostLedgerUsage|reserveExternalCost|settleExternalCost|externalCostTail|external_cost_request|external_cost_response|applyExternalCostOperation|validateExternalCostBudget|verifyExternalCostEvidence/u.test(taskService),
+    'Task Service external-cost compatibility must remain migration-and-rejection only'
+  );
+  invariant(
+    taskTypeRegistry.includes('function normalizeManagementRecord') &&
+      taskTypeRegistry.includes("Object.hasOwn(source, 'externalCost')") &&
+      (taskTypeRegistry.match(/externalCost/gu) || []).length === 6 &&
+      (taskTypeRegistry.match(/TASK_EXTERNAL_COST_UNSUPPORTED/gu) || []).length === 4 &&
+      !/boundedExternalCost|MAX_EXTERNAL_COST_PER_RUN|EXTERNAL_COST_CURRENCY/u.test(taskTypeRegistry),
+    'Task type external-cost compatibility must remain migration-and-rejection only'
+  );
+  invariant(
+    architecture.includes('Task Master 2.8.0 removes the generic paid-provider metadata') &&
+      !architecture.includes('Paid task types declare a currency and task ceiling') &&
+      baseSkill.includes('does not provide a generic paid-provider budget') &&
+      !/externalCost\.(?:reserve|settle)/u.test(baseSkill) &&
+      taskPacksReference.includes('does not price, authorize, meter, or reimburse external providers'),
+    'Architecture and base Skill must describe the removed external-cost runtime consistently'
+  );
+  invariant(
+    architecture.includes('relevant visible frame is unreadable, omitted, or errors') &&
+      architecture.includes('hidden/decorative child frame that merely reaches the observation budget') &&
+      taskPacksReference.includes('dense main document or a hidden/decorative child frame') &&
+      releaseGate.includes('relevant visible unreadable/omitted/errored frames block scale'),
+    'Surface-frame warning and blocking documentation drift'
+  );
+  invariant(
+    !/(?:walmart|reddit|amazon|youtube|quora|fashion-media)/iu.test([
+      architecture,
+      baseSkill,
+      taskPacksReference
+    ].join('\n')),
+    'Base architecture or Skill contains site-specific Pack logic'
   );
   invariant(
     workflow.includes('windows-latest') && workflow.includes('macos-latest') &&

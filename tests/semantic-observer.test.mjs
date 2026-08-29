@@ -66,5 +66,10 @@ test('semantic observer reserves budget for a challenge iframe after a dense mai
   assert.equal(snapshot.framesTotal, 2);
   assert.equal(snapshot.framesInspected, 2);
   assert.equal(snapshot.framesOmitted, 0);
+  assert.equal(snapshot.mainFrameTruncated, true);
+  assert.equal(snapshot.visibleChildFrameErrors, 0);
+  assert.equal(snapshot.visibleChildFramesTruncated, 0);
+  assert.equal(snapshot.frameDetails.find((frame) => frame.main)?.truncated, true);
+  assert.equal(snapshot.frameDetails.find((frame) => !frame.main)?.visible, true);
   assert.equal(snapshot.refs.some((item) => item.frame === 1 && /Press and hold/u.test(item.name)), true);
 });

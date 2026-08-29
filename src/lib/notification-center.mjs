@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { JsonStore } from './json-store.mjs';
 import { redactPublicText } from './redaction.mjs';
 import { createSystemNotifier } from './system-notifier.mjs';
@@ -11,6 +11,8 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const MAX_RECORDS = 500;
 const CHANNELS = Object.freeze(['system', 'telegram', 'feishu']);
 const ACTIVE_STATE = 'active';
+const DEFAULT_DASHBOARD_URL = 'http://127.0.0.1:19946/dashboard';
+const CHANNEL_STATUSES = new Set(['ready', 'needs_setup', 'permission_blocked', 'unavailable', 'test_failed']);
 
 function clone(value) {
   return structuredClone(value);
@@ -47,7 +49,7 @@ function defaultStore() {
       channels: {
         system: { enabled: true },
         telegram: { enabled: false, botToken: null, chatId: null },
-        feishu: { enabled: false, webhookUrl: null }
+        feishu: { enabled: false, webhookUrl: null, signingSecret: null }
       }
     },
     records: []
@@ -83,24 +85,67 @@ function maskedWebhook(value) {
   }
 }
 
-function publicSettings(settings, systemConfigured) {
+function publicLastTest(value) {
+  if (!value || typeof value !== 'object' || typeof value.testedAt !== 'string') return null;
+  return {
+    ok: value.ok === true,
+    testedAt: boundedPublicText(value.testedAt, 64),
+    attempts: Number(value.attempts) || 0,
+    ...(value.code ? { code: boundedPublicText(value.code, 64, 'NOTIFICATION_TEST_FAILED') } : {}),
+    ...(Number.isInteger(value.statusCode) ? { statusCode: value.statusCode } : {})
+  };
+}
+
+function channelStatus(configured, lastTest) {
+  if (!configured || !lastTest) return 'needs_setup';
+  return lastTest?.ok === false ? 'test_failed' : 'ready';
+}
+
+function normalizeSystemStatus(value) {
+  const status = value && typeof value === 'object' ? value : {};
+  const state = CHANNEL_STATUSES.has(status.state) ? status.state : status.configured === false ? 'unavailable' : 'ready';
+  return {
+    state,
+    configured: status.configured === true || ['ready', 'permission_blocked', 'test_failed'].includes(state),
+    canOpenSettings: status.canOpenSettings === true,
+    ...(status.code ? { code: boundedPublicText(status.code, 64, 'SYSTEM_NOTIFICATION_FAILED') } : {})
+  };
+}
+
+function publicSettings(settings, systemCapability) {
   const channels = settings.channels;
   const telegramConfigured = Boolean(channels.telegram.botToken && channels.telegram.chatId);
   const feishuConfigured = Boolean(channels.feishu.webhookUrl);
+  const system = normalizeSystemStatus(systemCapability);
+  const systemLastTest = publicLastTest(channels.system.lastTest);
+  const telegramLastTest = publicLastTest(channels.telegram.lastTest);
+  const feishuLastTest = publicLastTest(channels.feishu.lastTest);
+  const systemStatus = ['unavailable', 'needs_setup', 'permission_blocked'].includes(system.state)
+    ? system.state
+    : systemLastTest?.ok === false ? 'test_failed' : system.state;
   return {
     channels: {
       system: {
         enabled: channels.system.enabled === true,
-        configured: systemConfigured
+        configured: system.configured,
+        status: systemStatus,
+        canOpenSettings: system.canOpenSettings,
+        lastTest: systemLastTest,
+        ...(system.code ? { code: system.code } : {})
       },
       telegram: {
         enabled: channels.telegram.enabled === true,
         configured: telegramConfigured,
+        status: channelStatus(telegramConfigured, telegramLastTest),
+        lastTest: telegramLastTest,
         ...(telegramConfigured ? { maskedTarget: maskTail(channels.telegram.chatId) } : {})
       },
       feishu: {
         enabled: channels.feishu.enabled === true,
         configured: feishuConfigured,
+        status: channelStatus(feishuConfigured, feishuLastTest),
+        signingConfigured: Boolean(channels.feishu.signingSecret),
+        lastTest: feishuLastTest,
         ...(feishuConfigured ? { maskedTarget: maskedWebhook(channels.feishu.webhookUrl) } : {})
       }
     }
@@ -185,16 +230,27 @@ function applySettingsPatch(settings, patch) {
       ? ['enabled']
       : channel === 'telegram'
         ? ['enabled', 'botToken', 'chatId']
-        : ['enabled', 'webhookUrl'];
+        : ['enabled', 'webhookUrl', 'signingSecret'];
     const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
     if (unknown.length) throw new TypeError(`Unsupported channels.${channel} fields: ${unknown.join(', ')}`);
     if (Object.hasOwn(value, 'enabled')) next.channels[channel].enabled = validateBoolean(value.enabled, `channels.${channel}.enabled`);
     if (channel === 'telegram') {
-      if (Object.hasOwn(value, 'botToken')) next.channels.telegram.botToken = validateSecret(value.botToken, 'channels.telegram.botToken', 512);
-      if (Object.hasOwn(value, 'chatId')) next.channels.telegram.chatId = validateSecret(value.chatId, 'channels.telegram.chatId', 256);
+      if (Object.hasOwn(value, 'botToken')) {
+        next.channels.telegram.botToken = validateSecret(value.botToken, 'channels.telegram.botToken', 512);
+        delete next.channels.telegram.lastTest;
+      }
+      if (Object.hasOwn(value, 'chatId')) {
+        next.channels.telegram.chatId = validateSecret(value.chatId, 'channels.telegram.chatId', 256);
+        delete next.channels.telegram.lastTest;
+      }
     }
     if (channel === 'feishu' && Object.hasOwn(value, 'webhookUrl')) {
       next.channels.feishu.webhookUrl = validateFeishuWebhook(value.webhookUrl);
+      delete next.channels.feishu.lastTest;
+    }
+    if (channel === 'feishu' && Object.hasOwn(value, 'signingSecret')) {
+      next.channels.feishu.signingSecret = validateSecret(value.signingSecret, 'channels.feishu.signingSecret', 512);
+      delete next.channels.feishu.lastTest;
     }
   }
   return next;
@@ -216,15 +272,22 @@ function retryable(error) {
   return !Number.isInteger(statusCode) || [408, 425, 429].includes(statusCode) || statusCode >= 500;
 }
 
-function fetchError(response) {
+function providerErrorCode(channel, statusCode) {
+  if ([401, 403].includes(statusCode)) return `${channel.toUpperCase()}_AUTH_REJECTED`;
+  if (statusCode === 429) return 'NOTIFICATION_RATE_LIMITED';
+  if (statusCode >= 500) return 'NOTIFICATION_PROVIDER_UNAVAILABLE';
+  return `${channel.toUpperCase()}_PROVIDER_REJECTED`;
+}
+
+function fetchError(response, channel) {
   const error = new Error('Notification endpoint rejected the request');
-  error.code = 'NOTIFICATION_DELIVERY_REJECTED';
+  error.code = providerErrorCode(channel, Number(response.status));
   error.statusCode = response.status;
   return error;
 }
 
 async function assertEndpointAccepted(response, channel) {
-  if (!response?.ok) throw fetchError(response || { status: 503 });
+  if (!response?.ok) throw fetchError(response || { status: 503 }, channel);
   // Native Response objects always expose json(). Test doubles may omit it.
   if (typeof response.json !== 'function') return;
   let payload;
@@ -232,19 +295,19 @@ async function assertEndpointAccepted(response, channel) {
     payload = await response.json();
   } catch {
     const error = new Error('Notification endpoint returned an invalid response');
-    error.code = 'NOTIFICATION_RESPONSE_INVALID';
+    error.code = `${channel.toUpperCase()}_RESPONSE_INVALID`;
     error.statusCode = response.status;
     throw error;
   }
   if (channel === 'telegram' && payload?.ok !== true) {
-    const error = fetchError({ status: Number(payload?.error_code) || response.status });
+    const error = fetchError({ status: Number(payload?.error_code) || response.status }, channel);
     error.retryable = [408, 425, 429].includes(error.statusCode) || error.statusCode >= 500;
     throw error;
   }
   if (channel === 'feishu') {
     const code = payload?.code ?? payload?.StatusCode;
     if (Number(code) !== 0) {
-      const error = fetchError({ status: response.status });
+      const error = fetchError({ status: response.status }, channel);
       error.retryable = false;
       throw error;
     }
@@ -259,7 +322,6 @@ export class NotificationCenter {
   #store;
   #fetch;
   #systemNotifier;
-  #systemConfigured;
   #eligibilityCheck;
   #now;
   #setTimer;
@@ -269,6 +331,7 @@ export class NotificationCenter {
   #deliveryTimeoutMs;
   #retryDelayMs;
   #maxAttempts;
+  #dashboardUrl;
   #timer = null;
   #scheduleGeneration = 0;
   #tail = Promise.resolve();
@@ -281,7 +344,7 @@ export class NotificationCenter {
   constructor({
     filePath,
     fetchImpl = globalThis.fetch,
-    systemNotifier = createSystemNotifier(),
+    systemNotifier,
     eligibilityCheck = async () => 'pending',
     now = Date.now,
     setTimer = setTimeout,
@@ -290,11 +353,11 @@ export class NotificationCenter {
     reminderMs = DEFAULT_REMINDER_MS,
     deliveryTimeoutMs = DEFAULT_DELIVERY_TIMEOUT_MS,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
-    maxAttempts = DEFAULT_MAX_ATTEMPTS
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
+    dashboardUrl = DEFAULT_DASHBOARD_URL
   } = {}) {
     if (!filePath) throw new TypeError('filePath is required');
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
-    if (typeof systemNotifier !== 'function') throw new TypeError('systemNotifier must be a function');
     if (typeof eligibilityCheck !== 'function') throw new TypeError('eligibilityCheck must be a function');
     if (typeof now !== 'function' || typeof setTimer !== 'function' || typeof clearTimer !== 'function' || typeof sleep !== 'function') {
       throw new TypeError('clock and timer dependencies must be functions');
@@ -309,10 +372,32 @@ export class NotificationCenter {
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) {
       throw new TypeError('maxAttempts must be an integer from 1 to 5');
     }
+    const normalizeDashboardUrl = (value) => {
+      try {
+        const parsed = new URL(value);
+        if (
+          !['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password ||
+          !['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)
+        ) throw new TypeError();
+        return parsed.href;
+      } catch {
+        throw new TypeError('dashboardUrl must resolve to a loopback HTTP(S) URL');
+      }
+    };
+    if (typeof dashboardUrl !== 'string' && typeof dashboardUrl !== 'function') {
+      throw new TypeError('dashboardUrl must be a string or function');
+    }
+    if (typeof dashboardUrl === 'string') {
+      const normalizedDashboardUrl = normalizeDashboardUrl(dashboardUrl);
+      this.#dashboardUrl = () => normalizedDashboardUrl;
+    } else {
+      this.#dashboardUrl = () => normalizeDashboardUrl(dashboardUrl());
+    }
+    const resolvedSystemNotifier = systemNotifier ?? createSystemNotifier({ dashboardUrl: this.#dashboardUrl });
+    if (typeof resolvedSystemNotifier !== 'function') throw new TypeError('systemNotifier must be a function');
     this.#store = new JsonStore(filePath, defaultStore);
     this.#fetch = fetchImpl;
-    this.#systemNotifier = systemNotifier;
-    this.#systemConfigured = systemNotifier.configured !== false;
+    this.#systemNotifier = resolvedSystemNotifier;
     this.#eligibilityCheck = eligibilityCheck;
     this.#now = now;
     this.#setTimer = setTimer;
@@ -329,6 +414,9 @@ export class NotificationCenter {
     await this.#store.init();
     const data = validateStore(await this.#store.read());
     await this.#store.replace(data);
+    if (typeof this.#systemNotifier.initialize === 'function') {
+      await this.#systemNotifier.initialize().catch(() => {});
+    }
     this.#initialized = true;
   }
 
@@ -356,7 +444,7 @@ export class NotificationCenter {
         const id = stableAlertId(task.id, task.userRequest.id);
         selected = data.records.find((record) => record.id === id) || null;
         if (!selected) {
-          const safeTaskId = boundedPublicText(task.id, 120, '浏览器任务');
+          const safeTaskName = boundedPublicText(task.displayName || task.id, 120, '浏览器任务');
           selected = {
             id,
             taskId: task.id,
@@ -364,7 +452,7 @@ export class NotificationCenter {
             kind: 'human_verification',
             state: ACTIVE_STATE,
             title: 'Eric Task Master 需要人工验证',
-            message: `任务 ${safeTaskId} 正在等待人工验证，请打开本机控制面板处理。`,
+            message: `任务 ${safeTaskName} 正在等待人工验证，请打开本机控制面板处理。`,
             createdAt: timestamp,
             updatedAt: timestamp,
             nextDueAt: timestamp,
@@ -510,7 +598,7 @@ export class NotificationCenter {
   async getSettings() {
     await this.init();
     const data = validateStore(await this.#store.read());
-    return publicSettings(data.settings, this.#systemConfigured);
+    return publicSettings(data.settings, this.#systemCapability());
   }
 
   async updateSettings(patch) {
@@ -519,7 +607,7 @@ export class NotificationCenter {
       validateStore(draft);
       draft.settings = applySettingsPatch(draft.settings, patch);
     });
-    return publicSettings(data.settings, this.#systemConfigured);
+    return publicSettings(data.settings, this.#systemCapability());
   }
 
   async testChannel(channel) {
@@ -527,9 +615,43 @@ export class NotificationCenter {
     if (!CHANNELS.includes(channel)) throw new TypeError('Unsupported notification channel');
     const result = await this.#deliverChannel(channel, {
       title: 'Eric Task Master 通知测试',
-      message: '测试消息已送达。任务通知通道可以正常使用。'
+      message: '测试消息已送达。任务通知通道可以正常使用。',
+      taskId: 'notification-test'
     }, { requireEnabled: false });
-    return { ...safeChannelResult(channel, result), testedAt: nowIso(this.#now) };
+    const testedAt = nowIso(this.#now);
+    const publicResult = { ...safeChannelResult(channel, result), testedAt };
+    await this.#store.update((data) => {
+      validateStore(data);
+      data.settings.channels[channel].lastTest = clone(publicResult);
+    });
+    return publicResult;
+  }
+
+  async openSystemSettings() {
+    await this.init();
+    if (typeof this.#systemNotifier.openSettings !== 'function') {
+      const error = new Error('System notification settings are unavailable');
+      error.code = 'SYSTEM_NOTIFICATION_SETTINGS_UNAVAILABLE';
+      throw error;
+    }
+    await this.#systemNotifier.openSettings();
+    return this.getSettings();
+  }
+
+  #systemCapability() {
+    if (typeof this.#systemNotifier.status === 'function') return this.#systemNotifier.status();
+    return {
+      state: this.#systemNotifier.configured === false ? 'unavailable' : 'ready',
+      supported: this.#systemNotifier.supported !== false,
+      configured: this.#systemNotifier.configured !== false,
+      canOpenSettings: typeof this.#systemNotifier.openSettings === 'function'
+    };
+  }
+
+  #taskTargetUrl(taskId) {
+    const target = new URL(this.#dashboardUrl());
+    if (taskId && taskId !== 'notification-test') target.searchParams.set('task', boundedPublicText(taskId, 128));
+    return target.href;
   }
 
   async flush() {
@@ -678,18 +800,22 @@ export class NotificationCenter {
       let botToken;
       let chatId;
       let webhookUrl;
+      let signingSecret;
       try {
         if (channel === 'telegram') {
           botToken = validateSecret(settings.botToken, 'channels.telegram.botToken', 512);
           chatId = validateSecret(settings.chatId, 'channels.telegram.chatId', 256);
         } else if (channel === 'feishu') {
           webhookUrl = validateFeishuWebhook(settings.webhookUrl);
+          signingSecret = settings.signingSecret === null || settings.signingSecret === undefined
+            ? null
+            : validateSecret(settings.signingSecret, 'channels.feishu.signingSecret', 512);
         }
       } catch {
         return { ok: false, attempts, code: 'CHANNEL_CONFIG_INVALID' };
       }
       const configured = channel === 'system'
-        ? this.#systemConfigured
+        ? this.#systemCapability().configured
         : channel === 'telegram'
           ? Boolean(botToken && chatId)
           : Boolean(webhookUrl);
@@ -698,7 +824,12 @@ export class NotificationCenter {
       try {
         await this.#withDeadline(async (signal) => {
           if (channel === 'system') {
-            await this.#systemNotifier({ title: record.title, message: record.message, signal });
+            await this.#systemNotifier({
+              title: record.title,
+              message: record.message,
+              targetUrl: this.#taskTargetUrl(record.taskId),
+              signal
+            });
             return;
           }
           if (channel === 'telegram') {
@@ -711,10 +842,16 @@ export class NotificationCenter {
             await assertEndpointAccepted(response, 'telegram');
             return;
           }
+          const feishuBody = { msg_type: 'text', content: { text: `${record.title}\n${record.message}` } };
+          if (signingSecret) {
+            const timestamp = String(Math.floor(this.#now() / 1_000));
+            feishuBody.timestamp = timestamp;
+            feishuBody.sign = createHmac('sha256', `${timestamp}\n${signingSecret}`).digest('base64');
+          }
           const response = await this.#fetch(webhookUrl, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ msg_type: 'text', content: { text: `${record.title}\n${record.message}` } }),
+            body: JSON.stringify(feishuBody),
             signal
           });
           await assertEndpointAccepted(response, 'feishu');
@@ -729,7 +866,11 @@ export class NotificationCenter {
     return {
       ok: false,
       attempts,
-      code: boundedPublicText(lastError?.code, 64, 'NOTIFICATION_DELIVERY_FAILED'),
+      code: boundedPublicText(
+        lastError?.code || (lastError instanceof TypeError ? 'NOTIFICATION_NETWORK_ERROR' : ''),
+        64,
+        'NOTIFICATION_DELIVERY_FAILED'
+      ),
       ...(Number.isInteger(lastError?.statusCode) ? { statusCode: lastError.statusCode } : {})
     };
   }

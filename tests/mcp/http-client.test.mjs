@@ -166,7 +166,7 @@ test('HTTP client exchanges admin credential once and uses scoped agent token af
   assert.deepEqual(requests.at(-1).body, { resumeKey: 'resume-safe-0001' });
 });
 
-test('HTTP client forwards Task Pack visibility, paid budget input, and focus request contracts', async (t) => {
+test('HTTP client forwards Task Pack visibility and focus while rejecting the removed cost budget input', async (t) => {
   const requests = [];
   const connection = await fixture(t, async (request, response) => {
     const body = await readJson(request);
@@ -179,19 +179,19 @@ test('HTTP client forwards Task Pack visibility, paid budget input, and focus re
       return;
     }
     if (request.method === 'GET' && request.url === '/v1/task-packs') {
-      reply(response, 200, { taskPacks: [{ id: 'pack:paid@1.0.0', name: 'paid', version: '1.0.0' }] });
+      reply(response, 200, { taskPacks: [{ id: 'pack:fixture@1.0.0', name: 'fixture', version: '1.0.0' }] });
       return;
     }
     if (request.method === 'POST' && request.url === '/v1/tasks') {
       reply(response, 202, {
-        taskId: 'task_paid',
-        dashboardUrl: `http://${request.headers.host}/dashboard?task=task_paid#code=${'d'.repeat(32)}`,
-        task: { id: 'task_paid', state: 'queued', externalCostBudget: body.externalCostBudget }
+        taskId: 'task_contract',
+        dashboardUrl: `http://${request.headers.host}/dashboard?task=task_contract#code=${'d'.repeat(32)}`,
+        task: { id: 'task_contract', state: 'queued' }
       });
       return;
     }
-    if (request.method === 'POST' && request.url === '/v1/tasks/task_paid/focus') {
-      reply(response, 200, { task: { id: 'task_paid', state: 'waiting_user' }, focusedAt: '2026-08-29T00:00:00.000Z' });
+    if (request.method === 'POST' && request.url === '/v1/tasks/task_contract/focus') {
+      reply(response, 200, { task: { id: 'task_contract', state: 'waiting_user' }, focusedAt: '2026-08-29T00:00:00.000Z' });
       return;
     }
     reply(response, 404, { error: { code: 'NOT_FOUND' } });
@@ -202,31 +202,29 @@ test('HTTP client forwards Task Pack visibility, paid budget input, and focus re
     clientName: 'Contract fixture'
   });
 
-  assert.equal((await client.listTaskPacks())[0].name, 'paid');
+  assert.equal((await client.listTaskPacks())[0].name, 'fixture');
   const started = await client.startTask({
-    taskType: 'fixture.paid',
+    taskType: 'fixture.collect',
     profileId: 'profile_safe',
     input: {},
-    externalCostBudget: { currency: 'USD', maxAmount: 3.25 },
-    idempotencyKey: 'paid-contract-0001'
+    idempotencyKey: 'task-contract-0001'
   });
-  assert.deepEqual(started.task.externalCostBudget, { currency: 'USD', maxAmount: 3.25 });
   const focused = await client.focusTask(started.taskId);
   assert.equal(focused.focusedAt, '2026-08-29T00:00:00.000Z');
 
-  assert.deepEqual(
-    requests.find((request) => request.url === '/v1/tasks' && request.method === 'POST').body.externalCostBudget,
-    { currency: 'USD', maxAmount: 3.25 }
+  assert.equal(
+    Object.hasOwn(requests.find((request) => request.url === '/v1/tasks' && request.method === 'POST').body, 'externalCostBudget'),
+    false
   );
   assert.deepEqual(requests.find((request) => request.url.endsWith('/focus')).body, {});
 
   await assert.rejects(client.startTask({
-    taskType: 'fixture.paid',
+    taskType: 'fixture.collect',
     profileId: 'profile_safe',
     input: {},
     externalCostBudget: { currency: 'usd', maxAmount: 3.25 },
-    idempotencyKey: 'paid-contract-0002'
-  }), { code: 'INVALID_TASK_EXTERNAL_COST_BUDGET' });
+    idempotencyKey: 'task-contract-0002'
+  }), { code: 'UNKNOWN_ARGUMENT' });
 });
 
 test('HTTP client preserves redacted Manager errors, request IDs, and exact recovery actions', async (t) => {
@@ -245,7 +243,8 @@ test('HTTP client preserves redacted Manager errors, request IDs, and exact reco
       message: 'Task input $.url is required; token=LEAK42; C:\\private\\task.json',
       error: {
         code: 'TASK_INPUT_SCHEMA_FAILED',
-        message: 'Task input $.url is required; token=LEAK42; C:\\private\\task.json'
+        message: 'Task input $.count must be integer; token=LEAK42; C:\\private\\task.json',
+        details: { field: '$.count', reason: 'must be integer', expectedType: 'integer', receivedType: 'string' }
       }
     }, { 'x-taskmaster-request-id': requestId });
   });
@@ -260,10 +259,13 @@ test('HTTP client preserves redacted Manager errors, request IDs, and exact reco
     }),
     (error) => {
       assert.equal(error.code, 'TASK_INPUT_SCHEMA_FAILED');
-      assert.match(error.message, /Task input \$\.url is required/u);
+      assert.match(error.message, /Task input \$\.count must be integer/u);
       assert.equal(error.message.includes('LEAK42'), false);
       assert.equal(error.message.includes('C:\\private'), false);
       assert.equal(error.requestId, requestId);
+      assert.deepEqual(error.details, {
+        field: '$.count', reason: 'must be integer', expectedType: 'integer', receivedType: 'string'
+      });
       assert.match(error.nextAction, /taskmaster_task_types_describe/u);
       return true;
     }

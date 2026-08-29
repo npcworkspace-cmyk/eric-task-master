@@ -44,6 +44,63 @@ function detectChallengeSignals(value) {
   ].filter(([, pattern]) => pattern.test(source)).map(([name]) => name);
 }
 
+function finiteCount(value, fallback = 0) {
+  const normalized = Number(value);
+  return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : fallback;
+}
+
+function summarizeFrameInspection(snapshot, fallbackChildFrames = 0) {
+  const framesTotal = finiteCount(snapshot?.framesTotal, fallbackChildFrames + 1);
+  const framesInspected = finiteCount(
+    snapshot?.framesInspected,
+    Math.max(0, framesTotal - finiteCount(snapshot?.frameErrors))
+  );
+  const truncatedFrames = finiteCount(snapshot?.truncatedFrames);
+  const mainFrameTruncated = snapshot?.mainFrameTruncated === true ||
+    (snapshot?.mainFrameTruncated === undefined && framesTotal <= 1 && snapshot?.truncated === true);
+  const visibleChildFrameErrors = finiteCount(
+    snapshot?.visibleChildFrameErrors,
+    finiteCount(snapshot?.frameErrors)
+  );
+  const hiddenChildFrameErrors = finiteCount(snapshot?.hiddenChildFrameErrors);
+  const visibleChildFramesTruncated = finiteCount(
+    snapshot?.visibleChildFramesTruncated,
+    Math.max(0, truncatedFrames - (mainFrameTruncated ? 1 : 0))
+  );
+  const hiddenChildFramesTruncated = finiteCount(snapshot?.hiddenChildFramesTruncated);
+  const omitted = finiteCount(snapshot?.framesOmitted, Math.max(0, framesTotal - framesInspected));
+  const visibleFramesOmitted = finiteCount(snapshot?.visibleFramesOmitted, omitted);
+  const hiddenFramesOmitted = finiteCount(snapshot?.hiddenFramesOmitted);
+  const unknownFramesOmitted = finiteCount(snapshot?.unknownFramesOmitted);
+  const blocking = visibleChildFrameErrors > 0 || visibleFramesOmitted > 0 || unknownFramesOmitted > 0;
+  const incomplete = blocking || mainFrameTruncated || visibleChildFramesTruncated > 0 ||
+    hiddenChildFrameErrors > 0 || hiddenChildFramesTruncated > 0 || hiddenFramesOmitted > 0;
+  const warnings = [];
+  if (mainFrameTruncated) warnings.push('main-document-truncated');
+  if (visibleChildFramesTruncated > 0) warnings.push('child-frame-truncated-bounded');
+  if (hiddenChildFrameErrors > 0 || hiddenChildFramesTruncated > 0 || hiddenFramesOmitted > 0) {
+    warnings.push('decorative-frame-incomplete');
+  }
+  return {
+    total: framesTotal,
+    inspected: framesInspected,
+    errors: finiteCount(snapshot?.frameErrors),
+    visibleChildFrameErrors,
+    hiddenChildFrameErrors,
+    truncatedFrames,
+    mainFrameTruncated,
+    visibleChildFramesTruncated,
+    hiddenChildFramesTruncated,
+    omitted,
+    visibleFramesOmitted,
+    hiddenFramesOmitted,
+    unknownFramesOmitted,
+    incomplete,
+    blocking,
+    warnings
+  };
+}
+
 async function observe(page, semantic, limit) {
   const observation = await page.evaluate((maximum) => {
     const text = (node) => (node?.innerText || node?.textContent || '').replace(/\s+/gu, ' ').trim();
@@ -114,36 +171,53 @@ async function observe(page, semantic, limit) {
       maxTextChars: 30_000
     });
   } catch {
-    semanticSnapshot = { content: '', frameErrors: observation.counts.frames > 0 ? 1 : 0 };
+    semanticSnapshot = {
+      content: '',
+      frameErrors: observation.counts.frames > 0 ? 1 : 0,
+      visibleChildFrameErrors: observation.counts.frames > 0 ? 1 : 0
+    };
   }
   const challengeSignals = new Set([
     ...detectChallengeSignals(observation.challengeText),
     ...detectChallengeSignals(semanticSnapshot.content)
   ]);
-  const framesTotal = Number.isSafeInteger(semanticSnapshot.framesTotal)
-    ? semanticSnapshot.framesTotal
-    : observation.counts.frames + 1;
-  const framesInspected = Number.isSafeInteger(semanticSnapshot.framesInspected)
-    ? semanticSnapshot.framesInspected
-    : Math.max(0, framesTotal - (Number(semanticSnapshot.frameErrors) || 0));
-  const truncatedFrames = Number(semanticSnapshot.truncatedFrames) || 0;
-  const omittedFrames = Number(semanticSnapshot.framesOmitted) || 0;
-  const frameInspectionIncomplete = Boolean(semanticSnapshot.truncated) ||
-    Number(semanticSnapshot.frameErrors) > 0 || framesInspected < framesTotal ||
-    truncatedFrames > 0 || omittedFrames > 0;
-  if (frameInspectionIncomplete) challengeSignals.add('frame-unreadable');
+  let frameInspection = summarizeFrameInspection(semanticSnapshot, observation.counts.frames);
+  if (frameInspection.visibleChildFramesTruncated > 0) {
+    try {
+      const challengeScan = await semantic.snapshot({
+        scope: 'viewport',
+        maxNodes: 500,
+        maxTextChars: 50_000
+      });
+      for (const signalName of detectChallengeSignals(challengeScan.content)) challengeSignals.add(signalName);
+      const secondPass = summarizeFrameInspection(challengeScan, observation.counts.frames);
+      frameInspection = {
+        ...frameInspection,
+        challengeScan: {
+          attempted: true,
+          blocking: secondPass.blocking,
+          incomplete: secondPass.incomplete,
+          warnings: secondPass.warnings
+        },
+        blocking: frameInspection.blocking || secondPass.blocking,
+        incomplete: frameInspection.incomplete || secondPass.incomplete,
+        warnings: [...new Set([...frameInspection.warnings, ...secondPass.warnings])]
+      };
+    } catch {
+      frameInspection = {
+        ...frameInspection,
+        challengeScan: { attempted: true, blocking: true, incomplete: true, warnings: [] },
+        blocking: true,
+        incomplete: true
+      };
+    }
+  }
+  if (frameInspection.blocking) challengeSignals.add('frame-unreadable');
   const { challengeText: _challengeText, ...safeObservation } = observation;
   return {
     ...safeObservation,
     challengeSignals: [...challengeSignals],
-    frameInspection: {
-      total: framesTotal,
-      inspected: framesInspected,
-      errors: Number(semanticSnapshot.frameErrors) || 0,
-      truncatedFrames,
-      omitted: omittedFrames,
-      incomplete: frameInspectionIncomplete
-    }
+    frameInspection
   };
 }
 

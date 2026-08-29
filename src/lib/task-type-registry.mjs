@@ -18,8 +18,6 @@ const INPUT_SCHEMA_TYPES = new Set(['array', 'boolean', 'integer', 'null', 'numb
 const TASK_RISKS = new Set(['read', 'write', 'mixed']);
 const DISCOVERY_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
 const PACK_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-const EXTERNAL_COST_CURRENCY = /^[A-Z]{3}$/;
-const MAX_EXTERNAL_COST_PER_RUN = 1_000_000_000;
 const ASSET_KINDS = new Set(['pack', 'standalone', 'system']);
 const MAX_ASSET_NOTE_LENGTH = 1_000;
 const INPUT_SCHEMA_KEYS = new Set([
@@ -73,7 +71,6 @@ function publicType(record, {
     ...(record.tags?.length ? { tags: [...record.tags] } : {}),
     ...(record.outputs?.length ? { outputs: [...record.outputs] } : {}),
     ...(record.risk ? { risk: record.risk } : {}),
-    ...(record.externalCost ? { externalCost: structuredClone(record.externalCost) } : {}),
     ...(record.pack ? {
       pack: {
         name: record.pack.name,
@@ -139,6 +136,12 @@ function comparePackVersions(left, right) {
 }
 
 function normalizeManagementRecord(record, systemNames = new Set()) {
+  const legacyPaidRuntime = record.legacyPaidRuntime === true || (
+    Object.hasOwn(record, 'externalCost') && record.externalCost !== null && record.externalCost !== undefined
+  );
+  delete record.externalCost;
+  if (legacyPaidRuntime) record.legacyPaidRuntime = true;
+  else delete record.legacyPaidRuntime;
   const system = systemNames.has(record.name) || record.assetKind === 'system';
   record.assetKind = system ? 'system' : record.pack ? 'pack' : 'standalone';
   record.protected = system || record.protected === true;
@@ -147,6 +150,11 @@ function normalizeManagementRecord(record, systemNames = new Set()) {
   record.note = typeof record.note === 'string' ? record.note.slice(0, MAX_ASSET_NOTE_LENGTH) : '';
   record.deprecatedAt = typeof record.deprecatedAt === 'string' ? record.deprecatedAt : null;
   record.replacedBy = typeof record.replacedBy === 'string' ? record.replacedBy : null;
+  if (legacyPaidRuntime) {
+    record.discoverable = false;
+    record.deprecatedAt ||= new Date().toISOString();
+    record.replacedBy = null;
+  }
   if (record.pack) {
     const title = boundedPackText(record.pack.title, 120);
     const description = boundedPackText(record.pack.description, 2_000);
@@ -157,39 +165,6 @@ function normalizeManagementRecord(record, systemNames = new Set()) {
       ...(description ? { description } : {})
     };
   }
-}
-
-function boundedExternalCost(value) {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TaskTypeRegistryError('INVALID_TASK_METADATA', 'meta.externalCost must be an object');
-  }
-  const unknown = Object.keys(value).filter((key) => !['currency', 'maxAmountPerRun'].includes(key));
-  if (unknown.length) {
-    throw new TaskTypeRegistryError(
-      'INVALID_TASK_METADATA',
-      `meta.externalCost has unsupported fields: ${unknown.join(', ')}`
-    );
-  }
-  if (typeof value.currency !== 'string' || !EXTERNAL_COST_CURRENCY.test(value.currency)) {
-    throw new TaskTypeRegistryError(
-      'INVALID_TASK_METADATA',
-      'meta.externalCost.currency must be a three-letter uppercase currency code'
-    );
-  }
-  if (
-    typeof value.maxAmountPerRun !== 'number' || !Number.isFinite(value.maxAmountPerRun) ||
-    value.maxAmountPerRun <= 0 || value.maxAmountPerRun > MAX_EXTERNAL_COST_PER_RUN
-  ) {
-    throw new TaskTypeRegistryError(
-      'INVALID_TASK_METADATA',
-      `meta.externalCost.maxAmountPerRun must be greater than 0 and at most ${MAX_EXTERNAL_COST_PER_RUN}`
-    );
-  }
-  return Object.freeze({
-    currency: value.currency,
-    maxAmountPerRun: value.maxAmountPerRun
-  });
 }
 
 function boundedTokenList(value, field, maximum = 32) {
@@ -321,7 +296,12 @@ function safeMetadata(meta, expectedName) {
   const intents = boundedTokenList(source.intents, 'intents', 16);
   const tags = boundedTokenList(source.tags, 'tags');
   const outputs = boundedTokenList(source.outputs, 'outputs');
-  const externalCost = boundedExternalCost(source.externalCost);
+  if (Object.hasOwn(source, 'externalCost')) {
+    throw new TaskTypeRegistryError(
+      'TASK_EXTERNAL_COST_UNSUPPORTED',
+      'meta.externalCost was removed in Task Master 2.8.0; govern paid provider calls outside Task Master'
+    );
+  }
   if (source.preferredBehavior !== undefined) {
     throw new TaskTypeRegistryError(
       'TASK_BEHAVIOR_PROFILE_OWNED',
@@ -354,7 +334,6 @@ function safeMetadata(meta, expectedName) {
     ...(tags ? { tags } : {}),
     ...(outputs ? { outputs } : {}),
     ...(source.risk ? { risk: source.risk } : {}),
-    ...(externalCost ? { externalCost } : {}),
     ...(source.interactionContract ? { interactionContract: source.interactionContract } : {}),
     supportsResume: source.supportsResume === true
   };
@@ -753,6 +732,13 @@ export class TaskTypeRegistry {
     const snapshotPath = path.join(this.#snapshotRoot, snapshotName);
     const current = currentTypes.find((item) => item.name === name);
     if (current?.sha256 === sha256) {
+      if (current.legacyPaidRuntime === true) {
+        throw new TaskTypeRegistryError(
+          'TASK_EXTERNAL_COST_UNSUPPORTED',
+          `Task type ${name} uses the removed external-cost runtime and must be replaced before installation`,
+          409
+        );
+      }
       if (current.snapshotName !== snapshotName) {
         throw new TaskTypeRegistryError('INVALID_TASK_SNAPSHOT', 'Task snapshot path is invalid', 500);
       }
@@ -1008,6 +994,13 @@ export class TaskTypeRegistry {
     if (!record) {
       throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
     }
+    if (record.legacyPaidRuntime === true) {
+      throw new TaskTypeRegistryError(
+        'TASK_EXTERNAL_COST_UNSUPPORTED',
+        `Task type ${name} uses the removed external-cost runtime and cannot be started`,
+        409
+      );
+    }
     if (record.deprecatedAt) {
       throw new TaskTypeRegistryError(
         'TASK_TYPE_DEPRECATED',
@@ -1071,6 +1064,13 @@ export class TaskTypeRegistry {
     await this.#store.update((data) => {
       const record = data.types.find((item) => item.name === name);
       if (!record) throw new TaskTypeRegistryError('TASK_TYPE_NOT_FOUND', `Task type ${name} was not found`, 404);
+      if (record.legacyPaidRuntime === true) {
+        throw new TaskTypeRegistryError(
+          'TASK_EXTERNAL_COST_UNSUPPORTED',
+          `Task type ${name} uses the removed external-cost runtime and cannot be restored`,
+          409
+        );
+      }
       record.deprecatedAt = null;
       record.replacedBy = null;
       restored = record;

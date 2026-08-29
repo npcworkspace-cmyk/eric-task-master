@@ -79,7 +79,6 @@ function serviceFixture() {
         state: 'queued',
         ownerRole: caller.role,
         ownerClientId: caller.clientId,
-        ...(input.externalCostBudget ? { externalCostBudget: input.externalCostBudget } : {}),
         ...(caller.agentName ? { ownerAgentName: caller.agentName } : {})
       };
       tasks.set(task.id, task);
@@ -283,7 +282,7 @@ test('role matrix keeps Agent tasks scoped while the Owner Console has a global 
   }
 });
 
-test('2.7 Manager routes expose read-only Pack state, paid budget, and focus while keeping human claim Owner-only', async (t) => {
+test('Manager routes expose read-only Pack state and focus while keeping human claim Owner-only', async (t) => {
   const { manager, service, baseUrl } = await fixture(t);
   const issued = await call(baseUrl, '/v1/agents/issue', {
     method: 'POST', token: manager.token, body: { clientId: 'v27.fixture', name: 'V27 fixture' }
@@ -296,21 +295,25 @@ test('2.7 Manager routes expose read-only Pack state, paid budget, and focus whi
   assert.equal(packs.payload.taskPacks[0].name, 'fixture');
   assert.equal(JSON.stringify(packs.payload).includes('modulePath'), false);
 
-  const started = await call(baseUrl, '/v1/tasks', {
+  const removedBudget = await call(baseUrl, '/v1/tasks', {
     method: 'POST', token: agentToken, body: {
       profileId: 'profile_fixture',
       taskType: 'fixture',
       externalCostBudget: { currency: 'USD', maxAmount: 2.5 },
-      idempotencyKey: 'v27:paid:fixture'
+      idempotencyKey: 'removed:budget:fixture'
+    }
+  });
+  assert.equal(removedBudget.status, 400);
+  assert.equal(removedBudget.payload.error.code, 'INVALID_TASK_CREATE');
+
+  const started = await call(baseUrl, '/v1/tasks', {
+    method: 'POST', token: agentToken, body: {
+      profileId: 'profile_fixture',
+      taskType: 'fixture',
+      idempotencyKey: 'task:start:fixture'
     }
   });
   assert.equal(started.status, 202);
-  assert.equal('externalCostBudget' in started.payload.task, false);
-  assert.equal(JSON.stringify(started.payload.task).includes('maxAmount'), false);
-  assert.deepEqual(
-    service.calls.find((entry) => entry[0] === 'create')[1].externalCostBudget,
-    { currency: 'USD', maxAmount: 2.5 }
-  );
 
   const focused = await call(baseUrl, `/v1/tasks/${started.payload.taskId}/focus`, {
     method: 'POST', token: agentToken, body: {}

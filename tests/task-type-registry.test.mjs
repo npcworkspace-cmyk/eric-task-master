@@ -37,7 +37,6 @@ test('a short-lived inspector accepts a valid task module and bounded metadata',
     '  description: "A valid inspector fixture",',
     '  version: "1.2.3",',
     '  readOnly: true,',
-    '  externalCost: { currency: "USD", maxAmountPerRun: 12.5 },',
     '  inputSchema: { type: "object", additionalProperties: false, properties: { url: { type: "string", minLength: 8 } } }',
     '};',
     'export async function run() { return { summary: "ok", evidence: [] }; }',
@@ -49,25 +48,52 @@ test('a short-lived inspector accepts a valid task module and bounded metadata',
   assert.equal(installed.title, 'Readable task');
   assert.equal(installed.version, '1.2.3');
   assert.equal(installed.readOnly, true);
-  assert.deepEqual(installed.externalCost, { currency: 'USD', maxAmountPerRun: 12.5 });
   assert.equal(installed.inputSchema.properties.url.minLength, 8);
   assert.match(installed.sha256, /^[a-f0-9]{64}$/);
 });
 
-test('paid task metadata fails closed on malformed currency, ceiling, or extra fields', async (t) => {
+test('external-cost task metadata is no longer accepted', async (t) => {
   const { allowed, registry } = await fixture(t);
-  for (const [name, externalCost] of [
-    ['lowercase-currency', '{ currency: "usd", maxAmountPerRun: 1 }'],
-    ['zero-ceiling', '{ currency: "USD", maxAmountPerRun: 0 }'],
-    ['extra-field', '{ currency: "USD", maxAmountPerRun: 1, providerToken: "no" }']
-  ]) {
-    const modulePath = await writeModule(allowed, `${name}.mjs`, [
-      `export const meta = { externalCost: ${externalCost} };`,
-      'export async function run() { return { summary: "unused", evidence: [] }; }',
-      ''
-    ].join('\n'));
-    await assert.rejects(registry.install({ name, modulePath }), { code: 'INVALID_TASK_METADATA' });
-  }
+  const modulePath = await writeModule(allowed, 'legacy-paid.mjs', [
+    'export const meta = { externalCost: { currency: "USD", maxAmountPerRun: 1 } };',
+    'export async function run() { return { summary: "unused", evidence: [] }; }',
+    ''
+  ].join('\n'));
+  await assert.rejects(
+    registry.install({ name: 'legacy-paid', modulePath }),
+    { code: 'TASK_EXTERNAL_COST_UNSUPPORTED' }
+  );
+});
+
+test('legacy external-cost registry entries retire without exposing or restoring the removed contract', async (t) => {
+  const { allowed, snapshotRoot, filePath, registry } = await fixture(t);
+  const modulePath = await writeModule(
+    allowed,
+    'legacy-paid-record.mjs',
+    'export async function run() { return { summary: "unused", evidence: [] }; }\n'
+  );
+  await registry.install({ name: 'legacy-paid-record', modulePath });
+  const persisted = JSON.parse(await readFile(filePath, 'utf8'));
+  persisted.types[0].externalCost = { currency: 'USD', maxAmountPerRun: 5 };
+  await writeFile(filePath, `${JSON.stringify(persisted)}\n`, 'utf8');
+
+  const reopened = new TaskTypeRegistry({
+    filePath,
+    snapshotRoot,
+    allowedRoots: [allowed],
+    seedTypes: []
+  });
+  assert.deepEqual(await reopened.listSummaries(), []);
+  const described = await reopened.describe('legacy-paid-record');
+  assert.equal(described.lifecycle, 'deprecated');
+  assert.equal(Object.hasOwn(described, 'externalCost'), false);
+  await assert.rejects(reopened.resolve('legacy-paid-record'), { code: 'TASK_EXTERNAL_COST_UNSUPPORTED' });
+  await assert.rejects(reopened.restore('legacy-paid-record'), { code: 'TASK_EXTERNAL_COST_UNSUPPORTED' });
+
+  const migrated = JSON.parse(await readFile(filePath, 'utf8'));
+  assert.equal(migrated.types[0].legacyPaidRuntime, true);
+  assert.equal(migrated.types[0].discoverable, false);
+  assert.equal(Object.hasOwn(migrated.types[0], 'externalCost'), false);
 });
 
 test('task modules cannot override Profile-owned behavior policy', async (t) => {

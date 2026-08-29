@@ -1,7 +1,9 @@
 const REQUEST_TIMEOUT_MS = 10_000;
 const READ_RETRY_DELAY_MS = 300;
+const TASK_PAGE_SIZE = 50;
+const TASK_BATCH_CONCURRENCY = 4;
 const LANGUAGE_STORAGE_KEY = 'eric-task-master-language';
-const VIEWS = new Set(['tasks', 'profiles', 'assets']);
+const VIEWS = new Set(['tasks', 'profiles', 'assets', 'settings']);
 const ACTIVE_TASK_STATES = new Set([
   'queued', 'acquiring_profile', 'starting_browser', 'running', 'cooling_down',
   'recovering', 'verifying', 'pause_requested', 'cancel_requested', 'cancelling'
@@ -28,7 +30,7 @@ const ACTIVITY_KEYS = Object.freeze({
 const I18N = Object.freeze({
   'zh-CN': Object.freeze({
     'page.title': 'Eric Task Master · 本机任务面板', 'skip.main': '跳到主要内容', 'brand.home': 'Eric Task Master 任务面板首页',
-    'nav.primary': '主要导航', 'nav.tasks': '任务', 'nav.profiles': 'Profiles', 'nav.assets': 'Task Packs',
+    'nav.primary': '主要导航', 'nav.tasks': '任务', 'nav.profiles': 'Profiles', 'nav.assets': 'Task Packs', 'nav.settings': '设置',
     'common.loading': '读取中', 'common.close': '关闭', 'common.delete': '删除', 'common.status': '状态',
     'connection.connecting': '正在连接本机 Manager', 'connection.online': '本机 Manager 在线', 'connection.ownerRequired': '需要建立 Owner 会话',
     'connection.stale': '连接中断 · 自动重试', 'connection.never': '尚未刷新', 'connection.refreshed': '刷新于 {time}',
@@ -43,6 +45,14 @@ const I18N = Object.freeze({
     'tasks.progressUnknown': '正在执行，尚无总量', 'tasks.runTime': '运行时间', 'tasks.cooldownTime': '冷却时间',
     'tasks.totalTime': '总时间', 'tasks.report': '查看 Agent 最终报告', 'tasks.lastFeedback': '最近反馈 {time}',
     'tasks.targetMissing': '指定的任务记录不存在或已删除', 'task.untitled': '未命名任务', 'task.waitingFeedback': '等待反馈',
+    'tasks.bulk': '任务批量管理', 'tasks.bulkActions': '任务批量操作', 'tasks.selectAll': '全选已加载任务',
+    'tasks.selectAria': '选择任务 {title}', 'tasks.noneSelected': '尚未选择任务', 'tasks.selected': '已选择 {count} 个任务',
+    'tasks.bulkPause': '批量暂停', 'tasks.bulkResume': '批量恢复', 'tasks.bulkCancel': '批量取消', 'tasks.bulkDelete': '批量删除记录',
+    'tasks.loadMore': '加载更多任务', 'tasks.loadingMore': '正在加载更多任务…', 'tasks.pageLoaded': '已加载 {count} 个任务',
+    'tasks.pageMore': '已加载 {count} 个任务 · 还有更多', 'tasks.batchRunning': '正在逐项执行 {action}…',
+    'tasks.batchDone': '{success} 项成功 · {failed} 项失败 · {skipped} 项跳过',
+    'tasks.batchSuccess': '已完成', 'tasks.batchSkipped': '当前状态不支持此操作', 'tasks.batchFailed': '失败：{message}',
+    'tasks.actionPause': '暂停', 'tasks.actionResume': '恢复', 'tasks.actionCancel': '取消', 'tasks.actionDelete': '删除记录',
     'state.queued': '排队中', 'state.acquiringProfile': '准备 Profile', 'state.startingBrowser': '启动浏览器', 'state.running': '执行中',
     'state.pauseRequested': '正在暂停', 'state.paused': '已暂停', 'state.waitingUser': '等待处理', 'state.coolingDown': '限流冷却',
     'state.recovering': '恢复中', 'state.verifying': '验收中', 'state.cancelRequested': '正在取消', 'state.cancelling': '正在取消',
@@ -89,6 +99,9 @@ const I18N = Object.freeze({
     'assets.version': '版本', 'assets.taskTypes': '任务类型', 'assets.runs': '运行次数', 'assets.successFailure': '成功 / 失败',
     'assets.lastUsed': '最后使用', 'assets.size': '文件体积', 'assets.fileCount': '{count} 个 · {size}', 'assets.assetNote': '资产备注',
     'assets.noNote': '暂无备注', 'assets.containsTypes': '包含 {count} 个任务类型', 'assets.blocked': '不可删除：{reasons}',
+    'assets.viewTask': '查看关联任务', 'assets.moreBlockers': '另有 {count} 个关联任务',
+    'assets.blocker.active_task': '任务仍在运行', 'assets.blocker.cleanup_pending': '任务清理尚未确认',
+    'assets.blocker.resume_available': '任务仍可从检查点恢复', 'assets.blocker.protected': '系统保护',
     'assets.count': '{visible} / {total} 项资产',
     'notifications.open': '打开通知', 'notifications.close': '关闭通知', 'notifications.title': '通知', 'notifications.loading': '正在读取通知…',
     'notifications.markAll': '全部标为已读', 'notifications.none': '当前没有需要处理的通知。',
@@ -99,13 +112,20 @@ const I18N = Object.freeze({
     'notifications.syncDegraded': '主任务操作已成功，但通知状态暂时同步失败；Manager 会自动重试。',
     'notifications.allRead': '全部通知已标为已读', 'notifications.verification': '需要人工验证', 'notifications.notice': '任务通知',
     'notifications.defaultTitle': '任务需要处理', 'notifications.defaultMessage': '请打开任务窗口完成必要操作。',
-    'settings.title': '通知设置', 'settings.system': '系统通知', 'settings.feishu': '飞书', 'settings.test': '发送测试',
+    'settings.title': '通知设置', 'settings.description': '只管理需要人工验证时的三种通知方式。',
+    'settings.system': '系统通知', 'settings.feishu': '飞书', 'settings.enable': '启用', 'settings.test': '发送测试',
+    'settings.systemDescription': '通过本机系统弹窗提醒人工接手验证。',
+    'settings.telegramDescription': '将人工验证提醒发送到指定 Telegram 会话。',
+    'settings.feishuDescription': '通过飞书或 Lark Webhook 提醒人工接手验证。',
     'settings.telegramToken': 'Bot Token（留空保留原配置）', 'settings.telegramChat': 'Chat ID（留空保留原配置）',
-    'settings.feishuWebhook': 'Webhook（留空保留原配置）', 'settings.secretPlaceholder': '不会回填已保存密钥',
+    'settings.feishuWebhook': 'Webhook（留空保留原配置）', 'settings.feishuSigningSecret': '签名密钥（可选，留空保留原配置）', 'settings.secretPlaceholder': '不会回填已保存密钥',
     'settings.destinationPlaceholder': '不会回填已保存目标', 'settings.maskedNote': '已保存的密钥只显示掩码，面板永远不会回填原文。',
     'settings.save': '保存通知设置', 'settings.configured': '已配置 {target}', 'settings.notConfigured': '尚未配置',
     'settings.systemReady': '本机系统通知', 'settings.saved': '通知设置已保存', 'settings.testSent': '{channel} 测试通知已发送',
-    'settings.clearCredentials': '清除凭据', 'settings.cleared': '{channel} 凭据已清除',
+    'settings.clearCredentials': '清除凭据', 'settings.cleared': '{channel} 凭据已清除', 'settings.openSystem': '打开系统设置',
+    'settings.systemOpened': '已打开系统通知设置', 'settings.status.ready': '已就绪', 'settings.status.needs_setup': '待配置或测试',
+    'settings.status.permission_blocked': '系统通知权限已关闭', 'settings.status.unavailable': '当前系统不可用',
+    'settings.status.test_failed': '最近测试失败', 'settings.signed': '已启用签名', 'settings.lastTestOk': '最近测试通过 {time}', 'settings.lastTestFailed': '最近测试失败 {time}',
     'error.request': '请求失败 ({status})', 'error.timeout': '本机 Manager 10 秒内没有响应', 'error.network': '无法连接本机 Manager',
     'error.read': '读取失败', 'error.operation': '操作失败', 'error.denied': '没有权限执行这项操作：{message}',
     'error.profileName': 'Profile 名称已存在，请换一个名称。', 'error.revision': '状态已变化，已刷新最新状态。请确认后重试。',
@@ -124,13 +144,15 @@ const I18N = Object.freeze({
     'confirm.ephemeralData': '临时任务设置', 'confirm.persistentData': '持久浏览器数据',
     'confirm.cancelTask': '确定取消任务“{title}”？Manager 会先关闭任务窗口并释放 Profile。',
     'confirm.deleteTask': '确定删除任务记录“{title}”？它会从面板消失且无法恢复，已生成的数据文件不会被删除。',
+    'confirm.bulkCancelTasks': '确定取消选中的 {count} 个任务？Manager 会逐项安全关闭任务窗口并释放 Profile。',
+    'confirm.bulkDeleteTasks': '确定删除选中的 {count} 个任务记录？只有已结束且完成清理的记录会被删除。',
     'confirm.assetSuffix': '等 {count} 项', 'confirm.deleteAssets': '确定删除 {names}{suffix}？Manager 会再次校验任务引用；删除后的执行器文件无法恢复。',
     'confirm.logout': '退出这台浏览器的 Owner 会话？后台任务不会停止。',
     'confirm.clearChannel': '确定清除 {channel} 的已保存凭据并关闭该通知通道？'
   }),
   en: Object.freeze({
     'page.title': 'Eric Task Master · Local Task Panel', 'skip.main': 'Skip to main content', 'brand.home': 'Eric Task Master dashboard home',
-    'nav.primary': 'Primary navigation', 'nav.tasks': 'Tasks', 'nav.profiles': 'Profiles', 'nav.assets': 'Task Packs',
+    'nav.primary': 'Primary navigation', 'nav.tasks': 'Tasks', 'nav.profiles': 'Profiles', 'nav.assets': 'Task Packs', 'nav.settings': 'Settings',
     'common.loading': 'Loading', 'common.close': 'Close', 'common.delete': 'Delete', 'common.status': 'Status',
     'connection.connecting': 'Connecting to local Manager', 'connection.online': 'Local Manager online', 'connection.ownerRequired': 'Owner session required',
     'connection.stale': 'Connection lost · retrying', 'connection.never': 'Not refreshed yet', 'connection.refreshed': 'Refreshed {time}',
@@ -145,6 +167,14 @@ const I18N = Object.freeze({
     'tasks.progressUnknown': 'Running without a known total', 'tasks.runTime': 'Run time', 'tasks.cooldownTime': 'Cooldown',
     'tasks.totalTime': 'Total time', 'tasks.report': 'View final Agent report', 'tasks.lastFeedback': 'Last update {time}',
     'tasks.targetMissing': 'The requested task record does not exist or was deleted', 'task.untitled': 'Untitled task', 'task.waitingFeedback': 'Waiting for feedback',
+    'tasks.bulk': 'Task batch management', 'tasks.bulkActions': 'Task batch actions', 'tasks.selectAll': 'Select loaded tasks',
+    'tasks.selectAria': 'Select task {title}', 'tasks.noneSelected': 'No tasks selected', 'tasks.selected': '{count} tasks selected',
+    'tasks.bulkPause': 'Pause selected', 'tasks.bulkResume': 'Resume selected', 'tasks.bulkCancel': 'Cancel selected', 'tasks.bulkDelete': 'Delete records',
+    'tasks.loadMore': 'Load more tasks', 'tasks.loadingMore': 'Loading more tasks…', 'tasks.pageLoaded': '{count} tasks loaded',
+    'tasks.pageMore': '{count} tasks loaded · more available', 'tasks.batchRunning': 'Applying {action} to each task…',
+    'tasks.batchDone': '{success} succeeded · {failed} failed · {skipped} skipped',
+    'tasks.batchSuccess': 'Done', 'tasks.batchSkipped': 'This action is unavailable in the current state', 'tasks.batchFailed': 'Failed: {message}',
+    'tasks.actionPause': 'pause', 'tasks.actionResume': 'resume', 'tasks.actionCancel': 'cancel', 'tasks.actionDelete': 'delete record',
     'state.queued': 'Queued', 'state.acquiringProfile': 'Preparing Profile', 'state.startingBrowser': 'Starting browser', 'state.running': 'Running',
     'state.pauseRequested': 'Pausing', 'state.paused': 'Paused', 'state.waitingUser': 'Action required', 'state.coolingDown': 'Cooling down',
     'state.recovering': 'Recovering', 'state.verifying': 'Verifying', 'state.cancelRequested': 'Cancelling', 'state.cancelling': 'Cancelling',
@@ -191,6 +221,9 @@ const I18N = Object.freeze({
     'assets.version': 'Version', 'assets.taskTypes': 'Task types', 'assets.runs': 'Runs', 'assets.successFailure': 'Success / failure',
     'assets.lastUsed': 'Last used', 'assets.size': 'File size', 'assets.fileCount': '{count} files · {size}', 'assets.assetNote': 'Asset note',
     'assets.noNote': 'No note', 'assets.containsTypes': 'Contains {count} task types', 'assets.blocked': 'Cannot delete: {reasons}',
+    'assets.viewTask': 'View related task', 'assets.moreBlockers': '{count} more related tasks',
+    'assets.blocker.active_task': 'Task is still active', 'assets.blocker.cleanup_pending': 'Task cleanup is not confirmed',
+    'assets.blocker.resume_available': 'Task can still resume from its checkpoint', 'assets.blocker.protected': 'System protected',
     'assets.count': '{visible} / {total} assets',
     'notifications.open': 'Open notifications', 'notifications.close': 'Close notifications', 'notifications.title': 'Notifications', 'notifications.loading': 'Loading notifications…',
     'notifications.markAll': 'Mark all as read', 'notifications.none': 'There are no notifications requiring attention.',
@@ -201,13 +234,20 @@ const I18N = Object.freeze({
     'notifications.syncDegraded': 'The task action succeeded, but notification-state sync is temporarily degraded. Manager will retry automatically.',
     'notifications.allRead': 'All notifications marked as read', 'notifications.verification': 'Manual verification required', 'notifications.notice': 'Task notification',
     'notifications.defaultTitle': 'Task action required', 'notifications.defaultMessage': 'Open the task window and complete the required action.',
-    'settings.title': 'Notification settings', 'settings.system': 'System notifications', 'settings.feishu': 'Feishu', 'settings.test': 'Send test',
+    'settings.title': 'Notification settings', 'settings.description': 'Manage only the three channels used when human verification needs attention.',
+    'settings.system': 'System notifications', 'settings.feishu': 'Feishu', 'settings.enable': 'Enable', 'settings.test': 'Send test',
+    'settings.systemDescription': 'Show a local system alert when human verification needs attention.',
+    'settings.telegramDescription': 'Send human-verification alerts to a Telegram conversation.',
+    'settings.feishuDescription': 'Send human-verification alerts through a Feishu or Lark webhook.',
     'settings.telegramToken': 'Bot Token (leave blank to keep current)', 'settings.telegramChat': 'Chat ID (leave blank to keep current)',
-    'settings.feishuWebhook': 'Webhook (leave blank to keep current)', 'settings.secretPlaceholder': 'Saved secrets are never repopulated',
+    'settings.feishuWebhook': 'Webhook (leave blank to keep current)', 'settings.feishuSigningSecret': 'Signing secret (optional; leave blank to keep current)', 'settings.secretPlaceholder': 'Saved secrets are never repopulated',
     'settings.destinationPlaceholder': 'Saved destinations are never repopulated', 'settings.maskedNote': 'Saved secrets are shown only as masked values and are never repopulated in the panel.',
     'settings.save': 'Save notification settings', 'settings.configured': 'Configured {target}', 'settings.notConfigured': 'Not configured',
     'settings.systemReady': 'Local system notification', 'settings.saved': 'Notification settings saved', 'settings.testSent': '{channel} test notification sent',
-    'settings.clearCredentials': 'Clear credentials', 'settings.cleared': '{channel} credentials cleared',
+    'settings.clearCredentials': 'Clear credentials', 'settings.cleared': '{channel} credentials cleared', 'settings.openSystem': 'Open system settings',
+    'settings.systemOpened': 'System notification settings opened', 'settings.status.ready': 'Ready', 'settings.status.needs_setup': 'Setup or test required',
+    'settings.status.permission_blocked': 'System notification permission is blocked', 'settings.status.unavailable': 'Unavailable on this system',
+    'settings.status.test_failed': 'Latest test failed', 'settings.signed': 'Signing enabled', 'settings.lastTestOk': 'Last test passed {time}', 'settings.lastTestFailed': 'Last test failed {time}',
     'error.request': 'Request failed ({status})', 'error.timeout': 'Local Manager did not respond within 10 seconds', 'error.network': 'Cannot reach local Manager',
     'error.read': 'Unable to load', 'error.operation': 'Operation failed', 'error.denied': 'You do not have permission: {message}',
     'error.profileName': 'That Profile name already exists. Choose another name.', 'error.revision': 'State changed. The latest state was loaded; review it and retry.',
@@ -226,6 +266,8 @@ const I18N = Object.freeze({
     'confirm.ephemeralData': 'temporary task settings', 'confirm.persistentData': 'persistent browser data',
     'confirm.cancelTask': 'Cancel task “{title}”? Manager will close the task window and release the Profile first.',
     'confirm.deleteTask': 'Delete task record “{title}”? It will disappear permanently, but generated data files are preserved.',
+    'confirm.bulkCancelTasks': 'Cancel the {count} selected tasks? Manager will safely close each task window and release its Profile.',
+    'confirm.bulkDeleteTasks': 'Delete the {count} selected task records? Only terminal records with confirmed cleanup will be deleted.',
     'confirm.assetSuffix': ' and {count} total', 'confirm.deleteAssets': 'Delete {names}{suffix}? Manager will recheck task references. Deleted executor files cannot be recovered.',
     'confirm.logout': 'Sign out this browser Owner session? Background tasks will continue.',
     'confirm.clearChannel': 'Clear the saved {channel} credentials and disable this notification channel?'
@@ -247,6 +289,9 @@ function t(key, values = {}) {
 }
 
 const ui = Object.freeze({
+  skipLink: document.querySelector('.skip-link'),
+  topbar: document.querySelector('.app-header'),
+  workspace: document.querySelector('.workspace'),
   navLinks: [...document.querySelectorAll('[data-view]')],
   viewPanels: [...document.querySelectorAll('[data-view-panel]')],
   connectionDot: document.querySelector('#connection-dot'),
@@ -272,6 +317,10 @@ const ui = Object.freeze({
   notificationTelegramToken: document.querySelector('#notification-telegram-token'),
   notificationTelegramChat: document.querySelector('#notification-telegram-chat'),
   notificationFeishuWebhook: document.querySelector('#notification-feishu-webhook'),
+  notificationFeishuSigningSecret: document.querySelector('#notification-feishu-signing-secret'),
+  notificationSystemSettings: document.querySelector('#notification-system-settings'),
+  notificationSettingsSave: document.querySelector('#notification-settings-save'),
+  settingsError: document.querySelector('#settings-error'),
   notificationChannelTests: [...document.querySelectorAll('.channel-test')],
   notificationChannelClears: [...document.querySelectorAll('.channel-clear')],
   refreshAll: document.querySelector('#refresh-all'),
@@ -281,6 +330,15 @@ const ui = Object.freeze({
   staleBanner: document.querySelector('#stale-banner'),
   retryStale: document.querySelector('#retry-stale'),
   taskCountChip: document.querySelector('#task-count-chip'),
+  taskSelectAll: document.querySelector('#task-select-all'),
+  taskSelectionSummary: document.querySelector('#task-selection-summary'),
+  taskBulkPause: document.querySelector('#task-bulk-pause'),
+  taskBulkResume: document.querySelector('#task-bulk-resume'),
+  taskBulkCancel: document.querySelector('#task-bulk-cancel'),
+  taskBulkDelete: document.querySelector('#task-bulk-delete'),
+  taskBatchFeedback: document.querySelector('#task-batch-feedback'),
+  taskLoadMore: document.querySelector('#task-load-more'),
+  taskPageStatus: document.querySelector('#task-page-status'),
   tasks: document.querySelector('#tasks'),
   tasksError: document.querySelector('#tasks-error'),
   profiles: document.querySelector('#profiles'),
@@ -320,7 +378,14 @@ const state = {
   assets: [],
   notifications: [],
   notificationSettings: null,
+  notificationSettingsDirty: false,
   notificationDrawerOpen: false,
+  selectedTaskIds: new Set(),
+  taskBatchResults: [],
+  taskNextCursor: null,
+  taskPageCount: 1,
+  taskLoadingMore: false,
+  targetedTaskId: new URL(location.href).searchParams.get('task') || '',
   selectedAssetIds: new Set(),
   openReportTaskIds: new Set(),
   taskReceivedAt: new Map(),
@@ -338,7 +403,8 @@ const state = {
   toastTimer: null,
   stopped: false,
   initialTaskId: new URL(location.href).searchParams.get('task') || '',
-  initialTaskHandled: false
+  initialTaskHandled: false,
+  taskFocusLoading: false
 };
 
 function applyStaticLanguage() {
@@ -486,10 +552,16 @@ function markAuthorizationRequired() {
   state.assets = [];
   state.notifications = [];
   state.notificationSettings = null;
+  state.selectedTaskIds.clear();
+  state.taskBatchResults = [];
+  state.taskNextCursor = null;
+  state.taskPageCount = 1;
+  state.taskLoadingMore = false;
   state.selectedAssetIds.clear();
   state.taskReceivedAt.clear();
   state.sectionErrors = {};
   state.mutationErrors = {};
+  state.notificationSettingsDirty = false;
   state.pendingMutations.clear();
   state.renderSignatures.clear();
   state.pendingFocusKey = '';
@@ -739,6 +811,7 @@ function renderWhenChanged(key, value, container, renderer, force = false) {
 
 function setView(requested, { updateHistory = true, focus = true } = {}) {
   const view = VIEWS.has(requested) ? requested : 'tasks';
+  if (state.notificationDrawerOpen) setNotificationDrawer(false, { focus: false });
   state.visibleView = view;
   for (const link of ui.navLinks) {
     const active = link.dataset.view === view;
@@ -793,11 +866,63 @@ function commandId() {
   return `dashboard:${crypto.randomUUID()}`;
 }
 
+function taskActionEligible(task, action) {
+  const status = taskState(task);
+  if (action === 'pause') return PAUSABLE_TASK_STATES.has(status);
+  if (action === 'resume') return status === 'paused';
+  if (action === 'cancel') return !TERMINAL_TASK_STATES.has(status) && !['cancel_requested', 'cancelling'].includes(status);
+  if (action === 'delete') return TERMINAL_TASK_STATES.has(status) && task.cleanup?.settled === true;
+  return false;
+}
+
+function selectedTasks() {
+  const selected = state.selectedTaskIds;
+  return state.tasks.filter((task) => selected.has(task.id));
+}
+
+function syncTaskBulkControls() {
+  const selected = selectedTasks();
+  const loadedIds = state.tasks.map((task) => task.id);
+  const selectedLoaded = loadedIds.filter((id) => state.selectedTaskIds.has(id)).length;
+  const pending = state.pendingMutations.has('task:batch');
+  ui.taskSelectAll.checked = loadedIds.length > 0 && selectedLoaded === loadedIds.length;
+  ui.taskSelectAll.indeterminate = selectedLoaded > 0 && selectedLoaded < loadedIds.length;
+  ui.taskSelectAll.disabled = pending || loadedIds.length === 0;
+  ui.taskSelectionSummary.textContent = selected.length
+    ? t('tasks.selected', { count: selected.length })
+    : t('tasks.noneSelected');
+  ui.taskBulkPause.disabled = pending || !selected.some((task) => taskActionEligible(task, 'pause'));
+  ui.taskBulkResume.disabled = pending || !selected.some((task) => taskActionEligible(task, 'resume'));
+  ui.taskBulkCancel.disabled = pending || !selected.some((task) => taskActionEligible(task, 'cancel'));
+  ui.taskBulkDelete.disabled = pending || !selected.some((task) => taskActionEligible(task, 'delete'));
+}
+
+function renderTaskBatchFeedback() {
+  ui.taskBatchFeedback.replaceChildren();
+  const results = state.taskBatchResults;
+  ui.taskBatchFeedback.classList.toggle('hidden', results.length === 0);
+  if (!results.length) return;
+  const list = element('ul');
+  for (const result of results) {
+    const item = element('li', `task-batch-result is-${result.status}`);
+    const message = result.status === 'pending'
+      ? t('tasks.batchRunning', { action: taskBatchActionLabel(result.action) })
+      : result.status === 'success'
+        ? t('tasks.batchSuccess')
+        : result.status === 'skipped'
+          ? t('tasks.batchSkipped')
+          : t('tasks.batchFailed', { message: result.error || t('error.operation') });
+    item.append(element('strong', '', result.title), element('span', '', message));
+    list.append(item);
+  }
+  ui.taskBatchFeedback.append(list);
+}
+
 function taskActionButtons(task) {
   const actions = element('div', 'task-actions');
   const status = taskState(task);
   const key = `task:${task.id}`;
-  const pending = state.pendingMutations.has(key);
+  const pending = state.pendingMutations.has(key) || state.pendingMutations.has('task:batch');
   if (PAUSABLE_TASK_STATES.has(status)) {
     const pause = focusKey(button(t('actions.pause'), 'npc-btn-secondary compact-button', () => void sendTaskAction(task, 'pause')), `${key}:pause`);
     pause.disabled = pending;
@@ -823,6 +948,8 @@ function taskActionButtons(task) {
 }
 
 function renderTasks(force = false) {
+  const validTaskIds = new Set(state.tasks.map((task) => task.id));
+  for (const id of state.selectedTaskIds) if (!validTaskIds.has(id)) state.selectedTaskIds.delete(id);
   const ordered = [...state.tasks].sort((left, right) => {
     const leftTerminal = TERMINAL_TASK_STATES.has(taskState(left));
     const rightTerminal = TERMINAL_TASK_STATES.has(taskState(right));
@@ -835,7 +962,12 @@ function renderTasks(force = false) {
   for (const id of state.openReportTaskIds) {
     if (!reportTaskIds.has(id)) state.openReportTaskIds.delete(id);
   }
-  renderWhenChanged('tasks', { ordered, pending: [...state.pendingMutations].filter((key) => key.startsWith('task:')) }, ui.tasks, () => {
+  renderWhenChanged('tasks', {
+    ordered,
+    selected: [...state.selectedTaskIds].sort(),
+    targetedTaskId: state.targetedTaskId,
+    pending: [...state.pendingMutations].filter((key) => key.startsWith('task:'))
+  }, ui.tasks, () => {
     ui.tasks.replaceChildren();
     if (!ordered.length) {
       ui.tasks.append(element('p', 'empty-state', state.authenticated === false ? t('tasks.authEmpty') : t('tasks.empty')));
@@ -848,12 +980,24 @@ function renderTasks(force = false) {
       const card = focusKey(element('article', `task-card task-${status}`), `task:${task.id}:card`);
       card.tabIndex = -1;
       card.dataset.taskId = task.id;
-      if (state.initialTaskId === task.id && !state.initialTaskHandled) card.classList.add('is-targeted');
+      if (state.targetedTaskId === task.id) card.classList.add('is-targeted');
 
       const heading = element('div', 'task-card-heading');
+      const selector = element('label', 'task-selector');
+      const checkbox = focusKey(element('input'), `task:${task.id}:select`);
+      checkbox.type = 'checkbox';
+      checkbox.checked = state.selectedTaskIds.has(task.id);
+      checkbox.disabled = state.pendingMutations.has('task:batch');
+      checkbox.setAttribute('aria-label', t('tasks.selectAria', { title: taskTitle(task) }));
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) state.selectedTaskIds.add(task.id);
+        else state.selectedTaskIds.delete(task.id);
+        syncTaskBulkControls();
+      });
+      selector.append(checkbox);
       const headingCopy = element('div');
       headingCopy.append(element('h2', '', taskTitle(task)), element('p', 'task-activity', activity.label));
-      heading.append(headingCopy, element('span', `npc-chip task-state-chip task-state-${status}`, taskStateLabel(task)));
+      heading.append(selector, headingCopy, element('span', `npc-chip task-state-chip task-state-${status}`, taskStateLabel(task)));
 
       const progressBlock = element('div', 'task-progress-block');
       const progressCopy = element('div', 'progress-copy');
@@ -914,6 +1058,12 @@ function renderTasks(force = false) {
   }, force);
   const active = state.tasks.filter((task) => !TERMINAL_TASK_STATES.has(taskState(task))).length;
   ui.taskCountChip.textContent = t('tasks.active', { active, total: state.tasks.length });
+  ui.taskLoadMore.hidden = !state.taskNextCursor;
+  ui.taskLoadMore.disabled = state.taskLoadingMore || state.authenticated === false;
+  ui.taskLoadMore.textContent = state.taskLoadingMore ? t('tasks.loadingMore') : t('tasks.loadMore');
+  ui.taskPageStatus.textContent = t(state.taskNextCursor ? 'tasks.pageMore' : 'tasks.pageLoaded', { count: state.tasks.length });
+  syncTaskBulkControls();
+  renderTaskBatchFeedback();
   setInlineError(ui.tasksError, state.mutationErrors.tasks || state.sectionErrors.tasks || '');
 }
 
@@ -1012,6 +1162,18 @@ function filteredAssets() {
   });
 }
 
+function assetBlockingTasks(asset) {
+  return Array.isArray(asset?.blockingTasks)
+    ? asset.blockingTasks.slice(0, 8).filter((item) => typeof item?.taskId === 'string' && item.taskId)
+    : [];
+}
+
+function assetBlockerLabel(blocker) {
+  const key = `assets.blocker.${blocker?.blockerCode || blocker?.code || ''}`;
+  const translated = t(key);
+  return translated === key ? blocker?.reason || blocker?.message || blocker?.state || t('assets.blocked', { reasons: '—' }) : translated;
+}
+
 function syncAssetBulkControls(visible = filteredAssets()) {
   const selected = state.assets.filter((asset) => state.selectedAssetIds.has(asset.id));
   const visibleIds = visible.map((asset) => asset.id);
@@ -1092,8 +1254,31 @@ function renderAssets(force = false) {
       }
       details.append(typeList);
       card.append(heading, purpose, facts, note, details);
-      if (!asset.deletable && asset.deleteBlockers?.length) {
-        card.append(element('p', 'asset-blocker', t('assets.blocked', { reasons: asset.deleteBlockers.join(state.language === 'en' ? '; ' : '；') })));
+      if (!asset.deletable && (asset.deleteBlockers?.length || assetBlockingTasks(asset).length)) {
+        const blockerPanel = element('div', 'asset-blocker');
+        const blockingTasks = assetBlockingTasks(asset);
+        const reasons = Array.isArray(asset.deleteBlockers) && asset.deleteBlockers.length
+          ? asset.deleteBlockers.join(state.language === 'en' ? '; ' : '；')
+          : blockingTasks.map(assetBlockerLabel).join(state.language === 'en' ? '; ' : '；');
+        blockerPanel.append(element('p', '', t('assets.blocked', { reasons })));
+        if (blockingTasks.length) {
+          const list = element('div', 'asset-blocking-tasks');
+          for (const blocker of blockingTasks) {
+            const row = element('div', 'asset-blocking-task');
+            const copy = element('span');
+            copy.append(
+              element('strong', '', blocker.title || blocker.displayName || blocker.taskId),
+              element('small', '', assetBlockerLabel(blocker))
+            );
+            const viewTask = button(t('assets.viewTask'), 'npc-btn-secondary compact-button', () => void focusTaskById(blocker.taskId));
+            row.append(copy, viewTask);
+            list.append(row);
+          }
+          const total = Number(asset.blockingTaskCount) || blockingTasks.length;
+          if (total > blockingTasks.length) list.append(element('p', 'asset-more-blockers', t('assets.moreBlockers', { count: total - blockingTasks.length })));
+          blockerPanel.append(list);
+        }
+        card.append(blockerPanel);
       }
       ui.assets.append(card);
     }
@@ -1200,38 +1385,83 @@ function renderNotifications(force = false) {
 function normalizeNotificationSettings(payload) {
   const value = dataFrom(payload)?.settings || dataFrom(payload) || {};
   const channels = value.channels || value;
-  const normalize = (channel) => ({
-    enabled: channels?.[channel]?.enabled === true,
-    configured: channels?.[channel]?.configured === true,
-    maskedTarget: channels?.[channel]?.maskedTarget || channels?.[channel]?.maskedDestination || ''
-  });
+  const statuses = new Set(['ready', 'needs_setup', 'permission_blocked', 'unavailable', 'test_failed']);
+  const normalize = (channel) => {
+    const source = channels?.[channel] || {};
+    const lastTest = source.lastTest && typeof source.lastTest === 'object' && typeof source.lastTest.testedAt === 'string'
+      ? {
+          ok: source.lastTest.ok === true,
+          testedAt: source.lastTest.testedAt,
+          attempts: Number(source.lastTest.attempts) || 0,
+          ...(typeof source.lastTest.code === 'string' ? { code: source.lastTest.code } : {}),
+          ...(Number.isInteger(source.lastTest.statusCode) ? { statusCode: source.lastTest.statusCode } : {})
+        }
+      : null;
+    return {
+      enabled: source.enabled === true,
+      configured: source.configured === true,
+      status: statuses.has(source.status) ? source.status : source.configured === true ? 'ready' : 'needs_setup',
+      canOpenSettings: source.canOpenSettings === true,
+      signingConfigured: source.signingConfigured === true,
+      lastTest,
+      maskedTarget: source.maskedTarget || source.maskedDestination || ''
+    };
+  };
   return { channels: { system: normalize('system'), telegram: normalize('telegram'), feishu: normalize('feishu') } };
 }
 
 function channelStatus(channel, label) {
   if (!channel) return t('settings.notConfigured');
-  if (!channel.configured) return t('settings.notConfigured');
-  const target = channel.maskedTarget ? `· ${channel.maskedTarget}` : '';
-  return channel === state.notificationSettings?.channels?.system
-    ? t('settings.systemReady')
-    : t('settings.configured', { target: target || label });
+  const statusKey = `settings.status.${channel.status || (channel.configured ? 'ready' : 'needs_setup')}`;
+  const parts = [t(statusKey)];
+  if (channel.maskedTarget) parts.push(channel.maskedTarget);
+  else if (label && channel.configured) parts.push(label);
+  if (channel.signingConfigured) parts.push(t('settings.signed'));
+  if (channel.lastTest?.testedAt) {
+    parts.push(t(channel.lastTest.ok ? 'settings.lastTestOk' : 'settings.lastTestFailed', {
+      time: formatTime(channel.lastTest.testedAt)
+    }));
+  }
+  return parts.join(' · ');
 }
 
 function renderNotificationSettings() {
   const settings = state.notificationSettings;
-  if (!settings) return;
+  const pending = [...state.pendingMutations].some((key) => key.startsWith('settings:'));
+  const controls = [
+    ui.notificationSystemEnabled, ui.notificationTelegramEnabled, ui.notificationFeishuEnabled,
+    ui.notificationTelegramToken, ui.notificationTelegramChat, ui.notificationFeishuWebhook, ui.notificationFeishuSigningSecret,
+    ui.notificationSettingsSave
+  ];
+  for (const control of controls) control.disabled = !settings || pending;
+  setInlineError(ui.settingsError, state.sectionErrors.notificationSettings || state.mutationErrors.settings || '');
+  if (!settings) {
+    ui.notificationSystemStatus.textContent = t('common.loading');
+    ui.notificationTelegramStatus.textContent = t('common.loading');
+    ui.notificationFeishuStatus.textContent = t('common.loading');
+    for (const buttonNode of [...ui.notificationChannelTests, ...ui.notificationChannelClears]) buttonNode.disabled = true;
+    ui.notificationSystemSettings.disabled = true;
+    return;
+  }
   const { system, telegram, feishu } = settings.channels;
-  ui.notificationSystemEnabled.checked = system.enabled;
-  ui.notificationTelegramEnabled.checked = telegram.enabled;
-  ui.notificationFeishuEnabled.checked = feishu.enabled;
+  if (!state.notificationSettingsDirty) {
+    ui.notificationSystemEnabled.checked = system.enabled;
+    ui.notificationTelegramEnabled.checked = telegram.enabled;
+    ui.notificationFeishuEnabled.checked = feishu.enabled;
+  }
   ui.notificationSystemStatus.textContent = channelStatus(system, '');
   ui.notificationTelegramStatus.textContent = channelStatus(telegram, 'Telegram');
   ui.notificationFeishuStatus.textContent = channelStatus(feishu, t('settings.feishu'));
   for (const buttonNode of ui.notificationChannelTests) {
-    buttonNode.disabled = settings.channels[buttonNode.dataset.channel]?.configured !== true;
+    buttonNode.disabled = pending || state.notificationSettingsDirty || settings.channels[buttonNode.dataset.channel]?.configured !== true;
   }
   for (const buttonNode of ui.notificationChannelClears) {
-    buttonNode.disabled = settings.channels[buttonNode.dataset.channel]?.configured !== true;
+    buttonNode.disabled = pending || state.notificationSettingsDirty || settings.channels[buttonNode.dataset.channel]?.configured !== true;
+  }
+  ui.notificationSystemSettings.disabled = pending || system.canOpenSettings !== true;
+  for (const [name, channel] of Object.entries({ system, telegram, feishu })) {
+    const card = document.querySelector(`[data-channel-card="${name}"]`);
+    if (card) card.dataset.channelState = channel.enabled ? 'enabled' : channel.configured ? 'configured' : 'unconfigured';
   }
 }
 
@@ -1242,7 +1472,36 @@ function setNotificationDrawer(open, { focus = true } = {}) {
   ui.notificationDrawer.setAttribute('aria-hidden', String(!open));
   ui.notificationButton.setAttribute('aria-expanded', String(open));
   document.body.classList.toggle('notification-open', Boolean(open));
+  ui.skipLink.inert = Boolean(open);
+  ui.topbar.inert = Boolean(open);
+  ui.authBanner.inert = Boolean(open);
+  ui.staleBanner.inert = Boolean(open);
+  ui.workspace.inert = Boolean(open);
   if (focus) (open ? ui.notificationClose : ui.notificationButton).focus();
+}
+
+function trapNotificationDrawerFocus(event) {
+  if (!state.notificationDrawerOpen || event.key !== 'Tab') return;
+  const focusable = [...ui.notificationDrawer.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+  )].filter((node) => !node.hidden && node.getClientRects().length > 0);
+  if (!focusable.length) {
+    event.preventDefault();
+    ui.notificationDrawer.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (!ui.notificationDrawer.contains(document.activeElement) || !focusable.includes(document.activeElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 async function runNotificationAction(notification, action) {
@@ -1291,14 +1550,20 @@ async function markAllNotificationsRead() {
 
 async function refreshNotifications({ settings = false } = {}) {
   const requests = [request('/v1/notifications')];
-  if (settings || !state.notificationSettings) requests.push(request('/v1/notification-settings'));
+  if ((settings || !state.notificationSettings) && !state.notificationSettingsDirty) {
+    requests.push(request('/v1/notification-settings'));
+  }
   const results = await Promise.allSettled(requests);
   if (results[0].status === 'fulfilled') {
     state.notifications = listFrom(results[0].value, 'notifications');
     state.sectionErrors.notifications = '';
   } else if (results[0].reason?.status !== 401) state.sectionErrors.notifications = results[0].reason?.message || t('error.read');
-  if (results[1]?.status === 'fulfilled') state.notificationSettings = normalizeNotificationSettings(results[1].value);
-  else if (results[1]?.reason?.status !== 401) state.sectionErrors.notifications = results[1]?.reason?.message || t('error.read');
+  if (results[1]?.status === 'fulfilled' && !state.notificationSettingsDirty) {
+    state.notificationSettings = normalizeNotificationSettings(results[1].value);
+    state.sectionErrors.notificationSettings = '';
+  } else if (results[1]?.status === 'rejected' && results[1].reason?.status !== 401) {
+    state.sectionErrors.notificationSettings = results[1].reason?.message || t('error.read');
+  }
   renderNotifications(true);
   renderNotificationSettings();
 }
@@ -1310,40 +1575,58 @@ function pendingChannelSecrets(channel) {
       ...(ui.notificationTelegramChat.value.trim() ? { chatId: ui.notificationTelegramChat.value.trim() } : {})
     };
   }
-  if (channel === 'feishu') return ui.notificationFeishuWebhook.value.trim() ? { webhookUrl: ui.notificationFeishuWebhook.value.trim() } : {};
+  if (channel === 'feishu') return {
+    ...(ui.notificationFeishuWebhook.value.trim() ? { webhookUrl: ui.notificationFeishuWebhook.value.trim() } : {}),
+    ...(ui.notificationFeishuSigningSecret.value.trim() ? { signingSecret: ui.notificationFeishuSigningSecret.value.trim() } : {})
+  };
   return {};
 }
 
 async function saveNotificationSettings(event) {
   event.preventDefault();
+  if (state.pendingMutations.has('settings:save')) return;
   const body = { channels: {
     system: { enabled: ui.notificationSystemEnabled.checked },
     telegram: { enabled: ui.notificationTelegramEnabled.checked, ...pendingChannelSecrets('telegram') },
     feishu: { enabled: ui.notificationFeishuEnabled.checked, ...pendingChannelSecrets('feishu') }
   } };
+  state.pendingMutations.add('settings:save');
+  renderNotificationSettings();
   try {
     const result = await request('/v1/notification-settings', { method: 'PATCH', body });
     state.notificationSettings = normalizeNotificationSettings(result);
+    state.notificationSettingsDirty = false;
+    state.mutationErrors.settings = '';
     ui.notificationTelegramToken.value = '';
     ui.notificationTelegramChat.value = '';
     ui.notificationFeishuWebhook.value = '';
+    ui.notificationFeishuSigningSecret.value = '';
     renderNotificationSettings();
     setToast(t('settings.saved'), 'success');
   } catch (error) {
-    if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
+    if (error.status !== 401) {
+      state.mutationErrors.settings = error.message || t('error.operation');
+      setToast(state.mutationErrors.settings, 'error');
+    }
+  } finally {
+    state.pendingMutations.delete('settings:save');
+    renderNotificationSettings();
   }
 }
 
 async function testNotificationChannel(channel, buttonNode) {
-  if (buttonNode.disabled) return;
-  buttonNode.disabled = true;
+  const pendingKey = `settings:test:${channel}`;
+  if (buttonNode.disabled || state.pendingMutations.has(pendingKey)) return;
+  state.pendingMutations.add(pendingKey);
+  renderNotificationSettings();
   try {
     await request('/v1/notification-settings/test', { method: 'POST', body: { channel } });
     setToast(t('settings.testSent', { channel: channel === 'feishu' ? t('settings.feishu') : channel === 'system' ? t('settings.system') : 'Telegram' }), 'success');
   } catch (error) {
     if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
   } finally {
-    buttonNode.disabled = false;
+    state.pendingMutations.delete(pendingKey);
+    await refreshNotifications({ settings: true });
     renderNotificationSettings();
   }
 }
@@ -1351,22 +1634,48 @@ async function testNotificationChannel(channel, buttonNode) {
 async function clearNotificationChannel(channel, buttonNode) {
   const label = channel === 'feishu' ? t('settings.feishu') : 'Telegram';
   if (!confirm(t('confirm.clearChannel', { channel: label }))) return;
-  buttonNode.disabled = true;
+  const pendingKey = `settings:clear:${channel}`;
+  if (buttonNode.disabled || state.pendingMutations.has(pendingKey)) return;
+  state.pendingMutations.add(pendingKey);
+  renderNotificationSettings();
   const channels = channel === 'telegram'
     ? { telegram: { enabled: false, botToken: null, chatId: null } }
-    : { feishu: { enabled: false, webhookUrl: null } };
+    : { feishu: { enabled: false, webhookUrl: null, signingSecret: null } };
   try {
     const result = await request('/v1/notification-settings', { method: 'PATCH', body: { channels } });
     state.notificationSettings = normalizeNotificationSettings(result);
+    state.notificationSettingsDirty = false;
     ui.notificationTelegramToken.value = '';
     ui.notificationTelegramChat.value = '';
     ui.notificationFeishuWebhook.value = '';
+    ui.notificationFeishuSigningSecret.value = '';
     renderNotificationSettings();
     setToast(t('settings.cleared', { channel: label }), 'success');
   } catch (error) {
     if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
   } finally {
-    buttonNode.disabled = false;
+    state.pendingMutations.delete(pendingKey);
+    renderNotificationSettings();
+  }
+}
+
+async function openSystemNotificationSettings() {
+  const pendingKey = 'settings:open-system';
+  if (ui.notificationSystemSettings.disabled || state.pendingMutations.has(pendingKey)) return;
+  state.pendingMutations.add(pendingKey);
+  renderNotificationSettings();
+  try {
+    const result = await request('/v1/notification-settings/open-system-settings', { method: 'POST' });
+    state.notificationSettings = normalizeNotificationSettings(result);
+    state.mutationErrors.settings = '';
+    setToast(t('settings.systemOpened'), 'success');
+  } catch (error) {
+    if (error.status !== 401) {
+      state.mutationErrors.settings = error.message || t('error.operation');
+      setToast(state.mutationErrors.settings, 'error');
+    }
+  } finally {
+    state.pendingMutations.delete(pendingKey);
     renderNotificationSettings();
   }
 }
@@ -1382,15 +1691,103 @@ function renderAll(force = false) {
   focusInitialTask();
 }
 
+function taskPageFrom(payload) {
+  const data = dataFrom(payload) || {};
+  return {
+    tasks: listFrom(payload, 'tasks'),
+    nextCursor: typeof data.nextCursor === 'string' && data.nextCursor ? data.nextCursor : null
+  };
+}
+
+function taskPagePath(cursor = null) {
+  const query = new URLSearchParams({ limit: String(TASK_PAGE_SIZE) });
+  if (cursor) query.set('cursor', cursor);
+  return `/v1/tasks?${query}`;
+}
+
+async function readTaskPages(pageCount = 1, { incremental = true } = {}) {
+  if (incremental && pageCount > 1 && state.tasks.length) {
+    const firstPage = taskPageFrom(await request(taskPagePath()));
+    const merged = new Map(state.tasks.map((task) => [task.id, task]));
+    for (const task of firstPage.tasks) merged.set(task.id, task);
+    const firstPageIds = new Set(firstPage.tasks.map((task) => task.id));
+    const watchedIds = state.tasks
+      .filter((task) => (
+        !TERMINAL_TASK_STATES.has(taskState(task)) ||
+        state.selectedTaskIds.has(task.id) ||
+        state.targetedTaskId === task.id
+      ))
+      .map((task) => task.id)
+      .filter((id) => !firstPageIds.has(id))
+      .slice(0, 16);
+    const watched = await Promise.allSettled(watchedIds.map((id) => (
+      request(`/v1/tasks/${encodeURIComponent(id)}`)
+    )));
+    for (const [index, result] of watched.entries()) {
+      const id = watchedIds[index];
+      if (result.status === 'fulfilled') {
+        const task = dataFrom(result.value)?.task || result.value?.task || dataFrom(result.value);
+        if (task?.id === id) merged.set(id, task);
+      } else if (result.reason?.status === 404) {
+        merged.delete(id);
+        state.selectedTaskIds.delete(id);
+        if (state.targetedTaskId === id) state.targetedTaskId = '';
+      }
+    }
+    return {
+      tasks: [...merged.values()],
+      nextCursor: state.taskNextCursor,
+      pageCount: state.taskPageCount,
+      incremental: true
+    };
+  }
+  const tasks = [];
+  const seen = new Set();
+  let cursor = null;
+  let pagesRead = 0;
+  while (pagesRead < Math.max(1, pageCount)) {
+    const page = taskPageFrom(await request(taskPagePath(cursor)));
+    for (const task of page.tasks) {
+      if (!task?.id || seen.has(task.id)) continue;
+      seen.add(task.id);
+      tasks.push(task);
+    }
+    pagesRead += 1;
+    cursor = page.nextCursor;
+    if (!cursor) break;
+  }
+  if (state.targetedTaskId && !seen.has(state.targetedTaskId)) {
+    try {
+      const payload = await request(`/v1/tasks/${encodeURIComponent(state.targetedTaskId)}`);
+      const task = dataFrom(payload)?.task || payload?.task || dataFrom(payload);
+      if (task?.id === state.targetedTaskId) tasks.push(task);
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+  }
+  return { tasks, nextCursor: cursor, pageCount: pagesRead };
+}
+
+function mergeTask(task) {
+  if (!task?.id) return;
+  const index = state.tasks.findIndex((item) => item.id === task.id);
+  if (index >= 0) state.tasks[index] = task;
+  else state.tasks.push(task);
+  state.taskReceivedAt.set(task.id, Date.now());
+}
+
 function applyRefreshResult(key, result, receivedAt) {
   if (result.status === 'fulfilled') {
     state.sectionErrors[key] = '';
     if (key === 'profiles') state.profiles = listFrom(result.value, 'profiles');
     if (key === 'assets') state.assets = listFrom(result.value, 'assets');
     if (key === 'notifications') state.notifications = listFrom(result.value, 'notifications');
-    if (key === 'notificationSettings') state.notificationSettings = normalizeNotificationSettings(result.value);
+    if (key === 'notificationSettings' && !state.notificationSettingsDirty) state.notificationSettings = normalizeNotificationSettings(result.value);
     if (key === 'tasks') {
-      state.tasks = listFrom(result.value, 'tasks');
+      const page = taskPageFrom(result.value);
+      state.tasks = page.tasks;
+      state.taskNextCursor = page.nextCursor;
+      state.taskPageCount = Number.isSafeInteger(result.value?.pageCount) ? Math.max(1, result.value.pageCount) : 1;
       state.taskReceivedAt = new Map(state.tasks.map((task) => [task.id, receivedAt]));
     }
     return true;
@@ -1411,10 +1808,12 @@ async function refreshAll({ force = false } = {}) {
   state.refreshPromise = (async () => {
     const results = await Promise.allSettled([
       request('/v1/profiles'),
-      request('/v1/tasks'),
+      readTaskPages(state.taskPageCount, { incremental: !force }),
       request('/v1/task-assets'),
       request('/v1/notifications'),
-      force || !state.notificationSettings ? request('/v1/notification-settings') : Promise.resolve(state.notificationSettings)
+      (force || !state.notificationSettings) && !state.notificationSettingsDirty
+        ? request('/v1/notification-settings')
+        : Promise.resolve(state.notificationSettings)
     ]);
     if (sequence !== state.refreshSequence) return;
     const receivedAt = Date.now();
@@ -1477,20 +1876,77 @@ function scheduleDurationTick() {
   }, document.visibilityState === 'hidden' ? 5_000 : 1_000);
 }
 
-function focusInitialTask() {
-  if (state.initialTaskHandled || !state.initialTaskId || state.authenticated !== true || state.sectionErrors.tasks) return;
-  const card = ui.tasks.querySelector(`.task-card[data-task-id="${CSS.escape(state.initialTaskId)}"]`);
-  state.initialTaskHandled = true;
-  if (card) {
-    setView('tasks', { updateHistory: false, focus: false });
-    card.classList.add('is-targeted');
-    card.focus();
-    card.scrollIntoView({ block: 'center' });
-  } else {
-    setToast(t('tasks.targetMissing'), 'error');
+function focusTaskCard(taskId) {
+  const card = ui.tasks.querySelector(`.task-card[data-task-id="${CSS.escape(taskId)}"]`);
+  if (!card) return false;
+  card.classList.add('is-targeted');
+  card.focus();
+  card.scrollIntoView({ block: 'center' });
+  return true;
+}
+
+async function focusTaskById(taskId, { updateHistory = true, missingToast = true } = {}) {
+  if (!taskId || state.taskFocusLoading) return false;
+  state.taskFocusLoading = true;
+  state.targetedTaskId = taskId;
+  setView('tasks', { updateHistory: false, focus: false });
+  try {
+    if (!state.tasks.some((task) => task.id === taskId)) {
+      const payload = await request(`/v1/tasks/${encodeURIComponent(taskId)}`);
+      mergeTask(dataFrom(payload)?.task || payload?.task || dataFrom(payload));
+    }
+    renderTasks(true);
+    const found = focusTaskCard(taskId);
+    if (!found) throw new HttpError(t('tasks.targetMissing'), 404, 'TASK_NOT_FOUND');
+    if (updateHistory) {
+      const url = new URL(location.href);
+      url.searchParams.delete('view');
+      url.searchParams.set('task', taskId);
+      history.pushState(null, '', `${url.pathname}${url.search}`);
+    }
+    return true;
+  } catch (error) {
+    if (missingToast && error.status !== 401) setToast(t('tasks.targetMissing'), 'error');
+    if (state.targetedTaskId === taskId) state.targetedTaskId = '';
     const url = new URL(location.href);
     url.searchParams.delete('task');
     history.replaceState(null, '', `${url.pathname}${url.search}`);
+    renderTasks(true);
+    return false;
+  } finally {
+    state.taskFocusLoading = false;
+  }
+}
+
+function focusInitialTask() {
+  if (state.initialTaskHandled || !state.initialTaskId || state.authenticated !== true || state.sectionErrors.tasks) return;
+  state.initialTaskHandled = true;
+  void focusTaskById(state.initialTaskId, { updateHistory: false });
+}
+
+async function loadMoreTasks() {
+  if (!state.taskNextCursor || state.taskLoadingMore) return;
+  if (state.refreshPromise) await state.refreshPromise;
+  if (!state.taskNextCursor) return;
+  const cursor = state.taskNextCursor;
+  state.taskLoadingMore = true;
+  renderTasks(true);
+  try {
+    const page = taskPageFrom(await request(taskPagePath(cursor)));
+    for (const task of page.tasks) mergeTask(task);
+    state.taskNextCursor = page.nextCursor;
+    state.taskPageCount += 1;
+    state.sectionErrors.tasks = '';
+  } catch (error) {
+    if (error.code === 'INVALID_TASK_CURSOR' || error.status === 400) {
+      state.taskPageCount = 1;
+      await refreshAll({ force: true });
+    } else if (error.status !== 401) {
+      state.sectionErrors.tasks = error.message || t('error.read');
+    }
+  } finally {
+    state.taskLoadingMore = false;
+    renderTasks(true);
   }
 }
 
@@ -1638,10 +2094,103 @@ async function deleteTaskRecord(task) {
   const index = orderedIds.indexOf(task.id);
   const nextId = orderedIds[index + 1] || orderedIds[index - 1] || '';
   const focusAfter = nextId ? `task:${nextId}:card` : 'tasks-title';
-  await runMutation(`task:${task.id}`, () => request(`/v1/tasks/${encodeURIComponent(task.id)}`, {
+  const deleted = await runMutation(`task:${task.id}`, () => request(`/v1/tasks/${encodeURIComponent(task.id)}`, {
     method: 'DELETE',
     body: { commandId: commandId(), expectedRevision: task.revision }
   }), t('toast.taskDeleted'), { focusAfter });
+  if (deleted) {
+    state.selectedTaskIds.delete(task.id);
+    if (state.targetedTaskId === task.id) {
+      state.targetedTaskId = '';
+      const url = new URL(location.href);
+      url.searchParams.delete('task');
+      history.replaceState(null, '', `${url.pathname}${url.search}`);
+    }
+  }
+}
+
+function taskBatchActionLabel(action) {
+  return t(({
+    pause: 'tasks.actionPause', resume: 'tasks.actionResume', cancel: 'tasks.actionCancel', delete: 'tasks.actionDelete'
+  })[action]);
+}
+
+async function executeTaskBatchItem(task, action) {
+  if (!Number.isSafeInteger(task.revision) || task.revision < 1) {
+    throw new HttpError(t('toast.taskNotReady'), 409, 'TASK_REVISION_CONFLICT');
+  }
+  if (action === 'delete') {
+    return request(`/v1/tasks/${encodeURIComponent(task.id)}`, {
+      method: 'DELETE',
+      body: { commandId: commandId(), expectedRevision: task.revision }
+    });
+  }
+  return request(`/v1/tasks/${encodeURIComponent(task.id)}/actions`, {
+    method: 'POST',
+    body: { action, commandId: commandId(), expectedRevision: task.revision }
+  });
+}
+
+async function runTaskBatch(action) {
+  if (state.pendingMutations.has('task:batch')) return;
+  const tasks = selectedTasks();
+  if (!tasks.length) return;
+  if (action === 'cancel' && !confirm(t('confirm.bulkCancelTasks', { count: tasks.length }))) return;
+  if (action === 'delete' && !confirm(t('confirm.bulkDeleteTasks', { count: tasks.length }))) return;
+
+  state.pendingMutations.add('task:batch');
+  state.taskBatchResults = tasks.map((task) => ({
+    taskId: task.id,
+    title: taskTitle(task),
+    action,
+    status: taskActionEligible(task, action) ? 'pending' : 'skipped',
+    error: ''
+  }));
+  renderTasks(true);
+
+  let cursor = 0;
+  const runNext = async () => {
+    while (cursor < tasks.length) {
+      const index = cursor;
+      cursor += 1;
+      const task = tasks[index];
+      const result = state.taskBatchResults[index];
+      if (result.status === 'skipped') continue;
+      try {
+        await executeTaskBatchItem(task, action);
+        result.status = 'success';
+        if (action === 'delete') {
+          state.selectedTaskIds.delete(task.id);
+          if (state.targetedTaskId === task.id) {
+            state.targetedTaskId = '';
+            const url = new URL(location.href);
+            url.searchParams.delete('task');
+            history.replaceState(null, '', `${url.pathname}${url.search}`);
+          }
+        }
+      } catch (error) {
+        result.status = 'failed';
+        result.error = error.message || t('error.operation');
+      }
+      renderTaskBatchFeedback();
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(TASK_BATCH_CONCURRENCY, tasks.length) }, () => runNext()));
+  state.pendingMutations.delete('task:batch');
+  const counts = state.taskBatchResults.reduce((summary, result) => {
+    summary[result.status] = (summary[result.status] || 0) + 1;
+    return summary;
+  }, {});
+  const message = t('tasks.batchDone', {
+    success: counts.success || 0,
+    failed: counts.failed || 0,
+    skipped: counts.skipped || 0
+  });
+  setToast(message, counts.failed || counts.skipped ? 'warning' : 'success');
+  state.mutationErrors.tasks = '';
+  await refreshAll({ force: true });
+  restoreFocus(`task-bulk-${action}`);
 }
 
 async function runAssetAction(action) {
@@ -1694,6 +2243,21 @@ ui.notificationClose.addEventListener('click', () => setNotificationDrawer(false
 ui.notificationBackdrop.addEventListener('click', () => setNotificationDrawer(false));
 ui.notificationMarkAll.addEventListener('click', () => void markAllNotificationsRead());
 ui.notificationSettingsForm.addEventListener('submit', saveNotificationSettings);
+for (const input of [
+  ui.notificationSystemEnabled,
+  ui.notificationTelegramEnabled,
+  ui.notificationFeishuEnabled,
+  ui.notificationTelegramToken,
+  ui.notificationTelegramChat,
+  ui.notificationFeishuWebhook,
+  ui.notificationFeishuSigningSecret
+]) {
+  input.addEventListener(input.type === 'checkbox' ? 'change' : 'input', () => {
+    state.notificationSettingsDirty = true;
+    renderNotificationSettings();
+  });
+}
+ui.notificationSystemSettings.addEventListener('click', () => void openSystemNotificationSettings());
 for (const testButton of ui.notificationChannelTests) {
   testButton.addEventListener('click', () => void testNotificationChannel(testButton.dataset.channel, testButton));
 }
@@ -1708,6 +2272,18 @@ ui.toggleProfileCreate.addEventListener('click', () => profileCreateVisible(true
 ui.closeProfileCreate.addEventListener('click', () => profileCreateVisible(false));
 ui.profileKind.addEventListener('change', syncCreatePolicy);
 ui.createProfileForm.addEventListener('submit', createProfile);
+ui.taskSelectAll.addEventListener('change', () => {
+  for (const task of state.tasks) {
+    if (ui.taskSelectAll.checked) state.selectedTaskIds.add(task.id);
+    else state.selectedTaskIds.delete(task.id);
+  }
+  renderTasks(true);
+});
+ui.taskBulkPause.addEventListener('click', () => void runTaskBatch('pause'));
+ui.taskBulkResume.addEventListener('click', () => void runTaskBatch('resume'));
+ui.taskBulkCancel.addEventListener('click', () => void runTaskBatch('cancel'));
+ui.taskBulkDelete.addEventListener('click', () => void runTaskBatch('delete'));
+ui.taskLoadMore.addEventListener('click', () => void loadMoreTasks());
 ui.assetSearch.addEventListener('input', () => renderAssets(true));
 ui.assetFilter.addEventListener('change', () => renderAssets(true));
 ui.assetSelectAll.addEventListener('change', () => {
@@ -1726,11 +2302,16 @@ document.addEventListener('visibilitychange', () => {
   scheduleDurationTick();
 });
 document.addEventListener('keydown', (event) => {
+  trapNotificationDrawerFocus(event);
   if (event.key === 'Escape' && state.notificationDrawerOpen) setNotificationDrawer(false);
 });
 window.addEventListener('popstate', () => {
   const url = new URL(location.href);
   setView(url.searchParams.get('view') || 'tasks', { updateHistory: false, focus: false });
+  const taskId = url.searchParams.get('task') || '';
+  state.targetedTaskId = taskId;
+  if (taskId) void focusTaskById(taskId, { updateHistory: false });
+  else renderTasks(true);
 });
 window.addEventListener('pagehide', () => {
   state.stopped = true;

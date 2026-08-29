@@ -8,15 +8,18 @@ async function text(path) {
   return readFile(new URL(path, root), 'utf8');
 }
 
-test('task panel exposes Tasks, Profiles, and bounded Task Pack assets with accessible controls', async () => {
+test('task panel exposes Tasks, Profiles, Task Packs, and minimal notification settings with accessible controls', async () => {
   const [html, css] = await Promise.all([
     text('dashboard/index.html'),
     text('dashboard/styles.css')
   ]);
 
   for (const id of [
-    'view-tasks', 'view-profiles', 'view-assets', 'tasks', 'profiles', 'assets',
-    'tasks-error', 'profiles-error', 'assets-error', 'asset-search', 'asset-filter', 'asset-select-all'
+    'view-tasks', 'view-profiles', 'view-assets', 'view-settings', 'tasks', 'profiles', 'assets',
+    'tasks-error', 'profiles-error', 'assets-error', 'settings-error',
+    'task-select-all', 'task-bulk-pause', 'task-bulk-resume', 'task-bulk-cancel', 'task-bulk-delete',
+    'task-load-more', 'asset-search', 'asset-filter', 'asset-select-all', 'notification-settings-form',
+    'notification-system-settings', 'notification-feishu-signing-secret'
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
@@ -27,13 +30,20 @@ test('task panel exposes Tasks, Profiles, and bounded Task Pack assets with acce
     assert.doesNotMatch(html, new RegExp(`id="${removed}"`));
   }
   const views = [...html.matchAll(/data-view="([^"]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(views, ['tasks', 'profiles', 'assets']);
+  assert.deepEqual(views, ['tasks', 'profiles', 'assets', 'settings']);
   assert.match(html, /id="view-tasks" class="view is-active"/);
   assert.match(html, /href="#main-content"/);
   assert.match(html, /<nav[^>]+aria-label="主要导航"/);
   assert.match(html, /role="alert"/);
+  assert.match(html, /id="notification-drawer"[^>]+role="dialog"[^>]+aria-modal="true"/);
   assert.match(html, /aria-live="polite"/);
   assert.match(html, /href="\/dashboard\/styles\.css"/);
+  assert.ok(
+    html.indexOf('id="notification-settings-form"') > html.indexOf('id="view-settings"'),
+    'notification settings belong to the Settings view, not the bell drawer'
+  );
+  const drawer = html.slice(html.indexOf('id="notification-drawer"'), html.indexOf('id="auth-banner"'));
+  assert.doesNotMatch(drawer, /notification-settings-form|notification-system-enabled|notification-telegram-token/);
   assert.doesNotMatch(html, /(?:manager token|dashboard token|配对码|授权码|端口|localhost|127\.0\.0\.1)/i);
 
   const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
@@ -47,7 +57,7 @@ test('task panel exposes Tasks, Profiles, and bounded Task Pack assets with acce
   assert.match(css, /--npc-signal:/);
 });
 
-test('task panel keeps bounded same-origin reads, concurrency guards, task timing, and safe batch assets', async () => {
+test('task panel keeps bounded same-origin reads, paged and batch task controls, timing, and safe batch assets', async () => {
   const [html, source] = await Promise.all([
     text('dashboard/index.html'),
     text('dashboard/dashboard.js')
@@ -60,6 +70,8 @@ test('task panel keeps bounded same-origin reads, concurrency guards, task timin
   }
 
   assert.match(source, /const REQUEST_TIMEOUT_MS = 10_000/);
+  assert.match(source, /const TASK_PAGE_SIZE = 50/);
+  assert.match(source, /const TASK_BATCH_CONCURRENCY = 4/);
   assert.match(source, /new AbortController\(\)/);
   assert.match(source, /credentials:\s*'same-origin'/);
   assert.match(source, /request\('\/v1\/dashboard\/session'/);
@@ -89,6 +101,21 @@ test('task panel keeps bounded same-origin reads, concurrency guards, task timin
   assert.match(source, /状态已变化，已刷新最新状态/);
   assert.match(source, /error\.status === 403/);
   assert.match(source, /state\.pendingMutations\.has\(key\)/);
+  assert.match(source, /readTaskPages\(state\.taskPageCount, \{ incremental: !force \}\)/);
+  assert.match(source, /if \(incremental && pageCount > 1/);
+  assert.match(source, /state\.taskNextCursor/);
+  assert.match(source, /loadMoreTasks/);
+  assert.match(source, /focusTaskById/);
+  assert.match(source, /blockingTasks/);
+  assert.match(source, /runTaskBatch/);
+  assert.match(source, /Math\.min\(TASK_BATCH_CONCURRENCY, tasks\.length\)/);
+  assert.match(source, /notificationSettingsDirty/);
+  assert.match(source, /key\.startsWith\('settings:'\)/);
+  assert.match(source, /canOpenSettings/);
+  assert.match(source, /signingConfigured/);
+  assert.match(source, /lastTest/);
+  assert.match(source, /trapNotificationDrawerFocus/);
+  assert.match(source, /\.inert = Boolean\(open\)/);
   assert.match(source, /focusIntentSequence === state\.focusIntentSequence/);
   assert.match(source, /displayName \|\| task\?\.name \|\| task\?\.taskLabel/);
   assert.match(source, /timing\.runDurationMs/);
