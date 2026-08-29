@@ -58,7 +58,11 @@ class FakeClock {
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-notifications-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const centers = [];
+  t.after(async () => {
+    for (const item of [...centers].reverse()) await item.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
   const clock = options.clock || new FakeClock(Date.parse('2026-08-29T00:00:00.000Z'));
   const filePath = path.join(root, 'notifications.json');
   const systemCalls = [];
@@ -73,8 +77,12 @@ async function fixture(t, options = {}) {
     ...options.center
   });
   await center.init();
-  t.after(() => center.close());
-  return { center, clock, filePath, root, systemCalls };
+  centers.push(center);
+  const trackCenter = (item) => {
+    centers.push(item);
+    return item;
+  };
+  return { center, clock, filePath, root, systemCalls, trackCenter };
 }
 
 function verificationTask(overrides = {}) {
@@ -118,7 +126,7 @@ test('human-verification alerts persist, deliver immediately, and resume at the 
 
   await setup.center.close();
   const restartedCalls = [];
-  const restarted = new NotificationCenter({
+  const restarted = setup.trackCenter(new NotificationCenter({
     filePath: setup.filePath,
     now: setup.clock.now,
     setTimer: setup.clock.setTimer,
@@ -126,9 +134,8 @@ test('human-verification alerts persist, deliver immediately, and resume at the 
     systemNotifier: async (payload) => restartedCalls.push(payload),
     fetchImpl: async () => ({ ok: true, status: 200 }),
     sleep: async () => {}
-  });
+  }));
   await restarted.init();
-  t.after(() => restarted.close());
   assert.equal(setup.clock.timerCount, 0, 'reopened records stay disarmed until the Manager revalidates them');
   await restarted.observeTask(verificationTask());
   await setup.clock.advance(1);
