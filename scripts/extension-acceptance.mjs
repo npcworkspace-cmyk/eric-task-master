@@ -495,27 +495,32 @@ export async function runExtensionAcceptance({
 
     await clearTrace(page);
     const extensionCountBeforeParticipantCollision = Number(await page.locator('#extension-count').textContent());
-    await dispatchExtensionCommand(page, {
-      label: 'participant-a',
-      participantId: 'acceptance-extension-a',
-      requestId: 'shared-request-id',
-      kind: 'held',
-      durationMs: 10_000,
-      holdMs: 0
+    await coordinator.run('participant-grant-collision-holder', async () => {
+      await dispatchExtensionCommand(page, {
+        label: 'participant-a',
+        participantId: 'acceptance-extension-a',
+        requestId: 'shared-request-id',
+        kind: 'held',
+        durationMs: 10_000,
+        holdMs: 0
+      });
+      await dispatchExtensionCommand(page, {
+        label: 'participant-b',
+        participantId: 'acceptance-extension-b',
+        requestId: 'shared-request-id',
+        kind: 'click',
+        holdMs: 0
+      });
+      await waitForCoordinatorAudit(
+        coordinator,
+        (audit) => audit.active === 1 && audit.pending === 2,
+        'both participants must wait behind the Task lease before either grant is broadcast'
+      );
     });
     await waitForTrace(page, 'participant-a:start');
-    await dispatchExtensionCommand(page, {
-      label: 'participant-b',
-      participantId: 'acceptance-extension-b',
-      requestId: 'shared-request-id',
-      kind: 'click',
-      holdMs: 0
-    });
-    await waitForCoordinatorAudit(
-      coordinator,
-      (audit) => audit.active === 1 && audit.pending === 1,
-      'the second participant must be queued behind the first participant lease'
-    );
+    assert.equal(coordinator.audit().active, 1);
+    assert.equal(coordinator.audit().pending, 1);
+    assert.equal(labels(await readTrace(page)).includes('participant-b:start'), false);
     await dispatchExtensionCommand(page, {
       label: 'participant-a-release',
       participantId: 'acceptance-extension-a',
