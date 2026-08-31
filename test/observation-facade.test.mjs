@@ -522,7 +522,7 @@ test('real Playwright observation objects fail closed across public, predicate, 
     }
     if (request.url === '/worker.js') {
       response.setHeader('content-type', 'text/javascript');
-      response.end("console.log('worker-observation'); setInterval(() => {}, 1000);");
+      response.end("self.addEventListener('message', () => console.log('worker-observation')); setInterval(() => {}, 1000);");
       return;
     }
     response.setHeader('content-type', 'text/html');
@@ -621,14 +621,19 @@ test('real Playwright observation objects fail closed across public, predicate, 
   await responsePromise;
   assert.equal(responsePredicateObserved, true);
 
-  let workerMessage;
-  observed.page.on('console', (candidate) => {
-    if (candidate.text() === 'worker-observation') workerMessage = candidate;
+  const rawWorkerPromise = page.waitForEvent('worker');
+  await page.evaluate(() => {
+    globalThis.observationWorker = new Worker('/worker.js');
   });
-  await page.evaluate(() => { new Worker('/worker.js'); });
-  await page.waitForTimeout(50);
-  assert.ok(workerMessage?.worker());
-  assert.notEqual(workerMessage.worker(), page.workers()[0]);
+  const rawWorker = await rawWorkerPromise;
+  const workerMessagePromise = observed.page.waitForEvent('console', {
+    predicate: (candidate) => candidate.text() === 'worker-observation' && Boolean(candidate.worker()),
+    timeout: 5_000
+  });
+  await page.evaluate(() => globalThis.observationWorker.postMessage('observe'));
+  const workerMessage = await workerMessagePromise;
+  assert.ok(workerMessage.worker());
+  assert.notEqual(workerMessage.worker(), rawWorker);
   await assert.rejects(workerMessage.worker().evaluate(() => {}), blocked);
 
   await page.setContent(`<!doctype html><style>
