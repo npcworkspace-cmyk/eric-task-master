@@ -1,31 +1,22 @@
-# Eric Task Master — Always-on Task Automation System
+# Eric Task Master
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-**The always-on task automation system for AI agents and human operators.**
+**An always-on task automation system for AI agents.**
 
 Version: **2.8.2**
 
-AI agents can reason, plan, and write code, but a decision is not yet an operation. Production work must survive the end of a chat turn, keep account environments isolated, coordinate concurrent Agents, report progress, recover from interruption, request human help at the right moment, and leave verifiable results.
+AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
-Eric Task Master is the control and execution system for that work. It turns an Agent instruction or an external trigger into a durable, queued, observable, recoverable task that keeps running after the Agent disconnects. Playwright is its first execution engine, but the product is the task system around it: Profiles, workers, queues, progress, checkpoints, human handoff, recovery, evidence, cleanup, and reusable Task Packs.
+Eric Task Master fills that gap. It is an always-on task automation system built on Playwright that turns web work into durable, isolated, observable jobs. An Agent can start a task, leave it running for hours, reconnect later, inspect evidence, recover from a checkpoint, and verify that the browser closed—without occupying the user's everyday browser or repeatedly spending tokens rediscovering the same execution mechanics.
 
-`AI agent automation` · `always-on automation` · `unattended automation` · `task orchestration` · `workflow automation` · `browser automation` · `Playwright` · `MCP server` · `long-running tasks` · `multi-agent automation` · `RPA`
+MoneyHand is the Agent's lightweight browser hand for immediate interaction; Task Master keeps durable, unattended work running after the Agent leaves.
 
-## Two products, two distinct jobs
+`AI agent` · `browser automation` · `Playwright` · `MCP server` · `web automation` · `computer use` · `workflow automation` · `browser agent` · `headless browser` · `multi-agent automation`
 
-MoneyHand and Eric Task Master are complementary, not competing versions of the same product.
+## What can an Agent build with it?
 
-| Product | Positioning | Best used when | Core promise |
-| --- | --- | --- | --- |
-| [MoneyHand](https://github.com/npcworkspace-cmyk/npc-moneyhand) | the Agent's browser hand | an Agent needs immediate, high-frequency interaction with a Chromium browser in the current session | connect quickly, act directly, stay lightweight |
-| **Eric Task Master** | an always-on task automation system | work must run for minutes or hours, queue safely, survive Agent disconnects, coordinate Profiles or Agents, recover, and deliver evidence | start once, keep running, remain controllable, finish with proof |
-
-The simple choice: **use MoneyHand when the Agent needs to act now; use Task Master when the task needs to keep running.**
-
-## What can stay running on Task Master?
-
-Task Master is a general task system, not a site-specific bot. Combined with an Agent, a specialized Skill, or a Task Pack, it can support:
+Task Master is a general execution base, not a site-specific bot. Combined with an Agent, a specialized Skill, or a Task Pack, it can support:
 
 - unattended research, monitoring, and source-backed web collection;
 - long-running batch work across hundreds of pages without keeping an Agent turn open;
@@ -36,26 +27,25 @@ Task Master is a general task system, not a site-specific bot. Combined with an 
 - browser QA, content verification, form processing, file upload/download, and evidence capture;
 - production Task Packs for lead operations, ecommerce operations, media research, supplier research, customer support, compliance checks, or internal RPA.
 
-Those are composable possibilities, not bundled permissions or claims that every website is supported. Task Master supplies the always-on control plane and managed execution runtime; a specialized Skill or Task Pack supplies business logic, site policy, parsing, outputs, and task-specific completion evidence.
+Those are composable possibilities, not bundled permissions or claims that every website is supported. Task Master supplies the reliable browser runtime; a specialized Skill or Task Pack supplies the business logic, site policy, parsing, checkpoints, outputs, and completion evidence.
 
 ## Why not just use an Agent browser or a CDP script?
 
 | Approach | Good at | What is usually missing |
 | --- | --- | --- |
 | Built-in Agent browser | quick interactive browsing | durable jobs, reusable login Profiles, long-task recovery, scoped trusted-local Agent operation, explicit cleanup proof |
-| MoneyHand | immediate, direct, high-frequency browser interaction | intentionally focuses on live control rather than durable task operations |
 | One-off CDP controller | fast raw browser control | a stable lifecycle, queues, progress, checkpoints, evidence, resumability, reusable task contracts |
-| Eric Task Master | always-on, production-shaped task automation | site-specific knowledge, intentionally supplied by Skills and Task Packs |
+| Eric Task Master | production-shaped browser work | site-specific knowledge, intentionally supplied by Skills and Task Packs |
 
-Task Master does not replace Agent reasoning and is not another browser hand. It gives tasks a durable place to live, run, recover, and finish.
+Task Master does not replace Agent reasoning. It keeps long-running work alive, manageable, and recoverable after an Agent turn ends.
 
 ## The three-layer model
 
-1. **Task control plane** — Manager and Owner Console keep queues, lifecycle, progress, pause/resume/cancel, human handoff, recovery, audit, and task-asset governance available from one fixed local address.
-2. **Managed execution plane** — isolated Playwright Profiles and Workers run browser work independently, while Human Journey, checkpoints, evidence, and cleanup keep execution observable and recoverable.
-3. **Capability plane** — MCP connects trusted local Agents; Skills explain when and how to use capabilities; versioned Task Packs turn repeatable business work into reusable automation assets without coupling it to the core.
+1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, cleanup, and a central Human Journey engine for visible browser interaction.
+2. **Owner Console** — one fixed local web address keeps human control simple: paginated task progress and batch controls, shared Profile management, a Task Pack asset catalog with direct blocker-to-task navigation, dedicated notification settings, Chinese/English switching, and a compact human-verification inbox. Users sign in directly inside isolated persistent Playwright Profiles.
+3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
-This separation keeps the system universal: operate one reliable task system, then define many specialized automation workers above it.
+This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
 
 ## For AI Agents: one fixed bootstrap protocol
 
