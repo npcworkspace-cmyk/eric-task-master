@@ -162,3 +162,46 @@ test('handoff rejects a second call while the first is still preparing', async (
   releaseCapture(null);
   await assert.rejects(first, { code: 'TASK_CANCELLED' });
 });
+
+test('handoff drain joins a callback that outlives its stopped admission', async () => {
+  let captureStarted = false;
+  let releaseCapture;
+  const captureGate = new Promise((resolve) => { releaseCapture = resolve; });
+  const handoff = createUserHandoff({
+    capture: async () => {
+      captureStarted = true;
+      await captureGate;
+      return 'late.png';
+    }
+  });
+  const waiting = handoff.request({ reason: 'Inspect the page', timeoutMs: 5_000 });
+  while (!captureStarted) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(handoff.seal(), true);
+  await assert.rejects(waiting, { code: 'TASK_USER_HANDOFF_AFTER_COMPLETION' });
+  let drained = false;
+  const drain = handoff.drain().then(() => { drained = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, false);
+
+  releaseCapture();
+  await drain;
+  assert.equal(drained, true);
+});
+
+test('handoff drain fails within a bound when a stopped callback never settles', async () => {
+  let captureStarted = false;
+  const handoff = createUserHandoff({
+    capture: async () => {
+      captureStarted = true;
+      return new Promise(() => {});
+    }
+  });
+  const waiting = handoff.request({ reason: 'Inspect the page', timeoutMs: 5_000 });
+  while (!captureStarted) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(handoff.seal(), true);
+  await assert.rejects(waiting, { code: 'TASK_USER_HANDOFF_AFTER_COMPLETION' });
+  await assert.rejects(handoff.drain({ timeoutMs: 20 }), {
+    code: 'TASK_USER_HANDOFF_DRAIN_UNSETTLED'
+  });
+});

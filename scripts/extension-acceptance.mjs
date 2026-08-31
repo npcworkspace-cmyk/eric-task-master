@@ -58,6 +58,8 @@ function extensionContentSource() {
     const running = new Set();
     const completed = new Set();
     const manualFinishes = new Map();
+    const readyStartedAt = Date.now();
+    let readyAttempts = 0;
 
     function root() {
       return document.documentElement;
@@ -79,12 +81,18 @@ function extensionContentSource() {
       element.setAttribute(traceAttribute, JSON.stringify(entries.slice(-100)));
     }
 
+    function scheduleReadyRetry() {
+      if (Date.now() - readyStartedAt >= 20_000 || readyAttempts >= 100) return;
+      setTimeout(markReady, 200);
+    }
+
     function markReady() {
       const element = root();
       if (!element) {
-        setTimeout(markReady, 0);
+        scheduleReadyRetry();
         return;
       }
+      readyAttempts += 1;
       element.dataset.taskmasterAcceptanceExtension = 'active';
       chrome.runtime.sendMessage({ kind: 'acceptance-ready' }).then((response) => {
         if (response?.ok === true) {
@@ -92,8 +100,10 @@ function extensionContentSource() {
           element.dataset.taskmasterAcceptanceCapabilities = Array.isArray(response.capabilities)
             ? response.capabilities.join(',')
             : 'missing';
+          return;
         }
-      }).catch(() => {});
+        scheduleReadyRetry();
+      }).catch(scheduleReadyRetry);
     }
 
     document.addEventListener(protocol.grantEvent, (event) => {
@@ -1178,7 +1188,9 @@ export async function runExtensionAcceptance({
         extensionsEnabled: true
       },
       heartbeatMs: 1_000,
-      timeoutMs: 5_000
+      // This acceptance must reach the post-effect proof before timing out.
+      // Fresh persistent Profile startup is materially slower on Windows CI.
+      timeoutMs: 20_000
     }, {
       loadPlaywright: async () => ({
         chromium: {

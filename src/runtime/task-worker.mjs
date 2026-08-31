@@ -731,7 +731,8 @@ export function freezePlaywrightClientPrototypes({ context, page }) {
 
 export async function runTaskWorker(config, {
   loadPlaywright = () => import('playwright'),
-  signal
+  signal,
+  handoffDrainTimeoutMs = 20_000
 } = {}) {
   if (
     config.interactionContract !== undefined &&
@@ -781,6 +782,7 @@ export async function runTaskWorker(config, {
   let sealRuntimeControlBoundary = () => {};
   let drainRuntimeControlBoundary = async () => {};
   let sealHandoffBoundary = () => false;
+  let drainHandoffBoundary = async () => {};
   let sealCooldownBoundary = () => false;
   let frozenResumeRecord = null;
   let resumeCheckpointConsumed = false;
@@ -1559,6 +1561,14 @@ export async function runTaskWorker(config, {
     });
     activeHandoff = handoff;
     sealHandoffBoundary = () => handoff.seal();
+    let handoffDrainPromise = null;
+    drainHandoffBoundary = () => {
+      if (!handoffDrainPromise) {
+        handoffDrainPromise = handoff.drain({ timeoutMs: handoffDrainTimeoutMs });
+        handoffDrainPromise.catch(() => {});
+      }
+      return handoffDrainPromise;
+    };
     cooldown = createCooldownHelper({
       signal: executionSignal,
       onSignal: (kind) => action.signal(kind),
@@ -1701,6 +1711,7 @@ export async function runTaskWorker(config, {
     // work begins. The browser stays open only long enough for the bounded
     // screenshot, then finally closes it unconditionally.
     if (!executionSignal.aborted) executionController.abort(error);
+    await drainHandoffBoundary().catch(() => {});
     const cancelled = error instanceof TaskCancelledError || error?.code === 'TASK_CANCELLED';
     if (!cancelled && !lastScreenshot) {
       const diagnostics = await captureFailure(
@@ -1722,6 +1733,7 @@ export async function runTaskWorker(config, {
     sealRuntimeControlBoundary();
     sealCheckpointBoundary();
     sealEffectResolutionBoundary();
+    await drainHandoffBoundary().catch(() => {});
     await drainProgressBoundary().catch(() => {});
     await drainRuntimeControlBoundary().catch(() => {});
     await drainCheckpointBoundary().catch(() => {});

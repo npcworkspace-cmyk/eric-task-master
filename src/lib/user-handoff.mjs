@@ -44,6 +44,7 @@ export function createUserHandoff({
   let preparing = null;
   let pending = null;
   let continuing = null;
+  const inFlightSteps = new Set();
 
   const cancellationError = () => (
     signal?.reason instanceof Error
@@ -91,10 +92,50 @@ export function createUserHandoff({
       assertLive(admission);
       return callback();
     });
+    inFlightSteps.add(operation);
+    operation.then(
+      () => inFlightSteps.delete(operation),
+      () => inFlightSteps.delete(operation)
+    );
     operation.catch(() => {});
     const result = await Promise.race([operation, admission.stopPromise]);
     assertLive(admission);
     return result;
+  }
+
+  async function drain({ timeoutMs = 20_000 } = {}) {
+    // Stopping an admission rejects its public request promptly, but an
+    // already-started diagnostic/publication callback cannot be cancelled by a
+    // Promise race. Join those callbacks before the Worker tears down its
+    // output tree or returns terminal state.
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 60_000) {
+      throw new TypeError('handoff drain timeoutMs must be an integer from 10 to 60000');
+    }
+    const settled = (async () => {
+      for (;;) {
+        const operations = [...inFlightSteps];
+        if (!operations.length) return;
+        await Promise.allSettled(operations);
+      }
+    })();
+    settled.catch(() => {});
+    let timer;
+    try {
+      await Promise.race([
+        settled,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = handoffError(
+              'TASK_USER_HANDOFF_DRAIN_UNSETTLED',
+              'User handoff callbacks did not settle before task cleanup'
+            );
+            reject(error);
+          }, timeoutMs);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function failPending(error) {
@@ -294,6 +335,7 @@ export function createUserHandoff({
     continue: continueRequest,
     cancel,
     seal,
+    drain,
     get active() {
       return Boolean(preparing || pending || continuing);
     },

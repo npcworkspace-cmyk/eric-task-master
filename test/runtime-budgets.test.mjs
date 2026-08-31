@@ -1601,16 +1601,17 @@ test('Task WeakMap prototype tampering cannot capture a raw Locator and action c
 test('a delayed standalone Page mutation cannot run after task return', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-late-standalone-page-');
   const modulePath = path.join(root, 'task.mjs');
+  const marker = `__taskmasterLateStandalonePage_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  globalThis[marker] = null;
+  t.after(() => { delete globalThis[marker]; });
   await writeFile(modulePath, [
-    "import { writeFile } from 'node:fs/promises';",
-    "import path from 'node:path';",
-    'export async function run({ page, outputDir }) {',
+    'export async function run({ page }) {',
     '  setTimeout(async () => {',
     '    try {',
     "      await page.goto('https://late.example/');",
-    "      await writeFile(path.join(outputDir, 'late-page.txt'), 'applied');",
+    `      globalThis[${JSON.stringify(marker)}] = 'applied';`,
     '    } catch (error) {',
-    "      await writeFile(path.join(outputDir, 'late-page.txt'), error.code || 'rejected');",
+    `      globalThis[${JSON.stringify(marker)}] = error.code || 'rejected';`,
     '    }',
     '  }, 0);',
     "  return { summary: 'complete', evidence: [{ kind: 'message', value: 'no raw mutation' }] };",
@@ -1623,10 +1624,10 @@ test('a delayed standalone Page mutation cannot run after task return', async (t
   const outcome = await runTaskWorker(workerConfig(root, modulePath), {
     loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
   });
-  await eventually(async () => access(path.join(root, 'output', 'late-page.txt')).then(() => true, () => false));
+  await eventually(() => globalThis[marker] !== null);
   assert.equal(outcome.state, 'completed');
   assert.equal(rawGotoCalls, 0);
-  assert.equal(await readFile(path.join(root, 'output', 'late-page.txt'), 'utf8'), 'TASK_UI_ACTION_REQUIRES_ACTION');
+  assert.equal(globalThis[marker], 'TASK_UI_ACTION_REQUIRES_ACTION');
 });
 
 test('task completion rejects a fire-and-forget user handoff', async (t) => {
@@ -1642,6 +1643,35 @@ test('task completion rejects a fire-and-forget user handoff', async (t) => {
   const browser = fakeBrowser();
   const outcome = await runTaskWorker(workerConfig(root, modulePath), {
     loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_USER_HANDOFF_NOT_AWAITED');
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('a handoff queued behind a stuck action cannot deadlock terminal cleanup', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-stuck-action-handoff-');
+  const modulePath = path.join(root, 'task.mjs');
+  const marker = `__taskmasterStuckAction_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  globalThis[marker] = false;
+  t.after(() => { delete globalThis[marker]; });
+  await writeFile(modulePath, [
+    'export async function run({ action, handoff }) {',
+    "  void action.goto('https://stuck.example/').catch(() => {});",
+    `  while (!globalThis[${JSON.stringify(marker)}]) await new Promise((resolve) => setImmediate(resolve));`,
+    "  void handoff.request({ kind: 'human_verification', reason: 'Verify this page' }).catch(() => {});",
+    "  return { summary: 'must not complete', evidence: [{ kind: 'message', value: 'pending work' }] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  browser.page.goto = async () => {
+    globalThis[marker] = true;
+    return new Promise(() => {});
+  };
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } }),
+    handoffDrainTimeoutMs: 25
   });
   assert.equal(outcome.state, 'failed');
   assert.equal(outcome.error.code, 'TASK_USER_HANDOFF_NOT_AWAITED');
