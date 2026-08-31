@@ -17,6 +17,8 @@ import { createObservationFacade } from '../lib/observation-facade.mjs';
 import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
 import { createTaskFailureFacade, sanitizePublicTaskFailure } from '../lib/public-task-failure.mjs';
 import { isBehaviorMode } from '../contracts.mjs';
+import { createActionArbiter } from '../lib/action-arbiter.mjs';
+import { createExtensionActionCoordinator } from '../lib/extension-action-coordinator.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 20_000;
 const DEFAULT_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
@@ -85,6 +87,7 @@ export function createCooperativePauseGate({
   let activeActions = 0;
   let pauseCommandId = null;
   let transition = Promise.resolve();
+  let acceptingControls = true;
   const waiters = new Set();
   const idleWaiters = new Set();
 
@@ -94,6 +97,7 @@ export function createCooperativePauseGate({
 
   function wakeWaiters(error = null) {
     for (const waiter of waiters) {
+      if (waiter.abortListener) signal?.removeEventListener('abort', waiter.abortListener);
       if (error) waiter.reject(error);
       else waiter.resolve();
     }
@@ -104,12 +108,13 @@ export function createCooperativePauseGate({
     if (!pauseRequested) return Promise.resolve();
     if (signal?.aborted) return Promise.reject(abortError());
     return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject };
-      waiters.add(waiter);
-      signal?.addEventListener('abort', () => {
+      const abortListener = () => {
         waiters.delete(waiter);
         reject(abortError());
-      }, { once: true });
+      };
+      const waiter = { resolve, reject, abortListener };
+      waiters.add(waiter);
+      signal?.addEventListener('abort', abortListener, { once: true });
     });
   }
 
@@ -135,6 +140,11 @@ export function createCooperativePauseGate({
 
   async function requestPause(commandId = null) {
     if (signal?.aborted) throw abortError();
+    if (!acceptingControls) {
+      const error = new Error('Pause was requested after the task entered completion');
+      error.code = 'TASK_CONTROL_AFTER_COMPLETION';
+      throw error;
+    }
     if (pauseRequested) return { state: paused ? 'paused' : 'pause_requested', commandId: pauseCommandId };
     pauseRequested = true;
     paused = false;
@@ -161,6 +171,10 @@ export function createCooperativePauseGate({
       await onState('running', { commandId });
       return { state: 'running', commandId };
     });
+  }
+
+  function seal() {
+    acceptingControls = false;
   }
 
   async function run(callback) {
@@ -190,6 +204,7 @@ export function createCooperativePauseGate({
   return Object.freeze({
     requestPause,
     requestResume,
+    seal,
     run,
     waitIfPaused: waitUntilResumed,
     beforeCompletion: waitUntilResumed,
@@ -361,6 +376,7 @@ let activeHandoff = null;
 let activePauseControl = null;
 let pendingPauseControls = [];
 let activeActionHelper = null;
+let activeExtensionCoordinator = null;
 let pendingBehavior = null;
 let activeDiagnosticsPath = null;
 let activeDiagnostics = null;
@@ -574,6 +590,7 @@ export async function runTaskWorker(config, {
   let browserClosed = false;
   let outputBudget = null;
   let effectJournal = null;
+  let sealPendingProofBoundaries = async () => {};
   let frozenResumeRecord = null;
   let resumeCheckpointConsumed = false;
   let lastCheckpointReceipt = null;
@@ -714,9 +731,12 @@ export async function runTaskWorker(config, {
         }
       }
     });
+    const actionArbiter = createActionArbiter({ signal: executionSignal });
     activePauseControl = Object.freeze({
       requestPause: (commandId) => pauseGate.requestPause(commandId).catch((error) => {
-        if (!executionSignal.aborted) executionController.abort(error);
+        if (!executionSignal.aborted && error?.code !== 'TASK_CONTROL_AFTER_COMPLETION') {
+          executionController.abort(error);
+        }
         throw error;
       }),
       requestResume: (commandId) => pauseGate.requestResume(commandId).catch((error) => {
@@ -837,16 +857,34 @@ export async function runTaskWorker(config, {
     let semantic;
     let cooldown;
     const fullHumanJourney = config.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT;
+    const extensionCoordinator = await createExtensionActionCoordinator({
+      context,
+      page,
+      signal: executionSignal,
+      enabled: config.profile.extensionsEnabled === true
+    });
+    activeExtensionCoordinator = extensionCoordinator;
+    let terminalEffectGeneration = 0;
+    let effectRecordTail = Promise.resolve();
+    const recordEffectEvent = (event) => {
+      const recordPromise = effectRecordTail.then(() => effectJournal.record(event));
+      // Keep one observed tail so timeout recovery can wait for every durable
+      // append that was already scheduled without creating unhandled rejections.
+      effectRecordTail = recordPromise.catch(() => {});
+      return recordPromise;
+    };
     const rawAction = createActionHelper({
       page,
       mode: pendingBehavior ?? config.behavior,
       abortSignal: executionSignal,
       strictVisibleTraversal: fullHumanJourney,
       onEffect: async (event) => {
-        const sequence = await effectJournal.record(event);
+        const sequence = await recordEffectEvent(event);
+        if (event.state === 'succeeded') terminalEffectGeneration += 1;
         safeSend({ type: 'activity', activity: browserEffectActivity(event) });
         return sequence;
       },
+      onBeforeEffectSuccess: () => extensionCoordinator.beforeEffectSuccess(),
       onBehaviorState: (state) => safeSend({
         type: 'behavior',
         behavior: {
@@ -874,7 +912,56 @@ export async function runTaskWorker(config, {
         at: new Date().toISOString()
       }
     });
-    const guardedAction = (method) => (...args) => pauseGate.run(() => {
+    const persistUnknownProofBoundary = async () => {
+      try {
+        await recordEffectEvent({ state: 'started', operation: 'custom' });
+      } catch (error) {
+        // A pending effect already provides the required no-replay barrier.
+        if (error?.code !== 'TASK_EFFECT_OUTCOME_UNKNOWN') throw error;
+      }
+    };
+    const activeProofScopes = new Map();
+    let proofScopeSequence = 0;
+    const sealProofScope = async (scope) => {
+      await effectRecordTail;
+      if (scope.sealed || terminalEffectGeneration <= scope.generationAtStart) return;
+      if (!scope.sealPromise) {
+        scope.sealPromise = persistUnknownProofBoundary().then(() => {
+          scope.sealed = true;
+        });
+      }
+      await scope.sealPromise;
+    };
+    sealPendingProofBoundaries = async () => {
+      const scopes = [...activeProofScopes.values()];
+      await effectRecordTail;
+      for (const scope of scopes) await sealProofScope(scope);
+    };
+    const runExclusiveAction = (operation, callback) => actionArbiter.run(operation, async () => {
+      const scope = {
+        id: ++proofScopeSequence,
+        generationAtStart: terminalEffectGeneration,
+        sealed: false,
+        sealPromise: null
+      };
+      activeProofScopes.set(scope.id, scope);
+      try {
+        const result = await pauseGate.run(() => extensionCoordinator.run(operation, callback));
+        // A timed-out task can abort while a successful effect record is still
+        // being flushed. Never let the late success erase the unknown boundary.
+        if (executionSignal.aborted) await sealProofScope(scope);
+        activeProofScopes.delete(scope.id);
+        return result;
+      } catch (error) {
+        // The primitive can be durably succeeded before Journey verification,
+        // settling, or the outer extension slot finishes. If that outer proof
+        // fails, persist a new unknown boundary so resume cannot replay blindly.
+        await sealProofScope(scope);
+        activeProofScopes.delete(scope.id);
+        throw error;
+      }
+    });
+    const guardedAction = (method) => (...args) => runExclusiveAction(method, () => {
       if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
         const error = new Error('Consume the frozen checkpoint before issuing browser actions');
         error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
@@ -908,8 +995,13 @@ export async function runTaskWorker(config, {
     if (fullHumanJourney) {
       journey = createJourneyHelper({
         page,
-        action,
+        action: rawAction,
         contract: FULL_HUMAN_INTERACTION_CONTRACT,
+        runStep: runExclusiveAction,
+        coordinationAudit: () => ({
+          ...actionArbiter.audit(),
+          extension: extensionCoordinator.audit()
+        }),
         onState: ({ phase, operation, at }) => safeSend({
           type: 'activity',
           activity: {
@@ -931,6 +1023,15 @@ export async function runTaskWorker(config, {
       taskContext = observation.context;
       taskAction = restrictedPackAction(action);
       semantic = createSemanticObserver({ page, action: journey, locatorTransform: observation.locator });
+    } else if (extensionCoordinator.enabled) {
+      const observation = createObservationFacade({
+        page,
+        context,
+        requiredFacade: 'action'
+      });
+      taskPage = observation.page;
+      taskContext = observation.context;
+      semantic = createSemanticObserver({ page, action, locatorTransform: observation.locator });
     } else {
       semantic = createSemanticObserver({ page, action });
     }
@@ -1000,7 +1101,19 @@ export async function runTaskWorker(config, {
     taskPromise.catch(() => {});
 
     const rawResult = await Promise.race([taskPromise, timeoutPromise, cancellationPromise, budgetPromise]);
+    // Completion is a two-phase barrier. Seal all control/action ingress paths
+    // synchronously before awaiting an admitted pause or action.
+    pauseGate.seal();
+    actionArbiter.seal();
+    extensionCoordinator.seal();
     await pauseGate.beforeCompletion();
+    // Seal both action ingress paths first,
+    // then give an already-started unknown browser effect precedence over a
+    // queue-drain timeout. Re-check after draining because an admitted queued
+    // action may only create its effect record once it starts.
+    await effectJournal.assertSettled();
+    await actionArbiter.beforeCompletion();
+    await extensionCoordinator.beforeCompletion();
     if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
       const error = new Error('Resumed task did not consume its frozen checkpoint');
       error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
@@ -1038,6 +1151,11 @@ export async function runTaskWorker(config, {
     safeSend({ type: 'state', state: 'completed' });
     return { state: 'completed', result };
   } catch (error) {
+    try {
+      await sealPendingProofBoundaries();
+    } catch (proofBoundaryError) {
+      error = proofBoundaryError;
+    }
     // Stop cooperative task code and reject every new action before diagnostic
     // work begins. The browser stays open only long enough for the bounded
     // screenshot, then finally closes it unconditionally.
@@ -1065,7 +1183,10 @@ export async function runTaskWorker(config, {
     // Freeze the durable effect boundary before aborting module work. An action
     // that resumes only because cleanup fired must not overwrite a pending
     // unknown outcome with a misleading terminal record.
+    await sealPendingProofBoundaries().catch(() => {});
     await effectJournal?.close?.().catch(() => {});
+    await activeExtensionCoordinator?.close?.().catch(() => {});
+    activeExtensionCoordinator = null;
     if (!executionSignal.aborted) executionController.abort(new TaskCancelledError());
     browserClosed = await closeTaskBrowserSession(context, browser);
     let cleanupReceiptWritten = false;

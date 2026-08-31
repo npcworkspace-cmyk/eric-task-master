@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.8.1 - 2026-08-31
+
+- Added an Owner-controlled **Allow extensions** switch to every persistent Profile. The saved policy is shared by manual Profile windows and Agent tasks, while ephemeral Profiles remain extension-free.
+- Kept extension policy changes non-disruptive: a busy or manually opened Profile is never restarted, and the new setting takes effect only after that browser closes and launches again.
+- Made extension-enabled Profiles visible-only. Enabling extensions atomically disables background mode, and the Profile store rejects ambiguous extension-plus-headless combinations instead of silently launching with the wrong behavior.
+- Migrated existing visible persistent Profiles to allow their already-installed extensions, preserved explicit headless Profiles with extensions disabled, and kept extension inventory, installation, synchronization, credentials, and payloads outside Task Master.
+- Serialized every Task Master page action through one Worker FIFO; each Journey step now keeps its slot through transition verification and settling, including concurrent callers.
+- Added the opt-in `taskmaster-cooperative-v2` extension lease for strong shared serialization of trusted click, input, DOM, and navigation actions. Participant-scoped request IDs are idempotent, grants preserve both identities, navigation releases stale document leases, expired leases fail closed, completion seals all control/action ingress, nested actions fail fast, and failed post-effect proof creates a durable unknown-effect barrier. Arbitrary third-party extensions remain outside any universal serialization or authentication guarantee and must be operated only while the task is paused.
+- Required the Owner to pause a task before manually operating an extension, and restricted extension-enabled legacy tasks to page mutation through the `action` facade.
+- Added bilingual Owner Console guidance plus storage, authorization, task-worker, manual-window, migration, Dashboard, and real Chromium acceptance coverage proving that a temporary MV3 extension and Playwright control can operate together.
+
 ## 2.8.0 - 2026-08-29
 
 - Added bounded cursor pagination and revision-checked batch pause, resume, cancel, and safe task-record deletion to the Owner Console. Task Pack deletion blockers now identify the exact retained task to Owner clients and can load, select, and highlight that task without exposing cross-owner task IDs through Agent MCP inventory.

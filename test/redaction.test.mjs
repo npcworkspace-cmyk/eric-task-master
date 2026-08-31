@@ -82,6 +82,7 @@ test('Manager Profile view is an allowlist that ignores future private runtime f
     defaultBehavior: 'fast',
     headless: true,
     browserEngine: 'chromium',
+    extensionsEnabled: false,
     userDataDir: 'C:/private/profile',
     lease: { ownerId: 'secret' },
     launchOptions: { proxy: { username: 'eric', password: MARKER } },
@@ -93,7 +94,8 @@ test('Manager Profile view is an allowlist that ignores future private runtime f
     state: 'idle',
     defaultBehavior: 'fast',
     headless: true,
-    browserEngine: 'chromium'
+    browserEngine: 'chromium',
+    extensionsEnabled: false
   });
   assert.equal(JSON.stringify(safe).includes(MARKER), false);
 });
@@ -107,6 +109,7 @@ test('Manager and MCP Profile views share the same nullable public contract', ()
     defaultBehavior: 'auto',
     headless: false,
     browserEngine: 'chromium',
+    extensionsEnabled: true,
     access: 'private',
     ownerClientId: 'agent-owner',
     createdAt: '2026-08-24T00:00:00.000Z',

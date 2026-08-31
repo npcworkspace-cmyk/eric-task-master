@@ -518,6 +518,7 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   assert.equal(createResult.response.status, 201);
   assert.equal(createResult.body.profile.userDataDir, undefined);
   assert.equal(createResult.body.profile.lease, undefined);
+  assert.equal(createResult.body.profile.extensionsEnabled, false);
   const profileId = createResult.body.profile.id;
 
   const patchResult = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
@@ -536,6 +537,48 @@ test('profile CRUD, behavior policy, open and close are exposed without leaking 
   assert.equal(persistentResult.response.status, 201);
   assert.equal(persistentResult.body.profile.browserEngine, 'chrome');
   assert.equal(persistentResult.body.profile.defaultBehavior, 'human');
+  assert.equal(persistentResult.body.profile.extensionsEnabled, true);
+  const extensionsDisabled = await json(await fetch(
+    `${baseUrl}/v1/profiles/${persistentResult.body.profile.id}`,
+    {
+      method: 'PATCH',
+      headers: headers(manager.token),
+      body: JSON.stringify({ extensionsEnabled: false })
+    }
+  ));
+  assert.equal(extensionsDisabled.response.status, 200);
+  assert.equal(extensionsDisabled.body.profile.extensionsEnabled, false);
+
+  const agentToken = await issueAgent(baseUrl, manager.token, 'profile-extension-agent');
+  const agentDenied = await json(await fetch(
+    `${baseUrl}/v1/profiles/${persistentResult.body.profile.id}`,
+    {
+      method: 'PATCH',
+      headers: headers(agentToken),
+      body: JSON.stringify({ extensionsEnabled: true })
+    }
+  ));
+  assert.equal(agentDenied.response.status, 403);
+  assert.equal(agentDenied.body.error.code, 'PROFILE_EXTENSIONS_OWNER_REQUIRED');
+
+  const extensionsEnabled = await json(await fetch(
+    `${baseUrl}/v1/profiles/${persistentResult.body.profile.id}`,
+    {
+      method: 'PATCH',
+      headers: headers(manager.token),
+      body: JSON.stringify({ extensionsEnabled: true, headless: false })
+    }
+  ));
+  assert.equal(extensionsEnabled.response.status, 200);
+  assert.equal(extensionsEnabled.body.profile.extensionsEnabled, true);
+
+  const ephemeralExtensionsRejected = await json(await fetch(`${baseUrl}/v1/profiles/${profileId}`, {
+    method: 'PATCH',
+    headers: headers(manager.token),
+    body: JSON.stringify({ extensionsEnabled: true })
+  }));
+  assert.equal(ephemeralExtensionsRejected.response.status, 409);
+  assert.equal(ephemeralExtensionsRejected.body.error.code, 'EPHEMERAL_PROFILE_EXTENSIONS_UNSUPPORTED');
   const liveBehavior = await json(await fetch(
     `${baseUrl}/v1/profiles/${persistentResult.body.profile.id}`,
     {

@@ -472,3 +472,23 @@ test('an action exception stays pending because the website outcome is unknown',
   assert.equal(externalApplied, true);
   assert.deepEqual(events.map((event) => event.state), ['started']);
 });
+
+test('a detected extension conflict prevents a false succeeded effect record', async () => {
+  const { page } = fixture();
+  const events = [];
+  const conflict = Object.assign(new Error('extension overlapped click'), {
+    code: 'BROWSER_ACTION_CONFLICT'
+  });
+  const action = createActionHelper({
+    page,
+    sleep: async () => {},
+    onEffect: async (event) => {
+      events.push(event);
+      return 1;
+    },
+    onBeforeEffectSuccess: async () => { throw conflict; }
+  });
+
+  await assert.rejects(action.click('#submit'), { code: 'BROWSER_ACTION_CONFLICT' });
+  assert.deepEqual(events.map((event) => event.state), ['started']);
+});

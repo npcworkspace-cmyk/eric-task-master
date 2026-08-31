@@ -104,7 +104,7 @@
             <label class="check-field"><input id="profile-headless" type="checkbox"><span data-i18n="profiles.background">任务在后台运行</span></label>
             <button class="npc-btn npc-btn-primary" type="submit" data-i18n="profiles.create">创建 Profile</button>
           </form>
-          <p class="form-note" data-i18n="profiles.formNote">持久 Profile 固定使用本机 Chrome 与深度拟人行为；临时 Profile 会在任务结束后销毁浏览器状态。</p>
+          <p class="form-note" data-i18n="profiles.formNote">持久 Profile 默认允许已安装扩展在可见浏览器中运行；临时 Profile 不加载扩展，并在任务结束后销毁浏览器状态。</p>
         </section>
 
         <div id="profiles" class="profile-grid" aria-live="polite"><p class="empty-state span-all" data-i18n="profiles.loading">正在读取 Profiles…</p></div>

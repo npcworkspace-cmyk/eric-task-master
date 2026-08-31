@@ -69,7 +69,9 @@ export function createJourneyHelper({
   contract = FULL_HUMAN_INTERACTION_CONTRACT,
   random = Math.random,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-  onState = () => {}
+  onState = () => {},
+  runStep = async (_operation, callback) => callback(),
+  coordinationAudit = () => null
 } = {}) {
   if (!page || !action) throw new TypeError('page and action are required');
   if (contract !== FULL_HUMAN_INTERACTION_CONTRACT) {
@@ -98,18 +100,20 @@ export function createJourneyHelper({
   }
 
   async function step(operation, callback) {
-    active += 1;
-    report('started', operation);
-    try {
-      const result = await callback();
-      report('succeeded', operation);
-      return result;
-    } catch (error) {
-      report('failed', operation);
-      throw error;
-    } finally {
-      active -= 1;
-    }
+    return runStep(operation, async () => {
+      active += 1;
+      report('started', operation);
+      try {
+        const result = await callback();
+        report('succeeded', operation);
+        return result;
+      } catch (error) {
+        report('failed', operation);
+        throw error;
+      } finally {
+        active -= 1;
+      }
+    });
   }
 
   async function settle({ words, maximumWords = DEFAULT_READING_WORDS[1] } = {}) {
@@ -132,7 +136,7 @@ export function createJourneyHelper({
       after = await pageFingerprint(page);
     }
     if (typeof verify === 'function') {
-      const verified = await verify({ before, after, page });
+      const verified = await verify({ before, after });
       if (verified !== true) {
         throw new JourneyContractError('JOURNEY_TRANSITION_UNVERIFIED', 'Page transition verification returned false');
       }
@@ -271,11 +275,12 @@ export function createJourneyHelper({
     },
 
     async wait(milliseconds) {
-      return action.wait(milliseconds);
+      return step('wait', () => action.wait(milliseconds));
     },
 
     audit() {
       const primitive = action.audit || {};
+      const coordination = coordinationAudit?.() || null;
       const checks = {
         entryEstablished: counters.entries > 0,
         viewportObserved: counters.viewportReads >= counters.entries,
@@ -296,7 +301,13 @@ export function createJourneyHelper({
         ),
         transitionsVerified: counters.nextPages === 0 || counters.verifiedTransitions >= counters.nextPages,
         noBypassViolation: violations.length === 0,
-        allJourneyStepsSettled: active === 0
+        allJourneyStepsSettled: active === 0 && (
+          !coordination || (
+            coordination.active === 0 &&
+            coordination.maximumActive <= 1 &&
+            coordination.serialized === true
+          )
+        )
       };
       const passed = Object.values(checks).every(Boolean);
       return Object.freeze({
@@ -307,6 +318,7 @@ export function createJourneyHelper({
         checks,
         counters: { ...counters },
         primitives: { ...primitive },
+        ...(coordination ? { coordination: { ...coordination } } : {}),
         violations: violations.map((item) => ({ ...item }))
       });
     },

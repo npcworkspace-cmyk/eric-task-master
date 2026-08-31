@@ -1,15 +1,52 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { access, readFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VERSION } from '../src/contracts.mjs';
 import { assertReleaseWorkflowPolicy } from './release-workflow-policy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const EXTENSION_TEST_FILES = Object.freeze([
+  'test/action-arbiter.test.mjs',
+  'test/extension-action-coordinator.test.mjs',
+  'test/persistent-extension-real-browser.test.mjs'
+]);
+const EXTENSION_OUTPUT_TAIL_LIMIT = 64 * 1024;
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function assertExtensionAcceptanceGate({ packageJson, workflow, checkSource, extensionTests }) {
+  const extensionStageInvocation = ['await runExtension', 'Acceptance();'].join('');
+  invariant(
+    packageJson.scripts?.['acceptance:extensions'] === 'node scripts/check.mjs --extensions-only',
+    'independent extension acceptance command drift'
+  );
+  invariant(
+    checkSource.split(extensionStageInvocation).length - 1 >= 2 &&
+      checkSource.includes("'extension-acceptance'"),
+    'full release check no longer executes the named extension acceptance stage'
+  );
+  invariant(
+    (workflow.match(/TASKMASTER_EXTENSION_REPORT:/gu) || []).length === 2 &&
+      workflow.includes('artifacts/extension-acceptance.json') &&
+      workflow.includes('if: always()') &&
+      (checkSource.match(/EXTENSION_ACCEPTANCE_NOT_COMPLETED/gu) || []).length >= 2,
+    'cross-platform CI no longer retains extension acceptance or failure evidence'
+  );
+  invariant(
+    extensionTests.get('test/action-arbiter.test.mjs')?.includes('TASK_ACTION_REENTRANT') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('cannot replay after release') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('navigation releases') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('expired extension lease poisons') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('TASKMASTER_REAL_BROWSER') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('participant-scoped-request-ids') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('pre-existing-iframe') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('stale-extension-grant'),
+    'extension serialization, idempotency, navigation, or real-browser acceptance coverage drift'
+  );
 }
 
 async function staticChecks() {
@@ -62,6 +99,10 @@ async function staticChecks() {
     cooldown,
     observationFacade,
     acceptance,
+    checkSource,
+    extensionActionArbiterTest,
+    extensionCoordinatorTest,
+    extensionRealBrowserTest,
     mcpStdio,
     mcpServer,
     mcpPublicView,
@@ -96,6 +137,10 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'src', 'lib', 'cooldown.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'observation-facade.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'acceptance.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'scripts', 'check.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'test', 'action-arbiter.test.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'test', 'extension-action-coordinator.test.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'test', 'persistent-extension-real-browser.test.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'server.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'public-view.mjs'), 'utf8'),
@@ -114,6 +159,16 @@ async function staticChecks() {
   const releaseVersionChecks = [...releaseWorkflow.matchAll(/scripts\/assert-release-version\.mjs/g)]
     .map((match) => match.index);
   assertReleaseWorkflowPolicy(releaseWorkflow);
+  assertExtensionAcceptanceGate({
+    packageJson,
+    workflow,
+    checkSource,
+    extensionTests: new Map([
+      ['test/action-arbiter.test.mjs', extensionActionArbiterTest],
+      ['test/extension-action-coordinator.test.mjs', extensionCoordinatorTest],
+      ['test/persistent-extension-real-browser.test.mjs', extensionRealBrowserTest]
+    ])
+  });
   invariant(launcher.includes("['ci', '--ignore-scripts', '--no-audit', '--no-fund']"), 'fixed launcher lacks dependency bootstrap');
   invariant(
     launcher.includes('playwrightInstallArguments(') &&
@@ -224,7 +279,7 @@ async function staticChecks() {
       !manager.includes('(open|close|session)') &&
       !manager.includes('validatedSessionBundle') &&
       !taskService.includes('importSession'),
-    'extension or session-transfer runtime must remain removed'
+    'extension control-plane or session-transfer runtime must remain removed'
   );
   invariant(
     mcpStdio.includes("from '@modelcontextprotocol/server/stdio'") &&
@@ -455,7 +510,7 @@ async function staticChecks() {
       releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
     'release preflight, monotonic version, or standalone Skill archive proof drift'
   );
-  return { passed: 53, total: 53 };
+  return { passed: 54, total: 54 };
 }
 
 function run(command, args, env = {}) {
@@ -474,18 +529,183 @@ function run(command, args, env = {}) {
   });
 }
 
-try {
-  const staticResult = await staticChecks();
-  process.stdout.write(`${JSON.stringify({ stage: 'static', ok: true, ...staticResult })}\n`);
-  await run(process.execPath, ['--test', '--test-concurrency=1'], { TASKMASTER_REAL_BROWSER: '1' });
-  await run(process.execPath, [resolve(ROOT, 'scripts', 'acceptance.mjs')]);
-  await run(process.execPath, [resolve(ROOT, 'scripts', 'dashboard-acceptance.mjs')]);
-  await run(process.execPath, [resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')]);
-  process.stdout.write(`${JSON.stringify({
-    ok: true,
+function runCaptured(command, args, env = {}) {
+  return new Promise((resolveRun, rejectRun) => {
+    const chunks = [];
+    const remember = (chunk) => {
+      chunks.push(String(chunk));
+      const joined = chunks.join('');
+      if (joined.length > EXTENSION_OUTPUT_TAIL_LIMIT) {
+        chunks.splice(0, chunks.length, joined.slice(-EXTENSION_OUTPUT_TAIL_LIMIT));
+      }
+    };
+    const child = spawn(command, args, {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: { ...process.env, ...env }
+    });
+    child.stdout.on('data', (chunk) => {
+      process.stdout.write(chunk);
+      remember(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      process.stderr.write(chunk);
+      remember(chunk);
+    });
+    child.once('error', (error) => {
+      error.outputTail = chunks.join('');
+      rejectRun(error);
+    });
+    child.once('exit', (code, signal) => {
+      const outputTail = chunks.join('');
+      if (code === 0) resolveRun({ outputTail });
+      else {
+        const error = new Error(`${command} ${args.join(' ')} exited with ${signal || code}`);
+        error.outputTail = outputTail;
+        rejectRun(error);
+      }
+    });
+  });
+}
+
+async function writeExtensionReport(report) {
+  const requested = process.env.TASKMASTER_EXTENSION_REPORT;
+  if (!requested) return;
+  const target = resolve(ROOT, requested);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, `${JSON.stringify(report, null, 2)}\n`, { flag: 'w' });
+}
+
+async function readExtensionReport() {
+  const requested = process.env.TASKMASTER_EXTENSION_REPORT;
+  if (!requested) return null;
+  try {
+    return JSON.parse(await readFile(resolve(ROOT, requested), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+async function writePendingExtensionReport() {
+  const createdAt = new Date().toISOString();
+  await writeExtensionReport({
+    schemaVersion: 1,
+    stage: 'extension-acceptance',
     version: VERSION,
-    stages: ['static', 'tests', 'acceptance', 'dashboard-acceptance', 'commercial-acceptance']
-  })}\n`);
+    ok: false,
+    state: 'pending',
+    createdAt,
+    platform: process.platform,
+    arch: process.arch,
+    nodeVersion: process.versions.node,
+    realBrowser: true,
+    testFiles: [...EXTENSION_TEST_FILES],
+    failure: {
+      code: 'EXTENSION_ACCEPTANCE_NOT_COMPLETED',
+      message: 'The release gate did not complete the independent extension acceptance stage.'
+    }
+  });
+}
+
+async function runExtensionAcceptance() {
+  const startedAt = new Date();
+  const baseReport = {
+    schemaVersion: 1,
+    stage: 'extension-acceptance',
+    version: VERSION,
+    startedAt: startedAt.toISOString(),
+    platform: process.platform,
+    arch: process.arch,
+    nodeVersion: process.versions.node,
+    realBrowser: true,
+    testFiles: [...EXTENSION_TEST_FILES]
+  };
+  try {
+    await runCaptured(
+      process.execPath,
+      ['--test', '--test-concurrency=1', ...EXTENSION_TEST_FILES],
+      { TASKMASTER_REAL_BROWSER: '1' }
+    );
+    const browserAcceptance = await readExtensionReport();
+    if (process.env.TASKMASTER_EXTENSION_REPORT) {
+      invariant(
+        browserAcceptance?.ok === true && browserAcceptance?.summary?.passed === 15,
+        'real MV3 extension acceptance did not publish its 15/15 evidence'
+      );
+    }
+    const completedAt = new Date();
+    const report = {
+      ...baseReport,
+      ok: true,
+      ...(browserAcceptance ? { browserAcceptance } : {}),
+      completedAt: completedAt.toISOString(),
+      durationMs: completedAt.getTime() - startedAt.getTime()
+    };
+    await writeExtensionReport(report);
+    process.stdout.write(`${JSON.stringify({ stage: 'extension-acceptance', ok: true })}\n`);
+    return report;
+  } catch (error) {
+    const completedAt = new Date();
+    const browserAcceptance = await readExtensionReport();
+    await writeExtensionReport({
+      ...baseReport,
+      ok: false,
+      completedAt: completedAt.toISOString(),
+      durationMs: completedAt.getTime() - startedAt.getTime(),
+      ...(browserAcceptance && browserAcceptance.state !== 'pending' ? { browserAcceptance } : {}),
+      failure: {
+        code: 'EXTENSION_ACCEPTANCE_FAILED',
+        message: error.message,
+        outputTail: String(error.outputTail || '').slice(-EXTENSION_OUTPUT_TAIL_LIMIT)
+      }
+    });
+    throw error;
+  }
+}
+
+try {
+  await writePendingExtensionReport();
+  if (process.argv[2] === '--extensions-only') {
+    const [packageJson, workflow, checkSource, ...extensionSources] = await Promise.all([
+      readFile(resolve(ROOT, 'package.json'), 'utf8').then(JSON.parse),
+      readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
+      readFile(resolve(ROOT, 'scripts', 'check.mjs'), 'utf8'),
+      ...EXTENSION_TEST_FILES.map((relative) => readFile(resolve(ROOT, relative), 'utf8'))
+    ]);
+    assertExtensionAcceptanceGate({
+      packageJson,
+      workflow,
+      checkSource,
+      extensionTests: new Map(EXTENSION_TEST_FILES.map((relative, index) => [relative, extensionSources[index]]))
+    });
+    await runExtensionAcceptance();
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      version: VERSION,
+      stages: ['extension-acceptance']
+    })}\n`);
+  } else {
+    const staticResult = await staticChecks();
+    process.stdout.write(`${JSON.stringify({ stage: 'static', ok: true, ...staticResult })}\n`);
+    await run(process.execPath, ['--test', '--test-concurrency=1'], { TASKMASTER_REAL_BROWSER: '1' });
+    await runExtensionAcceptance();
+    await run(process.execPath, [resolve(ROOT, 'scripts', 'acceptance.mjs')]);
+    await run(process.execPath, [resolve(ROOT, 'scripts', 'dashboard-acceptance.mjs')]);
+    await run(process.execPath, [resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')]);
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      version: VERSION,
+      stages: [
+        'static',
+        'tests',
+        'extension-acceptance',
+        'acceptance',
+        'dashboard-acceptance',
+        'commercial-acceptance'
+      ]
+    })}\n`);
+  }
 } catch (error) {
   process.stderr.write(`${JSON.stringify({
     ok: false,

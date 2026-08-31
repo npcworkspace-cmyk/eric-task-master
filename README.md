@@ -4,7 +4,7 @@
 
 **A durable browser automation task system for AI agents.**
 
-Version: **2.8.0**
+Version: **2.8.1**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -98,7 +98,9 @@ Every task start returns a clickable Owner Console link focused on that task. Th
 - **persistent** — isolated reusable state for logged-in and recurring work; open it from the Dashboard and sign in directly in its Playwright window;
 - **ephemeral / 隐身临时** — a clean non-persistent browser for each no-login task, destroyed after cleanup.
 
-New persistent Profiles default to the local stable Chrome channel and `human`; new ephemeral Profiles default to the project-pinned Chromium and `auto`. Every Profile can select `fast`, `auto`, or `human`. A change is acknowledged by the live task Worker and takes effect at its next scheduling or movement boundary without restarting the task. The engine is immutable and never falls back automatically. Manual persistent-Profile windows are always visible; `headless` affects task runs only.
+New persistent Profiles default to the local stable Chrome channel and `human`; new ephemeral Profiles default to the project-pinned Chromium and `auto`. Every Profile can select `fast`, `auto`, or `human`. A behavior change is acknowledged by the live task Worker and takes effect at its next scheduling or movement boundary without restarting the task. The engine is immutable and never falls back automatically. The Owner can also allow extensions already installed inside each persistent Profile. That setting applies to both manual opens and Agent tasks on the next browser launch; it never restarts current work. Extension execution requires a visible browser and is mutually exclusive with headless mode. Ephemeral Profiles never load or retain extensions. Task Master does not install, copy, synchronize, inspect, or authenticate extensions.
+
+All Task Master runtime actions enter one Worker FIFO. A Journey step keeps its slot through the visible action, transition verification, and settling, so concurrent task code cannot interleave page changes. A trusted extension that implements `taskmaster-cooperative-v2` shares that queue for click, input, DOM, and navigation work; request IDs are idempotent within each participant, grants carry both participant and request identity, and a document navigation releases the lease. An expired lease fails the task closed before another browser action can start. This protocol is coordination, not extension authentication: arbitrary third-party extensions may load, but browser APIs cannot force their private code into the queue or reliably distinguish it from ordinary site scripts. Pause the task and wait for `paused` before operating an unintegrated extension; resume then revalidates the page. In an extension-enabled Profile, a legacy task may change the page only through the `action` facade; direct `page` or `context` mutation is rejected. A primitive that succeeds but later fails Journey proof creates a durable unknown-effect barrier, preventing blind replay.
 
 ### Behavior
 

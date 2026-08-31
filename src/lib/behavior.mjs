@@ -1,4 +1,5 @@
 import { isBehaviorMode } from '../contracts.mjs';
+import { unwrapObservationLocator } from './observation-facade.mjs';
 
 const DEFAULT_HUMAN_TIMING = Object.freeze({
   cautiousBeforeAction: [15, 45],
@@ -56,7 +57,7 @@ function numberBetween(range, random) {
 
 function asLocator(page, target) {
   if (typeof target === 'string') return page.locator(target);
-  if (target && typeof target === 'object') return target;
+  if (target && typeof target === 'object') return unwrapObservationLocator(target);
   throw new TypeError('Action target must be a selector string or Playwright Locator');
 }
 
@@ -127,6 +128,7 @@ export function createActionHelper({
   abortSignal,
   onFailure = async () => {},
   onEffect = async () => undefined,
+  onBeforeEffectSuccess = async () => {},
   onAutoState = null,
   onAdaptiveState = () => {},
   onBehaviorState = () => {},
@@ -696,6 +698,7 @@ export function createActionHelper({
     // If this durable terminal write fails, the preceding `started` record stays
     // pending. That is deliberately safer than falsely recording a failed action
     // after its external effect may already have succeeded.
+    await onBeforeEffectSuccess({ operation, effectOperation, sequence });
     await onEffect({ state: 'succeeded', operation: effectOperation, sequence });
     return result;
   }

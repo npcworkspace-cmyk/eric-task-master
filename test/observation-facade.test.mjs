@@ -73,3 +73,23 @@ test('Task Pack observation facade permits reads and blocks browser mutations', 
     'Page.mouse'
   ]);
 });
+
+test('extension-enabled legacy modules are read-only outside the serialized action facade', async () => {
+  const locator = { async click() {} };
+  const page = {
+    locator() { return locator; },
+    async click() {},
+    async evaluate() {}
+  };
+  const context = { pages() { return [page]; }, async newPage() {} };
+  const observed = createObservationFacade({ page, context, requiredFacade: 'action' });
+
+  assert.equal(unwrapObservationLocator(observed.page.locator('button')), locator);
+  await assert.rejects(observed.page.click('button'), {
+    code: 'TASK_UI_ACTION_REQUIRES_ACTION',
+    message: /use the action facade/u
+  });
+  await assert.rejects(observed.context.newPage(), {
+    code: 'TASK_UI_ACTION_REQUIRES_ACTION'
+  });
+});

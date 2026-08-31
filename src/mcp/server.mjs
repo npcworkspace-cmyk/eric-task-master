@@ -47,6 +47,7 @@ const ProfileSchema = z.strictObject({
   defaultBehavior: z.string().optional(),
   headless: z.boolean().optional(),
   browserEngine: z.enum(BROWSER_ENGINES).optional(),
+  extensionsEnabled: z.boolean().optional(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
   lastUsedAt: z.string().nullable().optional(),

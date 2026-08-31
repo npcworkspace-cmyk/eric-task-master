@@ -145,3 +145,50 @@ test('a caught direct-mutation violation still fails the completion contract', a
   assert.throws(() => journey.assertComplete(), { code: 'TASK_INTERACTION_CONTRACT_FAILED' });
   assert.equal(journey.audit().score, 9);
 });
+
+test('concurrent Journey calls hold one FIFO boundary through verification and settling', async () => {
+  const { action, locator, page } = fixture();
+  const events = [];
+  let tail = Promise.resolve();
+  let active = 0;
+  let maximumActive = 0;
+  const runStep = async (operation, callback) => {
+    const prior = tail;
+    let release;
+    tail = new Promise((resolve) => { release = resolve; });
+    await prior;
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    events.push(`${operation}:start`);
+    try {
+      return await callback();
+    } finally {
+      events.push(`${operation}:end`);
+      active -= 1;
+      release();
+    }
+  };
+  const journey = createJourneyHelper({
+    page,
+    action,
+    random: () => 0.5,
+    sleep: async () => {},
+    runStep,
+    coordinationAudit: () => ({ active, maximumActive, serialized: maximumActive <= 1 })
+  });
+
+  await journey.open('https://example.test');
+  await Promise.all([
+    journey.nextPage(locator, { timeoutMs: 500 }),
+    journey.click(locator)
+  ]);
+
+  assert.equal(maximumActive, 1);
+  assert.deepEqual(events.slice(-4), [
+    'next-page-visible:start',
+    'next-page-visible:end',
+    'click-visible:start',
+    'click-visible:end'
+  ]);
+  assert.equal(journey.audit().coordination.serialized, true);
+});

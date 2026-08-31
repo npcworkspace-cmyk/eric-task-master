@@ -124,6 +124,7 @@ test('MCP exposes globally shared Profiles without legacy ownership fields', asy
   });
   assert.equal(Object.hasOwn(listed.structuredContent.data.profiles[0], 'access'), false);
   assert.equal(Object.hasOwn(listed.structuredContent.data.profiles[0], 'createdBy'), false);
+  assert.equal(listed.structuredContent.data.profiles[0].extensionsEnabled, true);
 
   const updated = await connection.client.callTool({
     name: 'taskmaster_profiles_update',
@@ -141,6 +142,13 @@ test('MCP exposes globally shared Profiles without legacy ownership fields', asy
   });
   assert.equal(rejected.isError, true);
   assert.match(rejected.content[0].text, /Unrecognized key/u);
+
+  const extensionPolicyRejected = await connection.client.callTool({
+    name: 'taskmaster_profiles_update',
+    arguments: { profileId: 'profile_fixture', extensionsEnabled: false }
+  });
+  assert.equal(extensionPolicyRejected.isError, true);
+  assert.match(extensionPolicyRejected.content[0].text, /Unrecognized key/u);
 });
 
 test('MCP prepares unknown large work through one bounded built-in surface probe', async (t) => {

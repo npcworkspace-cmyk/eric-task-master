@@ -183,7 +183,7 @@ function requireProfileAccess(profile, auth, { manage = false } = {}) {
 }
 
 function validateProfilePatch(body) {
-  const allowed = new Set(['name', 'defaultBehavior', 'headless', 'access']);
+  const allowed = new Set(['name', 'defaultBehavior', 'headless', 'extensionsEnabled', 'access']);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
   if (unknown.length) {
     throw new HttpError(400, 'INVALID_PROFILE_PATCH', `Unsupported fields: ${unknown.join(', ')}`);
@@ -1071,6 +1071,13 @@ export async function createManager({
       const profileId = decodeURIComponent(profileMatch[1]);
       requireProfileAccess(await profileStore.get(profileId), auth, { manage: true });
       const patch = validateProfilePatch(await readJson(request, { maxBytes: 32 * 1024 }));
+      if (Object.hasOwn(patch, 'extensionsEnabled') && auth.role === 'agent') {
+        throw new HttpError(
+          403,
+          'PROFILE_EXTENSIONS_OWNER_REQUIRED',
+          'Only the Owner Console can change whether browser extensions run'
+        );
+      }
       const applyProfileBehavior = Object.hasOwn(patch, 'defaultBehavior')
         ? requireTaskMethod(taskService, 'applyProfileBehavior')
         : null;

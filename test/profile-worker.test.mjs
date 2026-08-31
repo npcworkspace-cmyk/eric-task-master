@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { closeProfileBrowserSession, runOpenProfile } from '../src/runtime/profile-worker.mjs';
 
-test('manual Profile launch is always visible and uses its fixed engine', async () => {
+test('manual Profile launch preserves a visible extension policy and its fixed engine', async () => {
   const controller = new AbortController();
   controller.abort();
   let launch;
@@ -13,8 +13,9 @@ test('manual Profile launch is always visible and uses its fixed engine', async 
   };
   await runOpenProfile({
     userDataDir: '/isolated/profile',
-    headless: true,
-    browserEngine: 'chrome'
+    headless: false,
+    browserEngine: 'chrome',
+    extensionsEnabled: true
   }, {
     signal: controller.signal,
     loadPlaywright: async () => ({
@@ -28,8 +29,39 @@ test('manual Profile launch is always visible and uses its fixed engine', async 
   });
   assert.deepEqual(launch, {
     userDataDir: '/isolated/profile',
-    options: { channel: 'chrome', headless: false }
+    options: {
+      channel: 'chrome',
+      ignoreDefaultArgs: ['--disable-extensions'],
+      headless: false
+    }
   });
+});
+
+test('manual Profile launch is visible even when background tasks are configured', async () => {
+  let launchOptions;
+  const context = {
+    pages() { return [{}]; },
+    browser() { return null; },
+    async close() {}
+  };
+  await runOpenProfile({
+    kind: 'persistent',
+    userDataDir: '/isolated/background-profile',
+    headless: true,
+    browserEngine: 'chrome',
+    extensionsEnabled: false
+  }, {
+    signal: AbortSignal.abort(),
+    loadPlaywright: async () => ({
+      chromium: {
+        async launchPersistentContext(_userDataDir, options) {
+          launchOptions = options;
+          return context;
+        }
+      }
+    })
+  });
+  assert.deepEqual(launchOptions, { channel: 'chrome', headless: false });
 });
 
 test('manual Profile never falls back after a Chrome launch failure', async () => {

@@ -176,7 +176,7 @@ export async function runCommercialAcceptance() {
     const openedManualProfile = await client.openProfile(persistentProfile.id);
     assertCheck(
       checks,
-      'persistent Profile opens through Playwright without an extension',
+      'persistent Profile opens through the same Playwright lifecycle used by tasks',
       openedManualProfile.state === 'open'
     );
     const closedManualProfile = await client.closeProfile(persistentProfile.id);

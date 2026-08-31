@@ -347,6 +347,9 @@ button { color: inherit; }
 .profile-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin: 16px 0; }
 .profile-facts .labelled-value { padding: 9px; }
 .profile-settings { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 8px; }
+.profile-toggle-stack { display: grid; align-self: end; gap: 7px; }
+.profile-extension-control { display: grid; gap: 4px; }
+.profile-setting-note { max-width: 220px; margin: 0; color: var(--npc-text-soft); font-size: 10px; line-height: 1.35; }
 .switch-field { padding: 0 8px; border: 1px solid rgba(9, 9, 9, .22); border-radius: 12px; background: var(--npc-paper-bright); }
 .profile-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 15px; padding-top: 14px; border-top: 1px solid var(--npc-line); }
 .profile-actions .npc-btn-danger { margin-left: auto; }

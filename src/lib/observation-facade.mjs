@@ -1,8 +1,10 @@
 export class ObservationMutationError extends Error {
-  constructor(surface, operation) {
-    super(`${surface}.${String(operation)} is unavailable to Task Packs; use the journey facade`);
+  constructor(surface, operation, requiredFacade = 'journey') {
+    super(`${surface}.${String(operation)} is unavailable to Task Packs; use the ${requiredFacade} facade`);
     this.name = 'ObservationMutationError';
-    this.code = 'TASK_UI_ACTION_REQUIRES_JOURNEY';
+    this.code = requiredFacade === 'journey'
+      ? 'TASK_UI_ACTION_REQUIRES_JOURNEY'
+      : 'TASK_UI_ACTION_REQUIRES_ACTION';
     this.surface = surface;
     this.operation = String(operation);
   }
@@ -81,7 +83,12 @@ function bindOrValue(target, property) {
   return typeof value === 'function' ? value.bind(target) : value;
 }
 
-export function createObservationFacade({ page, context, onViolation = () => {} } = {}) {
+export function createObservationFacade({
+  page,
+  context,
+  onViolation = () => {},
+  requiredFacade = 'journey'
+} = {}) {
   if (!page || !context) throw new TypeError('page and context are required');
   const locatorCache = new WeakMap();
   const frameCache = new WeakMap();
@@ -89,7 +96,7 @@ export function createObservationFacade({ page, context, onViolation = () => {} 
   const frameLocatorCache = new WeakMap();
 
   function reject(surface, operation) {
-    const error = new ObservationMutationError(surface, operation);
+    const error = new ObservationMutationError(surface, operation, requiredFacade);
     try {
       onViolation({ surface, operation: String(operation), code: error.code });
     } catch {}

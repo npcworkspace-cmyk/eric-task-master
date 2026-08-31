@@ -191,7 +191,8 @@ export async function runAcceptance({ baseUrl, token, stateDir, readInternalTask
     add(
       'persistent Profile policy',
       profile?.id && profile.state === 'idle' && profile.headless === true &&
-      profile.browserEngine === 'chromium' && profile.defaultBehavior === 'human'
+      profile.browserEngine === 'chromium' && profile.defaultBehavior === 'human' &&
+      profile.extensionsEnabled === false
     );
 
     const persistentFast = await api(baseUrl, `/v1/profiles/${encodeURIComponent(profile.id)}`, {
@@ -275,7 +276,7 @@ export async function runAcceptance({ baseUrl, token, stateDir, readInternalTask
       'ephemeral Profile policy',
       ephemeralProfile?.id && ephemeralProfile.kind === 'ephemeral' &&
       ephemeralProfile.state === 'idle' && ephemeralProfile.browserEngine === 'chromium' &&
-      ephemeralProfile.defaultBehavior === 'auto'
+      ephemeralProfile.defaultBehavior === 'auto' && ephemeralProfile.extensionsEnabled === false
     );
 
     const probeCreated = await api(baseUrl, '/v1/tasks', {

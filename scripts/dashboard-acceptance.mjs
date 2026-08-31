@@ -750,6 +750,7 @@ try {
   await page.getByRole('button', { name: 'Profiles', exact: true }).click();
   await page.getByRole('heading', { name: 'Browser Profiles', exact: true }).waitFor();
   await page.locator('.profile-card').first().getByText('Operation speed', { exact: true }).first().waitFor();
+  await page.locator('.profile-card').filter({ hasText: '验收账号' }).getByRole('checkbox', { name: 'Allow extensions' }).waitFor();
   await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
   await page.getByRole('heading', { name: 'Task Pack assets', exact: true }).waitFor();
   await page.locator('.asset-card').first().getByText('Agent discoverable', { exact: true }).waitFor();
@@ -823,6 +824,18 @@ try {
 
   await page.getByRole('button', { name: 'Profiles', exact: true }).click();
   const liveAccountCard = page.locator('.profile-card').filter({ hasText: '验收账号' });
+  const liveExtensions = liveAccountCard.getByRole('checkbox', { name: '允许扩展运行' });
+  const liveBackground = liveAccountCard.getByRole('checkbox', { name: '任务在后台运行' });
+  assert.equal(await liveExtensions.isChecked(), true);
+  assert.equal(await liveBackground.isDisabled(), true);
+  await liveExtensions.uncheck();
+  await page.locator('#dashboard-message').filter({ hasText: '扩展设置已保存；下次启动生效' }).waitFor();
+  assert.equal((await manager.profileStore.get(persistent.id)).extensionsEnabled, false);
+  assert.equal(await liveBackground.isDisabled(), false);
+  await liveExtensions.check();
+  await page.locator('#dashboard-message').filter({ hasText: '扩展设置已保存；下次启动生效' }).waitFor();
+  assert.equal((await manager.profileStore.get(persistent.id)).extensionsEnabled, true);
+  assert.equal(await liveBackground.isDisabled(), true);
   await liveAccountCard.locator('select').selectOption('fast');
   await page.getByRole('button', { name: '任务', exact: true }).click();
   await runningCard.locator('[data-task-behavior="fast"][data-task-behavior-effective="fast"][data-task-behavior-confirmed="true"]').waitFor();
@@ -885,6 +898,7 @@ try {
   const temporaryCard = page.locator('.profile-card').filter({ hasText: 'UI 临时' });
   await temporaryCard.waitFor();
   assert.equal(await temporaryCard.locator('select').inputValue(), 'auto');
+  assert.equal(await temporaryCard.getByRole('checkbox', { name: '允许扩展运行' }).count(), 0);
   await temporaryCard.locator('select').selectOption('human');
   await temporaryCard.getByText('深度拟人', { exact: true }).first().waitFor();
   await temporaryCard.locator('input[type="checkbox"]').check();
@@ -903,13 +917,17 @@ try {
   assert.deepEqual(control.behaviorChanges.at(-1), { id: persistent.id, behavior: 'human' });
   await renamedCard.getByRole('button', { name: '打开登录窗口' }).click();
   await renamedCard.getByRole('button', { name: '关闭窗口' }).waitFor();
+  await renamedCard.getByRole('checkbox', { name: '允许扩展运行' }).uncheck();
+  await page.locator('#dashboard-message').filter({ hasText: '当前窗口不会重启，关闭后生效' }).waitFor();
+  await renamedCard.getByRole('checkbox', { name: '允许扩展运行' }).check();
+  await page.locator('#dashboard-message').filter({ hasText: '当前窗口不会重启，关闭后生效' }).waitFor();
   await renamedCard.getByRole('button', { name: '关闭窗口' }).click();
   await renamedCard.getByRole('button', { name: '打开登录窗口' }).waitFor();
 
   page.once('dialog', (dialog) => dialog.accept());
   await temporaryCard.getByRole('button', { name: '删除' }).click();
   await temporaryCard.waitFor({ state: 'detached' });
-  checks.push('Profile defaults, fast/auto/human live control, create, edit, rename, open, close, and delete');
+  checks.push('Profile defaults, extension next-launch policy, fast/auto/human live control, create, edit, rename, open, close, and delete');
 
   await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
   assert.equal(await page.evaluate(() => document.activeElement?.id), 'assets-title');

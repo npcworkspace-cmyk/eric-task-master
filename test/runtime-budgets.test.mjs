@@ -82,7 +82,8 @@ test('task worker launches Chrome with the Profile headless policy and never fal
     ...config.profile,
     kind: 'persistent',
     browserEngine: 'chrome',
-    headless: true
+    headless: true,
+    extensionsEnabled: false
   };
 
   const outcome = await runTaskWorker(config, {
@@ -107,6 +108,39 @@ test('task worker launches Chrome with the Profile headless policy and never fal
     options: { channel: 'chrome', headless: true }
   }]);
   assert.equal(fallbackLaunches, 0);
+});
+
+test('task worker allows installed extensions only for a visible persistent Profile', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-extension-launch-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const launches = [];
+  const config = workerConfig(root, modulePath);
+  config.profile = {
+    ...config.profile,
+    kind: 'persistent',
+    browserEngine: 'chromium',
+    headless: false,
+    extensionsEnabled: true
+  };
+
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({
+      chromium: {
+        async launchPersistentContext(userDataDir, options) {
+          launches.push({ userDataDir, options });
+          throw Object.assign(new Error('Stop after launch policy capture'), { code: 'CAPTURED' });
+        }
+      }
+    })
+  });
+
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'CAPTURED');
+  assert.deepEqual(launches, [{
+    userDataDir: config.profile.userDataDir,
+    options: { ignoreDefaultArgs: ['--disable-extensions'], headless: false }
+  }]);
 });
 
 test('task worker exposes only an explicit bounded public failure contract', async (t) => {

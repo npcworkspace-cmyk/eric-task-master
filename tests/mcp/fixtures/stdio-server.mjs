@@ -32,8 +32,12 @@ const task = {
 const profile = {
   id: 'profile_fixture',
   name: 'Fixture',
+  kind: 'persistent',
   state: 'open',
   defaultBehavior: 'fast',
+  browserEngine: 'chrome',
+  headless: false,
+  extensionsEnabled: true,
   access: 'private',
   lastUsedAt: '2026-08-24T00:00:00.000Z',
   userDataDir: 'C:\\secret\\profile',

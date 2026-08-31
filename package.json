@@ -1,6 +1,6 @@
 {
   "name": "eric-task-master",
-  "version": "2.8.0",
+  "version": "2.8.1",
   "description": "Playwright browser automation runtime for AI agents with MCP, persistent Profiles, durable tasks, and unattended workflows.",
   "license": "MIT",
   "type": "module",
@@ -17,6 +17,7 @@
     "acceptance": "node scripts/acceptance.mjs",
     "acceptance:dashboard": "node scripts/dashboard-acceptance.mjs",
     "acceptance:commercial": "node scripts/commercial-acceptance.mjs",
+    "acceptance:extensions": "node scripts/check.mjs --extensions-only",
     "check": "node scripts/check.mjs",
     "mcp": "node src/mcp/stdio.mjs",
     "mcp:register": "node scripts/register-mcp.mjs install --json",

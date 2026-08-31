@@ -32,6 +32,7 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   assert.equal(created.headless, true);
   assert.equal(created.browserEngine, 'chrome');
   assert.equal(created.defaultBehavior, 'human');
+  assert.equal(created.extensionsEnabled, false);
   assert.match(created.id, /^profile_[a-f0-9]{32}$/);
   assert.equal(created.userDataDir, join(config.profilesRoot, created.id));
 
@@ -46,6 +47,18 @@ test('ProfileStore persists CRUD data and rejects ambiguous names', async (t) =>
   assert.equal(updated.defaultBehavior, 'fast');
   updated = await store.update(created.id, { defaultBehavior: 'auto' });
   assert.equal(updated.defaultBehavior, 'auto');
+  updated = await store.update(created.id, { extensionsEnabled: false });
+  assert.equal(updated.extensionsEnabled, false);
+  updated = await store.update(created.id, { extensionsEnabled: true });
+  assert.equal(updated.extensionsEnabled, true);
+  await assert.rejects(
+    store.update(created.id, { headless: true }),
+    { code: 'PROFILE_EXTENSIONS_HEADLESS_CONFLICT', statusCode: 409 }
+  );
+  await assert.rejects(
+    store.update(created.id, { extensionsEnabled: 'yes' }),
+    { code: 'INVALID_PROFILE_EXTENSIONS_POLICY' }
+  );
 
   await assert.rejects(
     store.create({ name: 'research PRIMARY' }),
@@ -87,19 +100,27 @@ test('ProfileStore creates ephemeral templates and migrates pre-kind records to 
   assert.equal(temporary.kind, 'ephemeral');
   assert.equal(temporary.browserEngine, 'chromium');
   assert.equal(temporary.defaultBehavior, 'auto');
+  assert.equal(temporary.extensionsEnabled, false);
+  await assert.rejects(
+    store.update(temporary.id, { extensionsEnabled: true }),
+    { code: 'EPHEMERAL_PROFILE_EXTENSIONS_UNSUPPORTED', statusCode: 409 }
+  );
   assert.equal(
     (await store.update(temporary.id, { defaultBehavior: 'fast' })).defaultBehavior,
     'fast'
   );
 
   const data = JSON.parse(await readFile(config.filePath, 'utf8'));
+  data.version = 5;
   delete data.profiles[0].kind;
+  delete data.profiles[0].extensionsEnabled;
   await writeFile(config.filePath, `${JSON.stringify(data)}\n`);
   const reopened = new ProfileStore(config);
   await reopened.init();
   const migrated = await reopened.get(temporary.id);
   assert.equal(migrated.kind, 'persistent');
   assert.equal(migrated.defaultBehavior, 'fast');
+  assert.equal(migrated.extensionsEnabled, true);
 
   await assert.rejects(
     reopened.create({ name: 'Invalid kind', kind: 'private' }),
@@ -119,6 +140,8 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   assert.equal(ephemeral.browserEngine, 'chromium');
   assert.equal(persistent.defaultBehavior, 'human');
   assert.equal(ephemeral.defaultBehavior, 'auto');
+  assert.equal(persistent.extensionsEnabled, true);
+  assert.equal(ephemeral.extensionsEnabled, false);
   assert.equal(
     (await store.create({ name: 'Fast persistent', defaultBehavior: 'fast' })).defaultBehavior,
     'fast'
@@ -137,7 +160,7 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   assert.equal((await migrated.get(persistent.id)).browserEngine, 'chrome');
   assert.equal((await migrated.get(ephemeral.id)).browserEngine, 'chromium');
   const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
-  assert.equal(persisted.version, 5);
+  assert.equal(persisted.version, 6);
   assert.equal(persisted.profiles.some((profile) => Object.hasOwn(profile, 'browserChannel')), false);
 
   persisted.version = 1;
@@ -164,7 +187,60 @@ test('ProfileStore migrates legacy adaptive behavior to auto without moving Prof
   const current = await migrated.get(profile.id);
   assert.equal(current.defaultBehavior, 'auto');
   assert.equal(current.userDataDir, originalPath);
-  assert.equal(JSON.parse(await readFile(config.filePath, 'utf8')).version, 5);
+  assert.equal(JSON.parse(await readFile(config.filePath, 'utf8')).version, 6);
+});
+
+test('ProfileStore rejects a corrupted extension and background policy without rewriting it', async (t) => {
+  const { config, store } = await fixture(t);
+  await store.create({ name: 'Corrupted extension policy' });
+  const data = JSON.parse(await readFile(config.filePath, 'utf8'));
+  data.profiles[0].headless = true;
+  data.profiles[0].extensionsEnabled = true;
+  const before = `${JSON.stringify(data)}\n`;
+  await writeFile(config.filePath, before);
+
+  const reopened = new ProfileStore(config);
+  await assert.rejects(
+    reopened.init(),
+    { code: 'PROFILE_EXTENSIONS_HEADLESS_CONFLICT', statusCode: 409 }
+  );
+  assert.equal(await readFile(config.filePath, 'utf8'), before);
+});
+
+test('ProfileStore extension migration is explicit for headless and malformed v6 records', async (t) => {
+  const { config, store } = await fixture(t);
+  const headless = await store.create({ name: 'Legacy headless', headless: true });
+  const legacy = JSON.parse(await readFile(config.filePath, 'utf8'));
+  legacy.version = 5;
+  delete legacy.profiles[0].extensionsEnabled;
+  await writeFile(config.filePath, `${JSON.stringify(legacy)}\n`);
+
+  const migrated = new ProfileStore(config);
+  await migrated.init();
+  assert.equal((await migrated.get(headless.id)).extensionsEnabled, false);
+
+  const cases = [
+    {
+      name: 'missing v6 extension metadata',
+      mutate(profile) { delete profile.extensionsEnabled; },
+      code: 'PROFILE_EXTENSIONS_MIGRATION_REQUIRED'
+    },
+    {
+      name: 'ephemeral v6 extension enablement',
+      mutate(profile) { profile.kind = 'ephemeral'; profile.extensionsEnabled = true; },
+      code: 'EPHEMERAL_PROFILE_EXTENSIONS_UNSUPPORTED'
+    }
+  ];
+  for (const item of cases) {
+    const data = JSON.parse(await readFile(config.filePath, 'utf8'));
+    data.version = 6;
+    item.mutate(data.profiles[0]);
+    const before = `${JSON.stringify(data)}\n`;
+    await writeFile(config.filePath, before);
+    const reopened = new ProfileStore(config);
+    await assert.rejects(reopened.init(), { code: item.code, statusCode: 409 }, item.name);
+    assert.equal(await readFile(config.filePath, 'utf8'), before, item.name);
+  }
 });
 
 test('ProfileStore rejects incomplete v2/v3 engine metadata without rewriting the store', async (t) => {
@@ -297,7 +373,7 @@ test('ProfileStore migrates private ownership metadata in place and keeps global
   assert.equal(Object.hasOwn(migratedProfile, 'createdBy'), false);
   assert.equal(Object.hasOwn(migratedProfile, 'access'), false);
   const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
-  assert.equal(persisted.version, 5);
+  assert.equal(persisted.version, 6);
 
   await migrated.acquireLease(profile.id, 'task:agent-b', {
     pid: 701,

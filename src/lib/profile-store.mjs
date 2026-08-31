@@ -60,6 +60,16 @@ function ensureHeadless(value) {
   return value;
 }
 
+function ensureExtensionsEnabled(value) {
+  if (typeof value !== 'boolean') {
+    throw new ProfileStoreError(
+      'INVALID_PROFILE_EXTENSIONS_POLICY',
+      'extensionsEnabled must be a boolean'
+    );
+  }
+  return value;
+}
+
 function ensureProfileKind(value) {
   if (!isProfileKind(value)) {
     throw new ProfileStoreError(
@@ -129,6 +139,34 @@ function migrateProfileBehavior(profile, { allowLegacy }) {
   profile.defaultBehavior = ensureBehaviorMode(normalized);
 }
 
+function migrateProfileExtensions(profile, { allowLegacy }) {
+  if (profile.extensionsEnabled === undefined) {
+    if (!allowLegacy) {
+      throw new ProfileStoreError(
+        'PROFILE_EXTENSIONS_MIGRATION_REQUIRED',
+        `Profile ${profile.id || '[unknown]'} has invalid extension policy metadata`,
+        409
+      );
+    }
+    profile.extensionsEnabled = profile.kind === 'persistent' && profile.headless !== true;
+  }
+  profile.extensionsEnabled = ensureExtensionsEnabled(profile.extensionsEnabled);
+  if (profile.kind === 'ephemeral' && profile.extensionsEnabled) {
+    throw new ProfileStoreError(
+      'EPHEMERAL_PROFILE_EXTENSIONS_UNSUPPORTED',
+      `Ephemeral Profile ${profile.id || '[unknown]'} cannot retain browser extensions`,
+      409
+    );
+  }
+  if (profile.kind === 'persistent' && profile.extensionsEnabled && profile.headless === true) {
+    throw new ProfileStoreError(
+      'PROFILE_EXTENSIONS_HEADLESS_CONFLICT',
+      `Persistent Profile ${profile.id || '[unknown]'} cannot enable extensions in background mode`,
+      409
+    );
+  }
+}
+
 function ensureOwnerClientId(value) {
   if (value === null || value === undefined) return null;
   if (typeof value !== 'string' || !CLIENT_ID_PATTERN.test(value)) {
@@ -162,7 +200,7 @@ export class ProfileStore {
     removePath = rm
   }) {
     if (!profilesRoot) throw new TypeError('profilesRoot is required');
-    this.#store = new JsonStore(filePath, { version: 5, profiles: [] });
+    this.#store = new JsonStore(filePath, { version: 6, profiles: [] });
     this.#profilesRoot = profilesRoot;
     this.#now = now;
     this.#processAlive = processAlive;
@@ -176,7 +214,7 @@ export class ProfileStore {
     // v0.x Profile records predate explicit persistence semantics. Preserve
     // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
-      if (data.version !== undefined && ![1, 2, 3, 4, 5].includes(data.version)) {
+      if (data.version !== undefined && ![1, 2, 3, 4, 5, 6].includes(data.version)) {
         throw new ProfileStoreError(
           'PROFILE_STORE_VERSION_UNSUPPORTED',
           `Profile store version ${String(data.version)} is unsupported`,
@@ -185,11 +223,13 @@ export class ProfileStore {
       }
       const allowLegacyChannel = data.version === undefined || data.version === 1;
       const allowLegacyBehavior = data.version === undefined || data.version <= 4;
+      const allowLegacyExtensions = data.version === undefined || data.version <= 5;
       for (const profile of data.profiles) {
         profile.kind ||= 'persistent';
         ensureProfileKind(profile.kind);
         migrateBrowserEngine(profile, { allowLegacyChannel });
         migrateProfileBehavior(profile, { allowLegacy: allowLegacyBehavior });
+        migrateProfileExtensions(profile, { allowLegacy: allowLegacyExtensions });
         // v4 makes Profiles machine-local shared resources. Remove only the
         // obsolete authorization metadata; userDataDir and browser state stay
         // byte-for-byte in their existing location.
@@ -204,7 +244,7 @@ export class ProfileStore {
           profile.lease.cleanupRequired = true;
         }
       }
-      data.version = 5;
+      data.version = 6;
     });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
@@ -274,6 +314,7 @@ export class ProfileStore {
           defaultBehavior,
           headless,
           browserEngine,
+          extensionsEnabled: kind === 'persistent' && !headless,
           state: 'idle',
           lease: null,
           createdAt: now,
@@ -290,7 +331,7 @@ export class ProfileStore {
   }
 
   async update(profileId, patch = {}) {
-    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'access']);
+    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'extensionsEnabled', 'access']);
     const unknown = Object.keys(patch).filter((key) => !allowed.has(key));
     if (unknown.length) {
       throw new ProfileStoreError(
@@ -303,6 +344,9 @@ export class ProfileStore {
       patch = { ...patch, defaultBehavior: ensureBehaviorMode(patch.defaultBehavior) };
     }
     if ('headless' in patch) patch = { ...patch, headless: ensureHeadless(patch.headless) };
+    if ('extensionsEnabled' in patch) {
+      patch = { ...patch, extensionsEnabled: ensureExtensionsEnabled(patch.extensionsEnabled) };
+    }
     // A cached 2.0 client may still send access. Accept it as a no-op while the
     // public contract and persisted record remain globally shared.
     if ('access' in patch) {
@@ -312,6 +356,22 @@ export class ProfileStore {
     let updated;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
+      if (profile.kind === 'ephemeral' && patch.extensionsEnabled === true) {
+        throw new ProfileStoreError(
+          'EPHEMERAL_PROFILE_EXTENSIONS_UNSUPPORTED',
+          `Ephemeral Profile ${profileId} cannot retain browser extensions`,
+          409
+        );
+      }
+      const nextExtensionsEnabled = patch.extensionsEnabled ?? profile.extensionsEnabled;
+      const nextHeadless = patch.headless ?? profile.headless;
+      if (profile.kind === 'persistent' && nextExtensionsEnabled && nextHeadless) {
+        throw new ProfileStoreError(
+          'PROFILE_EXTENSIONS_HEADLESS_CONFLICT',
+          'Browser extensions require a visible persistent Profile; disable background mode first',
+          409
+        );
+      }
       if (
         patch.name &&
         data.profiles.some(

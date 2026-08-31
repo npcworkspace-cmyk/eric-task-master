@@ -76,7 +76,10 @@ const I18N = Object.freeze({
     'profiles.namePlaceholder': '例如：工作账号', 'profiles.kind': '类型', 'profiles.persistent': '持久登录',
     'profiles.ephemeral': '临时无登录', 'profiles.browser': '浏览器', 'profiles.chrome': '本机稳定版 Chrome',
     'profiles.chromium': '项目锁定 Chromium', 'profiles.speed': '操作速度', 'profiles.background': '任务在后台运行',
-    'profiles.create': '创建 Profile', 'profiles.formNote': '持久 Profile 固定使用本机 Chrome 与深度拟人行为；临时 Profile 会在任务结束后销毁浏览器状态。',
+    'profiles.extensions': '允许扩展运行', 'profiles.extensionsNextLaunch': '下次打开 Profile 或启动任务时生效',
+    'profiles.extensionsDeferred': '当前窗口不会重启；关闭后再次打开或下次任务启动时生效',
+    'profiles.extensionsVisibleOnly': '扩展需要可见浏览器；关闭扩展后可启用后台运行',
+    'profiles.create': '创建 Profile', 'profiles.formNote': '持久 Profile 默认允许已安装扩展在可见浏览器中运行；临时 Profile 不加载扩展，并在任务结束后销毁浏览器状态。',
     'profiles.loading': '正在读取 Profiles…', 'profiles.authEmpty': '建立 Owner 会话后即可查看 Profiles。',
     'profiles.empty': '还没有 Profile。创建一个浏览器环境开始任务。', 'profiles.browserFact': '浏览器',
     'profiles.speedFact': '操作速度', 'profiles.recent': '最近使用', 'profiles.speedLive': '运行中切换会立即应用到当前任务，无需重启',
@@ -131,6 +134,7 @@ const I18N = Object.freeze({
     'error.profileName': 'Profile 名称已存在，请换一个名称。', 'error.revision': '状态已变化，已刷新最新状态。请确认后重试。',
     'error.refreshed': '{message} 已刷新最新状态。', 'time.justNow': '刚刚', 'time.soon': '即将', 'time.days': '{days}天 {clock}',
     'toast.profileCreated': 'Profile 已创建', 'toast.speedApplied': '操作速度已生效，运行中的任务无需重启',
+    'toast.extensionsSaved': '扩展设置已保存；下次启动生效', 'toast.extensionsDeferred': '扩展设置已保存；当前窗口不会重启，关闭后生效',
     'toast.profileSaved': 'Profile 设置已保存', 'toast.profileOpening': '正在打开独立登录窗口', 'toast.profileClosed': 'Profile 窗口已关闭',
     'toast.profileResidualCleaned': '残留临时 Profile 已清理', 'toast.profileDeleted': 'Profile 已删除',
     'toast.taskNotReady': '任务版本尚未就绪，正在刷新最新状态', 'toast.pauseSent': '暂停请求已发送',
@@ -198,7 +202,10 @@ const I18N = Object.freeze({
     'profiles.namePlaceholder': 'Example: Work account', 'profiles.kind': 'Type', 'profiles.persistent': 'Persistent login',
     'profiles.ephemeral': 'Temporary, no login', 'profiles.browser': 'Browser', 'profiles.chrome': 'Stable local Chrome',
     'profiles.chromium': 'Project-pinned Chromium', 'profiles.speed': 'Operation speed', 'profiles.background': 'Run tasks in background',
-    'profiles.create': 'Create Profile', 'profiles.formNote': 'Persistent Profiles use local Chrome and deep-human behavior by default. Temporary Profile browser state is destroyed after the task.',
+    'profiles.extensions': 'Allow extensions', 'profiles.extensionsNextLaunch': 'Applies the next time this Profile opens or a task starts',
+    'profiles.extensionsDeferred': 'The current browser will not restart; this applies after it closes and launches again',
+    'profiles.extensionsVisibleOnly': 'Extensions require a visible browser; disable extensions to use background mode',
+    'profiles.create': 'Create Profile', 'profiles.formNote': 'Persistent Profiles allow installed extensions in a visible browser by default. Temporary Profiles never load extensions and destroy browser state after the task.',
     'profiles.loading': 'Loading Profiles…', 'profiles.authEmpty': 'Start an Owner session to view Profiles.',
     'profiles.empty': 'There are no Profiles. Create a browser environment to start.', 'profiles.browserFact': 'Browser',
     'profiles.speedFact': 'Operation speed', 'profiles.recent': 'Last used', 'profiles.speedLive': 'Changes apply to the running task immediately, without a restart',
@@ -253,6 +260,7 @@ const I18N = Object.freeze({
     'error.profileName': 'That Profile name already exists. Choose another name.', 'error.revision': 'State changed. The latest state was loaded; review it and retry.',
     'error.refreshed': '{message} The latest state was loaded.', 'time.justNow': 'just now', 'time.soon': 'soon', 'time.days': '{days}d {clock}',
     'toast.profileCreated': 'Profile created', 'toast.speedApplied': 'Operation speed applied to running tasks without a restart',
+    'toast.extensionsSaved': 'Extension setting saved; it applies on the next launch', 'toast.extensionsDeferred': 'Extension setting saved; the current browser will not restart and the change applies after it closes',
     'toast.profileSaved': 'Profile settings saved', 'toast.profileOpening': 'Opening a separate login window', 'toast.profileClosed': 'Profile window closed',
     'toast.profileResidualCleaned': 'Temporary Profile residue cleaned', 'toast.profileDeleted': 'Profile deleted',
     'toast.taskNotReady': 'Task revision is not ready; loading the latest state', 'toast.pauseSent': 'Pause request sent',
@@ -1114,14 +1122,37 @@ function renderProfiles(force = false) {
         : t('profiles.speedChoose');
       mode.addEventListener('change', () => void updateProfile(profile, { defaultBehavior: mode.value }));
       modeLabel.append(mode);
+      const toggleStack = element('div', 'profile-toggle-stack');
+      if (persistent) {
+        const extensionControl = element('div', 'profile-extension-control');
+        const extensionLabel = element('label', 'switch-field');
+        const extensionsEnabled = focusKey(element('input'), `profile:${id}:extensions`);
+        extensionsEnabled.type = 'checkbox';
+        extensionsEnabled.checked = profile.extensionsEnabled !== false;
+        extensionsEnabled.disabled = pending;
+        extensionsEnabled.title = busy ? t('profiles.extensionsDeferred') : t('profiles.extensionsNextLaunch');
+        extensionsEnabled.addEventListener('change', () => void updateProfile(profile, extensionsEnabled.checked
+          ? { extensionsEnabled: true, headless: false }
+          : { extensionsEnabled: false }));
+        extensionLabel.append(extensionsEnabled, element('span', '', t('profiles.extensions')));
+        extensionControl.append(
+          extensionLabel,
+          element('p', 'profile-setting-note', busy ? t('profiles.extensionsDeferred') : t('profiles.extensionsNextLaunch'))
+        );
+        toggleStack.append(extensionControl);
+      }
       const headlessLabel = element('label', 'switch-field');
       const headless = focusKey(element('input'), `profile:${id}:headless`);
       headless.type = 'checkbox';
       headless.checked = Boolean(profile.headless);
-      headless.disabled = pending;
+      headless.disabled = pending || (persistent && profile.extensionsEnabled !== false);
+      headless.title = persistent && profile.extensionsEnabled !== false
+        ? t('profiles.extensionsVisibleOnly')
+        : t('profiles.background');
       headless.addEventListener('change', () => void updateProfile(profile, { headless: headless.checked }));
       headlessLabel.append(headless, element('span', '', t('profiles.background')));
-      settings.append(modeLabel, headlessLabel);
+      toggleStack.append(headlessLabel);
+      settings.append(modeLabel, toggleStack);
 
       const actions = element('div', 'profile-actions');
       const rename = focusKey(button(t('profiles.rename'), 'npc-btn-ghost compact-button', () => void renameProfile(profile)), `profile:${id}:rename`);
@@ -2036,10 +2067,14 @@ async function createProfile(event) {
 }
 
 async function updateProfile(profile, patch) {
+  const extensionChange = Object.hasOwn(patch, 'extensionsEnabled');
+  const extensionDeferred = extensionChange && !['idle', 'closed'].includes(profileState(profile));
   await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
     method: 'PATCH', body: patch
   }), Object.hasOwn(patch, 'defaultBehavior')
     ? t('toast.speedApplied')
+    : extensionChange
+      ? t(extensionDeferred ? 'toast.extensionsDeferred' : 'toast.extensionsSaved')
     : t('toast.profileSaved'));
 }
 

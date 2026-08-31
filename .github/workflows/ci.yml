@@ -40,6 +40,7 @@ jobs:
           TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
           TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
           TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
+          TASKMASTER_EXTENSION_REPORT: ${{ github.workspace }}/artifacts/extension-acceptance.json
           TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
       - name: Run release gate
         if: runner.os != 'Linux'
@@ -49,6 +50,7 @@ jobs:
           TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
           TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
           TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
+          TASKMASTER_EXTENSION_REPORT: ${{ github.workspace }}/artifacts/extension-acceptance.json
           TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
