@@ -517,7 +517,6 @@ test('terminal finalization seals a valid current-attempt checkpoint when checkp
 
 test('terminal finalization seals the newest same-attempt checkpoint before asset reads', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-asset-newer-checkpoint-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
   const modulePath = path.join(root, 'newer-checkpoint-task.mjs');
   await writeFile(modulePath, [
     'export const meta = { supportsResume: true };',
@@ -560,7 +559,10 @@ test('terminal finalization seals the newest same-attempt checkpoint before asse
       });
     }
   });
-  t.after(() => service.close());
+  t.after(async () => {
+    await service.close();
+    await rm(root, { recursive: true, force: true });
+  });
   await service.installTaskType({ name: 'newer.checkpoint.asset.v1', modulePath, transient: true }, ADMIN);
   const created = await service.create({
     profileId: 'profile_test', taskType: 'newer.checkpoint.asset.v1',
