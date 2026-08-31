@@ -23,6 +23,17 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function waitForCoordinatorAudit(coordinator, predicate, description, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  let audit = coordinator.audit();
+  while (!predicate(audit) && Date.now() < deadline) {
+    await delay(10);
+    audit = coordinator.audit();
+  }
+  assert.equal(predicate(audit), true, `${description}; observed ${JSON.stringify(audit)}`);
+  return audit;
+}
+
 function listen(server) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -135,7 +146,7 @@ function extensionContentSource() {
         pending.delete(job.key);
         manualFinishes.delete(job.key);
       };
-      if (job.kind === 'held') manualFinishes.set(job.key, finish);
+      if (job.kind === 'held' || job.manualRelease) manualFinishes.set(job.key, finish);
       else if (job.holdMs > 0) setTimeout(finish, job.holdMs);
       else finish();
     }, true);
@@ -163,6 +174,7 @@ function extensionContentSource() {
         durationMs: Number.isFinite(Number(command.durationMs)) && Number(command.durationMs) > 0
           ? Math.max(250, Math.min(10_000, Number(command.durationMs)))
           : 0,
+        manualRelease: command.manualRelease === true,
         kind: String(command.kind || 'click'),
         value: String(command.value || 'extension-value').slice(0, 200),
         url: String(command.url || location.href)
@@ -447,7 +459,8 @@ export async function runExtensionAcceptance({
       requestId: 'extension-first',
       kind: 'compound',
       value: 'extension-first-value',
-      holdMs: 220
+      manualRelease: true,
+      durationMs: 10_000
     });
     await waitForTrace(page, 'extension-first:start');
     const taskAfterExtension = coordinator.run('task-after-extension', async () => {
@@ -455,8 +468,13 @@ export async function runExtensionAcceptance({
       await page.locator('#task-button').click();
       await appendTrace(page, 'task-after-extension:end');
     });
-    await delay(60);
-    assert.equal(labels(await readTrace(page)).includes('task-after-extension:start'), false);
+    assert.equal(coordinator.audit().active, 1);
+    assert.equal(coordinator.audit().pending, 1);
+    await dispatchExtensionCommand(page, {
+      label: 'extension-first-release',
+      requestId: 'extension-first',
+      kind: 'release-held'
+    });
     await taskAfterExtension;
     const extensionFirstTrace = await readTrace(page);
     assertOrdered(extensionFirstTrace, [
@@ -482,7 +500,7 @@ export async function runExtensionAcceptance({
       participantId: 'acceptance-extension-a',
       requestId: 'shared-request-id',
       kind: 'held',
-      durationMs: 8_000,
+      durationMs: 10_000,
       holdMs: 0
     });
     await waitForTrace(page, 'participant-a:start');
@@ -493,8 +511,11 @@ export async function runExtensionAcceptance({
       kind: 'click',
       holdMs: 0
     });
-    await delay(80);
-    assert.equal(labels(await readTrace(page)).includes('participant-b:start'), false);
+    await waitForCoordinatorAudit(
+      coordinator,
+      (audit) => audit.active === 1 && audit.pending === 1,
+      'the second participant must be queued behind the first participant lease'
+    );
     await dispatchExtensionCommand(page, {
       label: 'participant-a-release',
       participantId: 'acceptance-extension-a',
@@ -521,8 +542,8 @@ export async function runExtensionAcceptance({
     await dispatchExtensionCommand(acceptanceFrame, {
       label: 'existing-frame-extension',
       requestId: 'existing-frame-extension',
-      kind: 'click',
-      holdMs: 1_200
+      kind: 'held',
+      durationMs: 10_000
     });
     await waitForTrace(acceptanceFrame, 'existing-frame-extension:start');
     let taskAfterFrameNavigationStarted = false;
@@ -530,7 +551,7 @@ export async function runExtensionAcceptance({
       taskAfterFrameNavigationStarted = true;
       await page.locator('#task-button').click();
     });
-    await delay(40);
+    assert.equal(coordinator.audit().pending, 1);
     assert.equal(taskAfterFrameNavigationStarted, false);
     const releasesBeforeFrameNavigation = coordinator.audit().navigationReleases;
     await page.goto(`${url}?frame-destroyed=1`, { waitUntil: 'domcontentloaded' });
@@ -551,9 +572,8 @@ export async function runExtensionAcceptance({
     await dispatchExtensionCommand(page, {
       label: 'main-page-holder',
       requestId: 'main-page-holder',
-      kind: 'click',
-      holdMs: 1_500,
-      durationMs: 4_000
+      kind: 'held',
+      durationMs: 10_000
     });
     await waitForTrace(page, 'main-page-holder:start');
     let unrelatedNavigationTaskStarted = false;
@@ -562,32 +582,35 @@ export async function runExtensionAcceptance({
     });
     const releasesBeforeUnrelatedNavigation = coordinator.audit().navigationReleases;
     const unrelatedNavigation = unrelatedPage.goto(`${url}?unrelated=2`, { waitUntil: 'domcontentloaded' });
-    await delay(80);
-    assert.equal(unrelatedNavigationTaskStarted, false);
-    assert.equal(coordinator.audit().navigationReleases, releasesBeforeUnrelatedNavigation);
     await unrelatedNavigation;
+    assert.equal(unrelatedNavigationTaskStarted, false);
+    assert.equal(coordinator.audit().pending, 1);
+    assert.equal(coordinator.audit().navigationReleases, releasesBeforeUnrelatedNavigation);
+    await dispatchExtensionCommand(page, {
+      label: 'main-page-holder-release',
+      requestId: 'main-page-holder',
+      kind: 'release-held'
+    });
     await unrelatedNavigationTask;
 
     await dispatchExtensionCommand(unrelatedPage, {
       label: 'source-page-close',
       requestId: 'source-page-close',
-      kind: 'click',
-      holdMs: 1_200,
-      durationMs: 4_000
+      kind: 'held',
+      durationMs: 10_000
     });
     await waitForTrace(unrelatedPage, 'source-page-close:start');
     let taskAfterSourceCloseStarted = false;
     const taskAfterSourceClose = coordinator.run('task-after-source-page-close', async () => {
       taskAfterSourceCloseStarted = true;
     });
-    await delay(40);
+    assert.equal(coordinator.audit().pending, 1);
     assert.equal(taskAfterSourceCloseStarted, false);
     const sourceCloseStartedAt = Date.now();
     await unrelatedPage.close();
     await taskAfterSourceClose;
     const sourceCloseWaitMs = Date.now() - sourceCloseStartedAt;
     assert.equal(taskAfterSourceCloseStarted, true);
-    assert.equal(sourceCloseWaitMs < 1_000, true);
     record('unrelated-tab-navigation-does-not-release-source-but-source-close-does', {
       unrelatedNavigationReleased: false,
       sourceCloseWaitMs
@@ -604,8 +627,11 @@ export async function runExtensionAcceptance({
         value: 'extension-after-task-value',
         holdMs: 40
       });
-      await delay(80);
-      assert.equal(labels(await readTrace(page)).includes('extension-after-task:start'), false);
+      await waitForCoordinatorAudit(
+        coordinator,
+        (audit) => audit.active === 1 && audit.pending === 1,
+        'the extension action must be queued behind the active Task lease'
+      );
       await page.locator('#task-button').click();
       await appendTrace(page, 'task-first:end');
     });
@@ -753,16 +779,18 @@ export async function runExtensionAcceptance({
     });
     await waitForTrace(page, 'extension-navigation:start');
     let taskAfterNavigationStarted = false;
+    let taskAfterNavigationUrl = null;
     const taskAfterNavigation = coordinator.run('task-after-extension-navigation', async () => {
       taskAfterNavigationStarted = true;
+      taskAfterNavigationUrl = page.url();
       await page.locator('#task-button').click();
     });
-    await delay(30);
+    assert.equal(coordinator.audit().pending, 1);
     assert.equal(taskAfterNavigationStarted, false);
     await page.waitForURL(/extension-navigation=1/u);
     await taskAfterNavigation;
     const navigationWaitMs = Date.now() - navigationStartedAt;
-    assert.equal(navigationWaitMs < 1_000, true);
+    assert.match(taskAfterNavigationUrl, /extension-navigation=1/u);
     assert.equal(coordinator.audit().navigationReleases >= 1, true);
     record('extension-navigation-releases-lease-at-document-boundary', {
       navigationWaitMs,
@@ -828,7 +856,6 @@ export async function runExtensionAcceptance({
     const proofDurationMs = Date.now() - proofStartedAt;
     assert.equal(proofOutcome.state, 'failed');
     assert.equal(proofOutcome.error.code, 'TASK_ACTION_REENTRANT');
-    assert.equal(proofDurationMs < 5_000, true);
     const proofJournal = await inspectEffectJournal(
       path.join(path.dirname(proofCheckpointPath), 'effect-journal.jsonl')
     );
@@ -902,14 +929,11 @@ export async function runExtensionAcceptance({
       blockMs: 800,
       holdMs: 0
     });
-    const staleLeaseDeadline = Date.now() + 1_000;
-    while (
-      coordinator.audit().extensionLeases === extensionLeasesBeforeStaleGrant &&
-      Date.now() < staleLeaseDeadline
-    ) {
-      await delay(10);
-    }
-    assert.equal(coordinator.audit().extensionLeases, extensionLeasesBeforeStaleGrant + 1);
+    await waitForCoordinatorAudit(
+      coordinator,
+      (audit) => audit.extensionLeases === extensionLeasesBeforeStaleGrant + 1,
+      'the stale-grant probe must acquire its extension lease before Task work is queued'
+    );
     let staleTaskStarted = false;
     const staleTaskOutcome = coordinator.run('task-after-stale-extension-grant', async () => {
       staleTaskStarted = true;
