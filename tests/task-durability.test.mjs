@@ -51,8 +51,12 @@ function fakeProfiles(root) {
     state: 'idle',
     lease: null
   };
+  let releaseLeaseBarrier = null;
   return {
     profile,
+    holdNextReleaseLease(barrier) {
+      releaseLeaseBarrier = barrier;
+    },
     async get(id) {
       if (id !== profile.id) throw new Error('profile not found');
       return structuredClone(profile);
@@ -67,6 +71,12 @@ function fakeProfiles(root) {
     async releaseLease(id, ownerId) {
       if (id !== profile.id) throw new Error('profile not found');
       if (profile.lease?.ownerId !== ownerId) return false;
+      if (releaseLeaseBarrier) {
+        const barrier = releaseLeaseBarrier;
+        releaseLeaseBarrier = null;
+        barrier.entered.resolve();
+        await barrier.release.promise;
+      }
       profile.lease = null;
       profile.state = 'idle';
       return true;
@@ -82,6 +92,12 @@ async function waitFor(predicate, timeoutMs = 5_000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('condition not reached');
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 async function installTaskType({ root, stateDir, profiles, moduleSource }) {
@@ -548,12 +564,29 @@ test('resume fails closed without checkpoint, settled cleanup, or an unchanged m
   );
   assert.equal((await service.getInternal(invalidOrphan.id)).checkpoint, null);
 
+  const releaseEntered = deferred();
+  const releaseAllowed = deferred();
+  profiles.holdNextReleaseLease({ entered: releaseEntered, release: releaseAllowed });
   const foreignPointer = await service.create({
     profileId: profiles.profile.id,
     taskType: 'guards',
     idempotencyKey: 'guard-foreign-checkpoint-pointer',
     input: { mode: 'foreign-pointer' }
   }, AGENT_A);
+  await releaseEntered.promise;
+  try {
+    const sealedBeforeCleanup = await service.getInternal(foreignPointer.id);
+    assert.equal(sealedBeforeCleanup.checkpointSeal.status, 'unavailable');
+    assert.equal(sealedBeforeCleanup.resumeCheckpointError.code, 'TASK_CHECKPOINT_INVALID');
+    assert.equal(sealedBeforeCleanup.cleanup.settled, false);
+    await service.get(foreignPointer.id, AGENT_A);
+    assert.equal(
+      (await service.getInternal(foreignPointer.id)).resumeCheckpointError.code,
+      'TASK_CHECKPOINT_INVALID'
+    );
+  } finally {
+    releaseAllowed.resolve();
+  }
   await waitFor(async () => (await service.get(foreignPointer.id, AGENT_A)).cleanup.settled);
   await assert.rejects(
     service.resume(foreignPointer.id, { resumeKey: 'resume-foreign-pointer' }, AGENT_A),

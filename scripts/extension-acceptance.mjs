@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
@@ -88,6 +89,9 @@ function extensionContentSource() {
       chrome.runtime.sendMessage({ kind: 'acceptance-ready' }).then((response) => {
         if (response?.ok === true) {
           element.dataset.taskmasterAcceptanceServiceWorker = 'ready';
+          element.dataset.taskmasterAcceptanceCapabilities = Array.isArray(response.capabilities)
+            ? response.capabilities.join(',')
+            : 'missing';
         }
       }).catch(() => {});
     }
@@ -136,11 +140,16 @@ function extensionContentSource() {
       const finish = () => {
         trace(job.label + ':end');
         document.dispatchEvent(new CustomEvent(protocol.releaseEvent, {
-          detail: {
-            participantId: job.participantId,
-            leaseId: detail.leaseId
-          }
-        }));
+           detail: {
+             participantId: job.participantId,
+             leaseId: detail.leaseId,
+             outcome: {
+               status: 'succeeded',
+               code: 'acceptance-' + job.kind + '-complete',
+               facts: ['visible-state-applied']
+             }
+           }
+         }));
         running.delete(job.key);
         completed.add(job.key);
         pending.delete(job.key);
@@ -155,6 +164,13 @@ function extensionContentSource() {
       const command = event?.detail && typeof event.detail === 'object' ? event.detail : {};
       const label = String(command.label || 'extension').slice(0, 60);
       const target = String(command.target || '#extension-button').slice(0, 100);
+      const kind = String(command.kind || 'click');
+      if (kind === 'unintegrated-click') {
+        trace(label + ':start');
+        document.querySelector(target)?.click();
+        trace(label + ':end');
+        return;
+      }
       const requestId = String(command.requestId || label).replace(/[^a-z0-9._:-]/gi, '-').slice(0, 64);
       const participantId = String(command.participantId || 'acceptance-extension')
         .replace(/[^a-z0-9._:-]/gi, '-').slice(0, 64);
@@ -175,7 +191,7 @@ function extensionContentSource() {
           ? Math.max(250, Math.min(10_000, Number(command.durationMs)))
           : 0,
         manualRelease: command.manualRelease === true,
-        kind: String(command.kind || 'click'),
+        kind,
         value: String(command.value || 'extension-value').slice(0, 200),
         url: String(command.url || location.href)
       };
@@ -254,7 +270,9 @@ function fixtureHtml() {
             const output = document.getElementById('page-secondary-count');
             output.textContent = String(Number(output.textContent) + 1);
           });
-          if (new URL(location.href).searchParams.get('worker') === 'cooperative-first') {
+          if (['cooperative-first', 'cooperative-unresolved'].includes(
+            new URL(location.href).searchParams.get('worker')
+          )) {
             setTimeout(() => document.dispatchEvent(new CustomEvent(${JSON.stringify(COMMAND_EVENT)}, {
               detail: {
                 label: 'worker-extension',
@@ -382,8 +400,10 @@ export async function runExtensionAcceptance({
       manifest_version: 3,
       name: 'Task Master MV3 serialization acceptance',
       version: '1.0.0',
-      background: { service_worker: 'background.js' },
-      content_scripts: [{
+       background: { service_worker: 'background.js' },
+       permissions: ['storage', 'tabs', 'scripting'],
+       host_permissions: ['http://127.0.0.1/*'],
+       content_scripts: [{
         matches: ['http://127.0.0.1/*'],
         js: ['content.js'],
         run_at: 'document_start',
@@ -391,10 +411,30 @@ export async function runExtensionAcceptance({
       }]
     }, null, 2)}\n`);
     await writeFile(path.join(extensionDir, 'background.js'), [
-      "chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {",
+      "chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {",
       "  if (message?.kind !== 'acceptance-ready') return false;",
-      "  sendResponse({ ok: true });",
-      '  return false;',
+      '  (async () => {',
+      "    const tabId = sender.tab?.id;",
+      "    if (!Number.isInteger(tabId)) throw new Error('sender tab is unavailable');",
+      "    await chrome.storage.local.set({ taskmasterAcceptance: 'ready' });",
+      "    const stored = await chrome.storage.local.get('taskmasterAcceptance');",
+      "    const declaredPermissions = await chrome.permissions.contains({ permissions: ['storage', 'tabs', 'scripting'] });",
+      "    const declaredOrigin = await chrome.permissions.contains({ origins: ['http://127.0.0.1/*'] });",
+      "    const probeTab = await chrome.tabs.create({ url: 'about:blank', active: false });",
+      '    const protectedTab = await chrome.tabs.get(probeTab.id);',
+      '    await chrome.tabs.remove(probeTab.id);',
+      '    const execution = await chrome.scripting.executeScript({',
+      '      target: { tabId },',
+      '      func: () => location.protocol',
+      '    });',
+      "    const capabilities = [];",
+      "    if (declaredPermissions && stored.taskmasterAcceptance === 'ready') capabilities.push('storage');",
+      "    if (declaredPermissions && protectedTab?.url === 'about:blank') capabilities.push('tabs');",
+      "    if (declaredPermissions && execution?.[0]?.result === 'http:') capabilities.push('scripting');",
+      "    if (declaredOrigin) capabilities.push('host-permissions');",
+      '    sendResponse({ ok: capabilities.length === 4, capabilities });',
+      '  })().catch(() => sendResponse({ ok: false, capabilities: [] }));',
+      '  return true;',
       '});',
       ''
     ].join('\n'));
@@ -430,7 +470,9 @@ export async function runExtensionAcceptance({
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => (
       document.documentElement.dataset.taskmasterAcceptanceExtension === 'active' &&
-      document.documentElement.dataset.taskmasterAcceptanceServiceWorker === 'ready'
+      document.documentElement.dataset.taskmasterAcceptanceServiceWorker === 'ready' &&
+      document.documentElement.dataset.taskmasterAcceptanceCapabilities ===
+        'storage,tabs,scripting,host-permissions'
     ));
     await page.locator('#acceptance-frame').waitFor();
     const acceptanceFrame = page.frames().find((frame) => {
@@ -450,7 +492,8 @@ export async function runExtensionAcceptance({
     });
     assert.ok(context.serviceWorkers().some((worker) => worker.url().startsWith('chrome-extension://')));
     record('mv3-content-script-and-service-worker-loaded', {
-      serviceWorkers: context.serviceWorkers().filter((worker) => worker.url().startsWith('chrome-extension://')).length
+      serviceWorkers: context.serviceWorkers().filter((worker) => worker.url().startsWith('chrome-extension://')).length,
+      chromeApis: ['storage', 'tabs', 'scripting', 'host-permissions']
     });
 
     await clearTrace(page);
@@ -692,12 +735,26 @@ export async function runExtensionAcceptance({
     await writeFile(workerModulePath, [
       "import { writeFile } from 'node:fs/promises';",
       "import path from 'node:path';",
-      'export async function run({ page, journey, input, outputDir }) {',
+      'export async function run({ page, journey, extensionFlow, input, outputDir, checkpoint }) {',
+      "  const completion = extensionFlow.expectCompletion({ participantId: 'acceptance-extension', requestId: 'worker-extension', operation: 'acceptance-compound', timeoutMs: 5_000 });",
       '  await journey.open(input.url);',
-      "  await Promise.all([journey.click('#task-button'), journey.click('#task-button')]);",
-      `  const trace = await page.evaluate((attribute) => JSON.parse(document.documentElement.getAttribute(attribute) || '[]'), ${JSON.stringify(TRACE_ATTRIBUTE)});`,
+      '  const receipt = await completion;',
+      "  const extensionState = { input: await page.locator('#extension-input').inputValue(), box: await page.locator('#extension-box').textContent(), count: Number(await page.locator('#extension-count').textContent()) };",
+      "  const verified = receipt.outcome.status === 'succeeded' && receipt.outcome.code === 'acceptance-compound-complete' && extensionState.input === 'worker-extension-value' && extensionState.box === 'worker-extension-value' && extensionState.count === 1;",
+      "  if (!verified) await extensionFlow.resolveCompletion(receipt.receiptId, { decision: 'rejected', code: 'page-state-mismatch' });",
+      "  const firstTaskClick = journey.click('#task-button');",
+      '  firstTaskClick.catch(() => {});',
+      "  const taskCountBeforeTakeover = Number(await page.locator('#task-count').textContent());",
+      "  if (taskCountBeforeTakeover !== 0) throw new Error('Task action escaped the extension completion gate');",
+      "  await checkpoint({ stage: 'extension-verified', participantId: receipt.participantId, requestId: receipt.requestId, operation: receipt.operation, outcome: receipt.outcome, extensionState });",
+      "  const resolution = await extensionFlow.resolveCompletion(receipt.receiptId, { decision: 'verified', code: 'page-state-verified' });",
+      '  await firstTaskClick;',
+      "  await journey.click('#task-button');",
+      "  const finalExtensionState = { input: await page.locator('#extension-input').inputValue(), box: await page.locator('#extension-box').textContent(), count: Number(await page.locator('#extension-count').textContent()) };",
+      "  if (JSON.stringify(finalExtensionState) !== JSON.stringify(extensionState)) throw new Error('Task action overwrote extension-owned state');",
+      `  const trace = JSON.parse(await page.locator('html').getAttribute(${JSON.stringify(TRACE_ATTRIBUTE)}) || '[]');`,
       "  const counts = await page.locator('output').allTextContents();",
-      "  await writeFile(path.join(outputDir, 'worker-trace.json'), JSON.stringify({ trace, counts }, null, 2));",
+      "  await writeFile(path.join(outputDir, 'worker-trace.json'), JSON.stringify({ trace, counts, receipt, resolution, extensionState, finalExtensionState, taskCountBeforeTakeover }, null, 2));",
       "  return { summary: 'Worker Journey and extension actions completed in one serialized browser.', evidence: [{ kind: 'artifact', file: 'worker-trace.json', agentVisible: true }] };",
       '}',
       ''
@@ -744,16 +801,183 @@ export async function runExtensionAcceptance({
       'task-button:click'
     ]);
     assert.deepEqual(workerEvidence.counts, ['2', '1', '0']);
+    assert.equal(workerEvidence.taskCountBeforeTakeover, 0);
+    assert.equal(workerEvidence.receipt.participantId, 'acceptance-extension');
+    assert.equal(workerEvidence.receipt.requestId, 'worker-extension');
+    assert.equal(workerEvidence.receipt.operation, 'acceptance-compound');
+    assert.equal(workerEvidence.receipt.outcome.status, 'succeeded');
+    assert.equal(workerEvidence.resolution.decision, 'verified');
+    assert.deepEqual(workerEvidence.extensionState, {
+      input: 'worker-extension-value',
+      box: 'worker-extension-value',
+      count: 1
+    });
+    assert.deepEqual(workerEvidence.finalExtensionState, workerEvidence.extensionState);
+    const workerCheckpoint = JSON.parse(await readFile(workerCheckpointPath, 'utf8'));
+    assert.equal(workerCheckpoint.extensionHandoff.receiptId, workerEvidence.receipt.receiptId);
+    assert.equal(workerCheckpoint.extensionHandoff.participantId, 'acceptance-extension');
+    assert.equal(workerCheckpoint.extensionHandoff.requestId, 'worker-extension');
+    assert.equal(workerCheckpoint.extensionHandoff.operation, 'acceptance-compound');
+    assert.equal(workerCheckpoint.data.stage, 'extension-verified');
+    assert.deepEqual(workerCheckpoint.data.extensionState, workerEvidence.extensionState);
     const interactionAudit = JSON.parse(await readFile(path.join(workerOutputDir, 'interaction-audit.json'), 'utf8'));
     assert.equal(interactionAudit.passed, true);
     assert.equal(interactionAudit.coordination.maximumActive, 1);
     assert.equal(interactionAudit.coordination.serialized, true);
     assert.equal(interactionAudit.coordination.extension.serialized, true);
-    record('real-worker-journey-and-extension-share-the-runtime-fifo', {
+    record('real-worker-extension-handoff-gates-task-takeover', {
       order: labels(workerEvidence.trace),
       taskClicks: 2,
       extensionClicks: 1,
+      taskCountBeforeTakeover: workerEvidence.taskCountBeforeTakeover,
+      receiptIdentity: [
+        workerEvidence.receipt.participantId,
+        workerEvidence.receipt.requestId,
+        workerEvidence.receipt.operation
+      ],
+      extensionOutcome: workerEvidence.receipt.outcome,
+      taskResolution: workerEvidence.resolution,
+      checkpointLinkedReceipt: workerCheckpoint.extensionHandoff.receiptId,
+      extensionStatePreserved: true,
       maximumActive: interactionAudit.coordination.maximumActive
+    });
+
+    const workerEffectJournalPath = path.join(
+      path.dirname(workerCheckpointPath),
+      'effect-journal.jsonl'
+    );
+    const workerEffectJournal = await inspectEffectJournal(workerEffectJournalPath);
+    assert.deepEqual(workerEffectJournal.pending, []);
+    const workerEffectRecords = (await readFile(workerEffectJournalPath, 'utf8'))
+      .trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.equal(workerEffectRecords.some((entry) => (
+      entry.state === 'started' && entry.operation === 'custom'
+    )), true);
+    assert.equal(workerEffectRecords.some((entry) => (
+      entry.state === 'succeeded' && entry.operation === 'custom'
+    )), true);
+
+    const unresolvedTaskId = 'task_extension_unresolved_acceptance';
+    const unresolvedModulePath = path.join(root, 'extension-unresolved-task.mjs');
+    const unresolvedRecoveryModulePath = path.join(root, 'extension-unresolved-recovery-task.mjs');
+    const unresolvedOutputDir = path.join(root, 'extension-unresolved-output');
+    const unresolvedRecoveryOutputDir = path.join(root, 'extension-unresolved-recovery-output');
+    const unresolvedCheckpointPath = path.join(root, 'extension-unresolved-state', 'checkpoint.json');
+    const unresolvedProfileDir = path.join(root, 'extension-unresolved-profile');
+    await writeFile(unresolvedModulePath, [
+      'export async function run({ journey, extensionFlow, input, checkpoint }) {',
+      "  await checkpoint({ stage: 'before-extension' });",
+      "  const completion = extensionFlow.expectCompletion({ participantId: 'acceptance-extension', requestId: 'worker-extension', operation: 'acceptance-compound', timeoutMs: 5_000 });",
+      '  await journey.open(input.url);',
+      '  await completion;',
+      "  const error = new Error('Acceptance verification crashed after the extension completed');",
+      "  error.code = 'ACCEPTANCE_EXTENSION_VERIFICATION_CRASH';",
+      '  throw error;',
+      '}',
+      ''
+    ].join('\n'));
+    const unresolvedOutcome = await runTaskWorker({
+      taskId: unresolvedTaskId,
+      attempt: 1,
+      modulePath: unresolvedModulePath,
+      outputDir: unresolvedOutputDir,
+      checkpointPath: unresolvedCheckpointPath,
+      input: { url: `${url}?worker=cooperative-unresolved` },
+      behavior: 'fast',
+      interactionContract: 'full-human-v1',
+      profile: {
+        kind: 'persistent',
+        browserEngine: 'chromium',
+        userDataDir: unresolvedProfileDir,
+        headless: false,
+        extensionsEnabled: true
+      },
+      heartbeatMs: 1_000,
+      timeoutMs: 30_000
+    }, {
+      loadPlaywright: async () => ({
+        chromium: {
+          launchPersistentContext(userDataDir, options) {
+            return chromium.launchPersistentContext(userDataDir, {
+              ...options,
+              args: [...(options.args || []), ...extensionArgs]
+            });
+          }
+        }
+      })
+    });
+    assert.equal(unresolvedOutcome.state, 'failed', JSON.stringify(unresolvedOutcome));
+    const unresolvedJournalPath = path.join(
+      path.dirname(unresolvedCheckpointPath),
+      'effect-journal.jsonl'
+    );
+    const unresolvedJournal = await inspectEffectJournal(unresolvedJournalPath, { includeMetadata: true });
+    assert.equal(unresolvedJournal.pending.length, 1);
+    assert.equal(unresolvedJournal.pending[0].operation, 'custom');
+    const unresolvedCheckpointBytes = await readFile(unresolvedCheckpointPath);
+    const unresolvedCheckpoint = JSON.parse(unresolvedCheckpointBytes.toString('utf8'));
+    assert.equal(unresolvedCheckpoint.data.stage, 'before-extension');
+    assert.equal(Object.hasOwn(unresolvedCheckpoint, 'extensionHandoff'), false);
+    const frozenResumePath = path.join(root, 'extension-unresolved-state', 'resume-input-attempt-2.json');
+    await writeFile(frozenResumePath, unresolvedCheckpointBytes);
+    await writeFile(unresolvedRecoveryModulePath, [
+      'export async function run({ journey, input, checkpoint, effects }) {',
+      '  const restored = await checkpoint.read();',
+      "  if (restored?.stage !== 'before-extension') throw new Error('Frozen resume checkpoint mismatch');",
+      "  if (effects.pending().length !== 1) throw new Error('Expected one unresolved extension effect');",
+      '  await journey.open(input.url);',
+      "  return { summary: 'must not replay unresolved extension effect', evidence: [] };",
+      '}',
+      ''
+    ].join('\n'));
+    const unresolvedResumeOutcome = await runTaskWorker({
+      taskId: unresolvedTaskId,
+      attempt: 2,
+      modulePath: unresolvedRecoveryModulePath,
+      outputDir: unresolvedRecoveryOutputDir,
+      checkpointPath: unresolvedCheckpointPath,
+      resumeCheckpoint: {
+        path: frozenResumePath,
+        sourceAttempt: 1,
+        targetAttempt: 2,
+        savedAt: unresolvedCheckpoint.savedAt,
+        sha256: createHash('sha256').update(unresolvedCheckpointBytes).digest('hex'),
+        sizeBytes: unresolvedCheckpointBytes.byteLength
+      },
+      input: { url: `${url}?worker=cooperative-resume-must-not-open` },
+      behavior: 'fast',
+      interactionContract: 'full-human-v1',
+      profile: {
+        kind: 'persistent',
+        browserEngine: 'chromium',
+        userDataDir: unresolvedProfileDir,
+        headless: false,
+        extensionsEnabled: true
+      },
+      heartbeatMs: 1_000,
+      timeoutMs: 30_000
+    }, {
+      loadPlaywright: async () => ({
+        chromium: {
+          launchPersistentContext(userDataDir, options) {
+            return chromium.launchPersistentContext(userDataDir, {
+              ...options,
+              args: [...(options.args || []), ...extensionArgs]
+            });
+          }
+        }
+      })
+    });
+    assert.equal(unresolvedResumeOutcome.state, 'failed', JSON.stringify(unresolvedResumeOutcome));
+    assert.equal(unresolvedResumeOutcome.error?.code, 'TASK_EFFECT_OUTCOME_UNKNOWN');
+    const unresolvedAfterResume = await inspectEffectJournal(unresolvedJournalPath, { includeMetadata: true });
+    assert.equal(unresolvedAfterResume.pending.length, 1);
+    assert.equal(unresolvedAfterResume.pending[0].sequence, unresolvedJournal.pending[0].sequence);
+    record('unresolved-extension-effect-blocks-resume-replay', {
+      pendingSequence: unresolvedJournal.pending[0].sequence,
+      pendingOperation: unresolvedJournal.pending[0].operation,
+      resumeError: unresolvedResumeOutcome.error?.code,
+      checkpointStage: unresolvedCheckpoint.data.stage
     });
 
     await clearTrace(page);
@@ -810,6 +1034,60 @@ export async function runExtensionAcceptance({
     record('ordinary-page-programmatic-events-do-not-false-positive', {
       secondaryClicks: 1,
       conflicts: coordinator.audit().conflicts
+    });
+
+    await clearTrace(page);
+    const unintegratedCountBefore = Number(await page.locator('#extension-count').textContent());
+    const unintegratedAuditBefore = coordinator.audit();
+    let markUnintegratedTaskStarted;
+    let releaseUnintegratedTask;
+    const unintegratedTaskStarted = new Promise((resolve) => { markUnintegratedTaskStarted = resolve; });
+    const unintegratedTaskRelease = new Promise((resolve) => { releaseUnintegratedTask = resolve; });
+    const unintegratedTask = coordinator.run('unintegrated-extension-holder', async () => {
+      await appendTrace(page, 'unintegrated-task:start');
+      markUnintegratedTaskStarted();
+      await unintegratedTaskRelease;
+      await appendTrace(page, 'unintegrated-task:end');
+    });
+    await unintegratedTaskStarted;
+    let unintegratedDuringTaskTrace;
+    try {
+      await dispatchExtensionCommand(page, {
+        label: 'unintegrated-extension',
+        kind: 'unintegrated-click',
+        target: '#extension-button'
+      });
+      await waitForTrace(page, 'unintegrated-extension:end');
+      unintegratedDuringTaskTrace = await readTrace(page);
+      assertOrdered(unintegratedDuringTaskTrace, [
+        'unintegrated-task:start',
+        'unintegrated-extension:start',
+        'extension-button:click',
+        'unintegrated-extension:end'
+      ]);
+      assert.equal(labels(unintegratedDuringTaskTrace).includes('unintegrated-task:end'), false);
+      assert.equal(Number(await page.locator('#extension-count').textContent()) - unintegratedCountBefore, 1);
+      assert.equal(coordinator.audit().active, 1);
+      assert.equal(coordinator.audit().pending, 0);
+      assert.equal(coordinator.audit().extensionLeases, unintegratedAuditBefore.extensionLeases);
+      assert.equal(coordinator.audit().conflicts, unintegratedAuditBefore.conflicts);
+    } finally {
+      releaseUnintegratedTask();
+      await unintegratedTask;
+    }
+    const unintegratedFinalTrace = await readTrace(page);
+    assertOrdered(unintegratedFinalTrace, [
+      'unintegrated-task:start',
+      'unintegrated-extension:start',
+      'unintegrated-extension:end',
+      'unintegrated-task:end'
+    ]);
+    record('unintegrated-extension-is-not-forced-into-fifo', {
+      extensionClicks: 1,
+      extensionLeaseDelta: coordinator.audit().extensionLeases - unintegratedAuditBefore.extensionLeases,
+      overlapObserved: true,
+      requiresPause: true,
+      order: labels(unintegratedFinalTrace)
     });
 
     const proofModulePath = path.join(root, 'proof-failure-task.mjs');
@@ -1005,7 +1283,7 @@ export async function runExtensionAcceptance({
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
-      summary: { passed: checks.length, total: 15 },
+      summary: { passed: checks.length, total: 17 },
       checks
     };
     assert.equal(report.summary.passed, report.summary.total);
@@ -1022,7 +1300,7 @@ export async function runExtensionAcceptance({
       startedAt: startedAt.toISOString(),
       finishedAt: failedAt.toISOString(),
       durationMs: failedAt.getTime() - startedAt.getTime(),
-      summary: { passed: checks.length, total: 15 },
+      summary: { passed: checks.length, total: 16 },
       checks,
       error: {
         code: String(error?.code || 'EXTENSION_ACCEPTANCE_FAILED'),

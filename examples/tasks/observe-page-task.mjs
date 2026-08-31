@@ -25,7 +25,7 @@ export const meta = Object.freeze({
   }
 });
 
-export async function run({ page, input, outputDir, action, semantic, progress, checkpoint }) {
+export async function run({ page, input, outputDir, action, semantic, capture, progress, checkpoint }) {
   const target = new URL(input.url);
   if (!['http:', 'https:'].includes(target.protocol)) throw new TypeError('url must use HTTP(S)');
   await mkdir(outputDir, { recursive: true });
@@ -48,7 +48,7 @@ export async function run({ page, input, outputDir, action, semantic, progress, 
   ];
   if (input.screenshot === true) {
     const screenshotName = 'page.png';
-    await page.screenshot({ path: path.join(outputDir, screenshotName), fullPage: false });
+    await capture.viewport({ file: screenshotName });
     evidence.push({ kind: 'artifact', file: screenshotName, agentVisible: true });
   }
   await checkpoint({ stage: 'observed', url: snapshot.url, artifact: artifactName });

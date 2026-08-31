@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { preflightTaskPack, readTaskPack, scaffoldTaskPack } from '../src/lib/task-pack.mjs';
+import { validateFullHumanPackSource } from '../src/lib/interaction-contract.mjs';
 import { TaskTypeRegistry } from '../src/lib/task-type-registry.mjs';
 
 async function registryFixture(t) {
@@ -173,6 +174,97 @@ test('Task Pack preflight rejects legacy action and direct Page mutation bypasse
   const result = await preflightTaskPack(root);
   assert.equal(result.ok, false);
   assert.equal(result.checks[0].code, 'TASK_PACK_JOURNEY_BYPASS');
+});
+
+test('Task Pack preflight rejects arbitrary in-page evaluation instead of trusting source regexes', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-pack-evaluate-bypass-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, 'tasks'), { recursive: true });
+  await writeFile(path.join(root, 'taskpack.json'), JSON.stringify({
+    name: 'evaluate-pack',
+    version: '1.0.0',
+    interactionContract: 'full-human-v1',
+    tasks: [{ name: 'evaluate-pack.collect.v1', module: 'tasks/collect.mjs' }]
+  }));
+  await writeFile(path.join(root, 'tasks', 'collect.mjs'), [
+    'export async function run({ page, journey }) {',
+    "  await journey.open('https://example.test');",
+    "  const result = await page.evaluate(() => document.title);",
+    '  return { summary: result, evidence: [] };',
+    '}',
+    ''
+  ].join('\n'));
+
+  const result = await preflightTaskPack(root);
+  assert.equal(result.ok, false);
+  assert.equal(result.checks[0].code, 'TASK_PACK_JOURNEY_BYPASS');
+});
+
+test('Task Pack preflight rejects direct Playwright package imports', () => {
+  for (const statement of [
+    "import { chromium } from 'playwright';",
+    "const runtime = await import('playwright-core');",
+    "const runtime = require('playwright/lib/index.js');",
+    "import runtime from 'file:///opt/app/node_modules/playwright-core/index.js';"
+  ]) {
+    assert.throws(
+      () => validateFullHumanPackSource([
+        statement,
+        'export async function run({ journey }) {',
+        "  await journey.open('https://example.test');",
+        "  return { summary: 'done', evidence: [] };",
+        '}'
+      ].join('\n')),
+      (error) => error?.code === 'TASK_PACK_JOURNEY_BYPASS'
+        && error.message.includes('direct Playwright import'),
+      statement
+    );
+  }
+});
+
+test('Task Pack preflight rejects capture APIs that can change visible page state', () => {
+  for (const statement of [
+    "await page.screenshot({ animations: 'disabled' });",
+    'await page.pdf();',
+    "await page.locator('#target').screenshot();"
+  ]) {
+    assert.throws(
+      () => validateFullHumanPackSource([
+        'export async function run({ page, journey }) {',
+        "  await journey.open('https://example.test');",
+        `  ${statement}`,
+        "  return { summary: 'done', evidence: [] };",
+        '}'
+      ].join('\n')),
+      { code: 'TASK_PACK_JOURNEY_BYPASS' },
+      statement
+    );
+  }
+});
+
+test('Task Pack preflight rejects an incomplete extension handoff contract', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-pack-extension-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, 'tasks'), { recursive: true });
+  await writeFile(path.join(root, 'taskpack.json'), JSON.stringify({
+    name: 'extension-pack',
+    version: '1.0.0',
+    interactionContract: 'full-human-v1',
+    tasks: [{ name: 'extension-pack.collect.v1', module: 'tasks/collect.mjs' }]
+  }));
+  await writeFile(path.join(root, 'tasks', 'collect.mjs'), [
+    'export async function run({ journey, extensionFlow }) {',
+    "  const completion = extensionFlow.expectCompletion({ participantId: 'helper', requestId: 'item-1', operation: 'collect' });",
+    "  await journey.click('#trigger');",
+    '  await completion;',
+    "  return { summary: 'unsafe continuation', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+
+  const result = await preflightTaskPack(root);
+  assert.equal(result.ok, false);
+  assert.equal(result.checks[0].code, 'TASK_PACK_EXTENSION_HANDOFF_INCOMPLETE');
 });
 
 test('installing a newer Task Pack version retires the older version and blocks downgrade', async (t) => {

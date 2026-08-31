@@ -102,67 +102,87 @@ function summarizeFrameInspection(snapshot, fallbackChildFrames = 0) {
 }
 
 async function observe(page, semantic, limit) {
-  const observation = await page.evaluate((maximum) => {
-    const text = (node) => (node?.innerText || node?.textContent || '').replace(/\s+/gu, ' ').trim();
-    const bounded = (value, length = 240) => String(value || '').slice(0, length);
-    const root = document.scrollingElement || document.documentElement;
-    const documentHeight = Math.max(
-      root?.scrollHeight || 0,
-      document.body?.scrollHeight || 0,
-      document.documentElement?.scrollHeight || 0
-    );
-    const links = [...document.querySelectorAll('a[href]')].slice(0, maximum).map((anchor) => ({
-      text: bounded(text(anchor)),
-      href: bounded(anchor.href, 2_048),
-      rel: bounded(anchor.getAttribute('rel'), 80)
-    }));
-    const controls = [...document.querySelectorAll('button,input,textarea,select,[role="button"],[role="textbox"],[role="combobox"]')]
-      .slice(0, maximum)
-      .map((node) => ({
-        tag: node.tagName.toLowerCase(),
-        type: bounded(node.getAttribute('type'), 40),
-        role: bounded(node.getAttribute('role'), 40),
-        name: bounded(node.getAttribute('aria-label') || node.getAttribute('name') || node.getAttribute('placeholder') || text(node))
-      }));
-    const headings = [...document.querySelectorAll('h1,h2,h3,[role="heading"]')]
-      .slice(0, maximum)
-      .map((node) => bounded(text(node), 300))
-      .filter(Boolean);
-    const nextCandidates = links.filter((link) => (
-      /(?:^|\s)next(?:\s|$)/iu.test(link.rel) || /^(?:next|older|more|下一页|下页|查看更多)$/iu.test(link.text)
-    ));
-    const shadowText = [];
-    const candidates = [...document.querySelectorAll('*')].slice(0, 5_000);
-    for (const node of candidates) {
-      if (node.shadowRoot) shadowText.push(text(node.shadowRoot).slice(0, 2_000));
-      if (shadowText.length >= 32) break;
+  const bounded = (value, length = 240) => String(value || '').replace(/\s+/gu, ' ').trim().slice(0, length);
+  const safeCount = async (selector) => page.locator(selector).count().catch(() => 0);
+  const safeText = async (locator, length = 240) => {
+    const inner = await locator.innerText({ timeout: 2_000 }).catch(() => null);
+    if (inner !== null) return bounded(inner, length);
+    return bounded(await locator.textContent({ timeout: 2_000 }).catch(() => ''), length);
+  };
+  const baseUrl = page.url();
+  const linkLocator = page.locator('a[href]');
+  const linkCount = await linkLocator.count().catch(() => 0);
+  const links = [];
+  for (let index = 0; index < Math.min(linkCount, limit); index += 1) {
+    const locator = linkLocator.nth(index);
+    const rawHref = await locator.getAttribute('href', { timeout: 2_000 }).catch(() => '');
+    let href = bounded(rawHref, 2_048);
+    try {
+      href = bounded(new URL(rawHref, baseUrl).href, 2_048);
+    } catch {}
+    links.push({
+      text: await safeText(locator),
+      href,
+      rel: bounded(await locator.getAttribute('rel', { timeout: 2_000 }).catch(() => ''), 80)
+    });
+  }
+  const controlLocator = page.locator('button,input,textarea,select,[role="button"],[role="textbox"],[role="combobox"]');
+  const controlCount = await controlLocator.count().catch(() => 0);
+  const controls = [];
+  for (let index = 0; index < Math.min(controlCount, limit); index += 1) {
+    const locator = controlLocator.nth(index);
+    const attributes = await Promise.all([
+      locator.getAttribute('type', { timeout: 2_000 }).catch(() => ''),
+      locator.getAttribute('role', { timeout: 2_000 }).catch(() => ''),
+      locator.getAttribute('aria-label', { timeout: 2_000 }).catch(() => ''),
+      locator.getAttribute('name', { timeout: 2_000 }).catch(() => ''),
+      locator.getAttribute('placeholder', { timeout: 2_000 }).catch(() => '')
+    ]);
+    controls.push({
+      tag: 'control',
+      type: bounded(attributes[0], 40),
+      role: bounded(attributes[1], 40),
+      name: bounded(attributes[2] || attributes[3] || attributes[4] || await safeText(locator))
+    });
+  }
+  const headingLocator = page.locator('h1,h2,h3,[role="heading"]');
+  const headingCount = await headingLocator.count().catch(() => 0);
+  const headings = [];
+  for (let index = 0; index < Math.min(headingCount, limit); index += 1) {
+    const value = await safeText(headingLocator.nth(index), 300);
+    if (value) headings.push(value);
+  }
+  const nextCandidates = links.filter((link) => (
+    /(?:^|\s)next(?:\s|$)/iu.test(link.rel) || /^(?:next|older|more|下一页|下页|查看更多)$/iu.test(link.text)
+  ));
+  const viewport = page.viewportSize() || { width: null, height: null };
+  const bodyBox = await page.locator('body').boundingBox({ timeout: 2_000 }).catch(() => null);
+  const counts = {
+    links: linkCount,
+    forms: await safeCount('form'),
+    controls: controlCount,
+    headings: headingCount,
+    articles: await safeCount('article,[role="article"]'),
+    frames: await safeCount('iframe')
+  };
+  const observation = {
+    url: baseUrl,
+    title: bounded(await page.title().catch(() => ''), 500),
+    language: bounded(await page.locator('html').getAttribute('lang', { timeout: 2_000 }).catch(() => ''), 40),
+    viewport: { width: viewport.width, height: viewport.height, scrollY: null },
+    documentHeight: Math.max(Number(bodyBox?.height) || 0, Number(viewport.height) || 0),
+    counts,
+    headings,
+    links,
+    controls,
+    nextCandidates,
+    challengeText: bounded(await safeText(page.locator('body'), 50_000), 50_000),
+    stableLocatorHints: {
+      testIds: await safeCount('[data-testid],[data-test],[data-qa]'),
+      labelledControls: await safeCount('[aria-label],[aria-labelledby],label[for]'),
+      landmarkRoles: await safeCount('main,nav,article,[role="main"],[role="navigation"],[role="article"]')
     }
-    return {
-      url: location.href,
-      title: bounded(document.title, 500),
-      language: bounded(document.documentElement.lang, 40),
-      viewport: { width: innerWidth, height: innerHeight, scrollY },
-      documentHeight,
-      counts: {
-        links: document.links.length,
-        forms: document.forms.length,
-        controls: document.querySelectorAll('button,input,textarea,select,[role="button"],[role="textbox"],[role="combobox"]').length,
-        headings: document.querySelectorAll('h1,h2,h3,[role="heading"]').length,
-        articles: document.querySelectorAll('article,[role="article"]').length,
-        frames: document.querySelectorAll('iframe').length
-      },
-      headings,
-      links,
-      controls,
-      nextCandidates,
-      challengeText: `${text(document.body).slice(0, 12_000)}\n${shadowText.join('\n')}`.slice(0, 50_000),
-      stableLocatorHints: {
-        testIds: document.querySelectorAll('[data-testid],[data-test],[data-qa]').length,
-        labelledControls: document.querySelectorAll('[aria-label],[aria-labelledby],label[for]').length,
-        landmarkRoles: document.querySelectorAll('main,nav,article,[role="main"],[role="navigation"],[role="article"]').length
-      }
-    };
-  }, limit);
+  };
   let semanticSnapshot = null;
   try {
     semanticSnapshot = await semantic.snapshot({

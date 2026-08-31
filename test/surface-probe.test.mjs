@@ -28,11 +28,56 @@ async function fixture(t, { observations, semantics }) {
   const handoffs = [];
   let observationIndex = 0;
   let semanticIndex = 0;
+  let activeObservation = observations[0];
+  const countFor = (selector) => {
+    if (selector === 'a[href]') return activeObservation.counts.links;
+    if (selector === 'form') return activeObservation.counts.forms;
+    if (selector === 'button,input,textarea,select,[role="button"],[role="textbox"],[role="combobox"]') {
+      return activeObservation.counts.controls;
+    }
+    if (selector === 'h1,h2,h3,[role="heading"]') return activeObservation.counts.headings;
+    if (selector === 'article,[role="article"]') return activeObservation.counts.articles;
+    if (selector === 'iframe') return activeObservation.counts.frames;
+    if (selector === '[data-testid],[data-test],[data-qa]') return activeObservation.stableLocatorHints.testIds;
+    if (selector === '[aria-label],[aria-labelledby],label[for]') return activeObservation.stableLocatorHints.labelledControls;
+    if (selector === 'main,nav,article,[role="main"],[role="navigation"],[role="article"]') {
+      return activeObservation.stableLocatorHints.landmarkRoles;
+    }
+    return 1;
+  };
+  const locator = (selector, index = 0) => ({
+    count: async () => countFor(selector),
+    nth: (nextIndex) => locator(selector, nextIndex),
+    locator: (childSelector) => locator(childSelector),
+    async getAttribute(name) {
+      if (selector === 'html' && name === 'lang') return activeObservation.language;
+      if (selector === 'a[href]') return activeObservation.links[index]?.[name] || '';
+      if (selector.includes('button,input')) return activeObservation.controls[index]?.[name] || '';
+      return '';
+    },
+    async innerText() {
+      if (selector === 'body') return activeObservation.challengeText;
+      if (selector === 'a[href]') return activeObservation.links[index]?.text || '';
+      if (selector.includes('h1,h2,h3')) return activeObservation.headings[index] || '';
+      if (selector.includes('button,input')) return activeObservation.controls[index]?.name || '';
+      return '';
+    },
+    async textContent() { return this.innerText(); },
+    async boundingBox() {
+      return selector === 'body'
+        ? { x: 0, y: 0, width: activeObservation.viewport.width, height: activeObservation.documentHeight }
+        : null;
+    }
+  });
   const result = await run({
     page: {
-      async evaluate() {
-        return structuredClone(observations[Math.min(observationIndex++, observations.length - 1)]);
-      }
+      url() {
+        activeObservation = structuredClone(observations[Math.min(observationIndex++, observations.length - 1)]);
+        return activeObservation.url;
+      },
+      async title() { return activeObservation.title; },
+      viewportSize() { return structuredClone(activeObservation.viewport); },
+      locator
     },
     semantic: {
       async snapshot() {

@@ -1,5 +1,4 @@
 import { isBehaviorMode } from '../contracts.mjs';
-import { unwrapObservationLocator } from './observation-facade.mjs';
 
 const DEFAULT_HUMAN_TIMING = Object.freeze({
   cautiousBeforeAction: [15, 45],
@@ -55,9 +54,9 @@ function numberBetween(range, random) {
   return Math.round(minimum + (maximum - minimum) * random());
 }
 
-function asLocator(page, target) {
+function asLocator(page, target, unwrapLocator) {
   if (typeof target === 'string') return page.locator(target);
-  if (target && typeof target === 'object') return unwrapObservationLocator(target);
+  if (target && typeof target === 'object') return unwrapLocator(target);
   throw new TypeError('Action target must be a selector string or Playwright Locator');
 }
 
@@ -134,10 +133,12 @@ export function createActionHelper({
   onBehaviorState = () => {},
   onNavigationCooldown = null,
   timing = DEFAULT_HUMAN_TIMING,
-  strictVisibleTraversal = false
+  strictVisibleTraversal = false,
+  unwrapLocator = (locator) => locator
 } = {}) {
   if (!page) throw new TypeError('page is required');
   if (!isBehaviorMode(mode)) throw new TypeError(`Unsupported behavior mode: ${mode}`);
+  if (typeof unwrapLocator !== 'function') throw new TypeError('unwrapLocator must be a function');
 
   let currentMode = mode;
   let autoLevel = 0;
@@ -777,28 +778,28 @@ export function createActionHelper({
 
     async click(target, options = {}) {
       return execute('click', async () => {
-        const locator = asLocator(page, target);
+        const locator = asLocator(page, target, unwrapLocator);
         return humanClick(locator, options);
       });
     },
 
     async fill(target, value, options = {}) {
-      return execute('fill', () => enterText(asLocator(page, target), value, options));
+      return execute('fill', () => enterText(asLocator(page, target, unwrapLocator), value, options));
     },
 
     async type(target, value, options = {}) {
-      return execute('type', () => enterText(asLocator(page, target), value, options));
+      return execute('type', () => enterText(asLocator(page, target, unwrapLocator), value, options));
     },
 
     async hover(target, options = {}) {
       return execute('hover', async () => {
-        const locator = asLocator(page, target);
+        const locator = asLocator(page, target, unwrapLocator);
         return moveToLocator(locator, options.position, options);
       });
     },
 
     async select(target, value, options = {}) {
-      return execute('select', () => chooseSelectOption(asLocator(page, target), value, options));
+      return execute('select', () => chooseSelectOption(asLocator(page, target, unwrapLocator), value, options));
     },
 
     async scroll(input = {}) {

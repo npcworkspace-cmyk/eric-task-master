@@ -29,13 +29,21 @@
         wheelEvents: 0,
         inputTimeline: []
       };
-      document.addEventListener('pointermove', () => { window.__taskmasterTrace.pointerMoves += 1; });
-      document.addEventListener('keydown', () => { window.__taskmasterTrace.keyEvents += 1; });
-      document.addEventListener('input', () => {
+      const syncTrace = () => {
+        document.documentElement.dataset.taskmasterTrace = JSON.stringify(window.__taskmasterTrace);
+      };
+      syncTrace();
+      document.addEventListener('pointermove', () => { window.__taskmasterTrace.pointerMoves += 1; syncTrace(); });
+      document.addEventListener('keydown', () => { window.__taskmasterTrace.keyEvents += 1; syncTrace(); });
+      document.addEventListener('input', (event) => {
         window.__taskmasterTrace.inputEvents += 1;
         window.__taskmasterTrace.inputTimeline.push(performance.now());
+        if (event.target?.id === 'upload') {
+          event.target.dataset.fileCount = String(event.target.files?.length || 0);
+        }
+        syncTrace();
       });
-      document.addEventListener('wheel', () => { window.__taskmasterTrace.wheelEvents += 1; });
+      document.addEventListener('wheel', () => { window.__taskmasterTrace.wheelEvents += 1; syncTrace(); });
       document.querySelector('#submit').addEventListener('click', () => {
         const name = document.querySelector('#name').value;
         const agreed = document.querySelector('#agree').checked;

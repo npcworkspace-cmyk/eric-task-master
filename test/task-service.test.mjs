@@ -205,6 +205,13 @@ test('task service isolates work in a child, tracks progress, and releases its l
   assert.equal(completed.progress.current, 1);
   assert.equal(completed.cleanup.browserClosed, true);
   assert.equal(completed.cleanup.settled, true);
+  assert.deepEqual(completed.completion.outputTree, {
+    version: 1,
+    files: 0,
+    bytes: 0,
+    directories: 0
+  });
+  assert.equal((await service.getInternal(created.id)).outputSeal, null);
   assert.equal(store.profile.state, 'idle');
   assert.ok(store.events.some((event) => event[0] === 'release'));
   await service.close();
@@ -1320,6 +1327,368 @@ test('cancellation becomes terminal only after cleanup releases the profile leas
   assert.equal(cleaned.cleanup.settled, true);
   assert.equal(store.profile.state, 'idle');
   await service.close();
+});
+
+test('Manager lifecycle is monotonic against late Worker state after cancel and completion claim', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-monotonic-worker-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  const workers = [];
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      const worker = new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          setImmediate(() => child.emit('message', { type: 'state', state: 'running' }));
+        }
+      });
+      workers.push(worker);
+      return worker;
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+
+  const cancelledTask = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'monotonic-cancel'
+  }, ADMIN);
+  await waitFor(async () => (await service.get(cancelledTask.id, ADMIN)).state === 'running');
+  await service.cancel(cancelledTask.id, ADMIN);
+  const cancelledWorker = workers[0];
+  cancelledWorker.emit('message', { type: 'state', state: 'running', commandId: 'late-resume-command' });
+  cancelledWorker.emit('message', {
+    type: 'progress', progress: { current: 9, total: 9, message: 'late progress after cancel' }
+  });
+  cancelledWorker.emit('message', {
+    type: 'waiting_user',
+    request: { id: `handoff_${'a'.repeat(32)}`, reason: 'late handoff', requestedAt: new Date().toISOString() }
+  });
+  cancelledWorker.emit('message', {
+    type: 'cooldown',
+    cooldown: {
+      status: 'active', durationMs: 10_000, startedAt: new Date().toISOString(),
+      resumeAt: new Date(Date.now() + 10_000).toISOString(), reason: 'late cooldown'
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const stillCancelling = await service.getInternal(cancelledTask.id);
+  assert.equal(stillCancelling.state, 'cancel_requested');
+  assert.equal(stillCancelling.progress.current, 0);
+  assert.equal(stillCancelling.userRequest ?? null, null);
+  assert.equal(stillCancelling.cooldown, null);
+  cancelledWorker.emit('message', { type: 'cleanup', browserClosed: true });
+  cancelledWorker.finish(0);
+  await waitFor(async () => (await service.get(cancelledTask.id, ADMIN)).cleanup.settled);
+
+  const completedTask = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'monotonic-complete'
+  }, ADMIN);
+  await waitFor(async () => (await service.get(completedTask.id, ADMIN)).state === 'running');
+  const completedWorker = workers[1];
+  completedWorker.emit('message', {
+    type: 'progress', progress: { current: 1, total: 1, message: 'Done' }
+  });
+  completedWorker.emit('message', {
+    type: 'result', result: { summary: 'Done', evidence: [{ kind: 'message', value: 'verified' }] }
+  });
+  completedWorker.emit('message', { type: 'state', state: 'completed' });
+  completedWorker.emit('message', { type: 'state', state: 'cooling_down' });
+  completedWorker.emit('message', {
+    type: 'progress', progress: { current: 2, total: 2, message: 'late progress after completion' }
+  });
+  completedWorker.emit('message', {
+    type: 'waiting_user',
+    request: { id: `handoff_${'b'.repeat(32)}`, reason: 'late handoff', requestedAt: new Date().toISOString() }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const verifying = await service.getInternal(completedTask.id);
+  assert.equal(verifying.state, 'verifying');
+  assert.equal(verifying.progress.current, 1);
+  assert.equal(verifying.userRequest ?? null, null);
+  assert.equal(verifying.cooldown, null);
+  completedWorker.emit('message', { type: 'cleanup', browserClosed: true });
+  completedWorker.finish(0);
+  const completed = await waitFor(async () => {
+    const current = await service.get(completedTask.id, ADMIN);
+    return current.cleanup.settled ? current : null;
+  });
+  assert.equal(completed.state, 'completed');
+  await service.close();
+});
+
+test('late heartbeat floods cannot postpone cancel or completion cleanup or renew a Profile lease', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-heartbeat-finalization-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  const workers = [];
+  const heartbeatTimers = [];
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerCleanupGraceMs: 35,
+    workerHardKillGraceMs: 20,
+    workerFactory() {
+      const worker = new FakeWorker((message, child) => {
+        if (message.type === 'start') {
+          setImmediate(() => child.emit('message', { type: 'state', state: 'running' }));
+        }
+      });
+      worker.killSignals = [];
+      worker.kill = (signal = 'SIGTERM') => {
+        worker.killSignals.push(signal);
+        worker.emit('message', { type: 'cleanup', browserClosed: true });
+        worker.finish(0, signal);
+        return true;
+      };
+      workers.push(worker);
+      return worker;
+    }
+  });
+  t.after(() => {
+    for (const timer of heartbeatTimers) clearInterval(timer);
+    return service.close().catch(() => {});
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+
+  const cancelled = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'heartbeat-cancel-flood'
+  }, ADMIN);
+  await waitFor(async () => (await service.get(cancelled.id, ADMIN)).state === 'running');
+  await service.cancel(cancelled.id, ADMIN);
+  heartbeatTimers.push(setInterval(() => {
+    workers[0].emit('message', { type: 'heartbeat', at: new Date().toISOString() });
+  }, 2));
+  await waitFor(() => workers[0].killSignals.length > 0, 500);
+  await waitFor(async () => (await service.get(cancelled.id, ADMIN)).cleanup.settled, 500);
+  clearInterval(heartbeatTimers.shift());
+  assert.deepEqual(workers[0].killSignals, ['SIGTERM']);
+  assert.equal(store.events.filter((event) => event[0] === 'acquire').length, 1);
+
+  const completed = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'heartbeat-complete-flood'
+  }, ADMIN);
+  await waitFor(async () => (await service.get(completed.id, ADMIN)).state === 'running');
+  workers[1].emit('message', {
+    type: 'progress', progress: { current: 1, total: 1, message: 'Done' }
+  });
+  workers[1].emit('message', {
+    type: 'result', result: { summary: 'Done', evidence: [{ kind: 'message', value: 'verified' }] }
+  });
+  workers[1].emit('message', { type: 'state', state: 'completed' });
+  await waitFor(async () => (await service.getInternal(completed.id)).completionClaimed === true);
+  heartbeatTimers.push(setInterval(() => {
+    workers[1].emit('message', { type: 'heartbeat', at: new Date().toISOString() });
+  }, 2));
+  await waitFor(() => workers[1].killSignals.length > 0, 500);
+  await waitFor(async () => (await service.get(completed.id, ADMIN)).cleanup.settled, 500);
+  clearInterval(heartbeatTimers.shift());
+  assert.deepEqual(workers[1].killSignals, ['SIGTERM']);
+  assert.equal(store.events.filter((event) => event[0] === 'acquire').length, 2);
+});
+
+test('Manager rejects output changes made after the Worker claims completion', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-output-after-complete-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  let worker;
+  let outputDir;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      worker = new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        outputDir = message.config.outputDir;
+        setImmediate(() => void (async () => {
+          await writeFile(path.join(outputDir, 'result.txt'), 'sealed\n');
+          child.emit('message', { type: 'state', state: 'running' });
+          child.emit('message', {
+            type: 'progress', progress: { current: 1, total: 1, message: 'Done' }
+          });
+          child.emit('message', {
+            type: 'result', result: { summary: 'Done', evidence: [{ kind: 'message', value: 'sealed' }] }
+          });
+          child.emit('message', { type: 'state', state: 'completed' });
+        })());
+      });
+      return worker;
+    }
+  });
+  t.after(() => service.close().catch(() => {}));
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'output-after-completion'
+  }, ADMIN);
+  await waitFor(async () => (await service.getInternal(created.id)).state === 'verifying');
+  // Let the completion-boundary snapshot settle while the Worker remains
+  // alive, then emulate a forgotten timer writing a late artifact.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await writeFile(path.join(outputDir, 'late.txt'), 'late\n');
+  worker.emit('message', { type: 'cleanup', browserClosed: true });
+  worker.finish(0);
+
+  const terminal = await waitFor(async () => {
+    const current = await service.get(created.id, ADMIN);
+    return current.cleanup.settled ? current : null;
+  });
+  assert.equal(terminal.state, 'failed');
+  assert.equal(terminal.error.code, 'TASK_OUTPUT_CHANGED_AFTER_COMPLETION');
+  assert.equal('result' in terminal, false);
+});
+
+test('a pre-seal queued task is upgraded at launch and rejects post-claim output changes', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-legacy-queued-seal-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'state');
+  const id = 'task_legacy_queued_without_output_seal';
+  const taskRoot = path.join(stateDir, id);
+  const outputDir = path.join(taskRoot, 'output');
+  const modulePath = path.join(root, 'task.mjs');
+  const source = 'export async function run() {}\n';
+  const timestamp = '2026-01-01T00:00:00.000Z';
+  await writeFile(modulePath, source);
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(path.join(taskRoot, 'task.json'), `${JSON.stringify({
+    id,
+    jobId: 'job_legacy_queued_without_output_seal',
+    revision: 1,
+    timelineSequence: 0,
+    timeline: [],
+    commands: [],
+    reports: [],
+    report: null,
+    profileId: 'profile_test',
+    taskType: 'legacy.fixture',
+    taskLabel: 'Legacy queued fixture',
+    taskTypeSha256: createHash('sha256').update(source).digest('hex'),
+    supportsResume: false,
+    modulePath,
+    ownerRole: 'manager-admin',
+    ownerClientId: 'manager-admin',
+    idempotencyKey: 'legacy-queued-output-seal',
+    requestHash: 'legacy-request-hash',
+    requestHashVersion: 4,
+    inputRevisionHash: 'legacy-input-hash',
+    behavior: 'fast',
+    input: {},
+    timeoutMs: null,
+    attempt: 1,
+    history: [],
+    diagnosticHistory: [],
+    resumeKeys: [],
+    state: 'queued',
+    progress: { current: 0, total: null, message: 'Queued' },
+    progressAt: timestamp,
+    heartbeatAt: timestamp,
+    health: { status: 'healthy', checkedAt: timestamp },
+    cooldown: null,
+    timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
+    outputDir,
+    checkpoint: null,
+    checkpointSeal: null,
+    resumeInput: null,
+    result: null,
+    error: null,
+    cleanup: { browserClosed: false, leaseReleased: false, workerExited: false, settled: false },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    startedAt: null,
+    finishedAt: null,
+    leaseOwner: `task:${id}`,
+    leaseHeld: false
+  })}\n`);
+
+  const service = createTaskService({
+    stateDir,
+    profileStore: fakeProfileStore(root),
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => void (async () => {
+          await writeFile(path.join(outputDir, 'result.txt'), 'sealed\n');
+          child.emit('message', { type: 'state', state: 'running' });
+          child.emit('message', {
+            type: 'progress', progress: { current: 1, total: 1, message: 'Done' }
+          });
+          child.emit('message', {
+            type: 'result', result: { summary: 'Done', evidence: [{ kind: 'message', value: 'sealed' }] }
+          });
+          child.emit('message', { type: 'state', state: 'completed' });
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await writeFile(path.join(outputDir, 'late.txt'), 'late\n');
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish(0);
+        })());
+      });
+    }
+  });
+  t.after(() => service.close().catch(() => {}));
+  const terminal = await waitFor(async () => {
+    const current = await service.get(id, ADMIN);
+    return current.cleanup.settled ? current : null;
+  }, 2_000);
+  const internal = await service.getInternal(id);
+  assert.equal(internal.outputSealRequired, true);
+  assert.equal(terminal.state, 'failed');
+  assert.equal(terminal.error.code, 'TASK_OUTPUT_CHANGED_AFTER_COMPLETION');
+});
+
+test('production completion fails closed when the Worker omits its pre-claim output seal', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-output-seal-missing-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: fakeProfileStore(root),
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    requireWorkerOutputSeal: true,
+    workerFactory() {
+      return new FakeWorker((message, child) => {
+        if (message.type !== 'start') return;
+        setImmediate(() => {
+          child.emit('message', { type: 'state', state: 'running' });
+          child.emit('message', {
+            type: 'progress', progress: { current: 1, total: 1, message: 'Done' }
+          });
+          child.emit('message', { type: 'state', state: 'verifying' });
+          child.emit('message', {
+            type: 'result', result: { summary: 'Done', evidence: [{ kind: 'message', value: 'done' }] }
+          });
+          child.emit('message', { type: 'state', state: 'completed' });
+          child.emit('message', { type: 'cleanup', browserClosed: true });
+          child.finish(0);
+        });
+      });
+    }
+  });
+  t.after(() => service.close().catch(() => {}));
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'missing-worker-output-seal'
+  }, ADMIN);
+  const terminal = await waitFor(async () => {
+    const current = await service.get(created.id, ADMIN);
+    return current.cleanup.settled ? current : null;
+  });
+  assert.equal(terminal.state, 'failed');
+  assert.equal(terminal.error.code, 'TASK_OUTPUT_SEAL_MISSING');
+  assert.equal('result' in terminal, false);
 });
 
 test('Manager rejects a worker that shrinks its declared progress total', async (t) => {

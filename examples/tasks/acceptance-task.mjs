@@ -24,7 +24,14 @@ export const meta = Object.freeze({
   }
 });
 
-export async function run({ page, context, input, outputDir, journey, progress, checkpoint }) {
+async function storageValue(context, url, name) {
+  const state = await context.storageState();
+  const origin = new URL(url).origin;
+  return state.origins?.find((item) => item.origin === origin)
+    ?.localStorage?.find((item) => item.name === name)?.value ?? null;
+}
+
+export async function run({ page, context, input, outputDir, journey, capture, progress, checkpoint }) {
   if (!input?.url || !input?.uploadPath) {
     throw new TypeError('acceptance task requires input.url and input.uploadPath');
   }
@@ -38,7 +45,7 @@ export async function run({ page, context, input, outputDir, journey, progress, 
   evidence.push({ kind: 'navigation', ok: page.url().startsWith(new URL(input.url).origin) });
   if (input.expectCleanStart || input.expectExistingState) {
     const initialCookies = await context.cookies(input.url);
-    const initialStorage = await page.evaluate(() => localStorage.getItem('taskmaster_fixture'));
+    const initialStorage = await storageValue(context, input.url, 'taskmaster_fixture');
     if (input.expectCleanStart) {
       evidence.push({
         kind: 'ephemeral-clean-start',
@@ -62,7 +69,9 @@ export async function run({ page, context, input, outputDir, journey, progress, 
   await journey.hover('#submit');
   await journey.scroll({ deltaY: 120, steps: 4 });
   const readingDelay = await journey.read({ words: 20 });
-  const behaviorTrace = await page.evaluate(() => window.__taskmasterTrace);
+  const behaviorTrace = JSON.parse(
+    await page.locator('html').getAttribute('data-taskmaster-trace') || '{}'
+  );
   const inputGaps = behaviorTrace.inputTimeline.slice(1).map((at, index) => at - behaviorTrace.inputTimeline[index]);
   const humanBehavior = journey.contract === 'full-human-v1';
   evidence.push({
@@ -89,7 +98,10 @@ export async function run({ page, context, input, outputDir, journey, progress, 
   await progress({ current: 3, total: 9, message: 'Click and selection verified' });
 
   await journey.upload('#upload', input.uploadPath);
-  evidence.push({ kind: 'upload', ok: await page.locator('#upload').evaluate((node) => node.files?.length === 1) });
+  evidence.push({
+    kind: 'upload',
+    ok: await page.locator('#upload').getAttribute('data-file-count') === '1'
+  });
   await progress({ current: 4, total: 9, message: 'Upload verified' });
 
   await journey.click('#submit');
@@ -99,7 +111,7 @@ export async function run({ page, context, input, outputDir, journey, progress, 
 
   const cookies = await context.cookies(input.url);
   evidence.push({ kind: 'cookie', ok: cookies.some((cookie) => cookie.name === 'taskmaster_fixture') });
-  const stored = await page.evaluate(() => localStorage.getItem('taskmaster_fixture'));
+  const stored = await storageValue(context, input.url, 'taskmaster_fixture');
   evidence.push({ kind: 'localStorage', ok: stored === 'accepted' });
   await progress({ current: 6, total: 9, message: 'Browser storage verified' });
 
@@ -112,7 +124,7 @@ export async function run({ page, context, input, outputDir, journey, progress, 
   await progress({ current: 7, total: 9, message: 'Download verified' });
 
   const screenshotPath = path.join(outputDir, 'acceptance.png');
-  await page.screenshot({ path: screenshotPath, fullPage: false });
+  await capture.viewport({ file: path.basename(screenshotPath) });
   evidence.push({ kind: 'screenshot', ok: true, file: path.basename(screenshotPath) });
   await progress({ current: 8, total: 9, message: 'Screenshot captured' });
 

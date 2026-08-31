@@ -10,6 +10,11 @@ import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
 import { readCleanupReceipt, removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
+import {
+  assertOutputTreeUnchanged,
+  outputSealLimitsForBudget,
+  snapshotOutputTree
+} from '../lib/output-seal.mjs';
 import { sanitizePublicTaskFailure } from '../lib/public-task-failure.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
@@ -34,6 +39,7 @@ const MAX_ARTIFACTS = 100;
 const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const MAX_DIAGNOSTICS_MANIFEST_BYTES = 64 * 1024;
+const OUTPUT_SEAL_LIMITS = outputSealLimitsForBudget();
 const SAFE_EVIDENCE_KINDS = new Set(['artifact', 'count', 'hash', 'message', 'note', 'url']);
 const MAX_ATTEMPTS = 100;
 const MAX_DIAGNOSTIC_ATTEMPTS = 16;
@@ -737,6 +743,7 @@ export function createTaskService({
   stateDir,
   profileStore,
   workerFactory = defaultWorkerFactory,
+  requireWorkerOutputSeal = workerFactory === defaultWorkerFactory,
   heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
   profileLeaseRenewalMs = 20_000,
   diagnosticGraceMs = DIAGNOSTIC_GRACE_MS,
@@ -771,6 +778,9 @@ export function createTaskService({
   }
   if (artifactValidationHook !== null && typeof artifactValidationHook !== 'function') {
     throw new TypeError('artifactValidationHook must be a function when provided');
+  }
+  if (typeof requireWorkerOutputSeal !== 'boolean') {
+    throw new TypeError('requireWorkerOutputSeal must be boolean');
   }
   if (typeof processAlive !== 'function') throw new TypeError('processAlive must be a function');
   if (!Number.isFinite(workerCleanupGraceMs) || workerCleanupGraceMs <= 0) {
@@ -1169,6 +1179,14 @@ export function createTaskService({
       if (!task.displayName) task.displayName = buildTaskDisplayName(task);
       normalizeTaskTiming(task);
       task.supportsResume = task.supportsResume === true;
+      // Output seals were introduced after older terminal records already
+      // existed. Preserve those records, while every task created or resumed
+      // by this runtime opts into the fail-closed completion boundary.
+      task.outputSealRequired = task.outputSealRequired === true;
+      if (!task.outputSealRequired) {
+        task.outputSeal = null;
+        task.outputSealError = null;
+      }
       const legacyExternalCost = migrateLegacyExternalCostState(task);
       task.checkpointSeal = task.checkpointSeal &&
         task.checkpointSeal.attempt === task.attempt &&
@@ -1687,6 +1705,49 @@ export function createTaskService({
     if (task.cleanup?.workerExited !== true || task.cleanup?.leaseReleased !== true) {
       throw completionGateFailure('Task worker and Profile lease cleanup were not confirmed');
     }
+    if (task.userRequest?.status === 'pending') {
+      throw completionGateFailure('Task cannot complete while a user handoff is still pending');
+    }
+    if (task.cooldown?.status === 'active') {
+      throw completionGateFailure('Task cannot complete while a cooldown is still active');
+    }
+    let outputTree = task.completion?.outputTree || null;
+    if (task.outputSealRequired === true && task.state === 'completed') {
+      if (
+        outputTree?.version !== 1 || !Number.isSafeInteger(outputTree.files) || outputTree.files < 0 ||
+        !Number.isSafeInteger(outputTree.bytes) || outputTree.bytes < 0 ||
+        !Number.isSafeInteger(outputTree.directories) || outputTree.directories < 0
+      ) {
+        throw new TaskServiceError(
+          'TASK_OUTPUT_SEAL_MISSING',
+          'Completed task has no verified output-tree seal',
+          409
+        );
+      }
+    } else if (task.outputSealRequired === true) {
+      if (task.outputSealError) {
+        throw new TaskServiceError(
+          task.outputSealError.code || 'TASK_OUTPUT_SEAL_FAILED',
+          task.outputSealError.message || 'Task output could not be sealed at the completion boundary',
+          409
+        );
+      }
+      if (!task.outputSeal) {
+        throw new TaskServiceError(
+          'TASK_OUTPUT_SEAL_MISSING',
+          'Task output was not sealed at the completion boundary',
+          409
+        );
+      }
+      const currentOutput = await snapshotOutputTree({ root: task.outputDir, limits: OUTPUT_SEAL_LIMITS });
+      assertOutputTreeUnchanged(task.outputSeal, currentOutput);
+      outputTree = Object.freeze({
+        version: currentOutput.version,
+        files: currentOutput.files,
+        bytes: currentOutput.bytes,
+        directories: currentOutput.directories.length
+      });
+    }
     const progressCurrent = Number(task.progress?.current);
     const progressTotal = task.progress?.total === null || task.progress?.total === undefined
       ? null
@@ -1717,26 +1778,39 @@ export function createTaskService({
           artifactAnchors.push(existing);
         } else {
           const sha256 = await hashOpenFile(opened.handle, Number(opened.stats.size));
-          cacheArtifactDigest(task, declaration, opened.stats, sha256);
+          const afterHash = await opened.handle.stat({ bigint: true });
+          if (!sameStableArtifactMetadata(opened.stats, afterHash)) {
+            throw new Error('artifact changed while hashing');
+          }
+          await assertArtifactPathIdentity(task, declaration, afterHash);
+          // Seed the cache only after the hash and both handle/path stability
+          // checks succeed. A raced or mismatched digest is never cacheable.
+          cacheArtifactDigest(task, declaration, afterHash, sha256, sha256);
           artifactAnchors.push({
             artifactId: declaration.id,
-            sizeBytes: Number(opened.stats.size),
+            sizeBytes: Number(afterHash.size),
             sha256
           });
         }
-        const afterHash = await opened.handle.stat({ bigint: true });
-        if (
-          !sameFileIdentity(opened.stats, afterHash) ||
-          opened.stats.size !== afterHash.size || opened.stats.mtimeNs !== afterHash.mtimeNs
-        ) throw new Error('artifact changed while hashing');
-        await assertArtifactPathIdentity(task, declaration, opened.stats);
+        if (reverifyExistingAnchors) {
+          const afterHash = await opened.handle.stat({ bigint: true });
+          if (!sameStableArtifactMetadata(opened.stats, afterHash)) {
+            throw new Error('artifact changed while hashing');
+          }
+          await assertArtifactPathIdentity(task, declaration, afterHash);
+        }
       } catch {
         throw completionGateFailure('A declared agent-visible artifact is missing or unstable');
       } finally {
         await opened?.handle.close().catch(() => {});
       }
     }
-    return { verifiedAt: nowIso(), artifactCount: required.length, artifacts: artifactAnchors };
+    return {
+      verifiedAt: nowIso(),
+      artifactCount: required.length,
+      artifacts: artifactAnchors,
+      ...(outputTree ? { outputTree } : {})
+    };
   }
 
   function refreshCleanupSettled(task) {
@@ -1832,6 +1906,26 @@ export function createTaskService({
     // late renewal cannot resurrect a completed task's lease.
     await entry?.leaseRenewalTail?.catch(() => {});
     await awaitTaskPersistence(task.id);
+    if (
+      task.outputSealRequired === true &&
+      (task.completionClaimed === true || task.state === 'verifying')
+    ) {
+      if (!entry?.outputSealPromise) {
+        task.outputSeal = null;
+        task.outputSealError = {
+          code: 'TASK_OUTPUT_SEAL_MISSING',
+          message: 'Task output was not sealed at the completion boundary'
+        };
+      } else {
+        try {
+          task.outputSeal = await entry.outputSealPromise;
+          task.outputSealError = null;
+        } catch (error) {
+          task.outputSeal = null;
+          task.outputSealError = sanitizeError(error, 'TASK_OUTPUT_SEAL_FAILED');
+        }
+      }
+    }
     // Freeze the final checkpoint generation before workerExited or settled
     // can become observable. IPC updates are drained above and no new Worker
     // messages are accepted after entry.attached=false.
@@ -1861,6 +1955,12 @@ export function createTaskService({
       } catch (error) {
         task.state = 'failed';
         task.error = sanitizeError(error, 'TASK_COMPLETION_GATE_FAILED');
+      } finally {
+        // The full per-file snapshot is needed only between completion claim
+        // and confirmed Worker exit. Persist the compact verified summary,
+        // never a potentially multi-megabyte hash table in every task record.
+        task.outputSeal = null;
+        task.outputSealError = null;
       }
     }
     refreshCleanupSettled(task);
@@ -1905,6 +2005,9 @@ export function createTaskService({
       checkpointSeal: task.checkpointSeal,
       resumeCheckpointValid: task.resumeCheckpointValid,
       resumeCheckpointError: task.resumeCheckpointError,
+      outputSealRequired: task.outputSealRequired,
+      outputSeal: task.outputSeal,
+      outputSealError: task.outputSealError,
       ...(task.completion ? { completion: task.completion } : {})
     });
     if (task.cleanup.settled === true) {
@@ -1994,15 +2097,34 @@ export function createTaskService({
       behaviorRequests: new Map(),
       focusRequests: new Map(),
       continueRequests: new Map(),
+      workerOutputSeal: null,
+      workerOutputSealError: null,
+      outputSealPromise: null,
       attached: false
     };
+
+    // Worker messages are advisory, but lifecycle state is authoritative in
+    // the Manager. Once cancellation or completion has begun, no late
+    // progress/cooldown/handoff/diagnostic callback may make the task look
+    // runnable again. Terminal error and cleanup messages remain accepted by
+    // their dedicated handlers below.
+    const lifecycleFinalizationStarted = () => Boolean(
+      closing || entry.finalized || task.cancelRequestedAt ||
+      task.completionClaimed === true || TERMINAL_TASK_STATES.has(task.state)
+    );
+    const mutableWorkerIngressClosed = () => Boolean(
+      lifecycleFinalizationStarted() || task.state === 'verifying'
+    );
 
     try {
       child.on('message', (message) => {
       if (!entry.attached) return;
       if (!message || typeof message !== 'object') return;
       if (message.type === 'heartbeat') {
-        if (TERMINAL_TASK_STATES.has(task.state)) {
+        // A heartbeat proves only that the Worker is alive. It must never undo
+        // an already-authoritative cancel/completion boundary, postpone forced
+        // cleanup, or renew a Profile lease after finalization has begun.
+        if (lifecycleFinalizationStarted()) {
           scheduleForcedStop(task, entry);
           return;
         }
@@ -2011,7 +2133,7 @@ export function createTaskService({
         entry.forceKillTimer = null;
         void update(task, { heartbeatAt: nowIso() }).catch(() => {});
         const renewal = entry.leaseRenewalTail.then(async () => {
-          if (!entry.attached || entry.finalized) return;
+          if (!entry.attached || lifecycleFinalizationStarted()) return;
           await profileStore.acquireLease(task.profileId, task.leaseOwner, {
             pid: child.pid,
             ttlMs: LEASE_TTL_MS,
@@ -2020,7 +2142,7 @@ export function createTaskService({
           });
         });
         entry.leaseRenewalTail = renewal.catch((error) => {
-          if (entry.finalized || TERMINAL_TASK_STATES.has(task.state)) return;
+          if (lifecycleFinalizationStarted()) return;
           void update(task, { state: 'failed', error: sanitizeError(error, 'LEASE_RENEWAL_FAILED') }).catch(() => {});
           send(child, { type: 'cancel' });
           scheduleForcedStop(task, entry);
@@ -2028,7 +2150,7 @@ export function createTaskService({
         return;
       }
       if (message.type === 'progress' && message.progress) {
-        if (task.state === 'verifying' || TERMINAL_TASK_STATES.has(task.state)) return;
+        if (mutableWorkerIngressClosed()) return;
         const current = Number(message.progress.current);
         const total = message.progress.total === null ? null : Number(message.progress.total);
         const progressMessage = typeof message.progress.message === 'string'
@@ -2082,12 +2204,13 @@ export function createTaskService({
       }
       if (message.type === 'activity') {
         const currentActivity = workerActivity(message.activity);
-        if (currentActivity && task.state !== 'verifying' && !TERMINAL_TASK_STATES.has(task.state)) {
+        if (currentActivity && !mutableWorkerIngressClosed()) {
           void update(task, { currentActivity }).catch(() => {});
         }
         return;
       }
       if (message.type === 'waiting_user' && message.request) {
+        if (mutableWorkerIngressClosed()) return;
         const request = message.request;
         if (
           typeof request.id !== 'string' || !HANDOFF_ID_PATTERN.test(request.id) ||
@@ -2137,6 +2260,12 @@ export function createTaskService({
         return;
       }
       if (message.type === 'state' && typeof message.state === 'string') {
+        const workerStateIsTerminal = TERMINAL_TASK_STATES.has(message.state);
+        if (mutableWorkerIngressClosed() && !workerStateIsTerminal) return;
+        if (
+          message.state === 'completed' &&
+          (task.cancelRequestedAt || task.state === 'cancel_requested')
+        ) return;
         if (['pause_requested', 'paused', 'recovering', 'running'].includes(message.state) && message.commandId) {
           const status = message.state === 'paused' || message.state === 'running' ? 'applied' : 'delivered';
           markCommandStatus(task, message.commandId, status, {
@@ -2185,11 +2314,33 @@ export function createTaskService({
         if (resumedFromCooldown) entry.stallDiagnoseAt = 0;
         if (message.state === 'completed') {
           if (!TERMINAL_TASK_STATES.has(task.state)) {
-            void update(task, {
+            const completionUpdate = update(task, {
               state: 'verifying',
               completionClaimed: true,
               progress: { ...task.progress, message: 'Verifying result and cleanup' }
-            }).catch(() => {});
+            });
+            if (task.outputSealRequired === true && !entry.outputSealPromise) {
+              if (entry.workerOutputSealError) {
+                entry.outputSealPromise = Promise.reject(entry.workerOutputSealError);
+              } else if (entry.workerOutputSeal) {
+                entry.outputSealPromise = Promise.resolve(entry.workerOutputSeal);
+              } else if (requireWorkerOutputSeal) {
+                entry.outputSealPromise = Promise.reject(new TaskServiceError(
+                  'TASK_OUTPUT_SEAL_MISSING',
+                  'Task Worker did not publish its completion output seal',
+                  409
+                ));
+              } else {
+                // Custom test Workers use a Manager-owned fallback snapshot.
+                // The production Worker must publish its pre-claim snapshot.
+                entry.outputSealPromise = snapshotOutputTree({
+                  root: task.outputDir,
+                  limits: OUTPUT_SEAL_LIMITS
+                });
+              }
+              void entry.outputSealPromise.catch(() => {});
+            }
+            void completionUpdate.catch(() => {});
           }
           scheduleForcedStop(task, entry);
           return;
@@ -2225,6 +2376,7 @@ export function createTaskService({
         return;
       }
       if (message.type === 'checkpoint') {
+        if (mutableWorkerIngressClosed()) return;
         void update(task, {
           checkpoint: {
             path: message.path,
@@ -2238,18 +2390,21 @@ export function createTaskService({
         return;
       }
       if (message.type === 'screenshot') {
+        if (mutableWorkerIngressClosed()) return;
         void update(task, {
           lastScreenshot: { path: message.path, reason: message.reason, at: nowIso(), attempt: task.attempt }
         }).catch(() => {});
         return;
       }
       if (message.type === 'observation') {
+        if (mutableWorkerIngressClosed()) return;
         void update(task, {
           lastObservation: { path: message.path, reason: message.reason, at: nowIso(), attempt: task.attempt }
         }).catch(() => {});
         return;
       }
       if (message.type === 'behavior' && message.behavior) {
+        if (mutableWorkerIngressClosed()) return;
         const state = workerBehaviorState(message.behavior, task.behavior);
         if (state) void update(task, { behaviorState: state }).catch(() => {});
         return;
@@ -2321,6 +2476,7 @@ export function createTaskService({
         return;
       }
       if (message.type === 'cooldown' && message.cooldown) {
+        if (mutableWorkerIngressClosed()) return;
         const record = message.cooldown;
         if (
           ['active', 'completed', 'interrupted'].includes(record.status) &&
@@ -2367,7 +2523,29 @@ export function createTaskService({
         }).catch(() => {});
         return;
       }
+      if (message.type === 'output_seal') {
+        if (
+          entry.finalized || task.cancelRequestedAt || task.completionClaimed === true ||
+          task.state !== 'verifying'
+        ) return;
+        if (entry.workerOutputSeal || entry.workerOutputSealError) {
+          entry.workerOutputSealError = new TaskServiceError(
+            'TASK_OUTPUT_SEAL_DUPLICATE',
+            'Task Worker published more than one completion output seal',
+            409
+          );
+          entry.workerOutputSeal = null;
+          return;
+        }
+        entry.workerOutputSeal = clone(message.snapshot);
+        return;
+      }
       if (message.type === 'result') {
+        const verificationIngressOpen = (
+          !entry.finalized && !task.cancelRequestedAt && task.completionClaimed !== true &&
+          task.state === 'verifying'
+        );
+        if (mutableWorkerIngressClosed() && !verificationIngressOpen) return;
         void update(task, { result: clone(redactSensitiveValue(message.result)) }).catch(() => {});
         return;
       }
@@ -2456,7 +2634,8 @@ export function createTaskService({
         return;
       }
 
-      const progressSensitive = ['starting_browser', 'running', 'recovering'].includes(task.state);
+      const progressSensitive = ['starting_browser', 'running', 'recovering'].includes(task.state) ||
+        (task.state === 'verifying' && task.completionClaimed !== true);
       if (!progressSensitive) return;
       const progressAge = Date.now() - Date.parse(task.progressAt || task.startedAt || task.createdAt);
       if (progressAge <= progressStallMs) return;
@@ -2515,6 +2694,11 @@ export function createTaskService({
     const acquiringAt = nowIso();
     await update(task, {
       state: 'acquiring_profile',
+      // Every attempt launched by this runtime uses the current double-snapshot
+      // contract, including queued tasks restored from a pre-2.8.2 state file.
+      outputSealRequired: true,
+      outputSeal: null,
+      outputSealError: null,
       progress: { current: 0, total: null, message: 'Acquiring Profile' },
       progressAt: acquiringAt,
       heartbeatAt: acquiringAt,
@@ -2783,6 +2967,9 @@ export function createTaskService({
       cooldown: null,
       timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
       outputDir,
+      outputSealRequired: true,
+      outputSeal: null,
+      outputSealError: null,
       checkpoint: null,
       checkpointSeal: null,
       resumeInput: null,
@@ -3018,7 +3205,13 @@ export function createTaskService({
       task.cleanup?.settled !== true
     ) {
       task.resumeCheckpointValid = false;
-      task.resumeCheckpointError = null;
+      // Terminal sealing happens before cleanup becomes observable as settled.
+      // A concurrent read in that window must not erase the current attempt's
+      // durable INVALID/REQUIRED classification and let finalization replace it
+      // with a weaker absence error.
+      if (!(task.state === 'failed' && task.checkpointSeal?.attempt === task.attempt)) {
+        task.resumeCheckpointError = null;
+      }
       return false;
     }
     try {
@@ -3245,6 +3438,9 @@ export function createTaskService({
     task.error = null;
     task.completion = null;
     task.completionClaimed = false;
+    task.outputSealRequired = true;
+    task.outputSeal = null;
+    task.outputSealError = null;
     task.checkpoint = null;
     task.checkpointSeal = null;
     task.cleanup = { browserClosed: false, leaseReleased: false, workerExited: false, settled: false };
@@ -3433,6 +3629,19 @@ export function createTaskService({
       left.dev === right.dev && left.ino === right.ino;
   }
 
+  function sameStableArtifactMetadata(left, right) {
+    return sameFileIdentity(left, right) &&
+      left.size === right.size && left.mtimeNs === right.mtimeNs &&
+      left.ctimeNs === right.ctimeNs && left.birthtimeNs === right.birthtimeNs;
+  }
+
+  function cacheableArtifactMetadata(stats) {
+    // ctime is the cross-platform generation signal for an in-place rewrite.
+    // If a filesystem cannot provide it, correctness wins over caching and the
+    // complete artifact is hashed on every verification.
+    return typeof stats?.ctimeNs === 'bigint' && stats.ctimeNs > 0n;
+  }
+
   async function hashOpenFile(handle, sizeBytes) {
     const digest = createHash('sha256');
     const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, sizeBytes)));
@@ -3447,19 +3656,25 @@ export function createTaskService({
     return digest.digest('hex');
   }
 
-  function artifactDigestKey(task, declaration, stats) {
+  function artifactDigestKey(task, declaration, stats, expectedDigest) {
+    if (!cacheableArtifactMetadata(stats)) return null;
     return [
       task.id,
+      task.attempt,
       declaration.id,
+      expectedDigest,
       stats.dev,
       stats.ino,
       stats.size,
-      stats.mtimeNs
+      stats.mtimeNs,
+      stats.ctimeNs,
+      stats.birthtimeNs
     ].join(':');
   }
 
-  function cacheArtifactDigest(task, declaration, stats, digest) {
-    const key = artifactDigestKey(task, declaration, stats);
+  function cacheArtifactDigest(task, declaration, stats, digest, expectedDigest = digest) {
+    const key = artifactDigestKey(task, declaration, stats, expectedDigest);
+    if (!key) return digest;
     artifactDigestCache.delete(key);
     artifactDigestCache.set(key, digest);
     while (artifactDigestCache.size > 1_024) {
@@ -3468,20 +3683,40 @@ export function createTaskService({
     return digest;
   }
 
-  async function cachedArtifactDigest(task, declaration, handle, stats) {
-    const key = artifactDigestKey(task, declaration, stats);
+  async function cachedArtifactDigest(task, declaration, handle, stats, expectedDigest) {
+    const key = artifactDigestKey(task, declaration, stats, expectedDigest);
     const cached = artifactDigestCache.get(key);
     if (cached) {
       artifactDigestCache.delete(key);
       artifactDigestCache.set(key, cached);
       return cached;
     }
-    return cacheArtifactDigest(
-      task,
-      declaration,
-      stats,
-      await hashOpenFile(handle, Number(stats.size))
-    );
+    const digest = await hashOpenFile(handle, Number(stats.size));
+    const afterHash = await handle.stat({ bigint: true });
+    if (!sameStableArtifactMetadata(stats, afterHash)) {
+      throw new TaskServiceError(
+        'ARTIFACT_INTEGRITY_FAILED',
+        'Completed task evidence changed while being verified',
+        409
+      );
+    }
+    try {
+      await assertArtifactPathIdentity(task, declaration, stats);
+    } catch {
+      throw new TaskServiceError(
+        'ARTIFACT_INTEGRITY_FAILED',
+        'Completed task evidence path changed after verification',
+        409
+      );
+    }
+    if (digest !== expectedDigest) {
+      throw new TaskServiceError(
+        'ARTIFACT_INTEGRITY_FAILED',
+        'Completed task evidence changed after verification',
+        409
+      );
+    }
+    return cacheArtifactDigest(task, declaration, afterHash, digest, expectedDigest);
   }
 
   async function validatedOutputRoot(task) {
@@ -3518,8 +3753,8 @@ export function createTaskService({
     if (
       !current.isFile() || current.isSymbolicLink() || current.nlink !== 1n ||
       !canonicalStats.isFile() || canonicalStats.isSymbolicLink() || canonicalStats.nlink !== 1n ||
-      !sameFileIdentity(expectedStats, current) || !sameFileIdentity(expectedStats, canonicalStats) ||
-      expectedStats.size !== current.size || expectedStats.mtimeNs !== current.mtimeNs
+      !sameStableArtifactMetadata(expectedStats, current) ||
+      !sameStableArtifactMetadata(expectedStats, canonicalStats)
     ) throw new Error('artifact path changed while being verified');
   }
 
@@ -3542,7 +3777,7 @@ export function createTaskService({
       const opened = await handle.stat({ bigint: true });
       if (
         !opened.isFile() || opened.nlink !== 1n || opened.ino <= 0n ||
-        opened.size > BigInt(Number.MAX_SAFE_INTEGER) || !sameFileIdentity(before, opened)
+        opened.size > BigInt(Number.MAX_SAFE_INTEGER) || !sameStableArtifactMetadata(before, opened)
       ) {
         throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
       }
@@ -3557,7 +3792,8 @@ export function createTaskService({
       if (
         !current.isFile() || current.isSymbolicLink() || current.nlink !== 1n ||
         !canonicalStats.isFile() || canonicalStats.isSymbolicLink() || canonicalStats.nlink !== 1n ||
-        !sameFileIdentity(opened, current) || !sameFileIdentity(opened, canonicalStats)
+        !sameStableArtifactMetadata(opened, current) ||
+        !sameStableArtifactMetadata(opened, canonicalStats)
       ) {
         throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
       }
@@ -3572,13 +3808,13 @@ export function createTaskService({
         if (
           !anchor || !Number.isSafeInteger(anchor.sizeBytes) || anchor.sizeBytes !== Number(opened.size) ||
           typeof anchor.sha256 !== 'string' ||
-          anchor.sha256 !== await cachedArtifactDigest(task, declaration, handle, opened)
+          anchor.sha256 !== await cachedArtifactDigest(task, declaration, handle, opened, anchor.sha256)
         ) {
           throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed after verification', 409);
         }
         const afterHash = await handle.stat({ bigint: true });
         if (
-          !sameFileIdentity(opened, afterHash) || opened.size !== afterHash.size || opened.mtimeNs !== afterHash.mtimeNs
+          !sameStableArtifactMetadata(opened, afterHash)
         ) {
           throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed while being verified', 409);
         }
@@ -3683,10 +3919,16 @@ export function createTaskService({
       const afterRead = await handle.stat({ bigint: true });
       if (
         !afterRead.isFile() || afterRead.nlink !== 1n ||
-        !sameFileIdentity(stats, afterRead) ||
-        afterRead.size !== stats.size || afterRead.mtimeNs !== stats.mtimeNs
+        !sameStableArtifactMetadata(stats, afterRead)
       ) {
-        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact changed while it was being read', 404);
+        const anchoredResult = declaration.kind === 'result' && Array.isArray(task.completion?.artifacts);
+        throw new TaskServiceError(
+          anchoredResult ? 'ARTIFACT_INTEGRITY_FAILED' : 'ARTIFACT_NOT_FOUND',
+          anchoredResult
+            ? 'Completed task evidence changed while it was being read'
+            : 'Artifact changed while it was being read',
+          anchoredResult ? 409 : 404
+        );
       }
       let consumed = bytesRead;
       let encoding = 'base64';

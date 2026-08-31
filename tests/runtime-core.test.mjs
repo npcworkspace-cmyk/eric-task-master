@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { access, link, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, link, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -492,6 +492,46 @@ test('artifact reads stay bound to the validated open file when its pathname is 
     { code: 'ARTIFACT_INTEGRITY_FAILED' }
   );
   assert.equal((await readFile(path.join(fixture.starts[0].outputDir, 'visible.txt'), 'utf8')), 'outside secret must not be returned');
+});
+
+test('artifact digest cache rejects same-inode same-size rewrites after mtime is restored', async (t) => {
+  const fixture = await serviceFixture(t, { withArtifacts: true });
+  const task = await fixture.service.create({
+    profileId: 'profile_fixture',
+    taskType: 'fixture',
+    idempotencyKey: 'artifact:restored-mtime-rewrite'
+  }, AGENT_A);
+  await waitFor(async () => (await fixture.service.get(task.id, AGENT_A)).cleanup.settled);
+
+  const visiblePath = path.join(fixture.starts[0].outputDir, 'visible.txt');
+  const fixedTime = new Date('2026-01-02T03:04:05.000Z');
+  await utimes(visiblePath, fixedTime, fixedTime);
+  const [artifact] = await fixture.service.listArtifacts(task.id, AGENT_A);
+  const first = await fixture.service.readArtifact(
+    task.id,
+    artifact.id,
+    { offset: 0, maxBytes: 48 },
+    AGENT_A
+  );
+  assert.equal(first.chunk, 'hello 世界 and more');
+  const before = await stat(visiblePath, { bigint: true });
+
+  // Keep the inode and length, then restore the exact public mtime that the old
+  // cache key trusted. ctime must still advance and invalidate the generation.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await writeFile(visiblePath, Buffer.alloc(Number(before.size), 0x58));
+  await utimes(visiblePath, fixedTime, fixedTime);
+  const after = await stat(visiblePath, { bigint: true });
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.size, before.size);
+  assert.equal(after.mtimeNs, before.mtimeNs);
+  assert.notEqual(after.ctimeNs, before.ctimeNs);
+
+  await assert.rejects(
+    fixture.service.readArtifact(task.id, artifact.id, { offset: 0, maxBytes: 48 }, AGENT_A),
+    { code: 'ARTIFACT_INTEGRITY_FAILED' }
+  );
 });
 
 test('artifact hardlinks are omitted and cannot expose a file outside the task output', async (t) => {

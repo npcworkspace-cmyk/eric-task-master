@@ -13,7 +13,12 @@ import { createSemanticObserver } from '../lib/semantic-observer.mjs';
 import { createUserHandoff } from '../lib/user-handoff.mjs';
 import { writeCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 import { createJourneyHelper } from '../lib/journey.mjs';
-import { createObservationFacade } from '../lib/observation-facade.mjs';
+import {
+  createObservationCapability,
+  createObservationFacade,
+  createObservationLocatorUnwrapper
+} from '../lib/observation-facade.mjs';
+import { outputSealLimitsForBudget, snapshotOutputTree } from '../lib/output-seal.mjs';
 import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
 import { createTaskFailureFacade, sanitizePublicTaskFailure } from '../lib/public-task-failure.mjs';
 import { isBehaviorMode } from '../contracts.mjs';
@@ -35,6 +40,51 @@ const EFFECT_ACTIVITY = Object.freeze({
   scroll: 'scrolling',
   custom: 'working'
 });
+
+function checkpointDataError(message = 'Task checkpoint data must be a bounded JSON value') {
+  const error = new TypeError(message);
+  error.code = 'TASK_CHECKPOINT_INVALID';
+  return error;
+}
+
+function normalizeCheckpointData(data) {
+  const stack = [{ value: data, depth: 0 }];
+  const seen = new Set();
+  let nodes = 0;
+  while (stack.length) {
+    const { value, depth } = stack.pop();
+    nodes += 1;
+    if (nodes > 250_000 || depth > 64) throw checkpointDataError('Task checkpoint data is too deeply nested');
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') continue;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw checkpointDataError('Task checkpoint numbers must be finite');
+      continue;
+    }
+    if (typeof value !== 'object') throw checkpointDataError();
+    if (seen.has(value)) throw checkpointDataError('Task checkpoint data cannot contain cycles or shared object references');
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        if (!Object.hasOwn(value, index)) throw checkpointDataError('Task checkpoint arrays cannot contain holes');
+        stack.push({ value: value[index], depth: depth + 1 });
+      }
+      continue;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw checkpointDataError('Task checkpoint objects must use plain JSON object shapes');
+    }
+    for (const key of Object.keys(value)) stack.push({ value: value[key], depth: depth + 1 });
+  }
+  let encoded;
+  try {
+    encoded = JSON.stringify(data);
+  } catch (cause) {
+    throw checkpointDataError(`Task checkpoint data is not JSON serializable: ${cause?.name || 'serialization-error'}`);
+  }
+  if (encoded === undefined) throw checkpointDataError();
+  return JSON.parse(encoded);
+}
 
 export function browserEffectActivity({ state, operation } = {}, now = () => new Date().toISOString()) {
   const phase = EFFECT_ACTIVITY[operation] || 'working';
@@ -80,7 +130,8 @@ export function createCooperativePauseGate({
   signal,
   onState = async () => {},
   onPaused = async () => {},
-  onResumeValidate = async () => {}
+  onResumeValidate = async () => {},
+  onResumed = async () => {}
 } = {}) {
   let pauseRequested = false;
   let paused = false;
@@ -91,30 +142,45 @@ export function createCooperativePauseGate({
   const waiters = new Set();
   const idleWaiters = new Set();
 
-  const abortError = () => (
-    signal?.reason instanceof Error ? signal.reason : new TaskCancelledError()
+  const abortError = (candidate = signal) => (
+    candidate?.reason instanceof Error ? candidate.reason : new TaskCancelledError()
   );
+
+  function detachWaiter(waiter) {
+    for (const [candidate, listener] of waiter.abortListeners || []) {
+      candidate.removeEventListener('abort', listener);
+    }
+    waiter.abortListeners = [];
+  }
 
   function wakeWaiters(error = null) {
     for (const waiter of waiters) {
-      if (waiter.abortListener) signal?.removeEventListener('abort', waiter.abortListener);
+      detachWaiter(waiter);
       if (error) waiter.reject(error);
       else waiter.resolve();
     }
     waiters.clear();
   }
 
-  function waitUntilResumed() {
+  function waitUntilResumed(admissionSignal = null) {
     if (!pauseRequested) return Promise.resolve();
     if (signal?.aborted) return Promise.reject(abortError());
+    if (admissionSignal?.aborted) return Promise.reject(abortError(admissionSignal));
     return new Promise((resolve, reject) => {
-      const abortListener = () => {
-        waiters.delete(waiter);
-        reject(abortError());
+      const waiter = { resolve, reject, abortListeners: [] };
+      const attachAbort = (candidate) => {
+        if (!candidate) return;
+        const abortListener = () => {
+          detachWaiter(waiter);
+          waiters.delete(waiter);
+          reject(abortError(candidate));
+        };
+        waiter.abortListeners.push([candidate, abortListener]);
+        candidate.addEventListener('abort', abortListener, { once: true });
       };
-      const waiter = { resolve, reject, abortListener };
       waiters.add(waiter);
-      signal?.addEventListener('abort', abortListener, { once: true });
+      attachAbort(signal);
+      if (admissionSignal !== signal) attachAbort(admissionSignal);
     });
   }
 
@@ -131,9 +197,9 @@ export function createCooperativePauseGate({
   }
 
   async function settlePause() {
-    if (!pauseRequested || paused || activeActions !== 0) return;
+    if (signal?.aborted || !pauseRequested || paused || activeActions !== 0) return;
     await onPaused({ commandId: pauseCommandId });
-    if (!pauseRequested || activeActions !== 0) return;
+    if (signal?.aborted || !pauseRequested || activeActions !== 0) return;
     paused = true;
     await onState('paused', { commandId: pauseCommandId });
   }
@@ -150,7 +216,9 @@ export function createCooperativePauseGate({
     paused = false;
     pauseCommandId = commandId || null;
     await onState('pause_requested', { commandId: pauseCommandId });
+    if (signal?.aborted) throw abortError();
     await queueTransition(settlePause);
+    if (signal?.aborted) throw abortError();
     return { state: paused ? 'paused' : 'pause_requested', commandId: pauseCommandId };
   }
 
@@ -161,14 +229,22 @@ export function createCooperativePauseGate({
       // A resume racing the final in-flight effect waits for the pause boundary
       // and its diagnostic proof before validating the live page.
       await waitUntilIdle();
+      if (signal?.aborted) throw abortError();
       await settlePause();
+      if (signal?.aborted) throw abortError();
       await onState('recovering', { commandId });
+      if (signal?.aborted) throw abortError();
       await onResumeValidate({ commandId, pauseCommandId });
+      if (signal?.aborted) throw abortError();
+      await onResumed({ commandId, pauseCommandId });
+      if (signal?.aborted) throw abortError();
       pauseRequested = false;
       paused = false;
       pauseCommandId = null;
       wakeWaiters();
+      if (signal?.aborted) throw abortError();
       await onState('running', { commandId });
+      if (signal?.aborted) throw abortError();
       return { state: 'running', commandId };
     });
   }
@@ -177,25 +253,47 @@ export function createCooperativePauseGate({
     acceptingControls = false;
   }
 
+  async function acquire({ signal: admissionSignal = null } = {}) {
+    for (;;) {
+      await waitUntilResumed(admissionSignal);
+      if (signal?.aborted) throw abortError();
+      if (admissionSignal?.aborted) throw abortError(admissionSignal);
+      // The flag check and counter increment are synchronous, so a pause cannot
+      // report its idle boundary between admission and accounting.
+      if (pauseRequested) continue;
+      activeActions += 1;
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        activeActions -= 1;
+        if (activeActions === 0) {
+          for (const waiter of idleWaiters) waiter.resolve();
+          idleWaiters.clear();
+        }
+        if (!signal?.aborted && pauseRequested && activeActions === 0) {
+          await queueTransition(settlePause);
+        }
+      };
+    }
+  }
+
   async function run(callback) {
     if (typeof callback !== 'function') throw new TypeError('pause gate callback is required');
-    await waitUntilResumed();
-    if (signal?.aborted) throw abortError();
-    activeActions += 1;
+    const release = await acquire();
     try {
       return await callback();
     } finally {
-      activeActions -= 1;
-      if (activeActions === 0) {
-        for (const waiter of idleWaiters) waiter.resolve();
-        idleWaiters.clear();
-      }
-      if (pauseRequested && activeActions === 0) await queueTransition(settlePause);
+      await release();
     }
   }
 
   signal?.addEventListener('abort', () => {
     const error = abortError();
+    acceptingControls = false;
+    pauseRequested = false;
+    paused = false;
+    pauseCommandId = null;
     wakeWaiters(error);
     for (const waiter of idleWaiters) waiter.reject(error);
     idleWaiters.clear();
@@ -205,6 +303,7 @@ export function createCooperativePauseGate({
     requestPause,
     requestResume,
     seal,
+    acquire,
     run,
     waitIfPaused: waitUntilResumed,
     beforeCompletion: waitUntilResumed,
@@ -374,6 +473,7 @@ let activeOutputBudget = null;
 let activeSemantic = null;
 let activeHandoff = null;
 let activePauseControl = null;
+let activeRuntimeControl = null;
 let pendingPauseControls = [];
 let activeActionHelper = null;
 let activeExtensionCoordinator = null;
@@ -549,6 +649,86 @@ function restrictedPackAction(action) {
   });
 }
 
+function freezePlaywrightPrototypeChain(label, client, seen) {
+  if (!client || typeof client !== 'object') return [];
+  const frozen = [];
+  let prototype = Object.getPrototypeOf(client);
+  let depth = 0;
+  // Playwright Page/Context/Frame clients inherit shared ChannelOwner and
+  // EventEmitter implementations. Freezing only the leaf would leave inherited
+  // dispatch hooks replaceable, so retain the complete unique client chain.
+  // EventEmitter2 creates own `on` and `off` aliases on every future handle.
+  // Lock every method on those constructor-sensitive layers except the two
+  // aliases, then continue through the unique chain instead of freezing an
+  // inherited non-writable alias that would break later handle construction.
+  while (prototype && prototype !== Object.prototype) {
+    if (depth > 16) {
+      const error = new Error(`Playwright ${label} client prototype chain is unexpectedly deep`);
+      error.code = 'BROWSER_CLIENT_PROTOTYPE_UNAVAILABLE';
+      throw error;
+    }
+    const isConstructorSensitiveEmitterLayer = (
+      Object.hasOwn(prototype, 'on') &&
+      Object.hasOwn(prototype, 'addListener') &&
+      Object.hasOwn(prototype, 'off') &&
+      Object.hasOwn(prototype, 'removeListener')
+    );
+    if (isConstructorSensitiveEmitterLayer) {
+      if (!seen.has(prototype)) {
+        seen.add(prototype);
+        for (const name of Object.getOwnPropertyNames(prototype)) {
+          if (name === 'constructor' || name === 'on' || name === 'off') continue;
+          const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+          if (!descriptor || typeof descriptor.value !== 'function') continue;
+          Object.defineProperty(prototype, name, {
+            ...descriptor,
+            writable: false,
+            configurable: false
+          });
+        }
+        frozen.push(`${label}:${prototype.constructor?.name || 'emitter'}-methods`);
+      }
+      prototype = Object.getPrototypeOf(prototype);
+      depth += 1;
+      continue;
+    }
+    if (!seen.has(prototype)) {
+      seen.add(prototype);
+      Object.freeze(prototype);
+      if (!Object.isFrozen(prototype)) {
+        const error = new Error(`Playwright ${label} client prototype could not be frozen`);
+        error.code = 'BROWSER_CLIENT_PROTOTYPE_UNAVAILABLE';
+        throw error;
+      }
+      frozen.push(depth === 0 ? label : `${label}:ancestor-${depth}`);
+    }
+    prototype = Object.getPrototypeOf(prototype);
+    depth += 1;
+  }
+  return frozen;
+}
+
+export function freezePlaywrightClientPrototypes({ context, page }) {
+  // Task modules execute in this Worker realm. Freeze the direct client
+  // prototypes before importing trusted Task code so an accidental package-wide
+  // monkeypatch cannot route later Playwright calls around the action FIFO. This
+  // is defense in depth, not a hostile-code sandbox.
+  const clients = [
+    ['Page', page],
+    ['BrowserContext', context],
+    ['Frame', typeof page?.mainFrame === 'function' ? page.mainFrame() : null],
+    ['Locator', typeof page?.locator === 'function' ? page.locator(':root') : null],
+    ['Mouse', page?.mouse],
+    ['Keyboard', page?.keyboard]
+  ];
+  if (page?.touchscreen) clients.push(['Touchscreen', page.touchscreen]);
+
+  const seen = new Set();
+  const frozen = clients
+    .flatMap(([label, client]) => freezePlaywrightPrototypeChain(label, client, seen));
+  return Object.freeze(frozen);
+}
+
 export async function runTaskWorker(config, {
   loadPlaywright = () => import('playwright'),
   signal
@@ -572,6 +752,7 @@ export async function runTaskWorker(config, {
   activeSemantic = null;
   activeHandoff = null;
   activePauseControl = null;
+  activeRuntimeControl = null;
   activeDiagnosticsPath = path.join(path.dirname(config.checkpointPath), 'diagnostics.json');
   activeDiagnostics = {
     version: 2,
@@ -591,6 +772,16 @@ export async function runTaskWorker(config, {
   let outputBudget = null;
   let effectJournal = null;
   let sealPendingProofBoundaries = async () => {};
+  let sealCheckpointBoundary = () => {};
+  let drainCheckpointBoundary = async () => {};
+  let sealEffectResolutionBoundary = () => {};
+  let drainEffectResolutionBoundary = async () => {};
+  let sealProgressBoundary = () => {};
+  let drainProgressBoundary = async () => {};
+  let sealRuntimeControlBoundary = () => {};
+  let drainRuntimeControlBoundary = async () => {};
+  let sealHandoffBoundary = () => false;
+  let sealCooldownBoundary = () => false;
   let frozenResumeRecord = null;
   let resumeCheckpointConsumed = false;
   let lastCheckpointReceipt = null;
@@ -659,13 +850,57 @@ export async function runTaskWorker(config, {
     effectJournal = await awaitExecution(createEffectJournal({
       filePath: path.join(path.dirname(config.checkpointPath), 'effect-journal.jsonl')
     }));
+    let effectRecordTail = Promise.resolve();
+    const recordEffectEvent = (event) => {
+      const recordPromise = effectRecordTail.then(() => effectJournal.record(event));
+      // Keep one observed tail so timeout recovery can wait for every durable
+      // append that was already scheduled without creating unhandled rejections.
+      effectRecordTail = recordPromise.catch(() => {});
+      return recordPromise;
+    };
+    let effectResolutionTail = Promise.resolve();
+    let effectResolutionFailure = null;
+    let effectResolutionAccepting = true;
+    sealEffectResolutionBoundary = () => { effectResolutionAccepting = false; };
+    drainEffectResolutionBoundary = async () => {
+      await effectResolutionTail;
+      if (effectResolutionFailure) throw effectResolutionFailure;
+    };
+    const effectResolutionAbortError = () => (
+      typeof executionSignal.reason?.code === 'string'
+        ? executionSignal.reason
+        : new TaskCancelledError()
+    );
     const guardResumeEffectResolution = (sequence, observedOutcome) => {
+      if (!effectResolutionAccepting) {
+        const error = new Error('Effect resolution was issued after the task entered completion');
+        error.code = 'TASK_EFFECT_AFTER_COMPLETION';
+        const rejection = Promise.reject(error);
+        rejection.catch(() => {});
+        return rejection;
+      }
+      if (executionSignal.aborted) {
+        const rejection = Promise.reject(effectResolutionAbortError());
+        rejection.catch(() => {});
+        return rejection;
+      }
       if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
         const error = new Error('Consume the frozen checkpoint before resolving an unknown effect');
         error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
-        throw error;
+        const rejection = Promise.reject(error);
+        rejection.catch(() => {});
+        return rejection;
       }
-      return effectJournal.resolveUnknown(sequence, observedOutcome);
+      const operation = effectResolutionTail.then(() => {
+        if (executionSignal.aborted) throw effectResolutionAbortError();
+        if (effectResolutionFailure) throw effectResolutionFailure;
+        return effectJournal.resolveUnknown(sequence, observedOutcome);
+      });
+      operation.catch(() => {});
+      effectResolutionTail = operation.catch((error) => {
+        if (!effectResolutionFailure) effectResolutionFailure = error;
+      });
+      return operation;
     };
     const effects = Object.freeze({
       pending: () => effectJournal.pending(),
@@ -701,7 +936,9 @@ export async function runTaskWorker(config, {
     const pages = context.pages();
     const page = pages[0] || await awaitExecution(context.newPage());
     activePage = page;
+    freezePlaywrightClientPrototypes({ context, page });
 
+    let extensionCoordinator = null;
     const pauseGate = createCooperativePauseGate({
       signal: executionSignal,
       onState: async (state, detail = {}) => safeSend({
@@ -710,6 +947,7 @@ export async function runTaskWorker(config, {
         ...(detail.commandId ? { commandId: detail.commandId } : {})
       }),
       onPaused: async () => {
+        extensionCoordinator?.pause();
         const diagnostics = await captureFailure(
           page,
           config.outputDir,
@@ -729,8 +967,28 @@ export async function runTaskWorker(config, {
         } catch {
           throw new TaskPauseResumeError('Task page could not be revalidated before resume');
         }
+      },
+      onResumed: async () => extensionCoordinator?.resume()
+    });
+    const assertResumeCheckpointConsumed = () => {
+      if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
+        const error = new Error('Consume the frozen checkpoint before issuing browser actions');
+        error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
+        throw error;
+      }
+    };
+    extensionCoordinator = await createExtensionActionCoordinator({
+      context,
+      page,
+      signal: executionSignal,
+      enabled: config.profile.extensionsEnabled === true,
+      onExtensionEffect: (event) => recordEffectEvent(event),
+      acquireExtensionBoundary: ({ signal: admissionSignal } = {}) => {
+        assertResumeCheckpointConsumed();
+        return pauseGate.acquire({ signal: admissionSignal });
       }
     });
+    activeExtensionCoordinator = extensionCoordinator;
     const actionArbiter = createActionArbiter({ signal: executionSignal });
     activePauseControl = Object.freeze({
       requestPause: (commandId) => pauseGate.requestPause(commandId).catch((error) => {
@@ -756,81 +1014,198 @@ export async function runTaskWorker(config, {
       }
     }
 
-    const progress = async ({ current, total = null, message, phase }) => {
-      await pauseGate.waitIfPaused();
-      await outputBudget.assertWithinBudget();
-      const normalizedCurrent = Number(current);
-      const normalizedTotal = total === null ? null : Number(total);
-      const previousTotal = activeProgress.total === null ? null : Number(activeProgress.total);
-      if (!Number.isFinite(normalizedCurrent) || normalizedCurrent < 0) {
-        throw new TypeError('progress.current must be a non-negative number');
+    let progressBoundaryTail = Promise.resolve();
+    let progressBoundaryFailure = null;
+    let progressBoundaryAccepting = true;
+    let progressBoundaryPending = 0;
+    const progressBoundaryController = new AbortController();
+    sealProgressBoundary = () => {
+      if (!progressBoundaryAccepting) return;
+      progressBoundaryAccepting = false;
+      if (progressBoundaryPending > 0 && !progressBoundaryController.signal.aborted) {
+        const error = new Error('Task returned before an admitted progress update settled');
+        error.code = 'TASK_PROGRESS_NOT_AWAITED';
+        progressBoundaryFailure ||= error;
+        progressBoundaryController.abort(error);
       }
-      if (normalizedCurrent < activeProgress.current) {
-        const error = new TypeError('progress.current cannot move backwards within an attempt');
-        error.code = 'TASK_PROGRESS_INVALID';
-        throw error;
+    };
+    drainProgressBoundary = async () => {
+      await progressBoundaryTail;
+      if (progressBoundaryFailure) throw progressBoundaryFailure;
+    };
+    const progress = ({ current, total = null, message, phase }) => {
+      // Admission is synchronous. A timer that calls progress after run()
+      // returns cannot sneak through merely because the first await yields.
+      if (!progressBoundaryAccepting) {
+        const error = new Error('Progress was issued after the task entered completion');
+        error.code = 'TASK_PROGRESS_AFTER_COMPLETION';
+        const rejection = Promise.reject(error);
+        rejection.catch(() => {});
+        return rejection;
       }
-      if (normalizedTotal !== null && (!Number.isFinite(normalizedTotal) || normalizedTotal < normalizedCurrent)) {
-        throw new TypeError('progress.total must be null or a number greater than or equal to current');
-      }
-      if (previousTotal !== null && (normalizedTotal === null || normalizedTotal < previousTotal)) {
-        const error = new TypeError('progress.total cannot be removed or reduced within an attempt');
-        error.code = 'TASK_PROGRESS_INVALID';
-        throw error;
-      }
-      if (!String(message || '').trim()) throw new TypeError('progress.message is required');
-      if (phase !== undefined && (typeof phase !== 'string' || !PROGRESS_PHASE_PATTERN.test(phase))) {
-        const error = new TypeError('progress.phase must match ^[a-z][a-z0-9_-]{0,31}$');
-        error.code = 'TASK_PROGRESS_INVALID';
-        throw error;
-      }
-      activeProgress = {
-        current: normalizedCurrent,
-        total: normalizedTotal,
-        message: String(message).slice(0, 500),
-        ...(phase === undefined ? {} : { phase })
-      };
-      safeSend({ type: 'progress', progress: activeProgress, at: new Date().toISOString() });
+      progressBoundaryPending += 1;
+      const operation = progressBoundaryTail.then(async () => {
+        if (executionSignal.aborted) throw (
+          executionSignal.reason instanceof Error ? executionSignal.reason : new TaskCancelledError()
+        );
+        await pauseGate.waitIfPaused(progressBoundaryController.signal);
+        if (executionSignal.aborted) throw (
+          executionSignal.reason instanceof Error ? executionSignal.reason : new TaskCancelledError()
+        );
+        await outputBudget.assertWithinBudget();
+        if (executionSignal.aborted) throw (
+          executionSignal.reason instanceof Error ? executionSignal.reason : new TaskCancelledError()
+        );
+        const normalizedCurrent = Number(current);
+        const normalizedTotal = total === null ? null : Number(total);
+        const previousTotal = activeProgress.total === null ? null : Number(activeProgress.total);
+        if (!Number.isFinite(normalizedCurrent) || normalizedCurrent < 0) {
+          throw new TypeError('progress.current must be a non-negative number');
+        }
+        if (normalizedCurrent < activeProgress.current) {
+          const error = new TypeError('progress.current cannot move backwards within an attempt');
+          error.code = 'TASK_PROGRESS_INVALID';
+          throw error;
+        }
+        if (normalizedTotal !== null && (!Number.isFinite(normalizedTotal) || normalizedTotal < normalizedCurrent)) {
+          throw new TypeError('progress.total must be null or a number greater than or equal to current');
+        }
+        if (previousTotal !== null && (normalizedTotal === null || normalizedTotal < previousTotal)) {
+          const error = new TypeError('progress.total cannot be removed or reduced within an attempt');
+          error.code = 'TASK_PROGRESS_INVALID';
+          throw error;
+        }
+        if (!String(message || '').trim()) throw new TypeError('progress.message is required');
+        if (phase !== undefined && (typeof phase !== 'string' || !PROGRESS_PHASE_PATTERN.test(phase))) {
+          const error = new TypeError('progress.phase must match ^[a-z][a-z0-9_-]{0,31}$');
+          error.code = 'TASK_PROGRESS_INVALID';
+          throw error;
+        }
+        activeProgress = {
+          current: normalizedCurrent,
+          total: normalizedTotal,
+          message: String(message).slice(0, 500),
+          ...(phase === undefined ? {} : { phase })
+        };
+        safeSend({ type: 'progress', progress: activeProgress, at: new Date().toISOString() });
+      }).finally(() => {
+        progressBoundaryPending -= 1;
+      });
+      progressBoundaryTail = operation.catch((error) => {
+        if (!executionSignal.aborted && !progressBoundaryFailure) progressBoundaryFailure = error;
+      });
+      return operation;
     };
 
     let checkpointWrittenThisAttempt = false;
-    const checkpoint = async (data) => {
-      await pauseGate.waitIfPaused();
-      if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
-        const error = new Error('Consume the frozen checkpoint before writing a new checkpoint');
-        error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
-        throw error;
-      }
-      await outputBudget.assertWithinBudget();
-      const record = {
-        taskId: config.taskId,
-        attempt: config.attempt,
-        savedAt: new Date().toISOString(),
-        data
-      };
-      const encoded = `${JSON.stringify(record, null, 2)}\n`;
-      if (Buffer.byteLength(encoded) > MAX_CHECKPOINT_BYTES) {
-        const error = new Error('Task checkpoint exceeds 8 MiB; persist bulk data under outputDir');
-        error.code = 'TASK_CHECKPOINT_TOO_LARGE';
-        throw error;
-      }
-      await writeTextAtomic(config.checkpointPath, encoded);
-      checkpointWrittenThisAttempt = true;
-      lastCheckpointReceipt = {
-        attempt: config.attempt,
-        savedAt: record.savedAt,
-        sha256: createHash('sha256').update(encoded).digest('hex'),
-        sizeBytes: Buffer.byteLength(encoded)
-      };
-      safeSend({
-        type: 'checkpoint',
-        path: config.checkpointPath,
-        ...lastCheckpointReceipt
-      });
-      return record;
+    let checkpointBoundaryTail = Promise.resolve();
+    let checkpointWriteFailure = null;
+    let checkpointBoundaryAccepting = true;
+    sealCheckpointBoundary = () => { checkpointBoundaryAccepting = false; };
+    drainCheckpointBoundary = async () => {
+      await checkpointBoundaryTail;
+      if (checkpointWriteFailure) throw checkpointWriteFailure;
     };
-    checkpoint.read = async () => {
+    const queueCheckpointBoundary = (callback, { write = false } = {}) => {
+      if (!checkpointBoundaryAccepting) {
+        const error = new Error('Checkpoint operation was issued after the task entered completion');
+        error.code = 'TASK_CHECKPOINT_AFTER_COMPLETION';
+        const rejection = Promise.reject(error);
+        rejection.catch(() => {});
+        return rejection;
+      }
+      const operation = checkpointBoundaryTail.then(() => {
+        if (checkpointWriteFailure) throw checkpointWriteFailure;
+        if (executionSignal.aborted) throw (
+          executionSignal.reason instanceof Error ? executionSignal.reason : new TaskCancelledError()
+        );
+        return callback();
+      });
+      checkpointBoundaryTail = operation.catch((error) => {
+        if (write && !checkpointWriteFailure) checkpointWriteFailure = error;
+      });
+      return operation;
+    };
+    const checkpoint = (data) => {
+      // Freeze both task data and extension proof at API admission. A checkpoint
+      // queued before an extension receipt must never become post-receipt proof
+      // merely because an earlier checkpoint delayed its durable write.
+      const extensionHandoffAtAdmission = activeExtensionCoordinator?.checkpointContext?.() || null;
+      let normalizedDataAtAdmission;
       try {
+        normalizedDataAtAdmission = normalizeCheckpointData(data);
+      } catch (error) {
+        const rejection = Promise.reject(error);
+        rejection.catch(() => {});
+        return rejection;
+      }
+      return queueCheckpointBoundary(async () => {
+        await pauseGate.waitIfPaused();
+        if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
+          const error = new Error('Consume the frozen checkpoint before writing a new checkpoint');
+          error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
+          throw error;
+        }
+        await outputBudget.assertWithinBudget();
+        const normalizedData = normalizedDataAtAdmission;
+        const extensionHandoff = extensionHandoffAtAdmission;
+        const record = {
+          taskId: config.taskId,
+          attempt: config.attempt,
+          savedAt: new Date().toISOString(),
+          ...(extensionHandoff ? { extensionHandoff } : {}),
+          data: normalizedData
+        };
+        const encoded = `${JSON.stringify(record, null, 2)}\n`;
+        if (Buffer.byteLength(encoded) > MAX_CHECKPOINT_BYTES) {
+          const error = new Error('Task checkpoint exceeds 8 MiB; persist bulk data under outputDir');
+          error.code = 'TASK_CHECKPOINT_TOO_LARGE';
+          throw error;
+        }
+        await writeTextAtomic(config.checkpointPath, encoded);
+        const persisted = await readFile(config.checkpointPath, 'utf8');
+        if (persisted !== encoded) {
+          const error = new Error('Task checkpoint changed before durable verification');
+          error.code = 'TASK_CHECKPOINT_INVALID';
+          throw error;
+        }
+        let persistedRecord;
+        try {
+          persistedRecord = JSON.parse(persisted);
+        } catch {
+          throw checkpointDataError('Task checkpoint could not be read after persistence');
+        }
+        if (
+          persistedRecord?.taskId !== config.taskId || persistedRecord?.attempt !== config.attempt ||
+          persistedRecord?.savedAt !== record.savedAt || !Object.hasOwn(persistedRecord, 'data') ||
+          JSON.stringify(persistedRecord.extensionHandoff ?? null) !== JSON.stringify(extensionHandoff)
+        ) {
+          throw checkpointDataError('Task checkpoint failed post-write verification');
+        }
+        checkpointWrittenThisAttempt = true;
+        lastCheckpointReceipt = {
+          attempt: config.attempt,
+          savedAt: record.savedAt,
+          sha256: createHash('sha256').update(persisted).digest('hex'),
+          sizeBytes: Buffer.byteLength(persisted)
+        };
+        if (extensionHandoff) {
+          activeExtensionCoordinator.checkpointCompleted(
+            extensionHandoff.receiptId,
+            lastCheckpointReceipt
+          );
+        }
+        safeSend({
+          type: 'checkpoint',
+          path: config.checkpointPath,
+          ...lastCheckpointReceipt
+        });
+        return persistedRecord;
+      }, { write: true });
+    };
+    checkpoint.read = () => queueCheckpointBoundary(async () => {
+      try {
+        if (checkpointWriteFailure) throw checkpointWriteFailure;
         const readingFrozenResume = Boolean(config.resumeCheckpoint && !checkpointWrittenThisAttempt);
         const record = readingFrozenResume
           ? frozenResumeRecord
@@ -852,29 +1227,25 @@ export async function runTaskWorker(config, {
         if (error.code === 'ENOENT') return null;
         throw error;
       }
-    };
+    });
 
     let semantic;
     let cooldown;
     const fullHumanJourney = config.interactionContract === FULL_HUMAN_INTERACTION_CONTRACT;
-    const extensionCoordinator = await createExtensionActionCoordinator({
-      context,
-      page,
-      signal: executionSignal,
-      enabled: config.profile.extensionsEnabled === true
+    const extensionFlow = Object.freeze({
+      enabled: extensionCoordinator.enabled,
+      protocol: extensionCoordinator.protocol,
+      expectCompletion: (options) => extensionCoordinator.expectCompletion(options),
+      resolveCompletion: (receiptId, resolution) => (
+        queueCheckpointBoundary(() => extensionCoordinator.resolveCompletion(receiptId, resolution))
+      )
     });
-    activeExtensionCoordinator = extensionCoordinator;
     let terminalEffectGeneration = 0;
-    let effectRecordTail = Promise.resolve();
-    const recordEffectEvent = (event) => {
-      const recordPromise = effectRecordTail.then(() => effectJournal.record(event));
-      // Keep one observed tail so timeout recovery can wait for every durable
-      // append that was already scheduled without creating unhandled rejections.
-      effectRecordTail = recordPromise.catch(() => {});
-      return recordPromise;
-    };
+    const observationCapability = createObservationCapability();
+    const unwrapTaskLocator = createObservationLocatorUnwrapper(observationCapability);
     const rawAction = createActionHelper({
       page,
+      unwrapLocator: unwrapTaskLocator,
       mode: pendingBehavior ?? config.behavior,
       abortSignal: executionSignal,
       strictVisibleTraversal: fullHumanJourney,
@@ -937,38 +1308,51 @@ export async function runTaskWorker(config, {
       await effectRecordTail;
       for (const scope of scopes) await sealProofScope(scope);
     };
-    const runExclusiveAction = (operation, callback) => actionArbiter.run(operation, async () => {
-      const scope = {
-        id: ++proofScopeSequence,
-        generationAtStart: terminalEffectGeneration,
-        sealed: false,
-        sealPromise: null
-      };
-      activeProofScopes.set(scope.id, scope);
+    const runExclusiveAction = (operation, callback) => {
+      // Reserve both Task admission and the shared Task/extension FIFO
+      // synchronously. A pre-completion action keeps its Task ticket while it
+      // waits behind an extension; coordinator rejection cancels that ticket.
+      let reservation;
       try {
-        const result = await pauseGate.run(() => extensionCoordinator.run(operation, callback));
-        // A timed-out task can abort while a successful effect record is still
-        // being flushed. Never let the late success erase the unknown boundary.
-        if (executionSignal.aborted) await sealProofScope(scope);
-        activeProofScopes.delete(scope.id);
-        return result;
+        assertResumeCheckpointConsumed();
+        reservation = actionArbiter.reserve(operation);
       } catch (error) {
-        // The primitive can be durably succeeded before Journey verification,
-        // settling, or the outer extension slot finishes. If that outer proof
-        // fails, persist a new unknown boundary so resume cannot replay blindly.
-        await sealProofScope(scope);
-        activeProofScopes.delete(scope.id);
-        throw error;
+        const rejection = Promise.reject(error);
+        rejection.catch(() => {});
+        return rejection;
       }
-    });
-    const guardedAction = (method) => (...args) => runExclusiveAction(method, () => {
-      if (config.resumeCheckpoint && !resumeCheckpointConsumed) {
-        const error = new Error('Consume the frozen checkpoint before issuing browser actions');
-        error.code = 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED';
+      const coordinated = extensionCoordinator.run(operation, () => reservation.execute(async () => {
+        const scope = {
+          id: ++proofScopeSequence,
+          generationAtStart: terminalEffectGeneration,
+          sealed: false,
+          sealPromise: null
+        };
+        activeProofScopes.set(scope.id, scope);
+        try {
+          const result = await pauseGate.run(callback);
+          // A timed-out task can abort while a successful effect record is still
+          // being flushed. Never let the late success erase the unknown boundary.
+          if (executionSignal.aborted) await sealProofScope(scope);
+          activeProofScopes.delete(scope.id);
+          return result;
+        } catch (error) {
+          // The primitive can be durably succeeded before Journey verification,
+          // settling, or the outer extension slot finishes. If that outer proof
+          // fails, persist a new unknown boundary so resume cannot replay blindly.
+          await sealProofScope(scope);
+          activeProofScopes.delete(scope.id);
+          throw error;
+        }
+      }));
+      return coordinated.catch(async (error) => {
+        await reservation.cancel();
         throw error;
-      }
-      return rawAction[method](...args);
-    });
+      });
+    };
+    const guardedAction = (method) => (...args) => (
+      runExclusiveAction(method, () => rawAction[method](...args))
+    );
     const action = Object.freeze({
       get mode() { return rawAction.mode; },
       get effectiveMode() { return rawAction.effectiveMode; },
@@ -988,10 +1372,58 @@ export async function runTaskWorker(config, {
       read: guardedAction('read'),
       wait: guardedAction('wait')
     });
+    const capture = Object.freeze({
+      viewport: (options = {}) => runExclusiveAction('capture-viewport', async () => {
+        if (!options || typeof options !== 'object' || Array.isArray(options)) {
+          const error = new TypeError('capture.viewport options must be an object');
+          error.code = 'TASK_CAPTURE_INVALID';
+          throw error;
+        }
+        const unknown = Object.keys(options).filter((key) => key !== 'file');
+        if (unknown.length) {
+          const error = new TypeError(`Unsupported capture.viewport fields: ${unknown.join(', ')}`);
+          error.code = 'TASK_CAPTURE_INVALID';
+          throw error;
+        }
+        const file = typeof options.file === 'string' ? options.file : '';
+        if (!/^[a-z0-9][a-z0-9._-]{0,119}\.(?:png|jpe?g)$/iu.test(file) || path.basename(file) !== file) {
+          const error = new TypeError('capture.viewport file must be a bounded PNG or JPEG basename');
+          error.code = 'TASK_CAPTURE_INVALID';
+          throw error;
+        }
+        const target = path.join(config.outputDir, file);
+        await outputBudget.assertSafeRoot();
+        try {
+          await lstat(target);
+          const error = new Error('capture.viewport never overwrites an existing artifact');
+          error.code = 'TASK_CAPTURE_FILE_EXISTS';
+          throw error;
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
+        const jpeg = /\.jpe?g$/iu.test(file);
+        const image = Buffer.from(await page.screenshot({
+          type: jpeg ? 'jpeg' : 'png',
+          ...(jpeg ? { quality: 80 } : {}),
+          fullPage: false,
+          animations: 'allow',
+          caret: 'initial'
+        }));
+        if (!image.length) {
+          const error = new Error('capture.viewport returned an empty image');
+          error.code = 'TASK_CAPTURE_FAILED';
+          throw error;
+        }
+        await writeBufferAtomic(target, image);
+        await outputBudget.assertWithinBudget();
+        return Object.freeze({ file, sizeBytes: image.length });
+      })
+    });
     let journey = null;
-    let taskPage = page;
-    let taskContext = context;
+    let taskPage;
+    let taskContext;
     let taskAction = action;
+    let observation;
     if (fullHumanJourney) {
       journey = createJourneyHelper({
         page,
@@ -1002,6 +1434,7 @@ export async function runTaskWorker(config, {
           ...actionArbiter.audit(),
           extension: extensionCoordinator.audit()
         }),
+        unwrapLocator: unwrapTaskLocator,
         onState: ({ phase, operation, at }) => safeSend({
           type: 'activity',
           activity: {
@@ -1014,31 +1447,97 @@ export async function runTaskWorker(config, {
           }
         })
       });
-      const observation = createObservationFacade({
+      observation = createObservationFacade({
         page,
         context,
+        capability: observationCapability,
         onViolation: (event) => journey.violation(event)
       });
-      taskPage = observation.page;
-      taskContext = observation.context;
       taskAction = restrictedPackAction(action);
-      semantic = createSemanticObserver({ page, action: journey, locatorTransform: observation.locator });
-    } else if (extensionCoordinator.enabled) {
-      const observation = createObservationFacade({
+    } else {
+      observation = createObservationFacade({
         page,
         context,
+        capability: observationCapability,
         requiredFacade: 'action'
       });
-      taskPage = observation.page;
-      taskContext = observation.context;
-      semantic = createSemanticObserver({ page, action, locatorTransform: observation.locator });
-    } else {
-      semantic = createSemanticObserver({ page, action });
     }
+    // Every task kind receives the same read-only browser surface. Extensions
+    // still execute with their native browser permissions, while Task code must
+    // route mutations through action/journey so both peers share one FIFO.
+    taskPage = observation.page;
+    taskContext = observation.context;
+    semantic = createSemanticObserver({
+      page,
+      action: fullHumanJourney ? journey : action,
+      locatorTransform: observation.locator
+    });
     activeSemantic = semantic;
+    let runtimeControlAccepting = true;
+    let runtimeControlTail = Promise.resolve();
+    const runtimeControlRejection = (code, message) => {
+      const error = new Error(message);
+      error.code = code;
+      const rejection = Promise.reject(error);
+      rejection.catch(() => {});
+      return rejection;
+    };
+    const queueRuntimeControl = (operation, callback) => {
+      if (!runtimeControlAccepting) {
+        return runtimeControlRejection(
+          'TASK_CONTROL_AFTER_COMPLETION',
+          'Runtime control was issued after the task entered completion'
+        );
+      }
+      if (executionSignal.aborted) {
+        const rejection = Promise.reject(
+          executionSignal.reason instanceof Error ? executionSignal.reason : new TaskCancelledError()
+        );
+        rejection.catch(() => {});
+        return rejection;
+      }
+      const operationPromise = runExclusiveAction(operation, callback);
+      runtimeControlTail = Promise.allSettled([runtimeControlTail, operationPromise]).then(() => {});
+      return operationPromise;
+    };
+    sealRuntimeControlBoundary = () => { runtimeControlAccepting = false; };
+    drainRuntimeControlBoundary = async () => { await runtimeControlTail; };
+    activeRuntimeControl = Object.freeze({
+      focus: (requestId) => queueRuntimeControl('focus-task-page', async () => {
+        if (!activePage || activePage.isClosed()) {
+          const error = new Error('Task Worker has no live page to focus');
+          error.code = 'TASK_FOCUS_NO_LIVE_PAGE';
+          throw error;
+        }
+        await activePage.bringToFront();
+        if (executionSignal.aborted) throw (
+          executionSignal.reason instanceof Error ? executionSignal.reason : new TaskCancelledError()
+        );
+        safeSend({ type: 'focus_applied', requestId, at: new Date().toISOString() });
+      }),
+      diagnose: (reason) => queueRuntimeControl('external-diagnostic', async () => {
+        const diagnostics = await captureFailure(
+          activePage,
+          config.outputDir,
+          reason || 'diagnostic',
+          outputBudget,
+          semantic
+        );
+        if (diagnostics.screenshotPath) lastScreenshot = diagnostics.screenshotPath;
+        if (!executionSignal.aborted) {
+          safeSend({ type: 'heartbeat', at: new Date().toISOString(), progress: activeProgress });
+        }
+        return diagnostics;
+      }),
+      seal: sealRuntimeControlBoundary,
+      beforeCompletion: drainRuntimeControlBoundary
+    });
     const handoff = createUserHandoff({
       signal: executionSignal,
-      capture: (reason) => captureFailure(page, config.outputDir, reason, outputBudget, semantic),
+      capture: (reason) => runExclusiveAction(
+        'handoff-diagnostic',
+        () => captureFailure(page, config.outputDir, reason, outputBudget, semantic)
+      ),
       onRequest: async (request, diagnostics) => safeSend({
         type: 'waiting_user',
         request,
@@ -1059,6 +1558,7 @@ export async function runTaskWorker(config, {
       })
     });
     activeHandoff = handoff;
+    sealHandoffBoundary = () => handoff.seal();
     cooldown = createCooldownHelper({
       signal: executionSignal,
       onSignal: (kind) => action.signal(kind),
@@ -1070,6 +1570,7 @@ export async function runTaskWorker(config, {
         message: `${reason}; resume at ${resumeAt} (${durationMs}ms)`
       })
     });
+    sealCooldownBoundary = () => cooldown.seal();
 
     const taskUrl = pathToFileURL(config.modulePath);
     const taskModule = await awaitExecution(import(`${taskUrl.href}?task=${encodeURIComponent(config.taskId)}`));
@@ -1092,6 +1593,8 @@ export async function runTaskWorker(config, {
       cooldown,
       effects,
       semantic,
+      capture,
+      extensionFlow,
       handoff,
       failure: createTaskFailureFacade(),
       progress,
@@ -1101,11 +1604,31 @@ export async function runTaskWorker(config, {
     taskPromise.catch(() => {});
 
     const rawResult = await Promise.race([taskPromise, timeoutPromise, cancellationPromise, budgetPromise]);
-    // Completion is a two-phase barrier. Seal all control/action ingress paths
-    // synchronously before awaiting an admitted pause or action.
+    // Completion is a two-phase barrier. Seal every durable/control/action
+    // ingress path synchronously before awaiting any admitted operation.
+    const handoffActiveAtCompletion = sealHandoffBoundary();
+    const cooldownActiveAtCompletion = sealCooldownBoundary();
+    sealProgressBoundary();
+    sealRuntimeControlBoundary();
+    sealCheckpointBoundary();
+    sealEffectResolutionBoundary();
     pauseGate.seal();
     actionArbiter.seal();
     extensionCoordinator.seal();
+    if (handoffActiveAtCompletion) {
+      const error = new Error('Task returned while a user handoff was still active');
+      error.code = 'TASK_USER_HANDOFF_NOT_AWAITED';
+      throw error;
+    }
+    if (cooldownActiveAtCompletion) {
+      const error = new Error('Task returned while a cooldown was still active');
+      error.code = 'TASK_COOLDOWN_NOT_AWAITED';
+      throw error;
+    }
+    await drainProgressBoundary();
+    await drainRuntimeControlBoundary();
+    await drainCheckpointBoundary();
+    await drainEffectResolutionBoundary();
     await pauseGate.beforeCompletion();
     // Seal both action ingress paths first,
     // then give an already-started unknown browser effect precedence over a
@@ -1146,11 +1669,29 @@ export async function runTaskWorker(config, {
       throw error;
     }
     const result = normalizeResult(resultInput);
+    // Enter a non-runnable verification phase before hashing output so a large
+    // but bounded tree cannot be mistaken for stalled task logic. The Worker
+    // publishes its exact content-addressed snapshot before the completion
+    // claim; Manager compares it again only after this process exits.
     safeSend({ type: 'state', state: 'verifying' });
+    const outputSeal = await snapshotOutputTree({
+      root: config.outputDir,
+      limits: outputSealLimitsForBudget(outputBudget.limits)
+    });
+    safeSend({ type: 'output_seal', snapshot: outputSeal });
     safeSend({ type: 'result', result });
     safeSend({ type: 'state', state: 'completed' });
     return { state: 'completed', result };
   } catch (error) {
+    sealHandoffBoundary();
+    sealCooldownBoundary();
+    sealProgressBoundary();
+    sealRuntimeControlBoundary();
+    sealCheckpointBoundary();
+    sealEffectResolutionBoundary();
+    await drainProgressBoundary().catch(() => {});
+    await drainRuntimeControlBoundary().catch(() => {});
+    await drainEffectResolutionBoundary().catch(() => {});
     try {
       await sealPendingProofBoundaries();
     } catch (proofBoundaryError) {
@@ -1175,6 +1716,16 @@ export async function runTaskWorker(config, {
     safeSend({ type: 'state', state });
     return { state, error: errorPayload(error, lastScreenshot) };
   } finally {
+    sealHandoffBoundary();
+    sealCooldownBoundary();
+    sealProgressBoundary();
+    sealRuntimeControlBoundary();
+    sealCheckpointBoundary();
+    sealEffectResolutionBoundary();
+    await drainProgressBoundary().catch(() => {});
+    await drainRuntimeControlBoundary().catch(() => {});
+    await drainCheckpointBoundary().catch(() => {});
+    await drainEffectResolutionBoundary().catch(() => {});
     stopBudgetChecks();
     clearInterval(heartbeatTimer);
     clearTimeout(timeoutTimer);
@@ -1210,6 +1761,7 @@ export async function runTaskWorker(config, {
     activeHandoff?.cancel();
     activeHandoff = null;
     activePauseControl = null;
+    activeRuntimeControl = null;
     pendingPauseControls = [];
     activeActionHelper = null;
     pendingBehavior = null;
@@ -1308,21 +1860,18 @@ if (typeof process.send === 'function') {
     if (message?.type === 'focus') {
       const requestId = typeof message.requestId === 'string' ? message.requestId : null;
       void (async () => {
-        if (!activePage || activePage.isClosed()) {
+        if (!activeRuntimeControl) {
           const error = new Error('Task Worker has no live page to focus');
           error.code = 'TASK_FOCUS_NO_LIVE_PAGE';
           throw error;
         }
-        await activePage.bringToFront();
-        safeSend({ type: 'focus_applied', requestId, at: new Date().toISOString() });
+        await activeRuntimeControl.focus(requestId);
       })().catch((error) => {
         safeSend({ type: 'focus_control_error', requestId, error: errorPayload(error) });
       });
     }
     if (message?.type === 'diagnose') {
-      void captureFailure(activePage, message.outputDir, message.reason || 'diagnostic').finally(() => {
-        safeSend({ type: 'heartbeat', at: new Date().toISOString(), progress: activeProgress });
-      });
+      void activeRuntimeControl?.diagnose(message.reason || 'diagnostic').catch(() => {});
     }
   });
 

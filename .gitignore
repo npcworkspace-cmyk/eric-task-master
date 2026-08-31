@@ -4,6 +4,7 @@ artifacts/
 dist/
 test-results/
 playwright-report/
+.tmp-videos/
 release-evidence/
 .env
 .env.*

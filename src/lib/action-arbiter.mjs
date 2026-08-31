@@ -32,8 +32,7 @@ export function createActionArbiter({ signal } = {}) {
     signal?.reason instanceof Error ? signal.reason : new ActionArbiterAbortError()
   );
 
-  async function run(operation, callback) {
-    if (typeof callback !== 'function') throw new TypeError('action arbiter callback is required');
+  function assertCanAdmit() {
     if (executionScope.getStore() === scopeToken) {
       const error = new Error('A browser action cannot start another browser action inside the same active FIFO slot');
       error.code = 'TASK_ACTION_REENTRANT';
@@ -45,6 +44,10 @@ export function createActionArbiter({ signal } = {}) {
       error.code = 'TASK_ACTION_AFTER_COMPLETION';
       throw error;
     }
+  }
+
+  function reserve(operation) {
+    assertCanAdmit();
     const name = String(operation || 'browser-action').slice(0, 80);
     const ticket = ++issued;
     const prior = tail.catch(() => {});
@@ -52,28 +55,57 @@ export function createActionArbiter({ signal } = {}) {
     tail = new Promise((resolve) => { release = resolve; });
     pending += 1;
     maximumQueueDepth = Math.max(maximumQueueDepth, pending);
+    let state = 'reserved';
 
-    await prior;
-    pending -= 1;
-    if (signal?.aborted) {
-      release();
-      throw abortError();
-    }
+    const settlePending = async () => {
+      await prior;
+      pending -= 1;
+    };
+    const execute = async (callback) => {
+      if (typeof callback !== 'function') throw new TypeError('action arbiter callback is required');
+      if (state !== 'reserved') {
+        const error = new Error('Browser action reservation was already consumed');
+        error.code = 'TASK_ACTION_RESERVATION_CONSUMED';
+        throw error;
+      }
+      state = 'executing';
+      await settlePending();
+      if (signal?.aborted) {
+        state = 'settled';
+        release();
+        throw abortError();
+      }
 
-    active += 1;
-    started += 1;
-    maximumActive = Math.max(maximumActive, active);
-    try {
-      const result = await executionScope.run(scopeToken, () => callback({ ticket, operation: name }));
-      completed += 1;
-      return result;
-    } catch (error) {
-      failed += 1;
-      throw error;
-    } finally {
-      active -= 1;
+      active += 1;
+      started += 1;
+      maximumActive = Math.max(maximumActive, active);
+      try {
+        const result = await executionScope.run(scopeToken, () => callback({ ticket, operation: name }));
+        completed += 1;
+        return result;
+      } catch (error) {
+        failed += 1;
+        throw error;
+      } finally {
+        active -= 1;
+        state = 'settled';
+        release();
+      }
+    };
+    const cancel = async () => {
+      if (state !== 'reserved') return false;
+      state = 'cancelling';
+      await settlePending();
+      state = 'settled';
       release();
-    }
+      return true;
+    };
+    return Object.freeze({ ticket, operation: name, execute, cancel });
+  }
+
+  async function run(operation, callback) {
+    if (typeof callback !== 'function') throw new TypeError('action arbiter callback is required');
+    return reserve(operation).execute(callback);
   }
 
   function audit() {
@@ -129,5 +161,5 @@ export function createActionArbiter({ signal } = {}) {
     }
   }
 
-  return Object.freeze({ run, audit, seal, beforeCompletion });
+  return Object.freeze({ run, reserve, assertCanAdmit, audit, seal, beforeCompletion });
 }

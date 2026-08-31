@@ -10,7 +10,14 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EXTENSION_TEST_FILES = Object.freeze([
   'test/action-arbiter.test.mjs',
   'test/extension-action-coordinator.test.mjs',
-  'test/persistent-extension-real-browser.test.mjs'
+  'test/observation-facade.test.mjs',
+  'test/persistent-extension-real-browser.test.mjs',
+  'test/runtime-budgets.test.mjs',
+  'test/user-handoff.test.mjs',
+  'test/cooldown.test.mjs',
+  'test/task-service.test.mjs',
+  'test/output-seal.test.mjs',
+  'tests/runtime-budget-browser.test.mjs'
 ]);
 const EXTENSION_OUTPUT_TAIL_LIMIT = 64 * 1024;
 
@@ -38,13 +45,65 @@ function assertExtensionAcceptanceGate({ packageJson, workflow, checkSource, ext
   );
   invariant(
     extensionTests.get('test/action-arbiter.test.mjs')?.includes('TASK_ACTION_REENTRANT') &&
+      extensionTests.get('test/action-arbiter.test.mjs')?.includes('cancellation during resume validation') &&
       extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('cannot replay after release') &&
       extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('navigation releases') &&
       extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('expired extension lease poisons') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('receipt gates the next FIFO action until verified') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('mismatch in any completion triple field') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('cannot be granted before the Task trigger settles') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('request or grant before expectation registration') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('pause freezes an awaiting extension handoff') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('pause cannot report paused while an extension lease is active') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('preserves extension-first FIFO arrival') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('preserves Task-first FIFO arrival') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('200 same-tick rounds') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('500 seeded mixed Task and extension admission rounds') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('does not expire behind a valid long Task action') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('never pre-acquires the pause boundary') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('does not inherit the external extension queue capacity') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('before completion seal still runs and gates completion') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('completion seal cancels a pre-queue boundary admission') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('every close caller joins the same in-flight boundary release') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('close drains a queued request release') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('can never publish a late grant') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('blocked in durable started persistence') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('blocked in durable terminal persistence') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('never creates a fake receipt') &&
+      extensionTests.get('test/extension-action-coordinator.test.mjs')?.includes('EXTENSION_COMPLETION_CHECKPOINT_REQUIRED') &&
+      extensionTests.get('test/observation-facade.test.mjs')?.includes("locator('#capture-target').screenshot()") &&
+      extensionTests.get('test/observation-facade.test.mjs')?.includes('ignores Task tampering with WeakMap prototype methods') &&
+      extensionTests.get('test/observation-facade.test.mjs')?.includes('ignores Task tampering with WeakSet prototype methods') &&
+      extensionTests.get('test/observation-facade.test.mjs')?.includes("observed.page.screenshot({ animations: 'disabled' })") &&
+      extensionTests.get('test/observation-facade.test.mjs')?.includes('observed.page.pdf()') &&
       extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('TASKMASTER_REAL_BROWSER') &&
       extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('participant-scoped-request-ids') &&
       extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('pre-existing-iframe') &&
-      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('stale-extension-grant'),
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('real-worker-extension-handoff-gates-task-takeover') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('checkpointLinkedReceipt') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('unresolved-extension-effect-blocks-resume-replay') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes("'storage', 'tabs', 'scripting', 'host-permissions'") &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('unintegrated-extension-is-not-forced-into-fifo') &&
+      extensionTests.get('test/persistent-extension-real-browser.test.mjs')?.includes('stale-extension-grant') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('gates Journey and task capture before any Playwright call') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('checkpoint admitted before an extension receipt') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('effect resolution ingress seals when task code returns') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('task cancellation rejects effect resolution') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('every task receives a read-only Page and browser mutations require the action facade') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('a delayed standalone Page mutation cannot run after task return') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('task completion rejects a fire-and-forget user handoff') &&
+      extensionTests.get('test/runtime-budgets.test.mjs')?.includes('task completion rejects a fire-and-forget cooldown') &&
+      extensionTests.get('test/user-handoff.test.mjs')?.includes('continuation reporting is joined and cancellation prevents a late running state') &&
+      extensionTests.get('test/user-handoff.test.mjs')?.includes('sealing a handoff while request publication is in flight blocks waiting state and progress') &&
+      extensionTests.get('test/cooldown.test.mjs')?.includes('cooldown admission is synchronous, single-instance, and seal blocks late publication') &&
+      extensionTests.get('test/cooldown.test.mjs')?.includes('sealing an active cooldown suppresses completed and running publications') &&
+      extensionTests.get('test/task-service.test.mjs')?.includes('Manager lifecycle is monotonic against late Worker state after cancel and completion claim') &&
+      extensionTests.get('test/task-service.test.mjs')?.includes('Manager rejects output changes made after the Worker claims completion') &&
+      extensionTests.get('test/task-service.test.mjs')?.includes('production completion fails closed when the Worker omits its pre-claim output seal') &&
+      extensionTests.get('test/output-seal.test.mjs')?.includes('TASK_OUTPUT_CHANGED_AFTER_COMPLETION') &&
+      extensionTests.get('test/output-seal.test.mjs')?.includes('output seal precisely reports added, removed, and renamed empty directories') &&
+      extensionTests.get('tests/runtime-budget-browser.test.mjs')?.includes('real Worker freezes Locator.prototype before Task import') &&
+      extensionTests.get('tests/runtime-budget-browser.test.mjs')?.includes('ChannelOwner.prototype._wrapApiCall was replaceable'),
     'extension serialization, idempotency, navigation, or real-browser acceptance coverage drift'
   );
 }
@@ -54,6 +113,12 @@ async function staticChecks() {
   const lock = JSON.parse(await readFile(resolve(ROOT, 'package-lock.json'), 'utf8'));
   const license = await readFile(resolve(ROOT, 'LICENSE'), 'utf8');
   const changelog = await readFile(resolve(ROOT, 'CHANGELOG.md'), 'utf8');
+  const extensionSources = await Promise.all(
+    EXTENSION_TEST_FILES.map((relative) => readFile(resolve(ROOT, relative), 'utf8'))
+  );
+  const extensionTests = new Map(
+    EXTENSION_TEST_FILES.map((relative, index) => [relative, extensionSources[index]])
+  );
   invariant(packageJson.version === VERSION, 'package.json version drift');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock.json version drift');
   invariant(packageJson.license === 'MIT', 'package license drift');
@@ -97,12 +162,13 @@ async function staticChecks() {
     journey,
     behavior,
     cooldown,
+    extensionCoordinator,
     observationFacade,
     acceptance,
+    builtinAcceptanceTask,
+    builtinReadPageTask,
+    builtinObservePageTask,
     checkSource,
-    extensionActionArbiterTest,
-    extensionCoordinatorTest,
-    extensionRealBrowserTest,
     mcpStdio,
     mcpServer,
     mcpPublicView,
@@ -114,7 +180,8 @@ async function staticChecks() {
     architecture,
     releaseGate,
     baseSkill,
-    taskPacksReference
+    taskPacksReference,
+    taskRuntimeReference
   ] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'cli.mjs'), 'utf8'),
@@ -135,12 +202,13 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'src', 'lib', 'journey.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'behavior.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'cooldown.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'src', 'lib', 'extension-action-coordinator.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'observation-facade.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'acceptance.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'examples', 'tasks', 'acceptance-task.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'examples', 'tasks', 'read-page-task.mjs'), 'utf8'),
+    readFile(resolve(ROOT, 'examples', 'tasks', 'observe-page-task.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'scripts', 'check.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'test', 'action-arbiter.test.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'test', 'extension-action-coordinator.test.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'test', 'persistent-extension-real-browser.test.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'stdio.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'server.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'mcp', 'public-view.mjs'), 'utf8'),
@@ -152,22 +220,24 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'ARCHITECTURE.md'), 'utf8'),
     readFile(resolve(ROOT, 'docs', 'RELEASE-GATE.md'), 'utf8'),
     readFile(resolve(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8'),
-    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-packs.md'), 'utf8')
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-packs.md'), 'utf8'),
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-runtime.md'), 'utf8')
   ]);
   const releaseCreation = releaseWorkflow.indexOf('gh release create');
   const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
   const releaseVersionChecks = [...releaseWorkflow.matchAll(/scripts\/assert-release-version\.mjs/g)]
     .map((match) => match.index);
   assertReleaseWorkflowPolicy(releaseWorkflow);
+  invariant(
+    [builtinAcceptanceTask, builtinReadPageTask, builtinObservePageTask]
+      .every((source) => source.includes('capture.viewport({ file:') && !source.includes('.screenshot(')),
+    'built-in tasks bypass the runtime-owned viewport capture boundary'
+  );
   assertExtensionAcceptanceGate({
     packageJson,
     workflow,
     checkSource,
-    extensionTests: new Map([
-      ['test/action-arbiter.test.mjs', extensionActionArbiterTest],
-      ['test/extension-action-coordinator.test.mjs', extensionCoordinatorTest],
-      ['test/persistent-extension-real-browser.test.mjs', extensionRealBrowserTest]
-    ])
+    extensionTests
   });
   invariant(launcher.includes("['ci', '--ignore-scripts', '--no-audit', '--no-fund']"), 'fixed launcher lacks dependency bootstrap');
   invariant(
@@ -266,13 +336,84 @@ async function staticChecks() {
       taskRecipes.includes("interactionContract: 'full-human-v1'") &&
       taskRecipes.includes('journey.nextPage') &&
       interactionContract.includes("FULL_HUMAN_INTERACTION_CONTRACT = 'full-human-v1'") &&
+      interactionContract.includes('TASK_PACK_EXTENSION_HANDOFF_INCOMPLETE') &&
       journey.includes('TASK_INTERACTION_CONTRACT_FAILED') &&
       observationFacade.includes('TASK_UI_ACTION_REQUIRES_JOURNEY') &&
+      observationFacade.includes('Object.freeze(Object.create(null))') &&
+      observationFacade.includes('return reject(surface, property)') &&
+      observationFacade.includes('const PAGE_BLOCKED_METHODS') &&
+      observationFacade.includes("'pdf', 'pickLocator'") &&
+      observationFacade.includes("'screenshot', 'scrollIntoViewIfNeeded'") &&
+      observationFacade.includes('function wrapEventValue(event, value)') &&
+      observationFacade.includes("if (event === 'response') return wrapResponse(value)") &&
+      observationFacade.includes('function wrappedWaitPredicate(event, predicate, facade)') &&
+      observationFacade.includes("members.set('contentFrame'") &&
+      observationFacade.includes("members.set('owner'") &&
+      observationFacade.includes("members.set('localStorage', wrapWebStorage") &&
+      interactionContract.includes("operation: 'arbitrary in-page JavaScript evaluation'") &&
       taskWorker.includes('createObservationFacade') &&
+      taskWorker.includes('const extensionFlow = Object.freeze({') &&
+      taskWorker.includes('extensionCoordinator.expectCompletion(options)') &&
+      taskWorker.includes('extensionCoordinator.resolveCompletion(receiptId, resolution)') &&
+      taskWorker.includes('activeExtensionCoordinator?.checkpointContext?.()') &&
+      taskWorker.includes('const extensionHandoffAtAdmission = activeExtensionCoordinator?.checkpointContext?.() || null') &&
+      taskWorker.includes('activeExtensionCoordinator.checkpointCompleted(') &&
+      taskWorker.includes('queueCheckpointBoundary') &&
+      taskWorker.includes('normalizeCheckpointData') &&
+      taskWorker.includes('onExtensionEffect: (event) => recordEffectEvent(event)') &&
+      taskWorker.includes('const assertResumeCheckpointConsumed = () => {') &&
+      taskWorker.includes('acquireExtensionBoundary: ({ signal: admissionSignal } = {}) => {') &&
+      taskWorker.includes('return pauseGate.acquire({ signal: admissionSignal });') &&
+      taskWorker.includes('reservation = actionArbiter.reserve(operation)') &&
+      taskWorker.includes('const coordinated = extensionCoordinator.run(operation, () => reservation.execute(async () => {') &&
+      taskWorker.includes('await reservation.cancel()') &&
+      taskWorker.includes('sealCheckpointBoundary();') &&
+      taskWorker.includes("error.code = 'TASK_CHECKPOINT_AFTER_COMPLETION'") &&
+      taskWorker.includes('sealEffectResolutionBoundary();') &&
+      taskWorker.includes("error.code = 'TASK_EFFECT_AFTER_COMPLETION'") &&
+      taskWorker.includes('if (executionSignal.aborted) throw effectResolutionAbortError();') &&
+      taskWorker.includes("viewport: (options = {}) => runExclusiveAction('capture-viewport'") &&
+      taskWorker.includes("animations: 'allow'") && taskWorker.includes("caret: 'initial'") &&
+      taskWorker.includes('extensionCoordinator?.pause()') &&
+      taskWorker.includes('extensionCoordinator?.resume()') &&
+      taskWorker.includes("safeSend({ type: 'output_seal', snapshot: outputSeal })") &&
+      taskService.includes("'TASK_OUTPUT_SEAL_MISSING'") &&
+      taskService.includes('requireWorkerOutputSeal') &&
+      extensionCoordinator.includes("waiter.phase = 'awaiting-extension'") &&
+      extensionCoordinator.includes("waiter.phase = 'extension-active'") &&
+      extensionCoordinator.includes("extensionGrantState = 'active'") &&
+      extensionCoordinator.includes("extensionBoundaryState: requiresExtensionBoundary ? 'idle' : 'ready'") &&
+      extensionCoordinator.includes("if (candidate.extensionBoundaryState === 'idle')") &&
+      extensionCoordinator.includes('candidate.prepareExtensionBoundary();') &&
+      extensionCoordinator.includes('const inFlightOperations = new Set()') &&
+      extensionCoordinator.includes('function raceLifecycle(candidate)') &&
+      extensionCoordinator.includes('if (closePromise) return closePromise') &&
+      extensionCoordinator.includes('completionEffectPending') &&
+      extensionCoordinator.includes('extension-grant-lifecycle-race') &&
+      extensionCoordinator.includes('EXTENSION_COMPLETION_CHECKPOINT_REQUIRED') &&
+      taskWorker.includes('extensionFlow,') &&
       taskWorker.includes('journey.assertComplete()') &&
       acceptance.includes('interaction-audit.json') &&
-      acceptance.includes('audit.score === 10'),
-    'mandatory Human Journey, read-only observation, or interaction-audit boundary drift'
+      acceptance.includes('audit.score === 10') &&
+      taskPacksReference.includes('## Mandatory extension coexistence contract') &&
+      ['PACK-EXT-01', 'PACK-EXT-02', 'PACK-EXT-03', 'PACK-EXT-04', 'PACK-EXT-05', 'PACK-EXT-06', 'PACK-EXT-07', 'PACK-EXT-08']
+        .every((rule) => taskPacksReference.split(rule).length - 1 === 1) &&
+      taskPacksReference.includes('are equal FIFO peers') &&
+      taskPacksReference.includes('participantId') && taskPacksReference.includes('requestId') &&
+      taskPacksReference.includes('does not reduce extension permissions') &&
+      taskPacksReference.includes('wait for the durable `paused` state') &&
+      taskPacksReference.includes('`waiting_user` is not equivalent to `paused`') &&
+      taskPacksReference.includes('Release or reported outcome alone is not success proof') &&
+      taskPacksReference.includes('register the exact expectation') &&
+      taskPacksReference.includes('must not blindly restore, duplicate, or overwrite an extension action') &&
+      taskRecipes.includes('Runtime owns browser/extension coordination; visible mutations stay in journey; extension-dependent steps use extensionFlow.') &&
+      taskRuntimeReference.includes('Cooperative extensions and Task Master are equal FIFO peers') &&
+      taskRuntimeReference.includes('extensionFlow.expectCompletion') &&
+      taskRuntimeReference.includes('extensionFlow.resolveCompletion') &&
+      taskRuntimeReference.includes('participantId + requestId + operation') &&
+      taskRuntimeReference.includes('Worker seals all lifecycle and action ingress') &&
+      baseSkill.includes("must also follow the reference's mandatory extension coexistence contract"),
+    'mandatory Human Journey, extension coexistence, read-only observation, or interaction-audit boundary drift'
   );
   invariant(
     !manager.includes('/v1/pair/extension') &&
@@ -625,13 +766,13 @@ async function runExtensionAcceptance() {
     await runCaptured(
       process.execPath,
       ['--test', '--test-concurrency=1', ...EXTENSION_TEST_FILES],
-      { TASKMASTER_REAL_BROWSER: '1' }
+      { TASKMASTER_REAL_BROWSER: '1', TASKMASTER_EXTENSION_STAGE: '1' }
     );
     const browserAcceptance = await readExtensionReport();
     if (process.env.TASKMASTER_EXTENSION_REPORT) {
       invariant(
-        browserAcceptance?.ok === true && browserAcceptance?.summary?.passed === 15,
-        'real MV3 extension acceptance did not publish its 15/15 evidence'
+        browserAcceptance?.ok === true && browserAcceptance?.summary?.passed === 17,
+        'real MV3 extension acceptance did not publish its 17/17 evidence'
       );
     }
     const completedAt = new Date();

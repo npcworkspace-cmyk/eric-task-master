@@ -27,11 +27,16 @@ export async function run({ page, input, outputDir, action, progress, checkpoint
   await action.goto(target.href, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await progress({ current: 1, total: 2, message: 'Target loaded' });
 
-  const result = await page.locator('body').evaluate((body) => ({
-    title: document.title.slice(0, 500),
-    url: location.href,
-    text: (body.innerText || body.textContent || '').slice(0, 20_000)
-  }));
+  const body = page.locator('body');
+  const result = {
+    title: (await page.title().catch(() => '')).slice(0, 500),
+    url: page.url(),
+    text: String(
+      await body.innerText({ timeout: 5_000 }).catch(async () => (
+        await body.textContent({ timeout: 5_000 }).catch(() => '')
+      ))
+    ).slice(0, 20_000)
+  };
   const artifactName = 'result.json';
   await writeFile(path.join(outputDir, artifactName), `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
   await checkpoint({ stage: 'persisted', url: result.url, artifact: artifactName });

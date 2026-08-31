@@ -1,5 +1,4 @@
 import { FULL_HUMAN_INTERACTION_CONTRACT } from './interaction-contract.mjs';
-import { unwrapObservationLocator } from './observation-facade.mjs';
 
 const DEFAULT_SETTLE = Object.freeze([220, 620]);
 const DEFAULT_READING_WORDS = Object.freeze([12, 42]);
@@ -17,9 +16,9 @@ function numberBetween(range, random) {
   return Math.round(minimum + (maximum - minimum) * random());
 }
 
-function asLocator(page, target) {
+function asLocator(page, target, unwrapLocator) {
   if (typeof target === 'string') return page.locator(target);
-  if (target && typeof target === 'object') return unwrapObservationLocator(target);
+  if (target && typeof target === 'object') return unwrapLocator(target);
   throw new TypeError('Journey target must be a selector string or Playwright Locator');
 }
 
@@ -71,9 +70,11 @@ export function createJourneyHelper({
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   onState = () => {},
   runStep = async (_operation, callback) => callback(),
-  coordinationAudit = () => null
+  coordinationAudit = () => null,
+  unwrapLocator = (locator) => locator
 } = {}) {
   if (!page || !action) throw new TypeError('page and action are required');
+  if (typeof unwrapLocator !== 'function') throw new TypeError('unwrapLocator must be a function');
   if (contract !== FULL_HUMAN_INTERACTION_CONTRACT) {
     throw new TypeError(`Unsupported journey contract: ${contract}`);
   }
@@ -173,7 +174,7 @@ export function createJourneyHelper({
     async click(target, options = {}) {
       return step('click-visible', async () => {
         const beforeUrl = page.url();
-        const result = await action.click(asLocator(page, target), options);
+        const result = await action.click(asLocator(page, target, unwrapLocator), options);
         counters.visibleClicks += 1;
         if (page.url() !== beforeUrl) await settle();
         return result;
@@ -184,7 +185,7 @@ export function createJourneyHelper({
       const timeoutMs = boundedInteger(options.timeoutMs, 15_000, 250, 60_000, 'timeoutMs');
       return step('navigate-visible', async () => {
         const before = await pageFingerprint(page);
-        await action.click(asLocator(page, target), options.actionOptions || {});
+        await action.click(asLocator(page, target, unwrapLocator), options.actionOptions || {});
         counters.visibleClicks += 1;
         return verifyTransition(before, options.verify, timeoutMs);
       });
@@ -194,7 +195,7 @@ export function createJourneyHelper({
       const timeoutMs = boundedInteger(options.timeoutMs, 15_000, 250, 60_000, 'timeoutMs');
       return step('next-page-visible', async () => {
         const before = await pageFingerprint(page);
-        await action.click(asLocator(page, target), options.actionOptions || {});
+        await action.click(asLocator(page, target, unwrapLocator), options.actionOptions || {});
         counters.visibleClicks += 1;
         counters.nextPages += 1;
         return verifyTransition(before, options.verify, timeoutMs);
@@ -212,7 +213,7 @@ export function createJourneyHelper({
 
     async fill(target, value, options = {}) {
       return step('fill-visible', async () => {
-        const result = await action.fill(asLocator(page, target), value, options);
+        const result = await action.fill(asLocator(page, target, unwrapLocator), value, options);
         counters.textInputs += 1;
         return result;
       });
@@ -220,14 +221,14 @@ export function createJourneyHelper({
 
     async type(target, value, options = {}) {
       return step('type-visible', async () => {
-        const result = await action.type(asLocator(page, target), value, options);
+        const result = await action.type(asLocator(page, target, unwrapLocator), value, options);
         counters.textInputs += 1;
         return result;
       });
     },
 
     async hover(target, options = {}) {
-      return step('hover-visible', () => action.hover(asLocator(page, target), options));
+      return step('hover-visible', () => action.hover(asLocator(page, target, unwrapLocator), options));
     },
 
     async scroll(input = {}) {
@@ -257,7 +258,7 @@ export function createJourneyHelper({
 
     async select(target, value, options = {}) {
       return step('select-visible', async () => {
-        const locator = asLocator(page, target);
+        const locator = asLocator(page, target, unwrapLocator);
         const result = await action.select(locator, value, options);
         counters.selections += 1;
         return result;
@@ -266,7 +267,7 @@ export function createJourneyHelper({
 
     async upload(target, files, options = {}) {
       return step('upload-visible', async () => {
-        const locator = asLocator(page, target);
+        const locator = asLocator(page, target, unwrapLocator);
         await action.hover(locator);
         const result = await action.run('upload', () => locator.setInputFiles(files, options));
         counters.uploads += 1;

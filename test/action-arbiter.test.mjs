@@ -119,6 +119,58 @@ test('seal rejects late actions before the admitted queue is drained', async () 
   await arbiter.beforeCompletion();
 });
 
+test('a reservation admitted before seal executes afterward and remains part of completion drain', async () => {
+  const arbiter = createActionArbiter();
+  const firstMayFinish = deferred();
+  const firstStarted = deferred();
+  const events = [];
+  const first = arbiter.run('first', async () => {
+    events.push('first');
+    firstStarted.resolve();
+    await firstMayFinish.promise;
+  });
+  await firstStarted.promise;
+  const admitted = arbiter.reserve('admitted-before-seal');
+  const second = admitted.execute(async () => events.push('second'));
+  arbiter.seal();
+  await assert.rejects(
+    arbiter.run('late', async () => {}),
+    { code: 'TASK_ACTION_AFTER_COMPLETION' }
+  );
+  let completionSettled = false;
+  const completion = arbiter.beforeCompletion().then(() => { completionSettled = true; });
+  await Promise.resolve();
+  assert.equal(completionSettled, false);
+  firstMayFinish.resolve();
+  await Promise.all([first, second, completion]);
+  assert.deepEqual(events, ['first', 'second']);
+  assert.equal(arbiter.audit().issued, 2);
+  assert.equal(arbiter.audit().completed, 2);
+});
+
+test('cancelling a reserved action releases its FIFO position only after prior work settles', async () => {
+  const arbiter = createActionArbiter();
+  const releaseFirst = deferred();
+  const firstStarted = deferred();
+  const first = arbiter.run('first', async () => {
+    firstStarted.resolve();
+    await releaseFirst.promise;
+  });
+  await firstStarted.promise;
+  const cancelled = arbiter.reserve('cancelled');
+  const later = arbiter.reserve('later');
+  let laterRan = false;
+  const cancellation = cancelled.cancel();
+  const laterExecution = later.execute(async () => { laterRan = true; });
+  await Promise.resolve();
+  assert.equal(laterRan, false);
+  releaseFirst.resolve();
+  assert.equal(await cancellation, true);
+  await Promise.all([first, laterExecution]);
+  assert.equal(laterRan, true);
+  assert.equal(arbiter.audit().pending, 0);
+});
+
 test('nested actions in the same async chain fail fast instead of deadlocking', async () => {
   const arbiter = createActionArbiter();
   await assert.rejects(
@@ -206,6 +258,54 @@ test('pause seal rejects late controls but lets an already-admitted pause resume
   assert.deepEqual(transitions, [
     'pause_requested', 'diagnostic', 'paused', 'recovering', 'validated', 'running'
   ]);
+});
+
+test('cancellation permanently prevents a late active action from publishing paused', async () => {
+  const controller = new AbortController();
+  const transitions = [];
+  const gate = createCooperativePauseGate({
+    signal: controller.signal,
+    onState: async (state) => transitions.push(state),
+    onPaused: async () => transitions.push('diagnostic')
+  });
+  const releaseAction = await gate.acquire();
+  const pause = gate.requestPause('cancelled-pause').then(() => null, (error) => error);
+  await Promise.resolve();
+  assert.deepEqual(transitions, ['pause_requested']);
+  controller.abort(Object.assign(new Error('cancelled'), { code: 'TASK_CANCELLED' }));
+  await releaseAction();
+  assert.equal((await pause)?.code, 'TASK_CANCELLED');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(transitions, ['pause_requested']);
+  assert.equal(gate.state, 'running');
+});
+
+test('cancellation during resume validation cannot publish a late running state', async () => {
+  const controller = new AbortController();
+  const validationStarted = deferred();
+  const finishValidation = deferred();
+  const transitions = [];
+  let resumed = 0;
+  const gate = createCooperativePauseGate({
+    signal: controller.signal,
+    onState: async (state) => transitions.push(state),
+    onResumeValidate: async () => {
+      validationStarted.resolve();
+      await finishValidation.promise;
+    },
+    onResumed: async () => { resumed += 1; }
+  });
+
+  await gate.requestPause('pause-before-cancel');
+  const resume = gate.requestResume('resume-before-cancel');
+  await validationStarted.promise;
+  controller.abort(Object.assign(new Error('cancelled'), { code: 'TASK_CANCELLED' }));
+  finishValidation.resolve();
+
+  await assert.rejects(resume, { code: 'TASK_CANCELLED' });
+  assert.equal(resumed, 0);
+  assert.deepEqual(transitions, ['pause_requested', 'paused', 'recovering']);
+  assert.equal(gate.state, 'running');
 });
 
 test('pause requested after completion seal cannot publish a paused state', async () => {

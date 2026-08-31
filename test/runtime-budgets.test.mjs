@@ -33,6 +33,15 @@ async function temporaryRoot(t, prefix) {
   return root;
 }
 
+async function eventually(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail('condition did not become true before the deadline');
+}
+
 function fakeBrowser() {
   let closed = false;
   const page = {
@@ -178,6 +187,64 @@ test('task worker exposes only an explicit bounded public failure contract', asy
     nextAction: 'Reduce itemCount or supply more sources, then retry once.'
   });
   assert.equal(browser.wasClosed(), true);
+});
+
+test('task capture writes one bounded viewport artifact through the runtime-owned action boundary', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-runtime-capture-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ capture }) {',
+    "  const artifact = await capture.viewport({ file: 'viewport.png' });",
+    "  if (artifact.file !== 'viewport.png' || artifact.sizeBytes !== 4) throw new Error('capture result drifted');",
+    "  return { summary: 'capture passed', evidence: [{ kind: 'artifact', file: artifact.file, agentVisible: true }] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  let screenshotOptions = null;
+  browser.page.screenshot = async (options) => {
+    screenshotOptions = options;
+    return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+  };
+  const config = workerConfig(root, modulePath);
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome));
+  assert.deepEqual(screenshotOptions, {
+    type: 'png',
+    fullPage: false,
+    animations: 'allow',
+    caret: 'initial'
+  });
+  assert.deepEqual([...await readFile(path.join(config.outputDir, 'viewport.png'))], [0x89, 0x50, 0x4e, 0x47]);
+});
+
+test('task capture rejects output-path escape before invoking Playwright', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-runtime-capture-path-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ capture }) {',
+    "  await capture.viewport({ file: '../escape.png' });",
+    "  return { summary: 'must not complete', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  let screenshotCalls = 0;
+  browser.page.screenshot = async () => {
+    screenshotCalls += 1;
+    return Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  };
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_CAPTURE_INVALID');
+  // One best-effort terminal diagnostic is allowed; the invalid task capture
+  // itself never reaches Playwright.
+  assert.ok(screenshotCalls <= 1);
+  await assert.rejects(access(path.join(root, 'escape.png')));
 });
 
 test('output budget preserves user files and reserves bounded diagnostic capacity', async (t) => {
@@ -788,6 +855,162 @@ test('checkpoint read returns the exact task data instead of its internal envelo
   });
 });
 
+test('checkpoint rejects values that JSON would silently erase or change', async (t) => {
+  const cases = [
+    'undefined',
+    "Symbol('hidden')",
+    '({ missing: undefined })',
+    'Number.NaN',
+    'new Date()',
+    '(() => { const value = {}; value.self = value; return value; })()'
+  ];
+  for (const [index, expression] of cases.entries()) {
+    const root = await temporaryRoot(t, `taskmaster-checkpoint-invalid-${index}-`);
+    const modulePath = path.join(root, 'task.mjs');
+    await writeFile(modulePath, [
+      'export async function run({ checkpoint }) {',
+      `  await checkpoint(${expression});`,
+      "  return { summary: 'must not complete', evidence: [] };",
+      '}',
+      ''
+    ].join('\n'));
+    const browser = fakeBrowser();
+    const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+      loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+    });
+    assert.equal(outcome.state, 'failed');
+    assert.equal(outcome.error.code, 'TASK_CHECKPOINT_INVALID');
+    assert.equal(browser.wasClosed(), true);
+    await assert.rejects(access(path.join(root, 'checkpoint.json')));
+  }
+});
+
+test('concurrent checkpoint calls persist in invocation order without a late overwrite', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-checkpoint-fifo-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ checkpoint }) {',
+    "  const older = checkpoint({ sequence: 1, payload: 'x'.repeat(512 * 1024) });",
+    '  const newer = checkpoint({ sequence: 2 });',
+    '  await Promise.all([older, newer]);',
+    '  const restored = await checkpoint.read();',
+    "  if (restored?.sequence !== 2) throw new Error('checkpoint order drifted');",
+    "  return { summary: 'checkpoint FIFO passed', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome));
+  assert.deepEqual(JSON.parse(await readFile(path.join(root, 'checkpoint.json'), 'utf8')).data, {
+    sequence: 2
+  });
+});
+
+test('checkpoint ingress seals at task return and rejects a delayed fire-and-forget overwrite', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-checkpoint-completion-seal-');
+  const modulePath = path.join(root, 'task.mjs');
+  const markerPath = path.join(root, 'late-checkpoint-result.txt');
+  await writeFile(modulePath, [
+    "import { writeFile } from 'node:fs/promises';",
+    'export async function run({ checkpoint, input }) {',
+    '  await checkpoint({ sequence: 1 });',
+    '  setTimeout(() => {',
+    '    checkpoint({ sequence: 2 }).then(',
+    "      () => writeFile(input.markerPath, 'resolved'),",
+    "      (error) => writeFile(input.markerPath, String(error?.code || 'unknown'))",
+    '    );',
+    '  }, 20);',
+    "  return { summary: 'completion seal passed', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  const config = workerConfig(root, modulePath);
+  config.input = { markerPath };
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(await readFile(markerPath, 'utf8'), 'TASK_CHECKPOINT_AFTER_COMPLETION');
+  assert.deepEqual(JSON.parse(await readFile(config.checkpointPath, 'utf8')).data, { sequence: 1 });
+});
+
+test('a checkpoint admitted before an extension receipt cannot become post-receipt proof', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-checkpoint-extension-admission-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    "import { writeFile } from 'node:fs/promises';",
+    "import path from 'node:path';",
+    'export async function run({ journey, extensionFlow, checkpoint, outputDir }) {',
+    "  const pad = 'x'.repeat(4 * 1024 * 1024);",
+    '  const backlog = Array.from({ length: 20 }, (_, index) => checkpoint({ index, pad }));',
+    '  const completion = extensionFlow.expectCompletion({',
+    "    participantId: 'extension-proof', requestId: 'request-proof', operation: 'input', timeoutMs: 5_000",
+    '  });',
+    "  await journey.open('https://example.test/start');",
+    "  await writeFile(path.join(outputDir, 'ready.txt'), 'ready');",
+    "  const admittedBeforeReceipt = checkpoint({ proof: 'constructed-before-receipt' });",
+    '  const receipt = await completion;',
+    '  await Promise.all(backlog);',
+    '  await admittedBeforeReceipt;',
+    "  await extensionFlow.resolveCompletion(receipt.receiptId, { decision: 'verified', code: 'verified' });",
+    "  return { summary: 'must not complete', evidence: [] };",
+    '}',
+    ''
+  ].join('\n'));
+  const config = workerConfig(root, modulePath);
+  config.interactionContract = 'full-human-v1';
+  config.timeoutMs = 30_000;
+  config.profile = {
+    ...config.profile,
+    kind: 'persistent',
+    headless: false,
+    extensionsEnabled: true
+  };
+  const browser = fakeBrowser();
+  let bridge = null;
+  browser.page.frames = () => [];
+  browser.page.mainFrame = () => browser.page;
+  browser.page.url = () => 'https://example.test/start';
+  browser.page.waitForLoadState = async () => {};
+  browser.page.on = () => {};
+  browser.page.off = () => {};
+  browser.page.evaluate = async () => null;
+  browser.context.exposeBinding = async (_name, callback) => { bridge = callback; };
+  browser.context.addInitScript = async () => {};
+
+  const worker = runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  await eventually(async () => access(path.join(config.outputDir, 'ready.txt')).then(() => true, () => false), 5_000);
+  assert.equal(typeof bridge, 'function');
+  const grant = await bridge({ page: browser.page, frame: browser.page }, {
+    kind: 'request',
+    participantId: 'extension-proof',
+    requestId: 'request-proof',
+    operation: 'input',
+    durationMs: 1_000
+  });
+  assert.equal(grant.ok, true, JSON.stringify(grant));
+  const released = await bridge({ page: browser.page, frame: browser.page }, {
+    kind: 'release',
+    participantId: 'extension-proof',
+    leaseId: grant.leaseId,
+    outcome: { status: 'succeeded', code: 'ok', facts: [] }
+  });
+  assert.equal(released.ok, true);
+  const outcome = await worker;
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'EXTENSION_COMPLETION_CHECKPOINT_REQUIRED');
+  const finalCheckpoint = JSON.parse(await readFile(config.checkpointPath, 'utf8'));
+  assert.deepEqual(finalCheckpoint.data, { proof: 'constructed-before-receipt' });
+  assert.equal(finalCheckpoint.extensionHandoff, undefined);
+});
+
 test('a resumed worker reads only its frozen checkpoint even if the live checkpoint path changes', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-frozen-resume-');
   const modulePath = path.join(root, 'task.mjs');
@@ -931,6 +1154,69 @@ test('a resumed worker cannot issue a browser action before reading its checkpoi
   assert.equal(browserActions, 0);
 });
 
+test('a resumed worker gates Journey and task capture before any Playwright call', async (t) => {
+  const cases = [
+    {
+      name: 'journey',
+      source: [
+        'export async function run({ journey }) {',
+        '  await journey.open("https://example.test/replayed");',
+        '  return { summary: "must not complete", evidence: [] };',
+        '}',
+        ''
+      ].join('\n'),
+      configure(config) { config.interactionContract = 'full-human-v1'; }
+    },
+    {
+      name: 'capture',
+      source: [
+        'export async function run({ capture }) {',
+        '  await capture.viewport({ file: "replayed.png" });',
+        '  return { summary: "must not complete", evidence: [] };',
+        '}',
+        ''
+      ].join('\n'),
+      configure() {}
+    }
+  ];
+
+  for (const candidate of cases) {
+    const root = await temporaryRoot(t, `taskmaster-frozen-resume-${candidate.name}-`);
+    const modulePath = path.join(root, 'task.mjs');
+    await writeFile(modulePath, candidate.source);
+    const config = { ...workerConfig(root, modulePath), attempt: 2 };
+    candidate.configure(config);
+    const savedAt = new Date().toISOString();
+    const source = Buffer.from(`${JSON.stringify({
+      taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
+    })}\n`);
+    const frozenPath = path.join(root, 'resume-input.json');
+    await writeFile(frozenPath, source);
+    config.resumeCheckpoint = {
+      path: frozenPath, sourceAttempt: 1, targetAttempt: 2, savedAt,
+      sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.byteLength
+    };
+    const browser = fakeBrowser();
+    let journeyCalls = 0;
+    let taskCaptureCalls = 0;
+    browser.page.goto = async () => {
+      journeyCalls += 1;
+      return { status: () => 200 };
+    };
+    browser.page.screenshot = async (options) => {
+      if (options?.type === 'png') taskCaptureCalls += 1;
+      return Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    };
+    const outcome = await runTaskWorker(config, {
+      loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+    });
+    assert.equal(outcome.state, 'failed', candidate.name);
+    assert.equal(outcome.error.code, 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED', candidate.name);
+    assert.equal(journeyCalls, 0, candidate.name);
+    assert.equal(taskCaptureCalls, 0, candidate.name);
+  }
+});
+
 test('a resumed worker cannot overwrite its live checkpoint before reading the frozen input', async (t) => {
   const root = await temporaryRoot(t, 'taskmaster-frozen-resume-write-');
   const modulePath = path.join(root, 'task.mjs');
@@ -996,6 +1282,111 @@ test('a resumed worker cannot resolve an unknown effect before reading its froze
   assert.equal(outcome.state, 'failed');
   assert.equal(outcome.error.code, 'TASK_RESUME_CHECKPOINT_NOT_CONSUMED');
   assert.deepEqual((await inspectEffectJournal(journalPath)).pending.map((item) => item.sequence), [1]);
+});
+
+test('effect resolution ingress seals when task code returns and preserves a late unknown barrier', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-effect-resolution-seal-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    "import { writeFile } from 'node:fs/promises';",
+    "import path from 'node:path';",
+    'export async function run({ checkpoint, effects, outputDir }) {',
+    '  await checkpoint.read();',
+    '  const [pending] = effects.pending();',
+    '  setTimeout(async () => {',
+    '    try {',
+    "      await effects.resolveUnknown(pending.sequence, 'observed_not_applied');",
+    "      await writeFile(path.join(outputDir, 'late-resolution.txt'), 'resolved');",
+    '    } catch (error) {',
+    "      await writeFile(path.join(outputDir, 'late-resolution.txt'), error.code || 'rejected');",
+    '    }',
+    '  }, 0);',
+    '  return { summary: "must not complete", evidence: [] };',
+    '}',
+    ''
+  ].join('\n'));
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const source = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, source);
+  config.resumeCheckpoint = {
+    path: frozenPath, sourceAttempt: 1, targetAttempt: 2, savedAt,
+    sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.byteLength
+  };
+  const journalPath = path.join(path.dirname(config.checkpointPath), 'effect-journal.jsonl');
+  const journal = await createEffectJournal({ filePath: journalPath });
+  await journal.record({ state: 'started', operation: 'click' });
+  await journal.close();
+
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(config, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_EFFECT_OUTCOME_UNKNOWN');
+  assert.equal(
+    await readFile(path.join(config.outputDir, 'late-resolution.txt'), 'utf8'),
+    'TASK_EFFECT_AFTER_COMPLETION'
+  );
+  const inspected = await inspectEffectJournal(journalPath);
+  assert.equal(inspected.records, 1);
+  assert.deepEqual(inspected.pending.map((item) => item.sequence), [1]);
+});
+
+test('task cancellation rejects effect resolution from an abort listener and preserves the unknown barrier', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-effect-resolution-cancel-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    "import { writeFile } from 'node:fs/promises';",
+    "import path from 'node:path';",
+    'export async function run({ checkpoint, effects, outputDir, signal }) {',
+    '  await checkpoint.read();',
+    '  const [pending] = effects.pending();',
+    '  signal.addEventListener(\'abort\', () => {',
+    "    void effects.resolveUnknown(pending.sequence, 'observed_not_applied')",
+    "      .then(() => writeFile(path.join(outputDir, 'cancel-resolution.txt'), 'resolved'))",
+    "      .catch((error) => writeFile(path.join(outputDir, 'cancel-resolution.txt'), error.code || 'rejected'));",
+    '  }, { once: true });',
+    "  await writeFile(path.join(outputDir, 'ready.txt'), 'ready');",
+    '  await new Promise(() => {});',
+    '}',
+    ''
+  ].join('\n'));
+  const config = { ...workerConfig(root, modulePath), attempt: 2 };
+  const savedAt = new Date().toISOString();
+  const source = Buffer.from(`${JSON.stringify({
+    taskId: config.taskId, attempt: 1, savedAt, data: { cursor: 1 }
+  })}\n`);
+  const frozenPath = path.join(root, 'resume-input.json');
+  await writeFile(frozenPath, source);
+  config.resumeCheckpoint = {
+    path: frozenPath, sourceAttempt: 1, targetAttempt: 2, savedAt,
+    sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.byteLength
+  };
+  const journalPath = path.join(path.dirname(config.checkpointPath), 'effect-journal.jsonl');
+  const journal = await createEffectJournal({ filePath: journalPath });
+  await journal.record({ state: 'started', operation: 'click' });
+  await journal.close();
+  const controller = new AbortController();
+  const browser = fakeBrowser();
+  const worker = runTaskWorker(config, {
+    signal: controller.signal,
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  await eventually(async () => access(path.join(config.outputDir, 'ready.txt')).then(() => true, () => false));
+  controller.abort();
+  const outcome = await worker;
+  await eventually(async () => access(path.join(config.outputDir, 'cancel-resolution.txt')).then(() => true, () => false));
+  assert.equal(outcome.state, 'cancelled');
+  assert.equal(outcome.error.code, 'TASK_CANCELLED');
+  assert.equal(await readFile(path.join(config.outputDir, 'cancel-resolution.txt'), 'utf8'), 'TASK_CANCELLED');
+  const inspected = await inspectEffectJournal(journalPath);
+  assert.equal(inspected.records, 1);
+  assert.deepEqual(inspected.pending.map((item) => item.sequence), [1]);
 });
 
 test('task timeout covers a browser launch that never resolves', async (t) => {
@@ -1069,5 +1460,209 @@ test('task timeout aborts new actions before bounded screenshot diagnostics', as
   assert.equal(await readFile(path.join(root, 'output', 'aborted.txt'), 'utf8'), 'yes');
   assert.equal(await readFile(path.join(root, 'output', 'blocked.txt'), 'utf8'), 'yes');
   await assert.rejects(access(path.join(root, 'output', 'late-action.txt')), { code: 'ENOENT' });
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('every task receives a read-only Page and browser mutations require the action facade', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-standalone-observation-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ page }) {',
+    "  await page.goto('https://late.example/');",
+    "  return { summary: 'must not complete', evidence: [{ kind: 'message', value: 'unsafe' }] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  let rawGotoCalls = 0;
+  browser.page.goto = async () => { rawGotoCalls += 1; };
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_UI_ACTION_REQUIRES_ACTION');
+  assert.equal(rawGotoCalls, 0);
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('a task import cannot mint a capability that unwraps the Worker observation proxy', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-observation-capability-');
+  const modulePath = path.join(root, 'task.mjs');
+  const observationModule = new URL('../src/lib/observation-facade.mjs', import.meta.url).href;
+  await writeFile(modulePath, [
+    `import { createObservationCapability, createObservationLocatorUnwrapper } from ${JSON.stringify(observationModule)};`,
+    'export async function run({ page, action }) {',
+    '  const observedLocator = page.locator("button");',
+    '  const importedCapability = createObservationCapability();',
+    '  const unwrap = createObservationLocatorUnwrapper(importedCapability);',
+    '  const candidate = unwrap(observedLocator);',
+    '  if (candidate !== observedLocator) throw new Error("task capability crossed the Worker boundary");',
+    '  let blocked = false;',
+    '  try { await candidate.click(); } catch (error) {',
+    '    blocked = error?.code === "TASK_UI_ACTION_REQUIRES_ACTION";',
+    '  }',
+    '  if (!blocked) throw new Error("task capability bypassed the action facade");',
+    '  await action.click(observedLocator);',
+    '  return { summary: "capability stayed isolated", evidence: [{ kind: "message", value: "action facade used" }] };',
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  let rawClicks = 0;
+  const rawLocator = {
+    async boundingBox() { return { x: 20, y: 20, width: 80, height: 30 }; },
+    async hover() {},
+    async click() { rawClicks += 1; }
+  };
+  browser.page.locator = () => rawLocator;
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome.error));
+  assert.equal(rawClicks, 1);
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('Task WeakMap prototype tampering cannot capture a raw Locator and action clicks remain FIFO', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-observation-weakmap-tamper-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ page, action }) {',
+    '  const originalGet = WeakMap.prototype.get;',
+    '  const originalSet = WeakMap.prototype.set;',
+    '  const originalHas = WeakMap.prototype.has;',
+    '  let capturedRaw = false;',
+    '  const inspect = (candidate) => {',
+    '    try {',
+    '      if (candidate?.observationAttackMarker === "worker-raw-locator") capturedRaw = true;',
+    '    } catch {}',
+    '  };',
+    '  WeakMap.prototype.get = function (key) {',
+    '    inspect(key);',
+    '    const value = Reflect.apply(originalGet, this, [key]);',
+    '    inspect(value);',
+    '    return value;',
+    '  };',
+    '  WeakMap.prototype.set = function (key, value) {',
+    '    inspect(key);',
+    '    inspect(value);',
+    '    return Reflect.apply(originalSet, this, [key, value]);',
+    '  };',
+    '  WeakMap.prototype.has = function (key) {',
+    '    inspect(key);',
+    '    return Reflect.apply(originalHas, this, [key]);',
+    '  };',
+    '  try {',
+    '    const observedLocator = page.locator("button");',
+    '    let blocked = false;',
+    '    try { await observedLocator.click(); } catch (error) {',
+    '      blocked = error?.code === "TASK_UI_ACTION_REQUIRES_ACTION";',
+    '    }',
+    '    if (!blocked) throw new Error("observation proxy allowed a direct click");',
+    '    await Promise.all([action.click(observedLocator), action.click(observedLocator)]);',
+    '    if (capturedRaw) throw new Error("WeakMap prototype tampering captured a raw Locator");',
+    '  } finally {',
+    '    WeakMap.prototype.get = originalGet;',
+    '    WeakMap.prototype.set = originalSet;',
+    '    WeakMap.prototype.has = originalHas;',
+    '  }',
+    '  return { summary: "WeakMap tampering stayed isolated", evidence: [{ kind: "message", value: "two FIFO action clicks" }] };',
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  let rawClicks = 0;
+  let activeClicks = 0;
+  let maxActiveClicks = 0;
+  const rawLocator = {
+    observationAttackMarker: 'worker-raw-locator',
+    async boundingBox() { return { x: 20, y: 20, width: 80, height: 30 }; },
+    async hover() {},
+    async click() {
+      activeClicks += 1;
+      maxActiveClicks = Math.max(maxActiveClicks, activeClicks);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      rawClicks += 1;
+      activeClicks -= 1;
+    }
+  };
+  browser.page.locator = () => rawLocator;
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+
+  assert.equal(outcome.state, 'completed', JSON.stringify(outcome.error));
+  assert.equal(rawClicks, 2);
+  assert.equal(maxActiveClicks, 1);
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('a delayed standalone Page mutation cannot run after task return', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-late-standalone-page-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    "import { writeFile } from 'node:fs/promises';",
+    "import path from 'node:path';",
+    'export async function run({ page, outputDir }) {',
+    '  setTimeout(async () => {',
+    '    try {',
+    "      await page.goto('https://late.example/');",
+    "      await writeFile(path.join(outputDir, 'late-page.txt'), 'applied');",
+    '    } catch (error) {',
+    "      await writeFile(path.join(outputDir, 'late-page.txt'), error.code || 'rejected');",
+    '    }',
+    '  }, 0);',
+    "  return { summary: 'complete', evidence: [{ kind: 'message', value: 'no raw mutation' }] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  let rawGotoCalls = 0;
+  browser.page.goto = async () => { rawGotoCalls += 1; };
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  await eventually(async () => access(path.join(root, 'output', 'late-page.txt')).then(() => true, () => false));
+  assert.equal(outcome.state, 'completed');
+  assert.equal(rawGotoCalls, 0);
+  assert.equal(await readFile(path.join(root, 'output', 'late-page.txt'), 'utf8'), 'TASK_UI_ACTION_REQUIRES_ACTION');
+});
+
+test('task completion rejects a fire-and-forget user handoff', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-unawaited-handoff-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ handoff }) {',
+    "  void handoff.request({ kind: 'human_verification', reason: 'Verify this page' }).catch(() => {});",
+    "  return { summary: 'must not complete', evidence: [{ kind: 'message', value: 'pending handoff' }] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_USER_HANDOFF_NOT_AWAITED');
+  assert.equal(browser.wasClosed(), true);
+});
+
+test('task completion rejects a fire-and-forget cooldown', async (t) => {
+  const root = await temporaryRoot(t, 'taskmaster-unawaited-cooldown-');
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export async function run({ cooldown }) {',
+    "  void cooldown({ milliseconds: 1_000, reason: 'rate limited' }).catch(() => {});",
+    "  return { summary: 'must not complete', evidence: [{ kind: 'message', value: 'active cooldown' }] };",
+    '}',
+    ''
+  ].join('\n'));
+  const browser = fakeBrowser();
+  const outcome = await runTaskWorker(workerConfig(root, modulePath), {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.equal(outcome.error.code, 'TASK_COOLDOWN_NOT_AWAITED');
   assert.equal(browser.wasClosed(), true);
 });

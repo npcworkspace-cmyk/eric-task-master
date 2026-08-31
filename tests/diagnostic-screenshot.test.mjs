@@ -12,6 +12,8 @@ test('diagnostic image helper accepts an already-bounded complete JPEG', async (
     async screenshot(options) {
       assert.equal(options.type, 'jpeg');
       assert.equal(options.fullPage, false);
+      assert.equal(options.animations, 'allow');
+      assert.equal(options.caret, 'initial');
       return Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
     },
     async evaluate() {
@@ -23,7 +25,7 @@ test('diagnostic image helper accepts an already-bounded complete JPEG', async (
   assert.equal(evaluateCalled, false);
 });
 
-test('high-entropy Chromium viewport becomes one complete bounded JPEG', {
+test('high-entropy Chromium viewport becomes one complete bounded JPEG without page-side resizing', {
   skip: process.env.TASKMASTER_REAL_BROWSER !== '1'
 }, async (t) => {
   const browser = await chromium.launch({ headless: true });
@@ -53,4 +55,23 @@ test('high-entropy Chromium viewport becomes one complete bounded JPEG', {
     height: image.naturalHeight
   }));
   assert.ok(dimensions.width > 0 && dimensions.height > 0);
+});
+
+test('diagnostic capture does not finish page animations or dispatch animation events', {
+  skip: process.env.TASKMASTER_REAL_BROWSER !== '1'
+}, async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  await page.setContent(`<style>
+    @keyframes diagnostic-animation { from { opacity: .99; } to { opacity: 1; } }
+    body { animation: diagnostic-animation 30s linear; }
+  </style><p>diagnostic</p>`);
+  await page.evaluate(() => {
+    document.body.addEventListener('animationend', () => {
+      document.body.dataset.diagnosticAnimationEnded = 'yes';
+    });
+  });
+  await captureBoundedDiagnosticImage(page);
+  assert.equal(await page.getAttribute('body', 'data-diagnostic-animation-ended'), null);
 });

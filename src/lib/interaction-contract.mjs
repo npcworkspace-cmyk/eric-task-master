@@ -18,19 +18,23 @@ export class InteractionContractError extends Error {
 
 const FORBIDDEN_PACK_PATTERNS = Object.freeze([
   {
+    pattern: /\b(?:from\s+|import\s*(?:\(\s*)?|require\s*\(\s*)['"](?:playwright(?:-core)?(?:[\\/][^'"]*)?|[^'"]*[\\/]node_modules[\\/]playwright(?:-core)?(?:[\\/][^'"]*)?)['"]/u,
+    operation: 'direct Playwright import'
+  },
+  {
     pattern: /\baction\s*(?:\.|\[)\s*['"]?(?:goto|click|fill|type|hover|select|scroll|read|run|wait|signal)['"]?\s*\]?\s*\(/u,
     operation: 'legacy action facade'
   },
   {
-    pattern: /\bpage\s*(?:\.|\[)\s*['"]?(?:goto|reload|goBack|goForward|setContent|close|bringToFront|click|dblclick|fill|type|press|hover|focus|check|uncheck|selectOption|setInputFiles|tap|dispatchEvent|dragAndDrop)['"]?\s*\]?\s*\(/u,
+    pattern: /\bpage\s*(?:\.|\[)\s*['"]?(?:goto|reload|goBack|goForward|setContent|close|bringToFront|addLocatorHandler|addScriptTag|addStyleTag|route|routeFromHAR|routeWebSocket|exposeBinding|exposeFunction|waitForFunction|screenshot|pdf|click|dblclick|fill|type|press|hover|focus|check|uncheck|selectOption|setInputFiles|tap|dispatchEvent|dragAndDrop)['"]?\s*\]?\s*\(/u,
     operation: 'direct Page navigation or mutation'
   },
   {
-    pattern: /\bcontext\s*(?:\.|\[)\s*['"]?(?:newPage|newCDPSession|addCookies|clearCookies|close|grantPermissions|setGeolocation|setExtraHTTPHeaders|addInitScript)['"]?\s*\]?\s*\(/u,
+    pattern: /\bcontext\s*(?:\.|\[)\s*['"]?(?:newPage|newCDPSession|addCookies|clearCookies|close|grantPermissions|setGeolocation|setExtraHTTPHeaders|setHTTPCredentials|setOffline|setStorageState|addInitScript|route|routeFromHAR|routeWebSocket)['"]?\s*\]?\s*\(/u,
     operation: 'direct BrowserContext mutation'
   },
   {
-    pattern: /\bpage\s*(?:\.|\[)\s*['"]?(?:mouse|keyboard|touchscreen)['"]?\b/u,
+    pattern: /\b(?:page|context)\s*(?:\.|\[)\s*['"]?(?:mouse|keyboard|touchscreen|clock|coverage|credentials|debugger|request|tracing|localStorage|sessionStorage)['"]?\b/u,
     operation: 'raw input device access'
   },
   {
@@ -38,12 +42,16 @@ const FORBIDDEN_PACK_PATTERNS = Object.freeze([
     operation: 'instant target positioning'
   },
   {
-    pattern: /\b(?:page|frame)\s*\.\s*(?:\$\$?|evaluateHandle|waitForSelector)\s*\(/u,
+    pattern: /\b(?:page|frame)\s*\.\s*(?:\$\$?|\$\$?eval|evaluateHandle|waitForFunction|waitForSelector)\s*\(/u,
     operation: 'raw ElementHandle or JSHandle escape'
   },
   {
-    pattern: /\.locator\s*\([^)]*\)\s*\.\s*(?:click|dblclick|fill|clear|type|press|pressSequentially|check|uncheck|setChecked|selectOption|setInputFiles|hover|focus|blur|dragTo|dispatchEvent)\s*\(/u,
+    pattern: /\.locator\s*\([^)]*\)\s*\.\s*(?:click|dblclick|fill|clear|type|press|pressSequentially|check|uncheck|setChecked|selectOption|selectText|setInputFiles|hover|highlight|hideHighlight|focus|blur|dragTo|drop|dispatchEvent|waitForFunction|screenshot)\s*\(/u,
     operation: 'direct Locator mutation'
+  },
+  {
+    pattern: /\.\s*(?:evaluate|evaluateAll)\s*\(/u,
+    operation: 'arbitrary in-page JavaScript evaluation'
   }
 ]);
 
@@ -65,6 +73,16 @@ export function validateFullHumanPackSource(source) {
     throw new InteractionContractError(
       'TASK_PACK_JOURNEY_BYPASS',
       `full-human-v1 Task Pack modules cannot use ${rule.operation}`
+    );
+  }
+  const expectsExtension = /\bexpectCompletion\s*\(/u.test(text);
+  const resolvesExtension = /\bresolveCompletion\s*\(/u.test(text);
+  if (expectsExtension !== resolvesExtension || (
+    expectsExtension && !/\bcheckpoint\s*\(/u.test(text)
+  )) {
+    throw new InteractionContractError(
+      'TASK_PACK_EXTENSION_HANDOFF_INCOMPLETE',
+      'extension-dependent Task Packs must expect completion, checkpoint verified state, and resolve the receipt'
     );
   }
   return true;
