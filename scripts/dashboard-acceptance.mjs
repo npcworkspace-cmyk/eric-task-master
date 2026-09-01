@@ -737,7 +737,8 @@ try {
   await page.locator('#dashboard-message').filter({ hasText: 'Telegram 凭据已清除' }).waitFor();
   const clearedTelegram = control.notificationSettingPatches.at(-1).channels.telegram;
   assert.deepEqual(clearedTelegram, { enabled: false, botToken: null, chatId: null });
-  await page.locator('#notification-telegram-status').filter({ hasText: '待配置或测试' }).waitFor();
+  await page.locator('[data-channel-card="telegram"][data-channel-state="unconfigured"]').waitFor();
+  assert.match(await page.locator('#notification-telegram-status').textContent(), /待配置或测试/u);
   assert.equal(await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' }).isDisabled(), true);
   assert.equal(await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).isDisabled(), true);
   checks.push('bell-only notification drawer plus three-card masked settings, dirty-state protection, channel status, system settings, signed Feishu, serialized tests, and explicit credential clearing');
