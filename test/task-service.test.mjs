@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm as removeFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -14,6 +14,13 @@ import {
 
 let nextPid = 40_000;
 const ADMIN = Object.freeze({ role: 'manager-admin', clientId: 'manager-admin' });
+
+async function rm(targetPath, options = {}) {
+  const boundedOptions = options.recursive === true
+    ? { maxRetries: 5, retryDelay: 50, ...options }
+    : options;
+  return removeFile(targetPath, boundedOptions);
+}
 
 class FakeWorker extends EventEmitter {
   constructor(onSend) {
