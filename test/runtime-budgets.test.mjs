@@ -952,8 +952,8 @@ test('a checkpoint admitted before an extension receipt cannot become post-recei
     "    participantId: 'extension-proof', requestId: 'request-proof', operation: 'input', timeoutMs: 5_000",
     '  });',
     "  await journey.open('https://example.test/start');",
-    "  await writeFile(path.join(outputDir, 'ready.txt'), 'ready');",
     "  const admittedBeforeReceipt = checkpoint({ proof: 'constructed-before-receipt' });",
+    "  await writeFile(path.join(outputDir, 'checkpoint-admitted.txt'), 'admitted');",
     '  const receipt = await completion;',
     '  await Promise.all(backlog);',
     '  await admittedBeforeReceipt;',
@@ -986,7 +986,7 @@ test('a checkpoint admitted before an extension receipt cannot become post-recei
   const worker = runTaskWorker(config, {
     loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => browser.context } })
   });
-  await eventually(async () => access(path.join(config.outputDir, 'ready.txt')).then(() => true, () => false), 5_000);
+  await eventually(async () => access(path.join(config.outputDir, 'checkpoint-admitted.txt')).then(() => true, () => false), 5_000);
   assert.equal(typeof bridge, 'function');
   const grant = await bridge({ page: browser.page, frame: browser.page }, {
     kind: 'request',
