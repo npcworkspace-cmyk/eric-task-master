@@ -188,7 +188,11 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'scripts', 'bootstrap-policy.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'manager.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8'),
-    readFile(resolve(ROOT, 'src', 'runtime', 'task-service.mjs'), 'utf8'),
+    Promise.all([
+      readFile(resolve(ROOT, 'src', 'runtime', 'task-service.mjs'), 'utf8'),
+      readFile(resolve(ROOT, 'src', 'runtime', 'task-record-policy.mjs'), 'utf8'),
+      readFile(resolve(ROOT, 'src', 'runtime', 'task-artifact-store.mjs'), 'utf8')
+    ]).then((sources) => sources.join('\n')),
     readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
     readFile(resolve(ROOT, '.github', 'workflows', 'release.yml'), 'utf8'),
     readFile(resolve(ROOT, 'dashboard', 'dashboard.js'), 'utf8'),
