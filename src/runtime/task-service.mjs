@@ -1,6 +1,6 @@
 import { fork } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isBehaviorMode, normalizeBehaviorMode, publicTask, TERMINAL_TASK_STATES } from '../contracts.mjs';
@@ -17,6 +17,8 @@ import {
 import { sanitizePublicTaskFailure } from '../lib/public-task-failure.mjs';
 import { TaskServiceError } from './task-service-error.mjs';
 import { createTaskAssetManager } from './task-asset-manager.mjs';
+import { createTaskCheckpointStore } from './task-checkpoint-store.mjs';
+import { createProfileRuntime } from './profile-runtime.mjs';
 import {
   artifactId,
   createTaskArtifactStore,
@@ -35,7 +37,6 @@ import {
   COMMAND_ID_PATTERN,
   decodeCursor,
   encodeCursor,
-  isSamePrincipal,
   isTaskOwner,
   legacyExternalCostUnsupportedError,
   MAX_TASK_COMMANDS,
@@ -43,7 +44,6 @@ import {
   normalizeTaskCoordination,
   normalizeTaskLabel,
   normalizeTaskTiming,
-  profileCallerIdentity,
   requestHash,
   requireCoordinationBody,
   requireProfileUse,
@@ -72,8 +72,6 @@ const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const BEHAVIOR_APPLY_TIMEOUT_MS = 5_000;
 const FOCUS_APPLY_TIMEOUT_MS = 5_000;
 const HANDOFF_CONTINUE_TIMEOUT_MS = 5_000;
-const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
-const MAX_DIAGNOSTICS_MANIFEST_BYTES = 64 * 1024;
 const OUTPUT_SEAL_LIMITS = outputSealLimitsForBudget();
 const SAFE_EVIDENCE_KINDS = new Set(['artifact', 'count', 'hash', 'message', 'note', 'url']);
 const MAX_ATTEMPTS = 100;
@@ -386,8 +384,6 @@ export function createTaskService({
   const cleanupReceiptsRoot = path.join(path.dirname(root), 'cleanup-receipts');
   const tasks = new Map();
   const children = new Map();
-  const openProfiles = new Map();
-  const openingProfiles = new Map();
   const persistChains = new Map();
   const controlChains = new Map();
   const behaviorApplyChains = new Map();
@@ -414,7 +410,6 @@ export function createTaskService({
     listArtifacts,
     openValidatedArtifact,
     readArtifact,
-    sameFileIdentity,
     sameStableArtifactMetadata
   } = createTaskArtifactStore({
     root,
@@ -424,6 +419,36 @@ export function createTaskService({
     reconcileTaskForRead,
     normalizeDiagnosticHistory,
     artifactValidationHook
+  });
+  const {
+    createResumeInput,
+    inspectResumeCheckpoint,
+    readDiagnosticsPointers,
+    verifyResumeCheckpoint,
+    verifyResumeContext,
+    verifyResumeModule
+  } = createTaskCheckpointStore({ root });
+  const {
+    closeAllProfiles,
+    closeProfile,
+    hasOpenProfiles,
+    isKnownLiveLease,
+    openProfile
+  } = createProfileRuntime({
+    profileStore,
+    workerFactory,
+    profileWorkerPath: PROFILE_WORKER,
+    profileLeaseRenewalMs,
+    heartbeatTimeoutMs,
+    deadlines: TASK_SERVICE_DEADLINES,
+    awaitReady: () => ready,
+    requireServiceOpen,
+    reconcileAnyCleanup,
+    markCleanupUnknown,
+    profileCleanupReceiptPath,
+    send,
+    sendChildMessageConfirmed,
+    scheduleQueuedTasks
   });
   const {
     applyTaskAssetAction,
@@ -464,6 +489,20 @@ export function createTaskService({
     const serialized = createTail.then(operation);
     createTail = serialized.catch(() => {});
     return serialized;
+  }
+
+  async function waitForEntry(promise, timeoutMs) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function taskCleanupReceiptPath(task) {
@@ -1020,9 +1059,7 @@ export function createTaskService({
         continue;
       }
       const activeLeaseOwner = profile.lease?.ownerId || '';
-      const openProfileEntry = openProfiles.get(task.profileId);
-      const knownLiveProfileOwner = openProfileEntry?.exited !== true &&
-        openProfileEntry?.ownerId === activeLeaseOwner;
+      const knownLiveProfileOwner = isKnownLiveLease(task.profileId, activeLeaseOwner);
       const leaseProcessAlive = Number.isSafeInteger(profile.lease?.pid) && profile.lease.pid > 0
         ? await processAlive(profile.lease.pid)
         : false;
@@ -2609,120 +2646,8 @@ export function createTaskService({
     return publicRecord(task);
   }
 
-  async function inspectResumeCheckpoint(task) {
-    const expected = path.join(root, task.id, 'checkpoint.json');
-    let handle;
-    try {
-      const before = await lstat(expected, { bigint: true });
-      if (
-        !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
-        before.size <= 0n || before.size > BigInt(MAX_CHECKPOINT_BYTES)
-      ) throw new Error('invalid checkpoint');
-      handle = await open(expected, 'r');
-      const opened = await handle.stat({ bigint: true });
-      if (!sameFileIdentity(before, opened) || opened.size !== before.size || opened.mtimeNs !== before.mtimeNs) {
-        throw new Error('checkpoint changed');
-      }
-      const source = await handle.readFile();
-      const after = await handle.stat({ bigint: true });
-      if (!sameFileIdentity(opened, after) || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs) {
-        throw new Error('checkpoint changed');
-      }
-      const record = JSON.parse(source.toString('utf8'));
-      if (
-        !record || typeof record !== 'object' || Array.isArray(record) ||
-        record.taskId !== task.id || record.attempt !== task.attempt ||
-        typeof record.savedAt !== 'string' || Number.isNaN(Date.parse(record.savedAt)) ||
-        !Object.hasOwn(record, 'data')
-      ) throw new Error('invalid checkpoint record');
-      return {
-        path: expected,
-        attempt: record.attempt,
-        savedAt: record.savedAt,
-        sha256: createHash('sha256').update(source).digest('hex'),
-        sizeBytes: source.byteLength,
-        source
-      };
-    } catch {
-      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint is unavailable or unstable', 409);
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-  }
-
-  async function inspectDiagnosticFile(task, entry, kind) {
-    if (
-      !entry || typeof entry !== 'object' || Array.isArray(entry) ||
-      typeof entry.relativePath !== 'string' || !entry.relativePath || entry.relativePath.includes('\0') ||
-      path.isAbsolute(entry.relativePath) ||
-      typeof entry.reason !== 'string' || !entry.reason.trim() || entry.reason.length > 64 ||
-      typeof entry.at !== 'string' || Number.isNaN(Date.parse(entry.at))
-    ) return null;
-    const relativePath = path.normalize(entry.relativePath);
-    if (
-      relativePath === '.' || relativePath === '..' || relativePath.startsWith(`..${path.sep}`) ||
-      (kind === 'screenshot' && !['.png', '.jpg', '.jpeg'].includes(path.extname(relativePath).toLowerCase())) ||
-      (kind === 'observation' && path.extname(relativePath).toLowerCase() !== '.json')
-    ) return null;
-    const candidate = path.resolve(task.outputDir, relativePath);
-    if (!inside(path.resolve(task.outputDir), candidate)) return null;
-    let handle;
-    try {
-      const before = await lstat(candidate, { bigint: true });
-      if (
-        !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
-        before.size <= 0n || before.size > BigInt(64 * 1024 * 1024)
-      ) return null;
-      const outputRoot = await realpath(task.outputDir);
-      const canonicalCandidate = await realpath(candidate);
-      if (!inside(outputRoot, canonicalCandidate)) return null;
-      handle = await open(candidate, 'r');
-      const opened = await handle.stat({ bigint: true });
-      if (!sameFileIdentity(before, opened) || opened.size !== before.size || opened.mtimeNs !== before.mtimeNs) {
-        return null;
-      }
-      return { path: candidate, reason: entry.reason, at: entry.at };
-    } catch {
-      return null;
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-  }
-
-  async function inspectDiagnosticsManifest(task) {
-    const manifestPath = path.join(root, task.id, 'diagnostics.json');
-    let handle;
-    try {
-      const before = await lstat(manifestPath, { bigint: true });
-      if (
-        !before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
-        before.size <= 0n || before.size > BigInt(MAX_DIAGNOSTICS_MANIFEST_BYTES)
-      ) return null;
-      handle = await open(manifestPath, 'r');
-      const opened = await handle.stat({ bigint: true });
-      if (!sameFileIdentity(before, opened) || opened.size !== before.size || opened.mtimeNs !== before.mtimeNs) {
-        return null;
-      }
-      const record = JSON.parse((await handle.readFile()).toString('utf8'));
-      const after = await handle.stat({ bigint: true });
-      if (
-        !sameFileIdentity(opened, after) || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs ||
-        record?.version !== 2 || record.taskId !== task.id || record.attempt !== task.attempt
-      ) return null;
-      const screenshot = await inspectDiagnosticFile(task, record.screenshot, 'screenshot');
-      const observation = await inspectDiagnosticFile(task, record.observation, 'observation');
-      if (screenshot) screenshot.attempt = record.attempt;
-      if (observation) observation.attempt = record.attempt;
-      return screenshot || observation ? { screenshot, observation } : null;
-    } catch {
-      return null;
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-  }
-
   async function recoverDiagnosticsPointers(task) {
-    const diagnostics = await inspectDiagnosticsManifest(task);
+    const diagnostics = await readDiagnosticsPointers(task);
     if (!diagnostics) return false;
     let changed = false;
     for (const [manifestKey, taskKey] of [
@@ -2867,94 +2792,6 @@ export function createTaskService({
       task.resumeCheckpointValid = false;
       task.resumeCheckpointError = sanitizeError(error, 'TASK_CHECKPOINT_INVALID');
       return false;
-    }
-  }
-
-  async function verifyResumeCheckpoint(task) {
-    const expected = path.join(root, task.id, 'checkpoint.json');
-    if (
-      typeof task.checkpoint?.path !== 'string' ||
-      path.resolve(task.checkpoint.path) !== path.resolve(expected)
-    ) {
-      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint is unavailable or invalid', 409);
-    }
-    const current = await inspectResumeCheckpoint(task);
-    if (
-      (typeof task.checkpoint.sha256 === 'string' && task.checkpoint.sha256 !== current.sha256) ||
-      (Number.isSafeInteger(task.checkpoint.sizeBytes) && task.checkpoint.sizeBytes !== current.sizeBytes) ||
-      (typeof task.checkpoint.savedAt === 'string' && task.checkpoint.savedAt !== current.savedAt)
-    ) {
-      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint changed after it was recorded', 409);
-    }
-    return current;
-  }
-
-  async function createResumeInput(task, checkpoint) {
-    const targetAttempt = task.attempt + 1;
-    const source = checkpoint.source;
-    if (!Buffer.isBuffer(source)) {
-      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint could not be frozen for resume', 409);
-    }
-    const snapshotPath = path.join(
-      root,
-      task.id,
-      `resume-input-attempt-${targetAttempt}-${randomUUID()}.json`
-    );
-    let handle;
-    try {
-      handle = await open(snapshotPath, 'wx', 0o600);
-      await handle.writeFile(source);
-      await handle.sync();
-    } catch {
-      throw new TaskServiceError('TASK_CHECKPOINT_INVALID', 'Task checkpoint could not be frozen for resume', 409);
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-    return {
-      path: snapshotPath,
-      sourceAttempt: task.attempt,
-      targetAttempt,
-      savedAt: checkpoint.savedAt,
-      sha256: checkpoint.sha256,
-      sizeBytes: checkpoint.sizeBytes
-    };
-  }
-
-  async function verifyResumeModule(task) {
-    if (typeof task.modulePath !== 'string' || typeof task.taskTypeSha256 !== 'string') {
-      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task module snapshot metadata is unavailable', 409);
-    }
-    try {
-      const before = await lstat(task.modulePath, { bigint: true });
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) throw new Error('invalid module');
-      const source = await readFile(task.modulePath);
-      const after = await lstat(task.modulePath, { bigint: true });
-      if (
-        !sameFileIdentity(before, after) || before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
-        createHash('sha256').update(source).digest('hex') !== task.taskTypeSha256
-      ) throw new Error('module changed');
-    } catch {
-      throw new TaskServiceError('TASK_MODULE_CHANGED', 'Task module snapshot changed or is unavailable', 409);
-    }
-  }
-
-  async function verifyResumeContext(task) {
-    if (!Object.hasOwn(task, 'input') || !task.input || typeof task.input !== 'object' || Array.isArray(task.input)) {
-      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task input required for resume is unavailable', 409);
-    }
-    if (
-      task.timeoutMs !== null && task.timeoutMs !== undefined &&
-      (!Number.isSafeInteger(task.timeoutMs) || task.timeoutMs < 1_000)
-    ) {
-      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task timeout required for resume is invalid', 409);
-    }
-    const expectedOutput = path.join(root, task.id, 'output');
-    if (typeof task.outputDir !== 'string' || path.resolve(task.outputDir) !== path.resolve(expectedOutput)) {
-      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task output context required for resume is unavailable', 409);
-    }
-    const outputStats = await lstat(expectedOutput).catch(() => null);
-    if (!outputStats?.isDirectory() || outputStats.isSymbolicLink()) {
-      throw new TaskServiceError('TASK_RESUME_CONTEXT_MISSING', 'Task output context required for resume is unavailable', 409);
     }
   }
 
@@ -4043,355 +3880,6 @@ export function createTaskService({
     }
   }
 
-  async function openProfile(
-    profileId,
-    suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
-  ) {
-    await ready;
-    requireServiceOpen();
-    const caller = profileCallerIdentity(suppliedCaller);
-    let requestedProfile = requireProfileUse(await profileStore.get(profileId), caller);
-    requestedProfile = await reconcileAnyCleanup(requestedProfile);
-    requireProfileUse(requestedProfile, caller);
-    if (/^session-import:/u.test(requestedProfile.lease?.ownerId || '')) {
-      throw new TaskServiceError(
-        'LEGACY_SESSION_IMPORT_CLEANUP_UNCONFIRMED',
-        'A legacy session import has no trusted cleanup proof; this Profile remains quarantined',
-        409
-      );
-    }
-    const existing = openProfiles.get(profileId);
-    if (existing) {
-      if (caller.role !== 'manager-admin' && !isSamePrincipal(existing, caller)) {
-        throw new TaskServiceError('PROFILE_IN_USE', 'Profile is open for another client', 409);
-      }
-      if (!existing.exited) {
-        return { status: 'open', profileId, pid: existing.child.pid };
-      }
-      // Never report a dead manual worker as an open browser. A valid cleanup
-      // receipt permits the old entry to release and a new worker to start;
-      // missing or invalid proof keeps the Profile quarantined explicitly.
-      await existing.cleanupReportPromise;
-      if (!(await existing.release())) {
-        await markCleanupUnknown(profileId, existing.ownerId);
-        throw new TaskServiceError(
-          'PROFILE_CLEANUP_UNCONFIRMED',
-          'The previous Profile browser exited without confirmed cleanup; the Profile remains blocked',
-          409
-        );
-      }
-      requestedProfile = await reconcileAnyCleanup(await profileStore.get(profileId));
-      requireProfileUse(requestedProfile, caller);
-    }
-    const pending = openingProfiles.get(profileId);
-    if (pending) {
-      if (caller.role !== 'manager-admin' && !isSamePrincipal(pending, caller)) {
-        throw new TaskServiceError('PROFILE_IN_USE', 'Profile is opening for another client', 409);
-      }
-      return pending.promise;
-    }
-    const operation = openProfileSingle(profileId, caller);
-    openingProfiles.set(profileId, {
-      promise: operation,
-      ownerRole: caller.role,
-      ownerClientId: caller.clientId
-    });
-    try {
-      return await operation;
-    } finally {
-      if (openingProfiles.get(profileId)?.promise === operation) openingProfiles.delete(profileId);
-    }
-  }
-
-  async function openProfileSingle(profileId, caller) {
-    const ownerRole = caller.role;
-    const ownerClientId = caller.clientId;
-    const leaseAccess = caller.role === 'agent' ? { authorizedClientId: caller.clientId } : {};
-    const ownerId = `profile-open:${ownerClientId}:${profileId}:${randomUUID().replaceAll('-', '')}`;
-    const profile = await profileStore.get(profileId);
-    if ((profile.kind || 'persistent') === 'ephemeral') {
-      throw new TaskServiceError(
-        'EPHEMERAL_PROFILE_OPEN_UNSUPPORTED',
-        'Ephemeral Profiles are created only for task-scoped browser contexts',
-        409
-      );
-    }
-    const cleanupReceiptPath = profileCleanupReceiptPath(ownerId);
-    let child;
-    try {
-      await rm(cleanupReceiptPath, { force: true });
-      child = workerFactory(PROFILE_WORKER, 'profile-open');
-      if (
-        !child ||
-        typeof child.once !== 'function' ||
-        typeof child.on !== 'function' ||
-        typeof child.send !== 'function' ||
-        typeof child.kill !== 'function'
-      ) {
-        throw new TaskServiceError('PROFILE_WORKER_INVALID', 'Profile worker could not be initialized', 500);
-      }
-    } catch (error) {
-      child?.kill?.('SIGKILL');
-      throw error;
-    }
-    let resolveExit;
-    let resolveCleanupReport;
-    const entry = {
-      child,
-      ownerId,
-      ownerRole,
-      ownerClientId,
-      released: false,
-      exited: false,
-      cleanupReported: false,
-      cleanupConfirmed: false,
-      browserStartSent: false,
-      spawnFailed: false,
-      renewal: null,
-      renewalTail: Promise.resolve(),
-      closing: false,
-      lastHeartbeatAt: Date.now(),
-      cleanupReceiptPath,
-      exitPromise: new Promise((resolve) => { resolveExit = resolve; }),
-      cleanupReportPromise: new Promise((resolve) => { resolveCleanupReport = resolve; }),
-      releasePromise: null
-    };
-    openProfiles.set(profileId, entry);
-
-    const release = async () => {
-      if (entry.released) return true;
-      if (!entry.exited || !entry.cleanupConfirmed) return false;
-      if (entry.releasePromise) return entry.releasePromise;
-      entry.releasePromise = (async () => {
-        entry.closing = true;
-        clearInterval(entry.renewal);
-        await entry.renewalTail.catch(() => {});
-        let released = await profileStore.releaseLease(profileId, ownerId, { cleanupConfirmed: true });
-        if (released !== true) {
-          const current = await profileStore.get(profileId);
-          released = current?.lease?.ownerId !== ownerId;
-        }
-        if (!released) return false;
-        await removeCleanupReceipt(cleanupReceiptPath).catch(() => {});
-        entry.released = true;
-        if (openProfiles.get(profileId) === entry) openProfiles.delete(profileId);
-        void scheduleQueuedTasks().catch(() => {});
-        return true;
-      })().catch(() => false);
-      const released = await entry.releasePromise;
-      if (!released) entry.releasePromise = null;
-      return released;
-    };
-    entry.release = release;
-    const confirmCleanup = async (browserClosed) => {
-      if (entry.cleanupReported) return entry.cleanupReportPromise;
-      entry.cleanupReported = true;
-      entry.cleanupConfirmed = browserClosed === true &&
-        await verifyCleanupReceipt(cleanupReceiptPath, {
-          kind: 'profile',
-          profileId,
-          ownerId,
-          workerPid: child.pid
-        });
-      resolveCleanupReport();
-      await release();
-      return entry.cleanupConfirmed;
-    };
-    try {
-      child.once('exit', (code, signal) => {
-        entry.exited = true;
-        entry.exitCode = code;
-        entry.exitSignal = signal || null;
-        resolveExit();
-        // A private, identity-bound receipt remains authoritative when the
-        // child exits after closing Chromium but its final IPC message is lost.
-        // `closed` normally arrives before `exit`. In that ordering the first
-        // cleanup confirmation cannot release the lease yet, so the exit edge
-        // must always retry the idempotent release after confirmation settles.
-        void confirmCleanup(true).then(() => release());
-      });
-      child.once('error', () => {
-        if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
-          entry.spawnFailed = true;
-          entry.exited = true;
-          entry.cleanupReported = true;
-          entry.cleanupConfirmed = true;
-          resolveCleanupReport();
-          resolveExit();
-          void release();
-        }
-      });
-      child.on('message', (message) => {
-        if (message?.type === 'heartbeat') entry.lastHeartbeatAt = Date.now();
-        if (message?.type === 'closed' && !entry.cleanupReported) {
-          void confirmCleanup(message.browserClosed === true);
-        }
-      });
-    } catch (error) {
-      if (openProfiles.get(profileId) === entry) openProfiles.delete(profileId);
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // The worker never received a browser-start command and owns no Profile lease.
-      }
-      throw error;
-    }
-
-    try {
-      await profileStore.acquireLease(profileId, ownerId, {
-        pid: child.pid,
-        ttlMs: 5 * 60_000,
-        cleanupRequired: true,
-        ...leaseAccess
-      });
-      if (entry.exited) {
-        throw new TaskServiceError('PROFILE_OPEN_FAILED', 'Profile worker exited before browser startup', 500);
-      }
-      let openTimer;
-      const openResult = new Promise((resolve, reject) => {
-        openTimer = setTimeout(
-          () => reject(new TaskServiceError('PROFILE_OPEN_TIMEOUT', 'Profile did not open in time', 504)),
-          TASK_SERVICE_DEADLINES.profileOpenMs
-        );
-        child.on('message', (message) => {
-          if (message?.type === 'ready') {
-            clearTimeout(openTimer);
-            resolve(message);
-          }
-          if (message?.type === 'error') {
-            clearTimeout(openTimer);
-            reject(Object.assign(new Error(message.error?.message), message.error));
-          }
-        });
-      });
-      openResult.catch(() => {});
-      entry.browserStartSent = await sendChildMessageConfirmed(child, {
-        type: 'open',
-        profile,
-        cleanupReceiptPath,
-        cleanupReceipt: { kind: 'profile', profileId, ownerId }
-      });
-      if (!entry.browserStartSent) {
-        clearTimeout(openTimer);
-        throw new TaskServiceError('PROFILE_OPEN_SEND_FAILED', 'Profile worker is unavailable', 500);
-      }
-      const result = await openResult;
-      void result;
-      if (entry.exited) throw new TaskServiceError('PROFILE_OPEN_FAILED', 'Profile worker exited while opening', 500);
-      entry.renewal = setInterval(() => {
-        if (entry.closing || entry.released) return;
-        if (Date.now() - entry.lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
-          void closeProfile(profileId, { role: 'manager-admin', clientId: 'manager-admin' }).catch(() => {});
-          return;
-        }
-        const renewal = entry.renewalTail.then(async () => {
-          if (entry.closing || entry.released) return;
-          await profileStore.acquireLease(profileId, ownerId, {
-            pid: child.pid,
-            ttlMs: 5 * 60_000,
-            cleanupRequired: true,
-            ...leaseAccess
-          });
-        });
-        entry.renewalTail = renewal.catch(() => {
-          if (!entry.closing && !entry.released) send(child, { type: 'close' });
-        });
-      }, profileLeaseRenewalMs);
-      entry.renewal.unref?.();
-      return { status: 'open', profileId, pid: child.pid };
-    } catch (error) {
-      if (!entry.browserStartSent) {
-        if (!entry.exited) {
-          child.kill?.('SIGKILL');
-          await waitForEntry(entry.exitPromise, TASK_SERVICE_DEADLINES.profileKillGraceMs);
-        }
-        entry.cleanupReported = true;
-        entry.cleanupConfirmed = entry.exited;
-        resolveCleanupReport();
-        if (!(await entry.release())) await markCleanupUnknown(profileId, ownerId);
-      } else {
-        send(child, { type: 'close' });
-        await shutdownProfileEntry(profileId, entry);
-      }
-      throw error;
-    }
-  }
-
-  async function waitForEntry(promise, timeoutMs) {
-    let timer;
-    try {
-      return await Promise.race([
-        promise.then(() => true),
-        new Promise((resolve) => {
-          timer = setTimeout(() => resolve(false), timeoutMs);
-        })
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function shutdownProfileEntry(profileId, entry) {
-    send(entry.child, { type: 'close' });
-    await waitForEntry(
-      Promise.allSettled([entry.cleanupReportPromise, entry.exitPromise]),
-      TASK_SERVICE_DEADLINES.profileCloseMs
-    );
-    if (!entry.exited) {
-      entry.child.kill?.('SIGTERM');
-      await waitForEntry(entry.exitPromise, TASK_SERVICE_DEADLINES.profileKillGraceMs);
-    }
-    if (!entry.exited) {
-      entry.child.kill?.('SIGKILL');
-      await waitForEntry(entry.exitPromise, TASK_SERVICE_DEADLINES.profileKillGraceMs);
-    }
-    if (await entry.release()) return true;
-    await markCleanupUnknown(profileId, entry.ownerId);
-    return false;
-  }
-
-  async function closeProfile(
-    profileId,
-    suppliedCaller = { role: 'manager-admin', clientId: 'manager-admin' }
-  ) {
-    await ready;
-    const caller = profileCallerIdentity(suppliedCaller);
-    requireProfileUse(await profileStore.get(profileId), caller);
-    const pending = openingProfiles.get(profileId);
-    if (pending) {
-      if (caller.role !== 'manager-admin' && !isSamePrincipal(pending, caller)) {
-        throw new TaskServiceError('PROFILE_IN_USE', 'Profile is opening for another client', 409);
-      }
-      await pending.promise.catch(() => {});
-    }
-    const entry = openProfiles.get(profileId);
-    if (!entry) {
-      let profile = await profileStore.get(profileId);
-      profile = await reconcileAnyCleanup(profile);
-      if (profile.lease || profile.state !== 'idle') {
-        throw new TaskServiceError(
-          'PROFILE_CLEANUP_UNCONFIRMED',
-          'Profile browser cleanup could not be confirmed; the Profile remains blocked',
-          409
-        );
-      }
-      void scheduleQueuedTasks().catch(() => {});
-      return { status: 'closed', profileId };
-    }
-    if (caller.role !== 'manager-admin' && !isSamePrincipal(entry, caller)) {
-      throw new TaskServiceError('PROFILE_IN_USE', 'Profile is open for another client', 409);
-    }
-    if (!(await shutdownProfileEntry(profileId, entry))) {
-      throw new TaskServiceError(
-        'PROFILE_CLEANUP_UNCONFIRMED',
-        'Profile browser cleanup could not be confirmed; the Profile remains blocked',
-        409
-      );
-    }
-    void scheduleQueuedTasks().catch(() => {});
-    return { status: 'closed', profileId };
-  }
-
   async function interruptTaskForShutdown(task) {
     const safelyPausedQueued = task.state === 'paused' && task.pauseContext?.previousState === 'queued' &&
       !task.startedAt && !task.workerPid && task.leaseHeld !== true;
@@ -4430,10 +3918,7 @@ export function createTaskService({
         ...[...tasks.values()]
           .filter((task) => task.state !== 'queued' && !TERMINAL_TASK_STATES.has(task.state))
           .map((task) => interruptTaskForShutdown(task)),
-        ...[...openProfiles.keys()].map((profileId) => closeProfile(
-          profileId,
-          { role: 'manager-admin', clientId: 'manager-admin' }
-        ))
+        closeAllProfiles()
       ]);
       if (exitingWorkers.length > 0) {
         await Promise.race([
@@ -4479,7 +3964,7 @@ export function createTaskService({
       if (
         shutdownResults.some((result) => result.status === 'rejected') ||
         children.size > 0 ||
-        openProfiles.size > 0 ||
+        hasOpenProfiles() ||
         cleanupUnconfirmed ||
         taskCleanupUnconfirmed ||
         finalizationFailures.size > 0
