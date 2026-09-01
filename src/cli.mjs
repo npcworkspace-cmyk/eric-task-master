@@ -21,8 +21,8 @@ import { waitForManagerShutdownProof } from './lib/manager-shutdown-proof.mjs';
 import { OperationalJournal } from './lib/operational-journal.mjs';
 import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
 import {
-  discardQuarantinedProfilesAfterShutdown,
-  inspectQuarantinedEphemeralUpgrade,
+  finalizeQuarantinedProfilesAfterShutdown,
+  inspectQuarantinedProfileUpgrade,
   recoverLegacyDiscardedQuarantineTasksAfterShutdown
 } from './lib/quarantined-profile-upgrade.mjs';
 import { preflightTaskPack, readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
@@ -329,6 +329,7 @@ async function waitForManager(config, timeoutMs = 20_000) {
 async function ensureManager(config) {
   let migratedFrom;
   let recoveredQuarantinedProfiles = 0;
+  let retainedQuarantinedProfiles = 0;
   let recoveredQuarantinedTasks = 0;
   try {
     return { health: await health(config), started: false };
@@ -337,6 +338,7 @@ async function ensureManager(config) {
       const stopped = await shutdownManager(config, { requireIdle: true });
       migratedFrom = stopped.version;
       recoveredQuarantinedProfiles = stopped.recoveredQuarantinedProfiles || 0;
+      retainedQuarantinedProfiles = stopped.retainedQuarantinedProfiles || 0;
       recoveredQuarantinedTasks = stopped.recoveredQuarantinedTasks || 0;
     } else if (error.code !== 'MANAGER_UNREACHABLE') {
       throw error;
@@ -382,6 +384,7 @@ async function ensureManager(config) {
     started: true,
     ...(migratedFrom ? { migratedFrom } : {}),
     ...(recoveredQuarantinedProfiles > 0 ? { recoveredQuarantinedProfiles } : {}),
+    ...(retainedQuarantinedProfiles > 0 ? { retainedQuarantinedProfiles } : {}),
     ...(recoveredQuarantinedTasks > 0 ? { recoveredQuarantinedTasks } : {})
   };
 }
@@ -616,6 +619,9 @@ async function connect(options, json) {
       ...(connection.recoveredQuarantinedProfiles > 0
         ? { recoveredQuarantinedProfiles: connection.recoveredQuarantinedProfiles }
         : {}),
+      ...(connection.retainedQuarantinedProfiles > 0
+        ? { retainedQuarantinedProfiles: connection.retainedQuarantinedProfiles }
+        : {}),
       ...(connection.recoveredQuarantinedTasks > 0
         ? { recoveredQuarantinedTasks: connection.recoveredQuarantinedTasks }
         : {})
@@ -632,6 +638,8 @@ async function connect(options, json) {
 async function shutdownManager(config, { requireIdle = false } = {}) {
   let running;
   let quarantinedProfileIds = [];
+  let discardQuarantinedProfileIds = [];
+  let retainedQuarantinedProfileIds = [];
   try {
     running = await health(config, 1_500, null);
   } catch (error) {
@@ -682,11 +690,15 @@ async function shutdownManager(config, { requireIdle = false } = {}) {
     const busyTasks = countKeys.reduce((total, key) => total + counts[key], 0);
     const busyProfiles = profiles.filter((profile) => profile?.state !== 'idle').length;
     if (busyTasks === 0 && busyProfiles > 0) {
-      const inspection = await inspectQuarantinedEphemeralUpgrade({
+      const inspection = await inspectQuarantinedProfileUpgrade({
         stateDir: config.stateDir,
         publicProfiles: profiles
       });
-      if (inspection.eligible) quarantinedProfileIds = inspection.profileIds;
+      if (inspection.eligible) {
+        quarantinedProfileIds = inspection.profileIds;
+        discardQuarantinedProfileIds = inspection.discardProfileIds;
+        retainedQuarantinedProfileIds = inspection.retainedProfileIds;
+      }
     }
     if (busyTasks > 0 || busyProfiles > quarantinedProfileIds.length) {
       throw cliError(
@@ -774,20 +786,26 @@ async function shutdownManager(config, { requireIdle = false } = {}) {
             `Keep the Manager state directory intact and inspect ${join(config.stateDir, 'manager-shutdown-failure.json')} before restarting.`
           );
         }
-        const recoveredQuarantinedProfiles = quarantinedProfileIds.length > 0
-          ? await discardQuarantinedProfilesAfterShutdown({
+        const quarantineRecovery = quarantinedProfileIds.length > 0
+          ? await finalizeQuarantinedProfilesAfterShutdown({
             stateDir: config.stateDir,
-            profileIds: quarantinedProfileIds,
+            discardProfileIds: discardQuarantinedProfileIds,
+            retainedProfileIds: retainedQuarantinedProfileIds,
             expectedManager: recorded
           })
-          : 0;
+          : { recoveredQuarantinedProfiles: 0, retainedQuarantinedProfiles: 0 };
         return {
           ok: true,
           stopped: true,
           graceful: gracefulRequested,
           pid: recorded.pid,
           version: running.version,
-          ...(recoveredQuarantinedProfiles > 0 ? { recoveredQuarantinedProfiles } : {})
+          ...(quarantineRecovery.recoveredQuarantinedProfiles > 0
+            ? { recoveredQuarantinedProfiles: quarantineRecovery.recoveredQuarantinedProfiles }
+            : {}),
+          ...(quarantineRecovery.retainedQuarantinedProfiles > 0
+            ? { retainedQuarantinedProfiles: quarantineRecovery.retainedQuarantinedProfiles }
+            : {})
         };
       }
       throw error;

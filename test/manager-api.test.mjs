@@ -34,7 +34,7 @@ async function managerFixture(t, { profileProcessAlive } = {}) {
   await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Task Master</title>');
 
   const tasks = new Map();
-  const calls = { open: [], close: [], behavior: [], resumes: [], deletes: [], lifecycle: [] };
+  const calls = { open: [], close: [], behavior: [], resumes: [], deletes: [], lifecycle: [], forceReleases: [] };
   let taskService;
   const buildTaskService = ({ profileStore }) => taskService = {
     async list() {
@@ -101,17 +101,32 @@ async function managerFixture(t, { profileProcessAlive } = {}) {
       calls.close.push(id);
       const profile = await profileStore.get(id);
       if (profile.lease?.ownerId === `profile-open:${id}`) {
-        await profileStore.releaseLease(id, `profile-open:${id}`);
+        await profileStore.releaseLease(id, `profile-open:${id}`, {
+          expectedGeneration: profile.lease.generation
+        });
       }
     },
     async applyProfileBehavior(id, behavior) {
       calls.behavior.push({ id, behavior });
       return { profileId: id, behavior, activeApplied: 0, taskIds: [] };
     },
+    async forceReleaseProfileLease(id, body, caller) {
+      calls.forceReleases.push({ id, body, caller });
+      const profile = await profileStore.get(id);
+      const released = await profileStore.forceReleaseLease(id, {
+        commandId: body.commandId,
+        expectedOwnerId: profile.lease.ownerId,
+        expectedGeneration: profile.lease.generation,
+        expectedUpdatedAt: body.expectedUpdatedAt
+      });
+      return { profile: released.profile, idempotent: released.idempotent };
+    },
     async close() {
       for (const profile of await profileStore.list()) {
         if (profile.lease?.ownerId === `profile-open:${profile.id}`) {
-          await profileStore.releaseLease(profile.id, profile.lease.ownerId);
+          await profileStore.releaseLease(profile.id, profile.lease.ownerId, {
+            expectedGeneration: profile.lease.generation
+          });
         }
       }
     }
@@ -142,7 +157,10 @@ test('Manager DELETE discards a dead task-quarantined ephemeral Profile', async 
     pid: 999_999,
     cleanupRequired: true
   });
-  await manager.profileStore.markCleanupUnknown(profileId, 'task:interrupted');
+  const quarantinedLease = await manager.profileStore.get(profileId);
+  await manager.profileStore.markCleanupUnknown(profileId, 'task:interrupted', {
+    expectedGeneration: quarantinedLease.lease.generation
+  });
   const listed = await json(await fetch(`${baseUrl}/v1/profiles`, {
     headers: headers(manager.token)
   }));
@@ -159,6 +177,52 @@ test('Manager DELETE discards a dead task-quarantined ephemeral Profile', async 
   assert.equal(removed.response.status, 200);
   assert.equal(removed.body.removed.id, profileId);
   await assert.rejects(manager.profileStore.get(profileId), { code: 'PROFILE_NOT_FOUND' });
+});
+
+test('Manager exposes Owner-only force release for a quarantined persistent Profile', async (t) => {
+  const { manager, baseUrl, calls } = await managerFixture(t, {
+    profileProcessAlive: async () => false
+  });
+  const created = await json(await fetch(`${baseUrl}/v1/profiles`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify({ name: 'Recover retained Profile', kind: 'persistent' })
+  }));
+  const profileId = created.body.profile.id;
+  const leased = await manager.profileStore.acquireLease(profileId, 'task:broken-owner', {
+    pid: 999_998,
+    ttlMs: 1_000,
+    cleanupRequired: true
+  });
+  await manager.profileStore.markCleanupUnknown(profileId, 'task:broken-owner', {
+    expectedGeneration: leased.lease.generation
+  });
+  const blocked = await manager.profileStore.get(profileId);
+  const body = {
+    confirm: true,
+    commandId: 'profile-force-release-api-0001',
+    expectedUpdatedAt: blocked.updatedAt
+  };
+
+  const agentToken = await issueAgent(baseUrl, manager.token, 'force-release-denied-agent');
+  const forbidden = await json(await fetch(`${baseUrl}/v1/profiles/${encodeURIComponent(profileId)}/force-release`, {
+    method: 'POST',
+    headers: headers(agentToken),
+    body: JSON.stringify(body)
+  }));
+  assert.equal(forbidden.response.status, 403);
+  assert.equal(forbidden.body.error.code, 'ROLE_FORBIDDEN');
+
+  const released = await json(await fetch(`${baseUrl}/v1/profiles/${encodeURIComponent(profileId)}/force-release`, {
+    method: 'POST',
+    headers: headers(manager.token),
+    body: JSON.stringify(body)
+  }));
+  assert.equal(released.response.status, 200);
+  assert.equal(released.body.profile.state, 'idle');
+  assert.equal(released.body.profile.cleanupRequired, undefined);
+  assert.equal(calls.forceReleases.length, 1);
+  assert.equal(calls.forceReleases[0].caller.role, 'manager-admin');
 });
 
 async function issueAgent(baseUrl, managerToken, clientId, name = clientId) {

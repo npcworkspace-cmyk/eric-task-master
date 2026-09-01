@@ -774,8 +774,12 @@ test('interrupted Profile deletion restores its exact directory on startup', asy
   await rename(profile.userDataDir, path.join(profilesRoot, tombstoneName));
   const data = JSON.parse(await readFile(filePath, 'utf8'));
   data.profiles[0].state = 'deleting';
+  data.profiles[0].leaseGeneration = 1;
   data.profiles[0].lease = {
-    ownerId: 'profile-delete:fixture', pid: 999999, expiresAt: new Date(0).toISOString()
+    ownerId: 'profile-delete:fixture',
+    pid: 999999,
+    generation: 1,
+    expiresAt: new Date(0).toISOString()
   };
   data.profiles[0].deletion = { tombstoneName, startedAt: new Date(0).toISOString() };
   await writeFile(filePath, `${JSON.stringify(data)}\n`);
@@ -835,8 +839,12 @@ test('Profile deletion startup finishes a crash after tombstone removal but befo
   await rm(profile.userDataDir, { recursive: true, force: true });
   const data = JSON.parse(await readFile(filePath, 'utf8'));
   data.profiles[0].state = 'deleting';
+  data.profiles[0].leaseGeneration = 1;
   data.profiles[0].lease = {
-    ownerId: 'profile-delete:fixture', pid: 999999, expiresAt: new Date(0).toISOString()
+    ownerId: 'profile-delete:fixture',
+    pid: 999999,
+    generation: 1,
+    expiresAt: new Date(0).toISOString()
   };
   data.profiles[0].deletion = {
     tombstoneName,

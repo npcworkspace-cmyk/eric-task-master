@@ -160,7 +160,7 @@ test('ProfileStore defaults new engines by kind and migrates legacy channels wit
   assert.equal((await migrated.get(persistent.id)).browserEngine, 'chrome');
   assert.equal((await migrated.get(ephemeral.id)).browserEngine, 'chromium');
   const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
-  assert.equal(persisted.version, 6);
+  assert.equal(persisted.version, 7);
   assert.equal(persisted.profiles.some((profile) => Object.hasOwn(profile, 'browserChannel')), false);
 
   persisted.version = 1;
@@ -187,7 +187,7 @@ test('ProfileStore migrates legacy adaptive behavior to auto without moving Prof
   const current = await migrated.get(profile.id);
   assert.equal(current.defaultBehavior, 'auto');
   assert.equal(current.userDataDir, originalPath);
-  assert.equal(JSON.parse(await readFile(config.filePath, 'utf8')).version, 6);
+  assert.equal(JSON.parse(await readFile(config.filePath, 'utf8')).version, 7);
 });
 
 test('ProfileStore rejects a corrupted extension and background policy without rewriting it', async (t) => {
@@ -301,7 +301,9 @@ test('ProfileStore enforces exclusive leases and recovers only expired dead owne
     store.releaseLease(profile.id, 'task:one'),
     { code: 'LEASE_OWNER_MISMATCH', statusCode: 409 }
   );
-  assert.equal(await store.releaseLease(profile.id, 'task:two'), true);
+  assert.equal(await store.releaseLease(profile.id, 'task:two', {
+    expectedGeneration: leased.lease.generation
+  }), true);
   assert.equal((await store.get(profile.id)).state, 'idle');
 
   const opened = await store.acquireLease(
@@ -311,7 +313,9 @@ test('ProfileStore enforces exclusive leases and recovers only expired dead owne
   );
   assert.equal(opened.state, 'open');
   await assert.rejects(store.remove(profile.id), { code: 'PROFILE_IN_USE', statusCode: 409 });
-  await store.releaseLease(profile.id, `profile-open:${profile.id}`);
+  await store.releaseLease(profile.id, `profile-open:${profile.id}`, {
+    expectedGeneration: opened.lease.generation
+  });
   assert.equal((await store.get(profile.id)).state, 'idle');
 });
 
@@ -333,12 +337,16 @@ test('ProfileStore lease acquisition cannot overwrite a concurrent same-owner re
     }
   });
   const profile = await store.create({ name: 'Lease CAS race' });
-  await store.acquireLease(profile.id, 'task:owner-a', { pid: 101, ttlMs: 1_000 });
+  const initial = await store.acquireLease(profile.id, 'task:owner-a', { pid: 101, ttlMs: 1_000 });
   currentTime += 2_000;
 
   const contender = store.acquireLease(profile.id, 'task:owner-b', { pid: 303, ttlMs: 1_000 });
   await probeStarted;
-  const renewed = await store.acquireLease(profile.id, 'task:owner-a', { pid: 202, ttlMs: 60_000 });
+  const renewed = await store.acquireLease(profile.id, 'task:owner-a', {
+    pid: 202,
+    ttlMs: 60_000,
+    expectedGeneration: initial.lease.generation
+  });
   assert.equal(renewed.lease.pid, 202);
   releaseProbe();
 
@@ -373,9 +381,9 @@ test('ProfileStore migrates private ownership metadata in place and keeps global
   assert.equal(Object.hasOwn(migratedProfile, 'createdBy'), false);
   assert.equal(Object.hasOwn(migratedProfile, 'access'), false);
   const persisted = JSON.parse(await readFile(config.filePath, 'utf8'));
-  assert.equal(persisted.version, 6);
+  assert.equal(persisted.version, 7);
 
-  await migrated.acquireLease(profile.id, 'task:agent-b', {
+  const agentBLease = await migrated.acquireLease(profile.id, 'task:agent-b', {
     pid: 701,
     ttlMs: 1_000,
     authorizedClientId: 'agent-b'
@@ -388,7 +396,9 @@ test('ProfileStore migrates private ownership metadata in place and keeps global
     }),
     { code: 'PROFILE_LEASED', statusCode: 409 }
   );
-  await migrated.releaseLease(profile.id, 'task:agent-b');
+  await migrated.releaseLease(profile.id, 'task:agent-b', {
+    expectedGeneration: agentBLease.lease.generation
+  });
   const nextLease = await migrated.acquireLease(profile.id, 'task:agent-a', {
     pid: 703,
     ttlMs: 1_000,
@@ -433,7 +443,7 @@ test('ProfileStore never TTL-reclaims a session import lease without confirmed c
   const first = new ProfileStore(config);
   await first.init();
   const profile = await first.create({ name: 'Cleanup proof' });
-  await first.acquireLease(profile.id, 'session-import:cleanup-proof', {
+  const importLease = await first.acquireLease(profile.id, 'session-import:cleanup-proof', {
     pid: 505,
     ttlMs: 1_000,
     cleanupRequired: true
@@ -449,16 +459,20 @@ test('ProfileStore never TTL-reclaims a session import lease without confirmed c
     reopened.acquireLease(profile.id, 'task:other', { pid: 606, ttlMs: 1_000 }),
     { code: 'PROFILE_CLEANUP_UNCONFIRMED', statusCode: 409 }
   );
-  await reopened.markCleanupUnknown(profile.id, 'session-import:cleanup-proof');
+  await reopened.markCleanupUnknown(profile.id, 'session-import:cleanup-proof', {
+    expectedGeneration: importLease.lease.generation
+  });
   assert.equal((await reopened.get(profile.id)).state, 'error');
   await assert.rejects(
-    reopened.releaseLease(profile.id, 'session-import:cleanup-proof'),
+    reopened.releaseLease(profile.id, 'session-import:cleanup-proof', {
+      expectedGeneration: importLease.lease.generation
+    }),
     { code: 'CLEANUP_PROOF_REQUIRED', statusCode: 409 }
   );
   assert.equal(await reopened.releaseLease(
     profile.id,
     'session-import:cleanup-proof',
-    { cleanupConfirmed: true }
+    { cleanupConfirmed: true, expectedGeneration: importLease.lease.generation }
   ), true);
   assert.equal((await reopened.get(profile.id)).state, 'idle');
 });
@@ -470,47 +484,148 @@ test('ProfileStore explicitly discards only dead empty task-quarantined ephemera
   });
 
   const disposable = await store.create({ name: 'Discardable quarantine', kind: 'ephemeral' });
-  await store.acquireLease(disposable.id, 'task:interrupted', {
+  const disposableLease = await store.acquireLease(disposable.id, 'task:interrupted', {
     pid: 101,
     cleanupRequired: true
   });
-  await store.markCleanupUnknown(disposable.id, 'task:interrupted');
+  await store.markCleanupUnknown(disposable.id, 'task:interrupted', {
+    expectedGeneration: disposableLease.lease.generation
+  });
   await assert.rejects(store.remove(disposable.id), { code: 'PROFILE_IN_USE', statusCode: 409 });
   const removed = await store.remove(disposable.id, { discardQuarantinedEphemeral: true });
   assert.equal(removed.id, disposable.id);
   await assert.rejects(store.get(disposable.id), { code: 'PROFILE_NOT_FOUND' });
 
   const persistent = await store.create({ name: 'Persistent quarantine' });
-  await store.acquireLease(persistent.id, 'task:persistent', {
+  const persistentLease = await store.acquireLease(persistent.id, 'task:persistent', {
     pid: 102,
     cleanupRequired: true
   });
-  await store.markCleanupUnknown(persistent.id, 'task:persistent');
+  await store.markCleanupUnknown(persistent.id, 'task:persistent', {
+    expectedGeneration: persistentLease.lease.generation
+  });
   await assert.rejects(
     store.remove(persistent.id, { discardQuarantinedEphemeral: true }),
     { code: 'PROFILE_CLEANUP_UNCONFIRMED', statusCode: 409 }
   );
 
   const live = await store.create({ name: 'Live quarantine', kind: 'ephemeral' });
-  await store.acquireLease(live.id, 'task:live', {
+  const liveLease = await store.acquireLease(live.id, 'task:live', {
     pid: livePid,
     cleanupRequired: true
   });
-  await store.markCleanupUnknown(live.id, 'task:live');
+  await store.markCleanupUnknown(live.id, 'task:live', {
+    expectedGeneration: liveLease.lease.generation
+  });
   await assert.rejects(
     store.remove(live.id, { discardQuarantinedEphemeral: true }),
     { code: 'PROFILE_IN_USE', statusCode: 409 }
   );
 
   const dirty = await store.create({ name: 'Dirty quarantine', kind: 'ephemeral' });
-  await store.acquireLease(dirty.id, 'task:dirty', {
+  const dirtyLease = await store.acquireLease(dirty.id, 'task:dirty', {
     pid: 103,
     cleanupRequired: true
   });
-  await store.markCleanupUnknown(dirty.id, 'task:dirty');
+  await store.markCleanupUnknown(dirty.id, 'task:dirty', {
+    expectedGeneration: dirtyLease.lease.generation
+  });
   await writeFile(join(dirty.userDataDir, 'unexpected-state.txt'), 'must not be discarded');
   await assert.rejects(
     store.remove(dirty.id, { discardQuarantinedEphemeral: true }),
     { code: 'EPHEMERAL_PROFILE_NOT_EMPTY', statusCode: 409 }
+  );
+});
+
+test('ProfileStore force-releases a quarantined persistent lease without deleting browser state and fences stale renewals', async (t) => {
+  let currentTime = Date.parse('2026-09-02T00:00:00.000Z');
+  const { store } = await fixture(t, { now: () => currentTime });
+  const profile = await store.create({ name: 'Owner recovery' });
+  const loginMarker = join(profile.userDataDir, 'login-state-marker.txt');
+  await writeFile(loginMarker, 'must survive');
+
+  const leased = await store.acquireLease(profile.id, 'task:stale-worker', {
+    pid: 909_090,
+    ttlMs: 1_000,
+    cleanupRequired: true
+  });
+  assert.equal(leased.lease.generation, 1);
+  currentTime += 2_000;
+  await store.markCleanupUnknown(profile.id, 'task:stale-worker', {
+    expectedGeneration: leased.lease.generation
+  });
+  const blocked = await store.get(profile.id);
+
+  await assert.rejects(
+    store.forceReleaseLease(profile.id, {
+      commandId: 'force-release-wrong-revision',
+      expectedOwnerId: 'task:stale-worker',
+      expectedGeneration: leased.lease.generation,
+      expectedUpdatedAt: '2026-09-01T00:00:00.000Z'
+    }),
+    { code: 'PROFILE_FORCE_RELEASE_CONFLICT', statusCode: 409 }
+  );
+
+  const released = await store.forceReleaseLease(profile.id, {
+    commandId: 'force-release-owner-0001',
+    expectedOwnerId: 'task:stale-worker',
+    expectedGeneration: leased.lease.generation,
+    expectedUpdatedAt: blocked.updatedAt
+  });
+  assert.equal(released.idempotent, false);
+  assert.equal(released.profile.state, 'idle');
+  assert.equal(released.profile.lease, null);
+  assert.ok(released.profile.leaseGeneration > leased.lease.generation);
+  assert.equal(await readFile(loginMarker, 'utf8'), 'must survive');
+
+  const replay = await store.forceReleaseLease(profile.id, {
+    commandId: 'force-release-owner-0001',
+    expectedOwnerId: 'task:stale-worker',
+    expectedGeneration: leased.lease.generation,
+    expectedUpdatedAt: blocked.updatedAt
+  });
+  assert.equal(replay.idempotent, true);
+
+  await assert.rejects(
+    store.acquireLease(profile.id, 'task:stale-worker', {
+      pid: 909_090,
+      ttlMs: 60_000,
+      expectedGeneration: leased.lease.generation
+    }),
+    { code: 'LEASE_FENCE_MISMATCH', statusCode: 409 }
+  );
+  const next = await store.acquireLease(profile.id, 'task:stale-worker', { pid: 909_091, ttlMs: 60_000 });
+  assert.ok(next.lease.generation > released.profile.leaseGeneration);
+  await assert.rejects(
+    store.releaseLease(profile.id, 'task:stale-worker', {
+      expectedGeneration: leased.lease.generation
+    }),
+    { code: 'LEASE_FENCE_MISMATCH', statusCode: 409 }
+  );
+  assert.equal(await store.markCleanupUnknown(profile.id, 'task:stale-worker', {
+    expectedGeneration: leased.lease.generation
+  }), false);
+  assert.equal((await store.get(profile.id)).state, 'leased');
+  await store.releaseLease(profile.id, 'task:stale-worker', {
+    expectedGeneration: next.lease.generation
+  });
+
+  const ephemeral = await store.create({ name: 'No retained state', kind: 'ephemeral' });
+  const ephemeralLease = await store.acquireLease(ephemeral.id, 'task:ephemeral', {
+    pid: 909_092,
+    cleanupRequired: true
+  });
+  await store.markCleanupUnknown(ephemeral.id, 'task:ephemeral', {
+    expectedGeneration: ephemeralLease.lease.generation
+  });
+  const blockedEphemeral = await store.get(ephemeral.id);
+  await assert.rejects(
+    store.forceReleaseLease(ephemeral.id, {
+      commandId: 'force-release-ephemeral-0001',
+      expectedOwnerId: 'task:ephemeral',
+      expectedGeneration: ephemeralLease.lease.generation,
+      expectedUpdatedAt: blockedEphemeral.updatedAt
+    }),
+    { code: 'PROFILE_FORCE_RELEASE_UNSUPPORTED', statusCode: 409 }
   );
 });

@@ -87,6 +87,7 @@ const I18N = Object.freeze({
     'profiles.closeWindow': '关闭窗口', 'profiles.openWindow': '打开登录窗口', 'profiles.taskOnly': '仅任务启动',
     'profiles.openTitle': '打开独立可见 Chrome 窗口进行人工登录或检查', 'profiles.taskOnlyTitle': '临时 Profile 只在任务中启动',
     'profiles.cleanupResidual': '清理残留', 'profiles.cleanupResidualTitle': '任务清理未确认；Manager 会再次确认 Worker 已退出且临时目录为空后再清理',
+    'profiles.forceRelease': '强制解除租约', 'profiles.forceReleaseTitle': '仅在任务已经结束、Worker 已失联时解除占用；保留 Profile 登录数据和原任务失败记录',
     'profiles.deleteBusy': 'Profile 空闲后才能删除', 'profiles.deleteTitle': '删除这个 Profile',
     'profileState.idle': '空闲', 'profileState.closed': '已关闭', 'profileState.open': '人工打开', 'profileState.leased': '任务占用',
     'profileState.starting': '启动中', 'profileState.error': '需检查',
@@ -137,6 +138,7 @@ const I18N = Object.freeze({
     'toast.extensionsSaved': '扩展设置已保存；下次启动生效', 'toast.extensionsDeferred': '扩展设置已保存；当前窗口不会重启，关闭后生效',
     'toast.profileSaved': 'Profile 设置已保存', 'toast.profileOpening': '正在打开独立登录窗口', 'toast.profileClosed': 'Profile 窗口已关闭',
     'toast.profileResidualCleaned': '残留临时 Profile 已清理', 'toast.profileDeleted': 'Profile 已删除',
+    'toast.profileLeaseReleased': 'Profile 租约已强制解除；原任务仍保留失败与清理未确认记录',
     'toast.taskNotReady': '任务版本尚未就绪，正在刷新最新状态', 'toast.pauseSent': '暂停请求已发送',
     'toast.resumeSent': '恢复请求已发送', 'toast.cancelSent': '取消请求已发送', 'toast.taskDeleted': '任务记录已删除',
     'toast.noteSaved': '资产备注已保存', 'toast.assetsDeprecated': '所选资产已废弃，Agent 不再发现它们',
@@ -144,6 +146,7 @@ const I18N = Object.freeze({
     'toast.loggedOut': '已退出；后台任务仍在继续', 'toast.logoutFailed': '退出失败', 'toast.ownerFailed': '无法建立 Owner 会话',
     'prompt.renameProfile': '新的 Profile 名称', 'prompt.assetNote': '填写资产备注（留空可清除备注）',
     'confirm.cleanupProfile': '确定清理异常临时 Profile“{name}”？Manager 只会在 Worker 已退出且目录为空时执行。',
+    'confirm.forceReleaseProfile': '确定强制解除 Profile“{name}”的租约？\n\n只会解除异常占用并保留登录数据；原任务仍保持失败，浏览器清理仍记录为未确认。若 Worker 仍存活，Manager 会拒绝本操作。',
     'confirm.deleteProfile': '确定删除 Profile“{name}”及其{description}？此操作无法撤销。',
     'confirm.ephemeralData': '临时任务设置', 'confirm.persistentData': '持久浏览器数据',
     'confirm.cancelTask': '确定取消任务“{title}”？Manager 会先关闭任务窗口并释放 Profile。',
@@ -213,6 +216,7 @@ const I18N = Object.freeze({
     'profiles.closeWindow': 'Close window', 'profiles.openWindow': 'Open login window', 'profiles.taskOnly': 'Task launch only',
     'profiles.openTitle': 'Open a separate visible Chrome window for manual login or inspection', 'profiles.taskOnlyTitle': 'Temporary Profiles only launch inside tasks',
     'profiles.cleanupResidual': 'Clean residue', 'profiles.cleanupResidualTitle': 'Cleanup is unconfirmed. Manager will verify that the Worker exited and the temporary directory is empty.',
+    'profiles.forceRelease': 'Force-release lease', 'profiles.forceReleaseTitle': 'Release a stale lease only after its task ended and Worker disappeared; Profile login data and the failed task record are retained.',
     'profiles.deleteBusy': 'The Profile must be idle before deletion', 'profiles.deleteTitle': 'Delete this Profile',
     'profileState.idle': 'Idle', 'profileState.closed': 'Closed', 'profileState.open': 'Open manually', 'profileState.leased': 'In use',
     'profileState.starting': 'Starting', 'profileState.error': 'Needs attention',
@@ -263,6 +267,7 @@ const I18N = Object.freeze({
     'toast.extensionsSaved': 'Extension setting saved; it applies on the next launch', 'toast.extensionsDeferred': 'Extension setting saved; the current browser will not restart and the change applies after it closes',
     'toast.profileSaved': 'Profile settings saved', 'toast.profileOpening': 'Opening a separate login window', 'toast.profileClosed': 'Profile window closed',
     'toast.profileResidualCleaned': 'Temporary Profile residue cleaned', 'toast.profileDeleted': 'Profile deleted',
+    'toast.profileLeaseReleased': 'Profile lease force-released; the original task remains failed with cleanup unconfirmed',
     'toast.taskNotReady': 'Task revision is not ready; loading the latest state', 'toast.pauseSent': 'Pause request sent',
     'toast.resumeSent': 'Resume request sent', 'toast.cancelSent': 'Cancel request sent', 'toast.taskDeleted': 'Task record deleted',
     'toast.noteSaved': 'Asset note saved', 'toast.assetsDeprecated': 'Selected assets deprecated and hidden from Agents',
@@ -270,6 +275,7 @@ const I18N = Object.freeze({
     'toast.loggedOut': 'Signed out; background tasks are still running', 'toast.logoutFailed': 'Sign-out failed', 'toast.ownerFailed': 'Unable to start Owner session',
     'prompt.renameProfile': 'New Profile name', 'prompt.assetNote': 'Asset note (leave blank to clear)',
     'confirm.cleanupProfile': 'Clean abnormal temporary Profile “{name}”? Manager will proceed only after the Worker exits and the directory is empty.',
+    'confirm.forceReleaseProfile': 'Force-release the lease for Profile “{name}”?\n\nOnly the stale lease is released and login data is retained. The original task remains failed and browser cleanup stays unconfirmed. Manager will reject this action if the Worker is still alive.',
     'confirm.deleteProfile': 'Delete Profile “{name}” and its {description}? This cannot be undone.',
     'confirm.ephemeralData': 'temporary task settings', 'confirm.persistentData': 'persistent browser data',
     'confirm.cancelTask': 'Cancel task “{title}”? Manager will close the task window and release the Profile first.',
@@ -1089,6 +1095,7 @@ function renderProfiles(force = false) {
       const persistent = profile.kind !== 'ephemeral';
       const busy = !['idle', 'closed'].includes(currentState);
       const quarantinedEphemeral = !persistent && currentState === 'error' && profile.cleanupRequired === true;
+      const quarantinedPersistent = persistent && currentState === 'error' && profile.cleanupRequired === true;
       const pending = state.pendingMutations.has(`profile:${id}`);
       const card = element('article', `profile-card profile-${profile.kind || 'persistent'}`);
       const heading = element('div', 'card-heading');
@@ -1159,16 +1166,20 @@ function renderProfiles(force = false) {
       const rename = focusKey(button(t('profiles.rename'), 'npc-btn-ghost compact-button', () => void renameProfile(profile)), `profile:${id}:rename`);
       const toggleLabel = persistent ? (busy ? t('profiles.closeWindow') : t('profiles.openWindow')) : t('profiles.taskOnly');
       const toggle = focusKey(button(toggleLabel, 'npc-btn-secondary compact-button', () => void setProfileOpen(profile, !busy)), `profile:${id}:toggle`);
-      toggle.disabled = !persistent || pending || currentState === 'starting';
+      toggle.disabled = !persistent || pending || currentState === 'starting' || quarantinedPersistent;
       toggle.title = persistent ? t('profiles.openTitle') : t('profiles.taskOnlyTitle');
-      const remove = focusKey(button(quarantinedEphemeral ? t('profiles.cleanupResidual') : t('common.delete'), 'npc-btn-danger compact-button', () => void deleteProfile(profile)), `profile:${id}:delete`);
+      const remove = quarantinedPersistent
+        ? focusKey(button(t('profiles.forceRelease'), 'npc-btn-danger compact-button', () => void forceReleaseProfileLease(profile)), `profile:${id}:force-release`)
+        : focusKey(button(quarantinedEphemeral ? t('profiles.cleanupResidual') : t('common.delete'), 'npc-btn-danger compact-button', () => void deleteProfile(profile)), `profile:${id}:delete`);
       rename.disabled = pending;
-      remove.disabled = (busy && !quarantinedEphemeral) || pending;
-      remove.title = quarantinedEphemeral
-        ? t('profiles.cleanupResidualTitle')
-        : busy
-          ? t('profiles.deleteBusy')
-          : t('profiles.deleteTitle');
+      remove.disabled = (!quarantinedPersistent && busy && !quarantinedEphemeral) || pending;
+      remove.title = quarantinedPersistent
+        ? t('profiles.forceReleaseTitle')
+        : quarantinedEphemeral
+          ? t('profiles.cleanupResidualTitle')
+          : busy
+            ? t('profiles.deleteBusy')
+            : t('profiles.deleteTitle');
       actions.append(rename, toggle, remove);
       card.append(heading, facts, settings, actions);
       ui.profiles.append(card);
@@ -2134,6 +2145,18 @@ async function deleteProfile(profile) {
   await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
     method: 'DELETE'
   }), quarantinedEphemeral ? t('toast.profileResidualCleaned') : t('toast.profileDeleted'), { focusAfter: 'profiles-title' });
+}
+
+async function forceReleaseProfileLease(profile) {
+  if (!confirm(t('confirm.forceReleaseProfile', { name: profile.name || profile.id }))) return;
+  await runMutation(`profile:${profile.id}`, () => request(`/v1/profiles/${encodeURIComponent(profile.id)}/force-release`, {
+    method: 'POST',
+    body: {
+      confirm: true,
+      commandId: commandId(),
+      expectedUpdatedAt: profile.updatedAt
+    }
+  }), t('toast.profileLeaseReleased'), { focusAfter: 'profiles-title' });
 }
 
 async function sendTaskAction(task, action) {

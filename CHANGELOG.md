@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.9.1 - 2026-09-02
+
+- Added an Owner-only **Force-release lease** recovery action for cleanup-blocked persistent Profiles. Manager refuses active tasks, tracked browsers, or a possibly live lease process; successful recovery preserves the Profile directory and login state, keeps the original task failed with cleanup explicitly unconfirmed, and records the intervention.
+- Added monotonic lease generations across tasks and manually opened Profiles. Heartbeat renewal, cleanup marking, and normal release are fenced to the generation they acquired, so a stale Worker cannot reclaim or mutate a Profile after Owner recovery.
+- Allowed a verified-dead, task-owned persistent quarantine to survive an idle Manager upgrade without blocking it. Persistent data and failed-task evidence are retained; only the existing empty ephemeral quarantine path is discarded, and live owners still stop the upgrade.
+
 ## 2.9.0 - 2026-09-01
 
 - Entered a stability-convergence release instead of expanding the browser feature surface. Fixed the observed cross-platform flakes by making recursive test-state cleanup tolerate bounded Windows sharing and directory-entry lag, waiting on the Owner Console's structured Telegram state instead of racing translated text, and preventing an older notification-settings read from overwriting a newer save, test, clear, or system-settings action.

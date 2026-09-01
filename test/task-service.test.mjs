@@ -85,14 +85,18 @@ async function writeSessionReceipt(message, child, outcome) {
 }
 
 function fakeProfileStore(root) {
+  const timestamp = new Date().toISOString();
   const profile = {
     id: 'profile_test',
     name: 'Test',
+    kind: 'persistent',
     userDataDir: path.join(root, 'profile'),
     defaultBehavior: 'fast',
     browserEngine: 'chromium',
     state: 'idle',
-    lease: null
+    lease: null,
+    leaseGeneration: 0,
+    updatedAt: timestamp
   };
   const events = [];
   return {
@@ -108,32 +112,92 @@ function fakeProfileStore(root) {
     async acquireLease(id, ownerId, options) {
       if (id !== profile.id) throw new Error('not found');
       if (profile.lease && profile.lease.ownerId !== ownerId) throw new Error('leased');
+      if (profile.lease && options.expectedGeneration !== profile.lease.generation) {
+        throw Object.assign(new Error('lease fence changed'), { code: 'LEASE_FENCE_MISMATCH' });
+      }
+      if (!profile.lease && options.expectedGeneration !== undefined) {
+        throw Object.assign(new Error('lease fence changed'), { code: 'LEASE_FENCE_MISMATCH' });
+      }
+      const generation = profile.lease?.generation ?? (profile.leaseGeneration += 1);
       profile.lease = {
         ownerId,
         pid: options.pid,
+        generation,
+        expiresAt: new Date(Date.now() + (options.ttlMs || 60_000)).toISOString(),
         cleanupRequired: options.cleanupRequired === true || profile.lease?.cleanupRequired === true
       };
       profile.state = ownerId.startsWith('profile-open:') ? 'open' : 'leased';
+      profile.updatedAt = new Date().toISOString();
       events.push(['acquire', ownerId, options.pid, options.cleanupRequired === true]);
       return structuredClone(profile);
     },
-    async releaseLease(id, ownerId) {
+    async releaseLease(id, ownerId, options = {}) {
       if (id !== profile.id) throw new Error('not found');
       if (profile.lease?.ownerId === ownerId) {
+        if (
+          options.expectedGeneration !== undefined &&
+          options.expectedGeneration !== profile.lease.generation
+        ) {
+          throw Object.assign(new Error('lease fence changed'), { code: 'LEASE_FENCE_MISMATCH' });
+        }
         profile.lease = null;
         profile.state = 'idle';
+        profile.updatedAt = new Date().toISOString();
         events.push(['release', ownerId]);
         return true;
       }
       return false;
     },
-    async markCleanupUnknown(id, ownerId) {
+    async markCleanupUnknown(id, ownerId, options = {}) {
       if (id !== profile.id) throw new Error('not found');
       if (profile.lease?.ownerId !== ownerId) return false;
+      if (
+        options.expectedGeneration !== undefined &&
+        options.expectedGeneration !== profile.lease.generation
+      ) return false;
+      if (
+        profile.state === 'error' &&
+        profile.lease.cleanupRequired === true &&
+        typeof profile.cleanupUnknownAt === 'string'
+      ) return false;
       profile.state = 'error';
       profile.lease.cleanupRequired = true;
+      profile.cleanupUnknownAt = new Date().toISOString();
+      profile.updatedAt = profile.cleanupUnknownAt;
       events.push(['cleanup-unknown', ownerId]);
       return true;
+    },
+    async forceReleaseLease(id, options) {
+      if (id !== profile.id) throw new Error('not found');
+      if (profile.lastForcedLeaseRelease?.commandId === options.commandId && !profile.lease) {
+        return { profile: structuredClone(profile), audit: structuredClone(profile.lastForcedLeaseRelease), idempotent: true };
+      }
+      if (
+        profile.state !== 'error' || profile.lease?.cleanupRequired !== true ||
+        profile.lease.ownerId !== options.expectedOwnerId ||
+        profile.lease.generation !== options.expectedGeneration ||
+        profile.updatedAt !== options.expectedUpdatedAt
+      ) throw Object.assign(new Error('force release conflict'), { code: 'PROFILE_FORCE_RELEASE_CONFLICT' });
+      const releasedAt = new Date().toISOString();
+      const oldLease = structuredClone(profile.lease);
+      profile.leaseGeneration = Math.max(profile.leaseGeneration, oldLease.generation) + 1;
+      profile.state = 'idle';
+      profile.lease = null;
+      delete profile.cleanupUnknownAt;
+      profile.updatedAt = releasedAt;
+      profile.lastForcedLeaseRelease = {
+        commandId: options.commandId,
+        releasedAt,
+        ownerId: oldLease.ownerId,
+        revokedGeneration: oldLease.generation,
+        fenceGeneration: profile.leaseGeneration
+      };
+      events.push(['force-release', oldLease.ownerId, oldLease.generation]);
+      return {
+        profile: structuredClone(profile),
+        audit: structuredClone(profile.lastForcedLeaseRelease),
+        idempotent: false
+      };
     }
   };
 }
@@ -1840,6 +1904,74 @@ test('a failed durable lease release never reports task cleanup as settled', asy
   await assert.rejects(service.close(), { code: 'SERVICE_SHUTDOWN_UNCONFIRMED' });
 });
 
+test('Owner force release preserves the failed task, revokes its stale lease, and permits clean shutdown', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-owner-force-release-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, 'export async function run() {}\n');
+  const store = fakeProfileStore(root);
+  store.releaseLease = async () => false;
+  const liveLeasePids = new Set();
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    processAlive: async (pid) => liveLeasePids.has(pid),
+    workerFactory() {
+      const child = new FakeWorker();
+      child.send = () => {
+        throw new Error('injected task start send failure');
+      };
+      return child;
+    }
+  });
+  await service.installTaskType({ name: 'fixture', modulePath }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'fixture',
+    idempotencyKey: 'owner-force-release-failed-worker'
+  }, ADMIN);
+  const failed = await waitFor(async () => {
+    const task = await service.get(created.id, ADMIN);
+    return task.state === 'failed' && store.profile.state === 'error' ? task : null;
+  });
+  const originalError = failed.error.code;
+  const blockedUpdatedAt = store.profile.updatedAt;
+
+  liveLeasePids.add(store.profile.lease.pid);
+  await assert.rejects(service.forceReleaseProfileLease('profile_test', {
+    confirm: true,
+    commandId: 'owner-force-release-task-live',
+    expectedUpdatedAt: blockedUpdatedAt
+  }, ADMIN), { code: 'PROFILE_FORCE_RELEASE_OWNER_ACTIVE' });
+  liveLeasePids.clear();
+
+  const released = await service.forceReleaseProfileLease('profile_test', {
+    confirm: true,
+    commandId: 'owner-force-release-task-0001',
+    expectedUpdatedAt: blockedUpdatedAt
+  }, ADMIN);
+  assert.equal(released.profile.state, 'idle');
+  assert.equal(store.profile.lease, null);
+  const retained = await service.get(created.id, ADMIN);
+  assert.equal(retained.state, 'failed');
+  assert.equal(retained.error.code, originalError);
+  assert.equal(retained.cleanup.leaseReleased, true);
+  assert.equal(retained.cleanup.ownerForceReleased, true);
+  assert.equal(retained.cleanup.settled, false);
+  assert.equal((await service.getInternal(created.id)).leaseHeld, false);
+  assert.ok(retained.timeline.some((event) => event.type === 'profile.lease.force_released'));
+
+  const replay = await service.forceReleaseProfileLease('profile_test', {
+    confirm: true,
+    commandId: 'owner-force-release-task-0001',
+    expectedUpdatedAt: blockedUpdatedAt
+  }, ADMIN);
+  assert.equal(replay.idempotent, true);
+  await service.close();
+});
+
 test('task get and list recover a valid cleanup receipt after cleanup IPC is lost', async (t) => {
   for (const readMode of ['get', 'list']) {
     const root = await mkdtemp(path.join(os.tmpdir(), `taskmaster-lost-cleanup-${readMode}-`));
@@ -2973,18 +3105,16 @@ test('live-but-stalled tasks trigger diagnostics and fail after the bounded prog
   const created = await service.create({
     profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'stalled-task'
   }, ADMIN);
-  const stalled = await waitFor(async () => {
-    const task = await service.get(created.id, ADMIN);
-    return task.health?.status === 'stalled' ? task : null;
-  }, 6_000);
-  assert.equal(stalled.health.diagnosticRequested, true);
-  assert.ok(messages.includes('diagnose:progress-stalled'));
+  await waitFor(() => messages.includes('diagnose:progress-stalled'), 6_000);
   const failed = await waitFor(async () => {
     const task = await service.get(created.id, ADMIN);
     return task.cleanup.settled ? task : null;
   }, 4_000);
   assert.equal(failed.state, 'failed');
   assert.equal(failed.error.code, 'TASK_PROGRESS_STALLED');
+  assert.equal(failed.health.status, 'failed');
+  assert.equal(failed.health.diagnosticRequested, true);
+  assert.equal(typeof failed.health.since, 'string');
   assert.equal(failed.cleanup.browserClosed, true);
   await service.close();
 });

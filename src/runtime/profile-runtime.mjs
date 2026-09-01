@@ -66,7 +66,7 @@ export function createProfileRuntime({
       // missing or invalid proof keeps the Profile quarantined explicitly.
       await existing.cleanupReportPromise;
       if (!(await existing.release())) {
-        await markCleanupUnknown(profileId, existing.ownerId);
+        await markCleanupUnknown(profileId, existing.ownerId, existing.leaseGeneration);
         throw new TaskServiceError(
           'PROFILE_CLEANUP_UNCONFIRMED',
           'The previous Profile browser exited without confirmed cleanup; the Profile remains blocked',
@@ -145,6 +145,7 @@ export function createProfileRuntime({
       closing: false,
       lastHeartbeatAt: Date.now(),
       cleanupReceiptPath,
+      leaseGeneration: null,
       exitPromise: new Promise((resolve) => { resolveExit = resolve; }),
       cleanupReportPromise: new Promise((resolve) => { resolveCleanupReport = resolve; }),
       releasePromise: null
@@ -159,7 +160,12 @@ export function createProfileRuntime({
         entry.closing = true;
         clearInterval(entry.renewal);
         await entry.renewalTail.catch(() => {});
-        let released = await profileStore.releaseLease(profileId, ownerId, { cleanupConfirmed: true });
+        let released = await profileStore.releaseLease(profileId, ownerId, {
+          cleanupConfirmed: true,
+          ...(Number.isSafeInteger(entry.leaseGeneration)
+            ? { expectedGeneration: entry.leaseGeneration }
+            : {})
+        });
         if (released !== true) {
           const current = await profileStore.get(profileId);
           released = current?.lease?.ownerId !== ownerId;
@@ -231,12 +237,13 @@ export function createProfileRuntime({
     }
 
     try {
-      await profileStore.acquireLease(profileId, ownerId, {
+      const leasedProfile = await profileStore.acquireLease(profileId, ownerId, {
         pid: child.pid,
         ttlMs: 5 * 60_000,
         cleanupRequired: true,
         ...leaseAccess
       });
+      entry.leaseGeneration = leasedProfile.lease?.generation ?? null;
       if (entry.exited) {
         throw new TaskServiceError('PROFILE_OPEN_FAILED', 'Profile worker exited before browser startup', 500);
       }
@@ -283,6 +290,9 @@ export function createProfileRuntime({
             pid: child.pid,
             ttlMs: 5 * 60_000,
             cleanupRequired: true,
+            ...(Number.isSafeInteger(entry.leaseGeneration)
+              ? { expectedGeneration: entry.leaseGeneration }
+              : {}),
             ...leaseAccess
           });
         });
@@ -301,7 +311,7 @@ export function createProfileRuntime({
         entry.cleanupReported = true;
         entry.cleanupConfirmed = entry.exited;
         resolveCleanupReport();
-        if (!(await entry.release())) await markCleanupUnknown(profileId, ownerId);
+        if (!(await entry.release())) await markCleanupUnknown(profileId, ownerId, entry.leaseGeneration);
       } else {
         send(child, { type: 'close' });
         await shutdownProfileEntry(profileId, entry);
@@ -339,7 +349,7 @@ export function createProfileRuntime({
       await waitForEntry(entry.exitPromise, deadlines.profileKillGraceMs);
     }
     if (await entry.release()) return true;
-    await markCleanupUnknown(profileId, entry.ownerId);
+    await markCleanupUnknown(profileId, entry.ownerId, entry.leaseGeneration);
     return false;
   }
 
@@ -411,4 +421,3 @@ export function createProfileRuntime({
     openProfile
   });
 }
-

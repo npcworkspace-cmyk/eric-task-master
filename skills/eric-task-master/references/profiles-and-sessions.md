@@ -31,7 +31,7 @@ For manual extension work, pause the task and wait until its state is `paused`, 
 
 The persistent Profile's native Playwright `userDataDir` retains Cookie, LocalStorage, IndexedDB, service-worker, and other browser-managed state. Task Master does not copy credentials from another browser, expose them to an Agent, or maintain a parallel login-state vault. If a site logs out or rejects the state, reopen the same Profile and let the user sign in again there.
 
-Only one live lease is allowed. The Dashboard cannot open a Profile while a task owns it, and a task waits while the user has its login window open. If cleanup cannot be proved, the Profile stays quarantined instead of being reused.
+Only one live lease is allowed. The Dashboard cannot open a Profile while a task owns it, and a task waits while the user has its login window open. If cleanup cannot be proved, the Profile stays quarantined instead of being reused. For a persistent Profile whose owning task is already terminal and whose Worker is no longer live, the Owner Console may explicitly **Force-release lease**. Agents must not request or invoke this Owner recovery path. It preserves browser data, leaves the original task failed and cleanup-unconfirmed, and advances a lease fence so the stale Worker cannot renew. A possibly live owner makes the operation fail closed.
 
 ## Behavior defaults
 

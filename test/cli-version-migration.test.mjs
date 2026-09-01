@@ -172,6 +172,7 @@ async function writeBlockedProfile(stateDir, {
     defaultBehavior: kind === 'persistent' ? 'human' : 'auto',
     headless: false,
     browserEngine: kind === 'persistent' ? 'chrome' : 'chromium',
+    extensionsEnabled: kind === 'persistent',
     state: 'error',
     lease: {
       ownerId,
@@ -187,7 +188,7 @@ async function writeBlockedProfile(stateDir, {
     cleanupUnknownAt: timestamp
   };
   await writeFile(path.join(stateDir, 'profiles.json'), `${JSON.stringify({
-    version: 5,
+    version: 6,
     profiles: [profile]
   }, null, 2)}\n`);
   return profile;
@@ -464,6 +465,61 @@ test('connect safely discards a dead empty task-quarantined ephemeral Profile du
   assert.equal(recoveredTask.cleanup.quarantinedProfileDiscardRecovered, true);
 });
 
+test('connect preserves a dead task-quarantined persistent Profile while upgrading the Manager', async (t) => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'eric-task-master-cli-upgrade-retained-quarantine-'));
+  const deadWorker = spawn(process.execPath, ['-e', '']);
+  const deadWorkerPid = deadWorker.pid;
+  await once(deadWorker, 'exit');
+  const taskId = 'task_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const profile = await writeBlockedProfile(stateDir, {
+    id: 'profile_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+    kind: 'persistent',
+    pid: deadWorkerPid,
+    retainedData: true,
+    ownerId: `task:${taskId}`
+  });
+  await writeInterruptedTask(stateDir, { id: taskId, profileId: profile.id, workerPid: deadWorkerPid });
+  const legacy = await startLegacyManager({
+    stateDir,
+    profiles: [{ id: profile.id, state: profile.state, cleanupRequired: true }]
+  });
+  let currentStarted = false;
+  t.after(async () => {
+    if (currentStarted) {
+      await execFileAsync(process.execPath, [
+        CLI, 'manager', 'stop', '--host', '127.0.0.1', '--port', String(legacy.port),
+        '--state-dir', stateDir, '--json'
+      ], { cwd: ROOT }).catch(() => {});
+    }
+    await legacy.close().catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  await writeFile(path.join(stateDir, `acceptance-${VERSION}.json`), `${JSON.stringify({
+    ok: true,
+    version: VERSION,
+    checks: []
+  })}\n`, 'utf8');
+  const result = JSON.parse((await execFileAsync(process.execPath, [
+    CLI, 'connect', '--host', '127.0.0.1', '--port', String(legacy.port),
+    '--state-dir', stateDir, '--skip-mcp-registration', '--json'
+  ], { cwd: ROOT, timeout: 30_000 })).stdout);
+  currentStarted = true;
+
+  assert.equal(legacy.wasShutdownAuthorized(), true);
+  assert.equal(result.manager.version, VERSION);
+  assert.equal(result.manager.migratedFrom, '1.0.4');
+  assert.equal(result.manager.retainedQuarantinedProfiles, 1);
+  const profiles = JSON.parse(await readFile(path.join(stateDir, 'profiles.json'), 'utf8'));
+  assert.equal(profiles.profiles.length, 1);
+  assert.equal(profiles.profiles[0].id, profile.id);
+  assert.equal(profiles.profiles[0].state, 'error');
+  assert.equal(await readFile(path.join(profile.userDataDir, 'retained.txt'), 'utf8'), 'keep');
+  const retainedTask = JSON.parse(await readFile(path.join(stateDir, 'tasks', taskId, 'task.json'), 'utf8'));
+  assert.equal(retainedTask.cleanup.settled, false);
+  assert.equal(retainedTask.leaseHeld, true);
+});
+
 test('connect repairs a legacy discarded quarantine task before starting the current Manager', async (t) => {
   const stateDir = await mkdtemp(path.join(tmpdir(), 'eric-task-master-cli-legacy-quarantine-task-'));
   const port = await unusedPort();
@@ -531,18 +587,22 @@ test('connect repairs a legacy discarded quarantine task before starting the cur
   await assert.rejects(lstat(path.join(stateDir, 'manager-shutdown-failure.json')), { code: 'ENOENT' });
 });
 
-test('connect preserves a non-discardable blocked Profile and leaves the older Manager running', async (t) => {
+test('connect preserves a live blocked Profile and leaves the older Manager running', async (t) => {
   const stateDir = await mkdtemp(path.join(tmpdir(), 'eric-task-master-cli-upgrade-profile-busy-'));
+  const liveWorker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
   const profile = await writeBlockedProfile(stateDir, {
     id: 'profile_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     kind: 'persistent',
-    pid: 1
+    pid: liveWorker.pid,
+    retainedData: true
   });
   const legacy = await startLegacyManager({
     stateDir,
     profiles: [{ id: profile.id, state: profile.state }]
   });
   t.after(async () => {
+    liveWorker.kill('SIGKILL');
+    await once(liveWorker, 'exit').catch(() => {});
     await legacy.close().catch(() => {});
     await rm(stateDir, { recursive: true, force: true });
   });

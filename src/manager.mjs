@@ -850,6 +850,7 @@ export async function createManager({
 
     const profileMatch = /^\/v1\/profiles\/([^/]+)$/.exec(url.pathname);
     const profileActionMatch = /^\/v1\/profiles\/([^/]+)\/(open|close)$/.exec(url.pathname);
+    const profileForceReleaseMatch = /^\/v1\/profiles\/([^/]+)\/force-release$/.exec(url.pathname);
     const agentActionMatch = /^\/v1\/agents\/([^/]+)\/actions$/.exec(url.pathname);
     const taskTypeMatch = /^\/v1\/task-types\/([^/]+)$/.exec(url.pathname);
     const taskTypeActionMatch = /^\/v1\/task-types\/([^/]+)\/actions$/.exec(url.pathname);
@@ -1098,6 +1099,23 @@ export async function createManager({
         discardQuarantinedEphemeral: true
       });
       sendJson(response, 200, { removed: publicProfile(removed) }, cors);
+      return;
+    }
+    if (profileForceReleaseMatch && request.method === 'POST') {
+      const auth = await authenticate(request);
+      requireRole(auth, 'manager-admin', 'dashboard');
+      const profileId = decodeURIComponent(profileForceReleaseMatch[1]);
+      requireProfileAccess(await profileStore.get(profileId), auth, { manage: true });
+      const released = await requireTaskMethod(taskService, 'forceReleaseProfileLease')(
+        profileId,
+        await readJson(request, { maxBytes: 4 * 1024 }),
+        serviceCaller(auth)
+      );
+      sendJson(response, 200, {
+        profile: publicProfile(released.profile),
+        ...(released.taskId ? { taskId: released.taskId } : {}),
+        idempotent: released.idempotent === true
+      }, cors);
       return;
     }
     if (profileActionMatch && request.method === 'POST') {
