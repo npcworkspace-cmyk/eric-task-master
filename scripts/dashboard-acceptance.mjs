@@ -794,10 +794,14 @@ try {
     .at(-1);
   assert.deepEqual(telegramTestRequest.body, { channel: 'telegram' });
   assert.equal(JSON.stringify(telegramTestRequest.body).includes('token'), false);
-  await page.waitForFunction(() => document.querySelector('#refresh-all')?.disabled === false);
   control.notificationSettingsReadDelayMs = 1_200;
   const settingsReadBeforeRefresh = control.notificationSettingsReadSequence;
-  await page.locator('#refresh-all').click();
+  await page.waitForFunction(() => {
+    const button = document.querySelector('#refresh-all');
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  });
   await waitForCondition(
     () => control.notificationSettingsReadSequence > settingsReadBeforeRefresh,
     'the delayed notification-settings read to start'
