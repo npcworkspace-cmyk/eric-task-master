@@ -150,7 +150,9 @@ async function staticChecks() {
     taskWorker,
     taskService,
     workflow,
+    codeqlWorkflow,
     releaseWorkflow,
+    dependabotConfig,
     dashboard,
     dashboardHtml,
     agentRegistry,
@@ -181,7 +183,12 @@ async function staticChecks() {
     releaseGate,
     baseSkill,
     taskPacksReference,
-    taskRuntimeReference
+    taskRuntimeReference,
+    taskPackSecurityReference,
+    securityPolicy,
+    taskPackSecurityPolicy,
+    stateBackupPolicy,
+    backupRestoreDrill
   ] = await Promise.all([
     readFile(resolve(ROOT, 'scripts', 'taskmaster.mjs'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'cli.mjs'), 'utf8'),
@@ -197,7 +204,9 @@ async function staticChecks() {
       readFile(resolve(ROOT, 'src', 'runtime', 'profile-runtime.mjs'), 'utf8')
     ]).then((sources) => sources.join('\n')),
     readFile(resolve(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
+    readFile(resolve(ROOT, '.github', 'workflows', 'codeql.yml'), 'utf8'),
     readFile(resolve(ROOT, '.github', 'workflows', 'release.yml'), 'utf8'),
+    readFile(resolve(ROOT, '.github', 'dependabot.yml'), 'utf8'),
     readFile(resolve(ROOT, 'dashboard', 'dashboard.js'), 'utf8'),
     readFile(resolve(ROOT, 'dashboard', 'index.html'), 'utf8'),
     readFile(resolve(ROOT, 'src', 'lib', 'agent-registry.mjs'), 'utf8'),
@@ -228,7 +237,12 @@ async function staticChecks() {
     readFile(resolve(ROOT, 'docs', 'RELEASE-GATE.md'), 'utf8'),
     readFile(resolve(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8'),
     readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-packs.md'), 'utf8'),
-    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-runtime.md'), 'utf8')
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-runtime.md'), 'utf8'),
+    readFile(resolve(ROOT, 'skills', 'eric-task-master', 'references', 'task-pack-security.md'), 'utf8'),
+    readFile(resolve(ROOT, 'SECURITY.md'), 'utf8'),
+    readFile(resolve(ROOT, 'docs', 'TASK-PACK-SECURITY.md'), 'utf8'),
+    readFile(resolve(ROOT, 'docs', 'STATE-BACKUP-RECOVERY.md'), 'utf8'),
+    readFile(resolve(ROOT, 'scripts', 'backup-restore-drill.mjs'), 'utf8')
   ]);
   const releaseCreation = releaseWorkflow.indexOf('gh release create');
   const mainPublicationRecheck = releaseWorkflow.indexOf('MAIN_SHA_NOW=');
@@ -259,6 +273,13 @@ async function staticChecks() {
   invariant(
     taskService.includes('scheduleQueuedTasks') && taskService.includes('TASK_PROGRESS_STALLED'),
     'task scheduler or progress-health boundary drift'
+  );
+  invariant(
+    architecture.includes('`task-service.mjs` remains the only lifecycle transition writer') &&
+      architecture.includes('`src/runtime/task-checkpoint-store.mjs`') &&
+      architecture.includes('`src/runtime/profile-runtime.mjs`') &&
+      architecture.includes('`src/runtime/task-asset-manager.mjs`'),
+    'staged runtime split or canonical lifecycle-writer boundary drift'
   );
   invariant(
     taskService.includes("{ name: 'surface-probe', modulePath: SURFACE_PROBE_TASK, discoverable: true }") &&
@@ -423,6 +444,16 @@ async function staticChecks() {
     'mandatory Human Journey, extension coexistence, read-only observation, or interaction-audit boundary drift'
   );
   invariant(
+    baseSkill.includes('references/task-pack-security.md') &&
+      taskPacksReference.includes('Task Pack trust and permissions') &&
+      taskPackSecurityReference.includes('executable trusted-local Node.js code') &&
+      taskPackSecurityReference.includes('not hostile-code sandboxed') &&
+      taskPackSecurityPolicy.includes('Effective permissions') &&
+      taskPackSecurityPolicy.includes('Required review before installation') &&
+      taskPackSecurityPolicy.includes('Incident response'),
+    'Task Pack executable-code trust and permission boundary drift'
+  );
+  invariant(
     !manager.includes('/v1/pair/extension') &&
       !manager.includes('(open|close|session)') &&
       !manager.includes('validatedSessionBundle') &&
@@ -511,6 +542,29 @@ async function staticChecks() {
     'cross-platform release matrix drift'
   );
   invariant(
+    codeqlWorkflow.includes('github/codeql-action/init@6f5948dfacef28e207b48d0905cf90c03365536d') &&
+      codeqlWorkflow.includes('github/codeql-action/analyze@6f5948dfacef28e207b48d0905cf90c03365536d') &&
+      codeqlWorkflow.includes('security-events: write') &&
+      codeqlWorkflow.includes('languages: javascript-typescript') &&
+      dependabotConfig.includes('package-ecosystem: npm') &&
+      dependabotConfig.includes('package-ecosystem: github-actions'),
+    'CodeQL or Dependabot security automation drift'
+  );
+  invariant(
+    securityPolicy.includes('Report a vulnerability privately') &&
+      securityPolicy.includes('Task Packs and standalone task modules are executable Node.js code') &&
+      securityPolicy.includes('Secret Scanning, push protection, Dependabot, and CodeQL') &&
+      packageJson.scripts?.['acceptance:backup-restore'] === 'node scripts/backup-restore-drill.mjs',
+    'security policy or backup drill command drift'
+  );
+  invariant(
+    stateBackupPolicy.includes('Manager Ed25519 identity') &&
+      stateBackupPolicy.includes('same absolute state-directory path') &&
+      backupRestoreDrill.includes('createStateBackup') && backupRestoreDrill.includes('resumeTask') &&
+      releaseGate.includes('isolated backup-delete-restore drill'),
+    'backup-delete-restore evidence boundary drift'
+  );
+  invariant(
     workflow.includes('actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1') &&
       workflow.includes('actions/setup-node@820762786026740c76f36085b0efc47a31fe5020') &&
       workflow.includes('actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a') &&
@@ -566,6 +620,7 @@ async function staticChecks() {
   );
   await Promise.all([
     access(resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')),
+    access(resolve(ROOT, 'scripts', 'backup-restore-drill.mjs')),
     access(resolve(ROOT, 'scripts', 'dashboard-acceptance.mjs')),
     access(resolve(ROOT, 'src', 'lib', 'semantic-observer.mjs')),
     access(resolve(ROOT, 'src', 'lib', 'task-pack.mjs')),
@@ -658,7 +713,7 @@ async function staticChecks() {
       releaseWorkflow.includes('${SKILL_PREFIX}/runtime.json'),
     'release preflight, monotonic version, or standalone Skill archive proof drift'
   );
-  return { passed: 54, total: 54 };
+  return { passed: 59, total: 59 };
 }
 
 function run(command, args, env = {}) {
@@ -841,6 +896,7 @@ try {
     await run(process.execPath, [resolve(ROOT, 'scripts', 'acceptance.mjs')]);
     await run(process.execPath, [resolve(ROOT, 'scripts', 'dashboard-acceptance.mjs')]);
     await run(process.execPath, [resolve(ROOT, 'scripts', 'commercial-acceptance.mjs')]);
+    await run(process.execPath, [resolve(ROOT, 'scripts', 'backup-restore-drill.mjs')]);
     process.stdout.write(`${JSON.stringify({
       ok: true,
       version: VERSION,
@@ -850,7 +906,8 @@ try {
         'extension-acceptance',
         'acceptance',
         'dashboard-acceptance',
-        'commercial-acceptance'
+        'commercial-acceptance',
+        'backup-restore-acceptance'
       ]
     })}\n`);
   }

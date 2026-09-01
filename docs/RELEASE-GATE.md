@@ -17,6 +17,7 @@ npm run check
 3. real Chromium feature acceptance across Profile-owned fast/auto/human behavior, mode-invariant humanized action topology with timing-only differences, Worker-confirmed live mid-task switching without restart, mandatory `full-human-v1` audits, immutable engine policy, removed task overrides, persistent Profile open/close, rendered-page traversal, curved pointer/click, keyboard input/select, continuous inertial scrolling and two-stream survey/backtrack, verified visible pagination, upload/download, storage, screenshot, progress, checkpoint, 10/10 interaction audit, artifacts, ephemeral isolation, user handoff, and cleanup;
 4. a real-browser Owner Console acceptance that exercises the intentionally focused Tasks, Profiles, Task Packs, and Settings views plus the header verification drawer; creates/updates/opens/closes/deletes Profiles; verifies stable task names, Worker-confirmed configured/effective behavior with receipt time, live run/cooldown/total timing, bounded final-report rendering, cursor pagination, exact task-ID focus, and revision-checked batch pause/resume/cancel/delete controls; searches, filters, selects, notes, deprecates, restores, and deletes executor assets; proves protected/live assets stay blocked and that every blocker can jump to the exact retained task; verifies notification claim/focus/continue, write-only Telegram/Feishu credentials, optional Feishu signing, native notification capability/settings/test state, settings-draft and pending-action race safety, immediate Chinese/English switching, and desktop/mobile layout; confirms removed Agent/raw-file/diagnostic/message surfaces are absent; checks 401 versus 403 handling; survives Manager restart; and validates responsive/keyboard/focus-trap/reduced-motion behavior;
 5. a commercial acceptance workload with persistent Cookie/localStorage retention across task execution, manual Profile open-close, and Manager restart; bounded concurrency; same-Profile FIFO pressure; queued cancellation; browser timeout diagnostics; ephemeral zero-state verification; quiescence; and terminal history recovery.
+6. an isolated backup-delete-restore drill that verifies the exact Manager identity, persistent Profile bytes and lease state, sealed resumable checkpoint, restored Manager authentication, real Worker resume, and final cleanup.
 
 Any failed assertion blocks release. The commercial workload report can be persisted with:
 
@@ -37,6 +38,12 @@ On the release maintainer's machine, also exercise the locally installed stable 
 $env:TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE = 'chrome'
 npm run acceptance:commercial
 Remove-Item Env:TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE
+```
+
+Also run the isolated state recovery gate directly when investigating recovery changes:
+
+```bash
+npm run acceptance:backup-restore
 ```
 
 The local command records the actual engine in its report. CI repeats this commercial workload on every advertised platform with the stable Chrome channel, while all ephemeral Profile checks continue to use the lockfile-pinned Chromium.

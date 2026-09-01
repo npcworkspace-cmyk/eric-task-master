@@ -4,7 +4,7 @@
 
 **An always-on task automation system for AI agents.**
 
-Version: **2.8.2**
+Version: **2.9.0**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -167,7 +167,7 @@ Run the complete local gate:
 npm run check
 ```
 
-It covers static boundaries, unit/integration/security tests, real Chromium acceptance, and concurrent/fault/restart workloads. GitHub CI verifies Windows, macOS, and Linux on Node.js 20 and 22. Releases are manually authorized, checksum-protected, and immutable.
+It covers static boundaries, unit/integration/security tests, real Chromium acceptance, backup-and-restore recovery, and concurrent/fault/restart workloads. GitHub CI verifies Windows, macOS, and Linux on Node.js 20 and 22. Releases are manually authorized, checksum-protected, and immutable.
 
 Stop the Manager safely:
 
@@ -175,7 +175,7 @@ Stop the Manager safely:
 node scripts/taskmaster.mjs manager stop --json
 ```
 
-Start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Technical details live in [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md).
+Start with [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md). Technical details live in [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`docs/MCP.md`](./docs/MCP.md), and [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md). Security reporting, Task Pack trust, and backup recovery are defined in [`SECURITY.md`](./SECURITY.md), [`docs/TASK-PACK-SECURITY.md`](./docs/TASK-PACK-SECURITY.md), and [`docs/STATE-BACKUP-RECOVERY.md`](./docs/STATE-BACKUP-RECOVERY.md).
 
 ## License
 

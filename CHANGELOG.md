@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.9.0 - 2026-09-01
+
+- Entered a stability-convergence release instead of expanding the browser feature surface. Fixed the two observed cross-platform flakes by making task-state cleanup retry bounded Windows file sharing and by waiting on the Owner Console's structured Telegram state instead of racing translated text.
+- Reduced the central Task Service through staged low- and medium-risk extraction. Task record policy, artifact identity/read policy, executor-asset management, checkpoint/diagnostic integrity, and Profile runtime coordination now live in narrow modules while `task-service.mjs` remains the only lifecycle state writer and scheduler.
+- Added a real backup-delete-restore acceptance gate. It cleanly stops an isolated Manager, preserves and verifies every file by SHA-256, restores to the same absolute state path, proves the Ed25519 Manager identity and persistent Profile bytes are unchanged, reloads a sealed checkpoint, resumes it through a real Worker, and verifies cleanup.
+- Added `SECURITY.md`, a complete Task Pack executable-code trust/permission policy, and a portable Skill reference. Task Packs are now explicitly documented as reviewed trusted Node.js code rather than hostile-code sandboxed data, with required declarations for domains, Profiles, files, external effects, extensions, paid providers, retention, provenance, and rollback.
+- Added pinned CodeQL scanning and weekly Dependabot configuration for npm and GitHub Actions. The release gate statically protects those settings, the staged runtime boundary, the backup drill, and the packaged Task Pack security guidance.
+- Extended every cross-platform CI job to retain backup/restore evidence alongside browser, Dashboard, commercial-workload, and extension evidence.
+
 ## 2.8.2 - 2026-08-31
 
 - Made extension coexistence a mandatory Task Pack authoring contract: cooperative extensions and Task Master are equal FIFO peers, Packs cannot bypass or overwrite either participant, and the coordinator schedules page-changing critical sections without filtering the Chrome APIs or permissions granted to an extension.

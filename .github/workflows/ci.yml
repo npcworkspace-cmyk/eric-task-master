@@ -40,6 +40,7 @@ jobs:
           TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
           TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
           TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
+          TASKMASTER_BACKUP_RESTORE_REPORT: ${{ github.workspace }}/artifacts/backup-restore.json
           TASKMASTER_EXTENSION_REPORT: ${{ github.workspace }}/artifacts/extension-acceptance.json
           TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
       - name: Run release gate
@@ -50,6 +51,7 @@ jobs:
           TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
           TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
           TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
+          TASKMASTER_BACKUP_RESTORE_REPORT: ${{ github.workspace }}/artifacts/backup-restore.json
           TASKMASTER_EXTENSION_REPORT: ${{ github.workspace }}/artifacts/extension-acceptance.json
           TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
       - if: always()
