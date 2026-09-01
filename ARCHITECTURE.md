@@ -22,12 +22,21 @@
 ## Components
 
 - `src/manager.mjs`: loopback HTTP manager and API.
+- `src/runtime/task-service.mjs`: sole task-lifecycle state writer and scheduler boundary.
+- `src/runtime/task-record-policy.mjs`: task record validation, normalization, and caller visibility policy.
+- `src/runtime/task-artifact-store.mjs`: bounded artifact identity, hashing, listing, and read policy.
+- `src/runtime/task-asset-manager.mjs`: serialized Task Pack and task-type lifecycle management.
+- `src/runtime/task-checkpoint-store.mjs`: checkpoint and diagnostic-file inspection and integrity verification; lifecycle sealing decisions remain in `task-service.mjs`.
+- `src/runtime/profile-runtime.mjs`: Profile open/close, lease renewal, cleanup receipts, and shutdown coordination through the injected Profile store.
 - `src/runtime/task-worker.mjs`: isolated Playwright task process.
+- `src/operations/state-backup.mjs`: offline, hash-verified state snapshot and absent-target restore primitives.
 - `src/cli.mjs`: fixed Agent entrypoint.
 - `src/mcp/`: standard STDIO MCP server and scoped Manager client.
 - `src/registration/`: transactional, per-host MCP configuration adapters.
 - `dashboard/`: full management interface served by the manager.
 - `skills/eric-task-master/`: progressive-disclosure Agent instructions.
+
+The split runtime modules do not own competing task state. `task-service.mjs` remains the only lifecycle transition writer and the only scheduler. The extracted modules accept narrow injected capabilities and return validated results; they cannot launch a second Manager, Worker, browser, queue, or task registry.
 
 ## Manager API v1
 

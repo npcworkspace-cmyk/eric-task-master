@@ -4,7 +4,7 @@
 
 **为 AI Agent 打造的全时任务自动化系统。**
 
-版本：**2.8.2**
+版本：**2.9.0**
 
 AI Agent 已经能够理解需求、制定计划和编写代码，但浏览器执行往往仍是最薄弱的一环。Agent 内置浏览器适合短时交互，却很难稳定保留登录态、任务上下文和恢复现场；简单的 CDP 控制器虽然能快速操作真实浏览器，却会迫使每个 Agent 为每次任务重新编写控制器、进度跟踪、异常恢复和清理逻辑。
 
@@ -167,7 +167,7 @@ CLI 安装的一次性单文件执行器默认是临时资产：第一个任务�
 npm run check
 ```
 
-它覆盖静态边界、单元/集成/安全测试、真实 Chromium 验收以及并发、故障、重启工作负载。GitHub CI 会在 Windows、macOS、Linux 的 Node.js 20 和 22 上验证。Release 需要人工授权，并且带校验和且不可覆盖。
+它覆盖静态边界、单元/集成/安全测试、真实 Chromium 验收、备份恢复，以及并发、故障、重启工作负载。GitHub CI 会在 Windows、macOS、Linux 的 Node.js 20 和 22 上验证。Release 需要人工授权，并且带校验和且不可覆盖。
 
 安全停止 Manager：
 
@@ -175,7 +175,7 @@ npm run check
 node scripts/taskmaster.mjs manager stop --json
 ```
 
-新 Agent 从 [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md) 开始。技术细节位于 [`ARCHITECTURE.md`](./ARCHITECTURE.md)、[`docs/MCP.md`](./docs/MCP.md) 和 [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md)。
+新 Agent 从 [`skills/eric-task-master/SKILL.md`](./skills/eric-task-master/SKILL.md) 开始。技术细节位于 [`ARCHITECTURE.md`](./ARCHITECTURE.md)、[`docs/MCP.md`](./docs/MCP.md) 和 [`docs/RELEASE-GATE.md`](./docs/RELEASE-GATE.md)。安全报告、Task Pack 可信边界和备份恢复分别见 [`SECURITY.md`](./SECURITY.md)、[`docs/TASK-PACK-SECURITY.md`](./docs/TASK-PACK-SECURITY.md) 与 [`docs/STATE-BACKUP-RECOVERY.md`](./docs/STATE-BACKUP-RECOVERY.md)。
 
 ## 开源许可
 
