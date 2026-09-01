@@ -1686,7 +1686,16 @@ export function createTaskService({
     }
     task.finishedAt ||= nowIso();
     if (TERMINAL_TASK_STATES.has(task.state)) task.progress = terminalProgress(task, task.state);
-    task.health = { status: task.state, checkedAt: nowIso() };
+    task.health = {
+      status: task.state,
+      checkedAt: nowIso(),
+      ...(task.health?.diagnosticRequested === true
+        ? {
+          diagnosticRequested: true,
+          ...(typeof task.health.since === 'string' ? { since: task.health.since } : {})
+        }
+        : {})
+    };
     finishAttemptHistory(task);
     await refreshResumeCheckpointState(task);
     await update(task, {
@@ -2362,9 +2371,15 @@ export function createTaskService({
         return;
       }
       if (progressAge >= progressFailureMs) {
+        const stalledSince = task.health?.since || task.progressAt || task.startedAt || task.createdAt;
         void update(task, {
           state: 'failed',
-          health: { status: 'failed', checkedAt: nowIso() },
+          health: {
+            status: 'failed',
+            since: stalledSince,
+            checkedAt: nowIso(),
+            diagnosticRequested: true
+          },
           error: {
             code: 'TASK_PROGRESS_STALLED',
             message: 'Task remained live but did not report meaningful progress before the stall deadline'

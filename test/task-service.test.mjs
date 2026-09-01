@@ -3105,18 +3105,16 @@ test('live-but-stalled tasks trigger diagnostics and fail after the bounded prog
   const created = await service.create({
     profileId: 'profile_test', taskType: 'fixture', idempotencyKey: 'stalled-task'
   }, ADMIN);
-  const stalled = await waitFor(async () => {
-    const task = await service.get(created.id, ADMIN);
-    return task.health?.status === 'stalled' ? task : null;
-  }, 6_000);
-  assert.equal(stalled.health.diagnosticRequested, true);
-  assert.ok(messages.includes('diagnose:progress-stalled'));
+  await waitFor(() => messages.includes('diagnose:progress-stalled'), 6_000);
   const failed = await waitFor(async () => {
     const task = await service.get(created.id, ADMIN);
     return task.cleanup.settled ? task : null;
   }, 4_000);
   assert.equal(failed.state, 'failed');
   assert.equal(failed.error.code, 'TASK_PROGRESS_STALLED');
+  assert.equal(failed.health.status, 'failed');
+  assert.equal(failed.health.diagnosticRequested, true);
+  assert.equal(typeof failed.health.since, 'string');
   assert.equal(failed.cleanup.browserClosed, true);
   await service.close();
 });
