@@ -561,7 +561,7 @@ test('terminal finalization seals the newest same-attempt checkpoint before asse
   });
   t.after(async () => {
     await service.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
   await service.installTaskType({ name: 'newer.checkpoint.asset.v1', modulePath, transient: true }, ADMIN);
   const created = await service.create({
