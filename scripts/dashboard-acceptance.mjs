@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright';
@@ -14,6 +14,9 @@ const reportPath = process.env.TASKMASTER_DASHBOARD_REPORT
   : null;
 const screenshotPath = process.env.TASKMASTER_DASHBOARD_SCREENSHOT
   ? path.resolve(process.env.TASKMASTER_DASHBOARD_SCREENSHOT)
+  : null;
+const profileRecoveryScreenshotPath = process.env.TASKMASTER_PROFILE_RECOVERY_SCREENSHOT
+  ? path.resolve(process.env.TASKMASTER_PROFILE_RECOVERY_SCREENSHOT)
   : null;
 
 function now() {
@@ -145,8 +148,23 @@ function createTaskHarness(profileStore, tasks, control) {
     },
     async closeProfile(id) {
       const ownerId = openOwners.get(id);
-      if (ownerId) await profileStore.releaseLease(id, ownerId);
+      if (ownerId) {
+        const profile = await profileStore.get(id);
+        await profileStore.releaseLease(id, ownerId, {
+          expectedGeneration: profile.lease.generation
+        });
+      }
       openOwners.delete(id);
+    },
+    async forceReleaseProfileLease(id, body) {
+      const profile = await profileStore.get(id);
+      const released = await profileStore.forceReleaseLease(id, {
+        commandId: body.commandId,
+        expectedOwnerId: profile.lease.ownerId,
+        expectedGeneration: profile.lease.generation,
+        expectedUpdatedAt: body.expectedUpdatedAt
+      });
+      return { profile: released.profile, idempotent: released.idempotent };
     },
     async applyProfileBehavior(id, behavior) {
       control.behaviorChanges.push({ id, behavior });
@@ -226,7 +244,12 @@ function createTaskHarness(profileStore, tasks, control) {
     },
     async close() {
       for (const [id, ownerId] of openOwners) {
-        await profileStore.releaseLease(id, ownerId).catch(() => {});
+        const profile = await profileStore.get(id).catch(() => null);
+        if (profile?.lease?.ownerId === ownerId) {
+          await profileStore.releaseLease(id, ownerId, {
+            expectedGeneration: profile.lease.generation
+          }).catch(() => {});
+        }
       }
       openOwners.clear();
     }
@@ -478,6 +501,24 @@ try {
     defaultBehavior: 'auto',
     headless: true
   });
+  const quarantined = await manager.profileStore.create({
+    name: '异常保留账号',
+    kind: 'persistent',
+    browserEngine: 'chrome',
+    defaultBehavior: 'human',
+    headless: false
+  });
+  await writeFile(path.join(quarantined.userDataDir, 'login-state-marker.txt'), 'preserved');
+  const quarantinedLease = await manager.profileStore.acquireLease(
+    quarantined.id,
+    'task:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    { pid: 999_997, ttlMs: 1_000, cleanupRequired: true }
+  );
+  await manager.profileStore.markCleanupUnknown(
+    quarantined.id,
+    quarantinedLease.lease.ownerId,
+    { expectedGeneration: quarantinedLease.lease.generation }
+  );
 
   tasks.set('task_running', {
     id: 'task_running',
@@ -788,6 +829,7 @@ try {
   await page.getByRole('heading', { name: 'Browser Profiles', exact: true }).waitFor();
   await page.locator('.profile-card').first().getByText('Operation speed', { exact: true }).first().waitFor();
   await page.locator('.profile-card').filter({ hasText: '验收账号' }).getByRole('checkbox', { name: 'Allow extensions' }).waitFor();
+  await page.locator('.profile-card').filter({ hasText: '异常保留账号' }).getByRole('button', { name: 'Force-release lease' }).waitFor();
   await page.getByRole('button', { name: 'Task Packs', exact: true }).click();
   await page.getByRole('heading', { name: 'Task Pack assets', exact: true }).waitFor();
   await page.locator('.asset-card').first().getByText('Agent discoverable', { exact: true }).waitFor();
@@ -926,6 +968,21 @@ try {
 
   await page.getByRole('button', { name: 'Profiles', exact: true }).click();
   assert.equal(await page.evaluate(() => document.activeElement?.id), 'profiles-title');
+  const quarantinedCard = page.locator('.profile-card').filter({ hasText: '异常保留账号' });
+  if (profileRecoveryScreenshotPath) {
+    await mkdir(path.dirname(profileRecoveryScreenshotPath), { recursive: true });
+    await quarantinedCard.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: profileRecoveryScreenshotPath });
+  }
+  page.once('dialog', (dialog) => dialog.accept());
+  await quarantinedCard.getByRole('button', { name: '强制解除租约', exact: true }).click();
+  await page.locator('#dashboard-message').filter({ hasText: 'Profile 租约已强制解除' }).waitFor();
+  assert.equal((await manager.profileStore.get(quarantined.id)).state, 'idle');
+  assert.equal(await readFile(
+    path.join(quarantined.userDataDir, 'login-state-marker.txt'),
+    'utf8'
+  ), 'preserved');
+  checks.push('Owner-confirmed persistent Profile lease release preserves browser data and clears only the stale lease');
   await page.getByRole('button', { name: '新建 Profile' }).click();
   assert.equal(await page.locator('#profile-mode').inputValue(), 'human');
   await page.locator('#profile-name').fill('UI 临时');

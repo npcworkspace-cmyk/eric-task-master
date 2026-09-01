@@ -4,7 +4,7 @@
 
 **An always-on task automation system for AI agents.**
 
-Version: **2.9.0**
+Version: **2.9.1**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -101,6 +101,8 @@ Every task start returns a clickable Owner Console link focused on that task. Th
 - **ephemeral / 隐身临时** — a clean non-persistent browser for each no-login task, destroyed after cleanup.
 
 New persistent Profiles default to the local stable Chrome channel and `human`; new ephemeral Profiles default to the project-pinned Chromium and `auto`. Every Profile can select `fast`, `auto`, or `human`. A behavior change is acknowledged by the live task Worker and takes effect at its next scheduling or movement boundary without restarting the task. The engine is immutable and never falls back automatically. The Owner can also allow extensions already installed inside each persistent Profile. That setting applies to both manual opens and Agent tasks on the next browser launch; it never restarts current work. Extension execution requires a visible browser and is mutually exclusive with headless mode. Ephemeral Profiles never load or retain extensions. Task Master does not install, copy, synchronize, inspect, or authenticate extensions.
+
+If a finished task leaves a persistent Profile blocked because browser cleanup could not be proved, the Console offers **Force-release lease** only as an Owner recovery action. Manager refuses it while the task or browser may still be alive. A successful release preserves the Profile's login data, keeps the original task failed and cleanup-unconfirmed for audit, and fences the old Worker out of future leases.
 
 All Task Master runtime actions enter one Worker FIFO. A Journey step keeps its slot through the visible action, transition verification, and settling, so concurrent task code cannot interleave page changes. A trusted extension that implements `taskmaster-cooperative-v2` shares that queue for click, input, DOM, and navigation work; request IDs are idempotent within each participant, grants carry both participant and request identity, and a document navigation releases the lease. When a Task Pack depends on an extension result, the runtime enforces one explicit handoff state machine: arm the exact participant/request/operation, finish one Task trigger, admit only that extension request, hold both peers at the holder-derived receipt, require a receipt-linked checkpoint after real page verification, then accept or reject the return. Early, late, overlapping, mismatched, uncheckpointed, expired, or unknown handoffs fail closed and never admit the next mutation. This protocol is coordination, not extension authentication or permission filtering: arbitrary third-party extensions may load, but browser APIs cannot force their private code into the queue or reliably distinguish it from ordinary site scripts. Pause the task and wait for `paused` before operating an unintegrated extension; resume then revalidates the page. Every task receives a read-only `page` and `context`: standalone mutations use `action`, while Task Pack mutations use `journey`. A primitive that succeeds but later fails Journey proof creates a durable unknown-effect barrier, preventing blind replay.
 

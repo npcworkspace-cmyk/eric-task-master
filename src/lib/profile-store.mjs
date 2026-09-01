@@ -7,6 +7,7 @@ import { JsonStore } from './json-store.mjs';
 
 const DEFAULT_LEASE_TTL_MS = 60_000;
 const CLIENT_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/u;
+const FORCE_RELEASE_COMMAND_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/u;
 
 export class ProfileStoreError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -175,6 +176,73 @@ function ensureOwnerClientId(value) {
   return value;
 }
 
+function ensureLeaseGeneration(value, { field = 'Lease generation', allowZero = false } = {}) {
+  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
+    throw new ProfileStoreError(
+      'INVALID_LEASE_GENERATION',
+      `${field} must be a ${allowZero ? 'non-negative' : 'positive'} safe integer`,
+      409
+    );
+  }
+  return value;
+}
+
+function nextLeaseGeneration(profile) {
+  const current = ensureLeaseGeneration(profile.leaseGeneration ?? 0, {
+    field: 'Profile lease generation',
+    allowZero: true
+  });
+  if (current >= Number.MAX_SAFE_INTEGER) {
+    throw new ProfileStoreError(
+      'LEASE_GENERATION_EXHAUSTED',
+      `Profile ${profile.id || '[unknown]'} exhausted its lease generation`,
+      409
+    );
+  }
+  profile.leaseGeneration = current + 1;
+  return profile.leaseGeneration;
+}
+
+function migrateLeaseFence(profile, { allowLegacy }) {
+  if (profile.leaseGeneration === undefined) {
+    if (!allowLegacy) {
+      throw new ProfileStoreError(
+        'PROFILE_LEASE_MIGRATION_REQUIRED',
+        `Profile ${profile.id || '[unknown]'} has no lease generation`,
+        409
+      );
+    }
+    profile.leaseGeneration = profile.lease ? 1 : 0;
+  }
+  ensureLeaseGeneration(profile.leaseGeneration, {
+    field: `Profile ${profile.id || '[unknown]'} lease generation`,
+    allowZero: true
+  });
+  if (!profile.lease) return;
+  if (profile.lease.generation === undefined) {
+    if (!allowLegacy) {
+      throw new ProfileStoreError(
+        'PROFILE_LEASE_MIGRATION_REQUIRED',
+        `Profile ${profile.id || '[unknown]'} has an unfenced lease`,
+        409
+      );
+    }
+    profile.leaseGeneration = Math.max(1, profile.leaseGeneration);
+    profile.lease.generation = profile.leaseGeneration;
+    return;
+  }
+  ensureLeaseGeneration(profile.lease.generation, {
+    field: `Profile ${profile.id || '[unknown]'} active lease generation`
+  });
+  if (profile.lease.generation !== profile.leaseGeneration) {
+    throw new ProfileStoreError(
+      'PROFILE_LEASE_MIGRATION_REQUIRED',
+      `Profile ${profile.id || '[unknown]'} lease generation is inconsistent`,
+      409
+    );
+  }
+}
+
 function findProfile(data, profileId) {
   const profile = data.profiles.find((item) => item.id === profileId);
   if (!profile) {
@@ -200,7 +268,7 @@ export class ProfileStore {
     removePath = rm
   }) {
     if (!profilesRoot) throw new TypeError('profilesRoot is required');
-    this.#store = new JsonStore(filePath, { version: 6, profiles: [] });
+    this.#store = new JsonStore(filePath, { version: 7, profiles: [] });
     this.#profilesRoot = profilesRoot;
     this.#now = now;
     this.#processAlive = processAlive;
@@ -214,7 +282,7 @@ export class ProfileStore {
     // v0.x Profile records predate explicit persistence semantics. Preserve
     // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
-      if (data.version !== undefined && ![1, 2, 3, 4, 5, 6].includes(data.version)) {
+      if (data.version !== undefined && ![1, 2, 3, 4, 5, 6, 7].includes(data.version)) {
         throw new ProfileStoreError(
           'PROFILE_STORE_VERSION_UNSUPPORTED',
           `Profile store version ${String(data.version)} is unsupported`,
@@ -224,6 +292,7 @@ export class ProfileStore {
       const allowLegacyChannel = data.version === undefined || data.version === 1;
       const allowLegacyBehavior = data.version === undefined || data.version <= 4;
       const allowLegacyExtensions = data.version === undefined || data.version <= 5;
+      const allowLegacyLeaseFence = data.version === undefined || data.version <= 6;
       for (const profile of data.profiles) {
         profile.kind ||= 'persistent';
         ensureProfileKind(profile.kind);
@@ -243,8 +312,9 @@ export class ProfileStore {
         ) {
           profile.lease.cleanupRequired = true;
         }
+        migrateLeaseFence(profile, { allowLegacy: allowLegacyLeaseFence });
       }
-      data.version = 6;
+      data.version = 7;
     });
     await this.#recoverInterruptedDeletions();
     await this.recoverExpiredLeases();
@@ -317,6 +387,7 @@ export class ProfileStore {
           extensionsEnabled: kind === 'persistent' && !headless,
           state: 'idle',
           lease: null,
+          leaseGeneration: 0,
           createdAt: now,
           updatedAt: now,
           lastUsedAt: null
@@ -480,10 +551,12 @@ export class ProfileStore {
           );
         }
         const nowMs = this.#now();
+        const deletionGeneration = nextLeaseGeneration(current);
         current.state = 'deleting';
         current.lease = {
           ownerId: deletionOwner,
           pid: process.pid,
+          generation: deletionGeneration,
           acquiredAt: new Date(nowMs).toISOString(),
           heartbeatAt: new Date(nowMs).toISOString(),
           expiresAt: new Date(nowMs + 5 * 60_000).toISOString()
@@ -733,6 +806,9 @@ export class ProfileStore {
     if (options.cleanupRequired !== undefined && typeof options.cleanupRequired !== 'boolean') {
       throw new ProfileStoreError('INVALID_LEASE_CLEANUP', 'Lease cleanupRequired must be a boolean');
     }
+    if (options.expectedGeneration !== undefined) {
+      ensureLeaseGeneration(options.expectedGeneration, { field: 'Expected lease generation' });
+    }
     // Validate legacy caller metadata to retain the old fail-closed input
     // boundary, but do not use it for authorization: every Profile is shared.
     if (options.authorizedClientId !== undefined) ensureOwnerClientId(options.authorizedClientId);
@@ -745,6 +821,24 @@ export class ProfileStore {
       throw new ProfileStoreError(
         'PROFILE_CLEANUP_UNCONFIRMED',
         `Profile ${profileId} is blocked because browser cleanup was not confirmed`,
+        409
+      );
+    }
+    const renewing = existing.lease?.ownerId === ownerId;
+    if (renewing && options.expectedGeneration === undefined) {
+      throw new ProfileStoreError(
+        'LEASE_FENCE_REQUIRED',
+        `Profile ${profileId} lease renewal requires its generation`,
+        409
+      );
+    }
+    if (
+      options.expectedGeneration !== undefined &&
+      (!renewing || existing.lease?.generation !== options.expectedGeneration)
+    ) {
+      throw new ProfileStoreError(
+        'LEASE_FENCE_MISMATCH',
+        `Profile ${profileId} lease generation changed`,
         409
       );
     }
@@ -775,9 +869,24 @@ export class ProfileStore {
         );
       }
       const nowMs = this.#now();
+      const continuingLease = profile.lease?.ownerId === ownerId;
+      if (
+        options.expectedGeneration !== undefined &&
+        (!continuingLease || profile.lease?.generation !== options.expectedGeneration)
+      ) {
+        throw new ProfileStoreError(
+          'LEASE_FENCE_MISMATCH',
+          `Profile ${profileId} lease generation changed`,
+          409
+        );
+      }
+      const generation = continuingLease
+        ? profile.lease.generation
+        : nextLeaseGeneration(profile);
       profile.lease = {
         ownerId,
         pid,
+        generation,
         acquiredAt: profile.lease?.ownerId === ownerId
           ? profile.lease.acquiredAt
           : new Date(nowMs).toISOString(),
@@ -797,6 +906,9 @@ export class ProfileStore {
     if (options.cleanupConfirmed !== undefined && typeof options.cleanupConfirmed !== 'boolean') {
       throw new ProfileStoreError('INVALID_CLEANUP_PROOF', 'cleanupConfirmed must be a boolean');
     }
+    if (options.expectedGeneration !== undefined) {
+      ensureLeaseGeneration(options.expectedGeneration, { field: 'Expected lease generation' });
+    }
     let released = false;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
@@ -805,6 +917,22 @@ export class ProfileStore {
         throw new ProfileStoreError(
           'LEASE_OWNER_MISMATCH',
           `Profile ${profileId} is leased by another owner`,
+          409
+        );
+      }
+      if (options.expectedGeneration === undefined) {
+        throw new ProfileStoreError(
+          'LEASE_FENCE_REQUIRED',
+          `Profile ${profileId} lease release requires its generation`,
+          409
+        );
+      }
+      if (
+        profile.lease.generation !== options.expectedGeneration
+      ) {
+        throw new ProfileStoreError(
+          'LEASE_FENCE_MISMATCH',
+          `Profile ${profileId} lease generation changed`,
           409
         );
       }
@@ -824,11 +952,127 @@ export class ProfileStore {
     return released;
   }
 
-  async markCleanupUnknown(profileId, ownerId) {
+  async forceReleaseLease(profileId, options = {}) {
+    const {
+      commandId,
+      expectedOwnerId,
+      expectedGeneration,
+      expectedUpdatedAt
+    } = options;
+    if (typeof commandId !== 'string' || !FORCE_RELEASE_COMMAND_PATTERN.test(commandId)) {
+      throw new ProfileStoreError(
+        'INVALID_PROFILE_FORCE_RELEASE',
+        'Force release commandId must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
+      );
+    }
+    if (typeof expectedOwnerId !== 'string' || !expectedOwnerId) {
+      throw new ProfileStoreError('INVALID_PROFILE_FORCE_RELEASE', 'Expected lease owner is required');
+    }
+    ensureLeaseGeneration(expectedGeneration, { field: 'Expected lease generation' });
+    if (typeof expectedUpdatedAt !== 'string' || !Number.isFinite(Date.parse(expectedUpdatedAt))) {
+      throw new ProfileStoreError('INVALID_PROFILE_FORCE_RELEASE', 'Expected Profile update time is required');
+    }
+
+    let outcome;
+    await this.#store.update((data) => {
+      const profile = findProfile(data, profileId);
+      if (
+        profile.lastForcedLeaseRelease?.commandId === commandId &&
+        profile.state === 'idle' && !profile.lease
+      ) {
+        outcome = {
+          profile,
+          audit: profile.lastForcedLeaseRelease,
+          idempotent: true
+        };
+        return;
+      }
+      if (profile.kind !== 'persistent') {
+        throw new ProfileStoreError(
+          'PROFILE_FORCE_RELEASE_UNSUPPORTED',
+          'Only a quarantined persistent Profile can have its retained lease force-released',
+          409
+        );
+      }
+      if (
+        profile.state !== 'error' ||
+        profile.lease?.cleanupRequired !== true ||
+        typeof profile.cleanupUnknownAt !== 'string'
+      ) {
+        throw new ProfileStoreError(
+          'PROFILE_FORCE_RELEASE_NOT_ALLOWED',
+          `Profile ${profileId} does not have a quarantined cleanup lease`,
+          409
+        );
+      }
+      if (
+        profile.updatedAt !== expectedUpdatedAt ||
+        profile.lease.ownerId !== expectedOwnerId ||
+        profile.lease.generation !== expectedGeneration
+      ) {
+        throw new ProfileStoreError(
+          'PROFILE_FORCE_RELEASE_CONFLICT',
+          `Profile ${profileId} quarantine changed; refresh before retrying`,
+          409
+        );
+      }
+
+      const releasedAt = new Date(this.#now()).toISOString();
+      const revokedLease = structuredClone(profile.lease);
+      const fenceGeneration = nextLeaseGeneration(profile);
+      const taskId = /^task:(task_[a-f0-9]{32})$/u.exec(revokedLease.ownerId)?.[1] ?? null;
+      profile.state = 'idle';
+      profile.lease = null;
+      delete profile.cleanupUnknownAt;
+      profile.updatedAt = releasedAt;
+      profile.lastForcedLeaseRelease = {
+        commandId,
+        releasedAt,
+        ownerType: taskId
+          ? 'task'
+          : revokedLease.ownerId.startsWith('profile-open:')
+            ? 'profile-open'
+            : revokedLease.ownerId.startsWith('session-import:')
+              ? 'legacy-session-import'
+              : 'unknown',
+        ...(taskId ? { taskId } : {}),
+        ownerId: revokedLease.ownerId,
+        revokedGeneration: revokedLease.generation,
+        fenceGeneration,
+        cleanupConfirmed: false
+      };
+      outcome = {
+        profile,
+        audit: profile.lastForcedLeaseRelease,
+        idempotent: false
+      };
+    });
+    return structuredClone(outcome);
+  }
+
+  async markCleanupUnknown(profileId, ownerId, options = {}) {
+    if (options.expectedGeneration !== undefined) {
+      ensureLeaseGeneration(options.expectedGeneration, { field: 'Expected lease generation' });
+    }
     let marked = false;
     await this.#store.update((data) => {
       const profile = findProfile(data, profileId);
       if (!profile.lease || profile.lease.ownerId !== ownerId) return;
+      if (options.expectedGeneration === undefined) {
+        throw new ProfileStoreError(
+          'LEASE_FENCE_REQUIRED',
+          `Profile ${profileId} cleanup update requires its generation`,
+          409
+        );
+      }
+      if (
+        profile.lease.generation !== options.expectedGeneration
+      ) return;
+      if (
+        profile.state === 'error' &&
+        profile.lease.cleanupRequired === true &&
+        typeof profile.cleanupUnknownAt === 'string'
+      ) return;
       profile.state = 'error';
       profile.lease.cleanupRequired = true;
       profile.cleanupUnknownAt = new Date(this.#now()).toISOString();

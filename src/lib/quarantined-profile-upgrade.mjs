@@ -110,25 +110,45 @@ function inProfilesRoot(profilesRoot, profileId, userDataDir) {
     expectedPath.startsWith(`${resolve(profilesRoot)}${sep}`);
 }
 
-export async function inspectQuarantinedEphemeralUpgrade({
+export async function inspectQuarantinedProfileUpgrade({
   stateDir,
   publicProfiles,
   processAlive = isProcessAlive
 }) {
   if (!Array.isArray(publicProfiles)) {
-    return { eligible: false, profileIds: [], reason: 'public-profile-summary-invalid' };
+    return {
+      eligible: false,
+      profileIds: [],
+      discardProfileIds: [],
+      retainedProfileIds: [],
+      reason: 'public-profile-summary-invalid'
+    };
   }
   const publicBlocked = publicProfiles.filter((profile) => profile?.state !== 'idle');
-  if (publicBlocked.length === 0) return { eligible: true, profileIds: [] };
+  if (publicBlocked.length === 0) {
+    return { eligible: true, profileIds: [], discardProfileIds: [], retainedProfileIds: [] };
+  }
 
   let data;
   try {
     data = await readJson(join(stateDir, 'profiles.json'));
   } catch {
-    return { eligible: false, profileIds: [], reason: 'private-profile-store-unreadable' };
+    return {
+      eligible: false,
+      profileIds: [],
+      discardProfileIds: [],
+      retainedProfileIds: [],
+      reason: 'private-profile-store-unreadable'
+    };
   }
   if (!Array.isArray(data?.profiles)) {
-    return { eligible: false, profileIds: [], reason: 'private-profile-store-invalid' };
+    return {
+      eligible: false,
+      profileIds: [],
+      discardProfileIds: [],
+      retainedProfileIds: [],
+      reason: 'private-profile-store-invalid'
+    };
   }
 
   const privateBlocked = data.profiles.filter((profile) => profile?.state !== 'idle');
@@ -138,37 +158,98 @@ export async function inspectQuarantinedEphemeralUpgrade({
     privateBlocked.length !== publicBlocked.length ||
     privateBlocked.some((profile) => !publicIds.has(profile?.id))
   ) {
-    return { eligible: false, profileIds: [], reason: 'profile-summary-mismatch' };
+    return {
+      eligible: false,
+      profileIds: [],
+      discardProfileIds: [],
+      retainedProfileIds: [],
+      reason: 'profile-summary-mismatch'
+    };
   }
 
   const profilesRoot = join(stateDir, 'profiles');
+  const discardProfileIds = [];
+  const retainedProfileIds = [];
   for (const profile of privateBlocked) {
-    const structurallyDisposable = profile.kind === 'ephemeral' &&
+    const recognizedOwner = /^task:/u.test(profile.lease?.ownerId || '');
+    const structurallyQuarantined = ['ephemeral', 'persistent'].includes(profile.kind) &&
       profile.state === 'error' &&
       profile.lease?.cleanupRequired === true &&
-      /^task:/u.test(profile.lease.ownerId || '') &&
+      recognizedOwner &&
       typeof profile.cleanupUnknownAt === 'string' &&
       inProfilesRoot(profilesRoot, profile.id, profile.userDataDir);
-    if (!structurallyDisposable) {
-      return { eligible: false, profileIds: [], reason: 'profile-not-disposable' };
+    if (!structurallyQuarantined) {
+      return {
+        eligible: false,
+        profileIds: [],
+        discardProfileIds: [],
+        retainedProfileIds: [],
+        reason: 'profile-not-quarantined'
+      };
     }
     if (await processAlive(profile.lease.pid)) {
-      return { eligible: false, profileIds: [], reason: 'profile-owner-alive' };
+      return {
+        eligible: false,
+        profileIds: [],
+        discardProfileIds: [],
+        retainedProfileIds: [],
+        reason: 'profile-owner-alive'
+      };
+    }
+    if (profile.kind === 'persistent') {
+      retainedProfileIds.push(profile.id);
+      continue;
+    }
+    if (!/^task:/u.test(profile.lease.ownerId || '')) {
+      return {
+        eligible: false,
+        profileIds: [],
+        discardProfileIds: [],
+        retainedProfileIds: [],
+        reason: 'ephemeral-profile-owner-unsupported'
+      };
     }
     let entries;
     try {
       entries = await readdir(resolve(profilesRoot, profile.id));
     } catch {
-      return { eligible: false, profileIds: [], reason: 'profile-directory-unreadable' };
+      return {
+        eligible: false,
+        profileIds: [],
+        discardProfileIds: [],
+        retainedProfileIds: [],
+        reason: 'profile-directory-unreadable'
+      };
     }
     if (entries.length !== 0) {
-      return { eligible: false, profileIds: [], reason: 'profile-directory-not-empty' };
+      return {
+        eligible: false,
+        profileIds: [],
+        discardProfileIds: [],
+        retainedProfileIds: [],
+        reason: 'profile-directory-not-empty'
+      };
     }
+    discardProfileIds.push(profile.id);
   }
   return {
     eligible: true,
-    profileIds: privateBlocked.map((profile) => profile.id)
+    profileIds: privateBlocked.map((profile) => profile.id),
+    discardProfileIds,
+    retainedProfileIds
   };
+}
+
+export async function inspectQuarantinedEphemeralUpgrade(options) {
+  const inspection = await inspectQuarantinedProfileUpgrade(options);
+  if (!inspection.eligible || inspection.retainedProfileIds.length > 0) {
+    return {
+      eligible: false,
+      profileIds: [],
+      reason: inspection.reason || 'profile-not-disposable'
+    };
+  }
+  return { eligible: true, profileIds: inspection.discardProfileIds };
 }
 
 async function waitForProcessExit(pid, processAlive, timeoutMs = 10_000) {
@@ -196,13 +277,23 @@ async function removeMatchingProof(filePath, expected, { required = false } = {}
   await rm(filePath, { force: true });
 }
 
-export async function discardQuarantinedProfilesAfterShutdown({
+export async function finalizeQuarantinedProfilesAfterShutdown({
   stateDir,
-  profileIds,
+  discardProfileIds = [],
+  retainedProfileIds = [],
   expectedManager,
   processAlive = isProcessAlive
 }) {
-  if (!Array.isArray(profileIds) || profileIds.length === 0) return 0;
+  if (!Array.isArray(discardProfileIds) || !Array.isArray(retainedProfileIds)) {
+    throw new TypeError('Quarantined Profile identifiers must be arrays');
+  }
+  const profileIds = [...discardProfileIds, ...retainedProfileIds];
+  if (new Set(profileIds).size !== profileIds.length) {
+    throw new TypeError('Quarantined Profile identifiers must be unique');
+  }
+  if (profileIds.length === 0) {
+    return { recoveredQuarantinedProfiles: 0, retainedQuarantinedProfiles: 0 };
+  }
   if (!(await waitForProcessExit(expectedManager?.pid, processAlive))) {
     throw Object.assign(new Error(
       `Older Manager process ${expectedManager?.pid || 'unknown'} did not exit; quarantined Profiles were preserved`
@@ -213,7 +304,7 @@ export async function discardQuarantinedProfilesAfterShutdown({
   await managerLock.acquire();
   try {
     const publicProfiles = profileIds.map((id) => ({ id, state: 'error' }));
-    const inspection = await inspectQuarantinedEphemeralUpgrade({
+    const inspection = await inspectQuarantinedProfileUpgrade({
       stateDir,
       publicProfiles,
       processAlive
@@ -221,7 +312,11 @@ export async function discardQuarantinedProfilesAfterShutdown({
     if (
       !inspection.eligible ||
       inspection.profileIds.length !== profileIds.length ||
-      inspection.profileIds.some((id) => !profileIds.includes(id))
+      inspection.profileIds.some((id) => !profileIds.includes(id)) ||
+      inspection.discardProfileIds.length !== discardProfileIds.length ||
+      inspection.discardProfileIds.some((id) => !discardProfileIds.includes(id)) ||
+      inspection.retainedProfileIds.length !== retainedProfileIds.length ||
+      inspection.retainedProfileIds.some((id) => !retainedProfileIds.includes(id))
     ) {
       throw Object.assign(new Error(
         'Quarantined Profile evidence changed after Manager shutdown; Profiles were preserved'
@@ -247,21 +342,39 @@ export async function discardQuarantinedProfilesAfterShutdown({
       processAlive
     });
     await store.init();
-    for (const profileId of profileIds) {
+    for (const profileId of discardProfileIds) {
       await store.remove(profileId, { discardQuarantinedEphemeral: true });
     }
 
-    await settleDiscardedProfileTasks({ stateDir, profileIds, processAlive });
+    await settleDiscardedProfileTasks({ stateDir, profileIds: discardProfileIds, processAlive });
 
     if (currentPidRecord) await removeMatchingProof(pidFile, expectedManager, { required: true });
     await removeMatchingProof(
       join(stateDir, 'manager-shutdown-failure.json'),
       expectedManager
     );
-    return profileIds.length;
+    return {
+      recoveredQuarantinedProfiles: discardProfileIds.length,
+      retainedQuarantinedProfiles: retainedProfileIds.length
+    };
   } finally {
     await managerLock.release();
   }
+}
+
+export async function discardQuarantinedProfilesAfterShutdown({
+  stateDir,
+  profileIds,
+  expectedManager,
+  processAlive = isProcessAlive
+}) {
+  const result = await finalizeQuarantinedProfilesAfterShutdown({
+    stateDir,
+    discardProfileIds: profileIds,
+    expectedManager,
+    processAlive
+  });
+  return result.recoveredQuarantinedProfiles;
 }
 
 export async function recoverLegacyDiscardedQuarantineTasksAfterShutdown({

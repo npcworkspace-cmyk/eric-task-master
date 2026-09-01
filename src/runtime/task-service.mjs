@@ -389,6 +389,7 @@ export function createTaskService({
   const behaviorApplyChains = new Map();
   const cleanupReconcileTails = new Map();
   const finalizationFailures = new Map();
+  const startupQuarantineOwners = new Set();
   const registry = taskTypeRegistry || new TaskTypeRegistry({
     filePath: taskTypesFile || path.join(path.dirname(root), 'task-types.json'),
     snapshotRoot: taskTypesRoot || path.join(path.dirname(root), 'task-types'),
@@ -532,9 +533,11 @@ export function createTaskService({
     return Boolean(await readTaskCleanupReceipt(task));
   }
 
-  async function markCleanupUnknown(profileId, ownerId) {
+  async function markCleanupUnknown(profileId, ownerId, leaseGeneration = null) {
     if (typeof profileStore.markCleanupUnknown !== 'function') return;
-    await profileStore.markCleanupUnknown(profileId, ownerId).catch(() => {});
+    await profileStore.markCleanupUnknown(profileId, ownerId, {
+      ...(Number.isSafeInteger(leaseGeneration) ? { expectedGeneration: leaseGeneration } : {})
+    }).catch(() => {});
   }
 
   async function reconcileProfileCleanup(profile) {
@@ -549,11 +552,14 @@ export function createTaskService({
       workerPid: lease.pid
     });
     if (!confirmed) {
-      await markCleanupUnknown(profile.id, lease.ownerId);
+      await markCleanupUnknown(profile.id, lease.ownerId, lease.generation);
       return false;
     }
-    if (!(await profileStore.releaseLease(profile.id, lease.ownerId, { cleanupConfirmed: true }))) {
-      await markCleanupUnknown(profile.id, lease.ownerId);
+    if (!(await profileStore.releaseLease(profile.id, lease.ownerId, {
+      cleanupConfirmed: true,
+      ...(Number.isSafeInteger(lease.generation) ? { expectedGeneration: lease.generation } : {})
+    }))) {
+      await markCleanupUnknown(profile.id, lease.ownerId, lease.generation);
       return false;
     }
     await removeCleanupReceipt(receiptPath).catch(() => {});
@@ -572,11 +578,14 @@ export function createTaskService({
       workerPid: lease.pid
     });
     if (!confirmed) {
-      await markCleanupUnknown(profile.id, lease.ownerId);
+      await markCleanupUnknown(profile.id, lease.ownerId, lease.generation);
       return false;
     }
-    if (!(await profileStore.releaseLease(profile.id, lease.ownerId, { cleanupConfirmed: true }))) {
-      await markCleanupUnknown(profile.id, lease.ownerId);
+    if (!(await profileStore.releaseLease(profile.id, lease.ownerId, {
+      cleanupConfirmed: true,
+      ...(Number.isSafeInteger(lease.generation) ? { expectedGeneration: lease.generation } : {})
+    }))) {
+      await markCleanupUnknown(profile.id, lease.ownerId, lease.generation);
       return false;
     }
     await removeCleanupReceipt(receiptPath).catch(() => {});
@@ -742,7 +751,7 @@ export function createTaskService({
     if (!workerExitConfirmed && await processAlive(task.workerPid)) return false;
     const receipt = await readTaskCleanupReceipt(task);
     if (!receipt) {
-      await markCleanupUnknown(task.profileId, task.leaseOwner);
+      await markCleanupUnknown(task.profileId, task.leaseOwner, task.leaseGeneration);
       return false;
     }
     if (!task.checkpointSeal && task.supportsResume === true) {
@@ -765,7 +774,12 @@ export function createTaskService({
     }
     if (profile?.lease?.ownerId === task.leaseOwner) {
       try {
-        await profileStore.releaseLease(task.profileId, task.leaseOwner, { cleanupConfirmed: true });
+        await profileStore.releaseLease(task.profileId, task.leaseOwner, {
+          cleanupConfirmed: true,
+          ...(Number.isSafeInteger(profile.lease?.generation)
+            ? { expectedGeneration: profile.lease.generation }
+            : {})
+        });
         profile = await profileStore.get(task.profileId);
       } catch {
         return false;
@@ -792,6 +806,19 @@ export function createTaskService({
     await mkdir(cleanupReceiptsRoot, { recursive: true, mode: 0o700 });
     await registry.list();
     await reconcileProfileCleanups();
+    if (typeof profileStore.list === 'function') {
+      const startupProfiles = await profileStore.list();
+      for (const profile of startupProfiles) {
+        if (
+          profile.state === 'error' &&
+          profile.lease?.cleanupRequired === true &&
+          /^task:/u.test(profile.lease.ownerId || '') &&
+          !(await processAlive(profile.lease.pid))
+        ) {
+          startupQuarantineOwners.add(profile.lease.ownerId);
+        }
+      }
+    }
     const entries = await readdir(root, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory() || !entry.name.startsWith('task_')) continue;
@@ -853,6 +880,24 @@ export function createTaskService({
         settled: false,
         ...(task.cleanup || {})
       };
+      task.leaseGeneration = Number.isSafeInteger(task.leaseGeneration) && task.leaseGeneration >= 1
+        ? task.leaseGeneration
+        : null;
+      if (task.leaseHeld === true && task.leaseGeneration === null) {
+        try {
+          const leasedProfile = await profileStore.get(task.profileId);
+          if (
+            leasedProfile.lease?.ownerId === task.leaseOwner &&
+            Number.isSafeInteger(leasedProfile.lease.generation) &&
+            leasedProfile.lease.generation >= 1
+          ) {
+            task.leaseGeneration = leasedProfile.lease.generation;
+          }
+        } catch {
+          // The existing recovery path below remains fail-closed when the
+          // Profile record is missing or unreadable.
+        }
+      }
       // Never trust a stale persisted `settled` bit on its own.
       refreshCleanupSettled(task);
       const wasTerminallySettled = (
@@ -1486,7 +1531,10 @@ export function createTaskService({
     try {
       if (!released) {
         released = await profileStore.releaseLease(task.profileId, task.leaseOwner, {
-          cleanupConfirmed: task.cleanup.browserClosed === true
+          cleanupConfirmed: task.cleanup.browserClosed === true,
+          ...(Number.isSafeInteger(task.leaseGeneration)
+            ? { expectedGeneration: task.leaseGeneration }
+            : {})
         }) === true;
         if (!released) released = await taskLeaseIsAbsent(task);
       }
@@ -1507,7 +1555,7 @@ export function createTaskService({
         code: 'LEASE_RELEASE_FAILED',
         message: 'Profile lease release could not be confirmed'
       };
-      await markCleanupUnknown(task.profileId, task.leaseOwner);
+      await markCleanupUnknown(task.profileId, task.leaseOwner, task.leaseGeneration);
     }
     await update(task, { cleanup: task.cleanup });
     return released;
@@ -1595,7 +1643,7 @@ export function createTaskService({
     if (task.cleanup?.browserClosed === true) {
       await releaseTaskLease(task);
     } else if (!(await reconcileTaskCleanupReceipt(task, { workerExitConfirmed: true }))) {
-      await markCleanupUnknown(task.profileId, task.leaseOwner);
+      await markCleanupUnknown(task.profileId, task.leaseOwner, task.leaseGeneration);
     }
     if (claimedCompletion && task.state === 'verifying') {
       try {
@@ -1685,7 +1733,7 @@ export function createTaskService({
       task.cleanup = { ...(task.cleanup || {}), settled: false };
       task.progress = terminalProgress(task, 'failed');
       task.health = { status: 'failed', checkedAt: nowIso() };
-      await markCleanupUnknown(task.profileId, task.leaseOwner);
+      await markCleanupUnknown(task.profileId, task.leaseOwner, task.leaseGeneration);
       await persist(task).catch(() => {});
     } finally {
       entry.resolveExit?.();
@@ -1788,6 +1836,9 @@ export function createTaskService({
             pid: child.pid,
             ttlMs: LEASE_TTL_MS,
             cleanupRequired: true,
+            ...(Number.isSafeInteger(task.leaseGeneration)
+              ? { expectedGeneration: task.leaseGeneration }
+              : {}),
             ...taskLeaseAccess(task)
           });
         });
@@ -2380,6 +2431,7 @@ export function createTaskService({
         ...taskLeaseAccess(task)
       });
       task.leaseHeld = true;
+      task.leaseGeneration = leasedProfile.lease?.generation ?? null;
       if (task.state === 'cancelled' || task.cancelRequestedAt) {
         throw new TaskServiceError('TASK_LAUNCH_CANCELLED', 'Queued task was cancelled before browser startup', 409);
       }
@@ -2631,7 +2683,8 @@ export function createTaskService({
       startedAt: null,
       finishedAt: null,
       leaseOwner: `task:${id}`,
-      leaseHeld: false
+      leaseHeld: false,
+      leaseGeneration: null
     };
     task.displayName = buildTaskDisplayName(task);
     appendTimeline(task, 'task.created', {
@@ -3810,6 +3863,147 @@ export function createTaskService({
     return { task: await readPublicRecord(task), focusedAt };
   }
 
+  async function forceReleaseProfileLease(profileId, body = {}, suppliedCaller = {}) {
+    await ready;
+    requireServiceOpen();
+    const caller = callerIdentity(suppliedCaller);
+    if (caller.role !== 'manager-admin') {
+      throw new TaskServiceError(
+        'PROFILE_FORCE_RELEASE_FORBIDDEN',
+        'Only the Owner can force-release a quarantined Profile lease',
+        403
+      );
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new TaskServiceError('INVALID_PROFILE_FORCE_RELEASE', 'Force release request must be an object');
+    }
+    const allowed = new Set(['confirm', 'commandId', 'expectedUpdatedAt']);
+    const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+    if (unknown.length) {
+      throw new TaskServiceError(
+        'INVALID_PROFILE_FORCE_RELEASE',
+        `Unsupported force release fields: ${unknown.join(', ')}`
+      );
+    }
+    if (body.confirm !== true) {
+      throw new TaskServiceError(
+        'PROFILE_FORCE_RELEASE_CONFIRMATION_REQUIRED',
+        'Owner confirmation is required before a Profile lease can be force-released',
+        409
+      );
+    }
+    if (typeof body.commandId !== 'string' || !COMMAND_ID_PATTERN.test(body.commandId)) {
+      throw new TaskServiceError(
+        'INVALID_PROFILE_FORCE_RELEASE',
+        'commandId must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
+      );
+    }
+    if (typeof body.expectedUpdatedAt !== 'string' || !Number.isFinite(Date.parse(body.expectedUpdatedAt))) {
+      throw new TaskServiceError(
+        'INVALID_PROFILE_FORCE_RELEASE',
+        'expectedUpdatedAt must identify the Profile state shown to the Owner'
+      );
+    }
+    if (typeof profileStore.forceReleaseLease !== 'function') {
+      throw new TaskServiceError(
+        'PROFILE_FORCE_RELEASE_UNAVAILABLE',
+        'The Profile store does not support force release',
+        501
+      );
+    }
+
+    return serializeTaskMutation(async () => {
+      let profile = await reconcileAnyCleanup(await profileStore.get(profileId));
+      const replayAudit = profile.lastForcedLeaseRelease?.commandId === body.commandId
+        ? profile.lastForcedLeaseRelease
+        : null;
+      const lease = profile.lease;
+      const ownerId = lease?.ownerId || replayAudit?.ownerId || '';
+      const taskId = /^task:(task_[a-f0-9]{32})$/u.exec(ownerId)?.[1] ?? replayAudit?.taskId ?? null;
+      const task = taskId ? tasks.get(taskId) : null;
+
+      if (!replayAudit) {
+        if (
+          profile.kind !== 'persistent' || profile.state !== 'error' ||
+          lease?.cleanupRequired !== true || typeof profile.cleanupUnknownAt !== 'string'
+        ) {
+          throw new TaskServiceError(
+            'PROFILE_FORCE_RELEASE_NOT_ALLOWED',
+            'Only a cleanup-blocked persistent Profile can be force-released',
+            409
+          );
+        }
+        const recognizedOwner = taskId || /^profile-open:/u.test(ownerId) || /^session-import:/u.test(ownerId);
+        if (!recognizedOwner) {
+          throw new TaskServiceError(
+            'PROFILE_FORCE_RELEASE_OWNER_UNKNOWN',
+            'The quarantined lease owner is not a recognized Task Master runtime',
+            409
+          );
+        }
+        if (task && !TERMINAL_TASK_STATES.has(task.state)) {
+          throw new TaskServiceError(
+            'PROFILE_FORCE_RELEASE_TASK_ACTIVE',
+            'Terminate the active task before force-releasing its Profile lease',
+            409
+          );
+        }
+        const leaseProcessAlive = Number.isSafeInteger(lease?.pid) && lease.pid > 0
+          ? await processAlive(lease.pid)
+          : false;
+        if ((taskId && children.has(taskId)) || isKnownLiveLease(profileId, ownerId) || leaseProcessAlive) {
+          throw new TaskServiceError(
+            'PROFILE_FORCE_RELEASE_OWNER_ACTIVE',
+            'The lease owner may still be alive; close or terminate it before force release',
+            409
+          );
+        }
+      }
+
+      const released = await profileStore.forceReleaseLease(profileId, replayAudit ? {
+        commandId: body.commandId,
+        expectedOwnerId: replayAudit.ownerId,
+        expectedGeneration: replayAudit.revokedGeneration,
+        expectedUpdatedAt: body.expectedUpdatedAt
+      } : {
+        commandId: body.commandId,
+        expectedOwnerId: lease.ownerId,
+        expectedGeneration: lease.generation,
+        expectedUpdatedAt: body.expectedUpdatedAt
+      });
+      profile = released.profile;
+
+      if (task && task.cleanup?.forceReleaseCommandId !== body.commandId) {
+        task.leaseHeld = false;
+        task.cleanup = {
+          ...(task.cleanup || {}),
+          leaseReleased: true,
+          settled: false,
+          ownerForceReleased: true,
+          ownerForceReleasedAt: released.audit.releasedAt,
+          forceReleaseCommandId: body.commandId,
+          revokedLeaseGeneration: released.audit.revokedGeneration,
+          leaseFenceGeneration: released.audit.fenceGeneration
+        };
+        delete task.cleanup.leaseReleaseError;
+        task.revision = (Number.isSafeInteger(task.revision) ? task.revision : 1) + 1;
+        task.updatedAt = nowIso();
+        appendTimeline(task, 'profile.lease.force_released', {
+          actor: taskActor(caller),
+          message: 'Owner force-released the quarantined Profile lease; browser cleanup remains unconfirmed'
+        });
+        await persist(task);
+      }
+      if (task) finalizationFailures.delete(task.id);
+      void scheduleQueuedTasks().catch(() => {});
+      return {
+        profile: structuredClone(profile),
+        ...(taskId ? { taskId } : {}),
+        idempotent: released.idempotent === true
+      };
+    });
+  }
+
   async function applyProfileBehavior(profileId, requestedBehavior) {
     await ready;
     requireServiceOpen();
@@ -3938,7 +4132,7 @@ export function createTaskService({
       const forcedExits = [];
       for (const [taskId, entry] of children) {
         const task = tasks.get(taskId);
-        if (task) await markCleanupUnknown(task.profileId, task.leaseOwner);
+        if (task) await markCleanupUnknown(task.profileId, task.leaseOwner, task.leaseGeneration);
         forcedExits.push(entry.exitPromise);
         entry.child.kill?.('SIGKILL');
       }
@@ -3954,12 +4148,27 @@ export function createTaskService({
         }
       }
       const profiles = typeof profileStore.list === 'function' ? await profileStore.list() : [];
-      const cleanupUnconfirmed = profiles.some((profile) => (
-        profile.state === 'error' || profile.lease?.cleanupRequired === true
-      ));
+      const historicalQuarantineOwners = new Set(profiles.filter((profile) => (
+        profile.state === 'error' &&
+        profile.lease?.cleanupRequired === true &&
+        startupQuarantineOwners.has(profile.lease.ownerId) &&
+        /^(?:task:|profile-open:|session-import:)/u.test(profile.lease.ownerId || '')
+      )).map((profile) => profile.lease.ownerId));
+      const cleanupUnconfirmed = profiles.some((profile) => {
+        if (historicalQuarantineOwners.has(profile.lease?.ownerId)) return false;
+        return profile.state === 'error' || profile.lease?.cleanupRequired === true;
+      });
       const taskCleanupUnconfirmed = [...tasks.values()].some((task) => (
-        task.leaseHeld === true ||
-        (TERMINAL_TASK_STATES.has(task.state) && task.startedAt && task.cleanup?.settled !== true)
+        !(
+          TERMINAL_TASK_STATES.has(task.state) &&
+          (
+            historicalQuarantineOwners.has(task.leaseOwner) ||
+            (task.cleanup?.ownerForceReleased === true && task.leaseHeld !== true)
+          )
+        ) && (
+          task.leaseHeld === true ||
+          (TERMINAL_TASK_STATES.has(task.state) && task.startedAt && task.cleanup?.settled !== true)
+        )
       ));
       if (
         shutdownResults.some((result) => result.status === 'rejected') ||
@@ -4051,6 +4260,7 @@ export function createTaskService({
     listTaskAssets,
     applyTaskAssetAction,
     applyProfileBehavior,
+    forceReleaseProfileLease,
     openProfile,
     closeProfile,
     close
