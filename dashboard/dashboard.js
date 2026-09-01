@@ -387,6 +387,7 @@ const state = {
   notifications: [],
   notificationSettings: null,
   notificationSettingsDirty: false,
+  notificationSettingsEpoch: 0,
   notificationDrawerOpen: false,
   selectedTaskIds: new Set(),
   taskBatchResults: [],
@@ -1456,6 +1457,20 @@ function channelStatus(channel, label) {
   return parts.join(' · ');
 }
 
+function notificationSettingsMutationPending() {
+  return [...state.pendingMutations].some((key) => key.startsWith('settings:'));
+}
+
+function notificationSettingsSnapshotIsCurrent(epoch) {
+  return epoch === state.notificationSettingsEpoch &&
+    !state.notificationSettingsDirty &&
+    !notificationSettingsMutationPending();
+}
+
+function advanceNotificationSettingsEpoch() {
+  state.notificationSettingsEpoch += 1;
+}
+
 function renderNotificationSettings() {
   const settings = state.notificationSettings;
   const pending = [...state.pendingMutations].some((key) => key.startsWith('settings:'));
@@ -1580,6 +1595,7 @@ async function markAllNotificationsRead() {
 }
 
 async function refreshNotifications({ settings = false } = {}) {
+  const settingsEpoch = state.notificationSettingsEpoch;
   const requests = [request('/v1/notifications')];
   if ((settings || !state.notificationSettings) && !state.notificationSettingsDirty) {
     requests.push(request('/v1/notification-settings'));
@@ -1589,10 +1605,12 @@ async function refreshNotifications({ settings = false } = {}) {
     state.notifications = listFrom(results[0].value, 'notifications');
     state.sectionErrors.notifications = '';
   } else if (results[0].reason?.status !== 401) state.sectionErrors.notifications = results[0].reason?.message || t('error.read');
-  if (results[1]?.status === 'fulfilled' && !state.notificationSettingsDirty) {
+  if (results[1]?.status === 'fulfilled' && notificationSettingsSnapshotIsCurrent(settingsEpoch)) {
     state.notificationSettings = normalizeNotificationSettings(results[1].value);
     state.sectionErrors.notificationSettings = '';
-  } else if (results[1]?.status === 'rejected' && results[1].reason?.status !== 401) {
+  } else if (results[1]?.status === 'rejected' &&
+    notificationSettingsSnapshotIsCurrent(settingsEpoch) &&
+    results[1].reason?.status !== 401) {
     state.sectionErrors.notificationSettings = results[1].reason?.message || t('error.read');
   }
   renderNotifications(true);
@@ -1622,6 +1640,7 @@ async function saveNotificationSettings(event) {
     feishu: { enabled: ui.notificationFeishuEnabled.checked, ...pendingChannelSecrets('feishu') }
   } };
   state.pendingMutations.add('settings:save');
+  advanceNotificationSettingsEpoch();
   renderNotificationSettings();
   try {
     const result = await request('/v1/notification-settings', { method: 'PATCH', body });
@@ -1641,6 +1660,7 @@ async function saveNotificationSettings(event) {
     }
   } finally {
     state.pendingMutations.delete('settings:save');
+    advanceNotificationSettingsEpoch();
     renderNotificationSettings();
   }
 }
@@ -1649,6 +1669,7 @@ async function testNotificationChannel(channel, buttonNode) {
   const pendingKey = `settings:test:${channel}`;
   if (buttonNode.disabled || state.pendingMutations.has(pendingKey)) return;
   state.pendingMutations.add(pendingKey);
+  advanceNotificationSettingsEpoch();
   renderNotificationSettings();
   try {
     await request('/v1/notification-settings/test', { method: 'POST', body: { channel } });
@@ -1657,6 +1678,7 @@ async function testNotificationChannel(channel, buttonNode) {
     if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
   } finally {
     state.pendingMutations.delete(pendingKey);
+    advanceNotificationSettingsEpoch();
     await refreshNotifications({ settings: true });
     renderNotificationSettings();
   }
@@ -1668,6 +1690,7 @@ async function clearNotificationChannel(channel, buttonNode) {
   const pendingKey = `settings:clear:${channel}`;
   if (buttonNode.disabled || state.pendingMutations.has(pendingKey)) return;
   state.pendingMutations.add(pendingKey);
+  advanceNotificationSettingsEpoch();
   renderNotificationSettings();
   const channels = channel === 'telegram'
     ? { telegram: { enabled: false, botToken: null, chatId: null } }
@@ -1686,6 +1709,7 @@ async function clearNotificationChannel(channel, buttonNode) {
     if (error.status !== 401) setToast(error.message || t('error.operation'), 'error');
   } finally {
     state.pendingMutations.delete(pendingKey);
+    advanceNotificationSettingsEpoch();
     renderNotificationSettings();
   }
 }
@@ -1694,6 +1718,7 @@ async function openSystemNotificationSettings() {
   const pendingKey = 'settings:open-system';
   if (ui.notificationSystemSettings.disabled || state.pendingMutations.has(pendingKey)) return;
   state.pendingMutations.add(pendingKey);
+  advanceNotificationSettingsEpoch();
   renderNotificationSettings();
   try {
     const result = await request('/v1/notification-settings/open-system-settings', { method: 'POST' });
@@ -1707,6 +1732,7 @@ async function openSystemNotificationSettings() {
     }
   } finally {
     state.pendingMutations.delete(pendingKey);
+    advanceNotificationSettingsEpoch();
     renderNotificationSettings();
   }
 }
@@ -1807,13 +1833,18 @@ function mergeTask(task) {
   state.taskReceivedAt.set(task.id, Date.now());
 }
 
-function applyRefreshResult(key, result, receivedAt) {
+function applyRefreshResult(key, result, receivedAt, notificationSettingsEpoch) {
+  if (key === 'notificationSettings' && !notificationSettingsSnapshotIsCurrent(notificationSettingsEpoch)) {
+    return result.status === 'fulfilled';
+  }
   if (result.status === 'fulfilled') {
     state.sectionErrors[key] = '';
     if (key === 'profiles') state.profiles = listFrom(result.value, 'profiles');
     if (key === 'assets') state.assets = listFrom(result.value, 'assets');
     if (key === 'notifications') state.notifications = listFrom(result.value, 'notifications');
-    if (key === 'notificationSettings' && !state.notificationSettingsDirty) state.notificationSettings = normalizeNotificationSettings(result.value);
+    if (key === 'notificationSettings') {
+      state.notificationSettings = normalizeNotificationSettings(result.value);
+    }
     if (key === 'tasks') {
       const page = taskPageFrom(result.value);
       state.tasks = page.tasks;
@@ -1834,6 +1865,7 @@ async function refreshAll({ force = false } = {}) {
     return state.refreshPromise;
   }
   const sequence = ++state.refreshSequence;
+  const notificationSettingsEpoch = state.notificationSettingsEpoch;
   ui.refreshAll.disabled = true;
   ui.refreshAll.classList.add('is-loading');
   state.refreshPromise = (async () => {
@@ -1849,7 +1881,9 @@ async function refreshAll({ force = false } = {}) {
     if (sequence !== state.refreshSequence) return;
     const receivedAt = Date.now();
     const keys = ['profiles', 'tasks', 'assets', 'notifications', 'notificationSettings'];
-    const successCount = results.reduce((count, result, index) => count + Number(applyRefreshResult(keys[index], result, receivedAt) && index < 4), 0);
+    const successCount = results.reduce((count, result, index) => count + Number(
+      applyRefreshResult(keys[index], result, receivedAt, notificationSettingsEpoch) && index < 4
+    ), 0);
     const unauthorized = results.some((result) => result.status === 'rejected' && result.reason?.status === 401);
     const connectivityFailure = results.slice(0, 4).every((result) => result.status === 'rejected' && (result.reason?.status === 0 || result.reason?.status >= 500));
     if (unauthorized) markAuthorizationRequired();

@@ -110,6 +110,8 @@ test('task panel keeps bounded same-origin reads, paged and batch task controls,
   assert.match(source, /runTaskBatch/);
   assert.match(source, /Math\.min\(TASK_BATCH_CONCURRENCY, tasks\.length\)/);
   assert.match(source, /notificationSettingsDirty/);
+  assert.match(source, /notificationSettingsEpoch/);
+  assert.match(source, /notificationSettingsSnapshotIsCurrent/);
   assert.match(source, /key\.startsWith\('settings:'\)/);
   assert.match(source, /canOpenSettings/);
   assert.match(source, /signingConfigured/);

@@ -24,6 +24,15 @@ function ago(ms) {
   return new Date(Date.now() - ms).toISOString();
 }
 
+async function waitForCondition(predicate, label, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 function serviceError(statusCode, code, message) {
   return Object.assign(new Error(message), { statusCode, code });
 }
@@ -304,7 +313,15 @@ function createNotificationHarness(control) {
       }
       return { resolved };
     },
-    async getSettings() { return publicSettings(); },
+    async getSettings() {
+      const readId = ++control.notificationSettingsReadSequence;
+      const snapshot = publicSettings();
+      const delayMs = control.notificationSettingsReadDelayMs;
+      control.notificationSettingsReadsStarted.push(readId);
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      control.notificationSettingsReadsCompleted.push(readId);
+      return snapshot;
+    },
     async updateSettings(body) {
       control.notificationSettingPatches.push(structuredClone(body));
       for (const name of ['system', 'telegram', 'feishu']) {
@@ -359,6 +376,10 @@ const control = {
   notificationSettingPatches: [],
   notificationTests: [],
   notificationTestDelayMs: 0,
+  notificationSettingsReadDelayMs: 0,
+  notificationSettingsReadSequence: 0,
+  notificationSettingsReadsStarted: [],
+  notificationSettingsReadsCompleted: [],
   notificationSystemOpens: 0,
   degradeNextNotificationSync: false,
   notificationSettings: {
@@ -732,16 +753,31 @@ try {
     .at(-1);
   assert.deepEqual(telegramTestRequest.body, { channel: 'telegram' });
   assert.equal(JSON.stringify(telegramTestRequest.body).includes('token'), false);
+  await page.waitForFunction(() => document.querySelector('#refresh-all')?.disabled === false);
+  control.notificationSettingsReadDelayMs = 1_200;
+  const settingsReadBeforeRefresh = control.notificationSettingsReadSequence;
+  await page.locator('#refresh-all').click();
+  await waitForCondition(
+    () => control.notificationSettingsReadSequence > settingsReadBeforeRefresh,
+    'the delayed notification-settings read to start'
+  );
+  const staleSettingsReadId = control.notificationSettingsReadSequence;
   page.once('dialog', (dialog) => dialog.accept());
   await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).click();
   await page.locator('#dashboard-message').filter({ hasText: 'Telegram 凭据已清除' }).waitFor();
   const clearedTelegram = control.notificationSettingPatches.at(-1).channels.telegram;
   assert.deepEqual(clearedTelegram, { enabled: false, botToken: null, chatId: null });
+  await waitForCondition(
+    () => control.notificationSettingsReadsCompleted.includes(staleSettingsReadId),
+    'the stale notification-settings read to complete'
+  );
+  control.notificationSettingsReadDelayMs = 0;
+  await page.waitForFunction(() => document.querySelector('#refresh-all')?.disabled === false);
   await page.locator('[data-channel-card="telegram"][data-channel-state="unconfigured"]').waitFor();
   assert.match(await page.locator('#notification-telegram-status').textContent(), /待配置或测试/u);
   assert.equal(await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '发送测试' }).isDisabled(), true);
   assert.equal(await page.locator('.setting-card').filter({ hasText: 'Telegram' }).getByRole('button', { name: '清除凭据' }).isDisabled(), true);
-  checks.push('bell-only notification drawer plus three-card masked settings, dirty-state protection, channel status, system settings, signed Feishu, serialized tests, and explicit credential clearing');
+  checks.push('bell-only notification drawer plus three-card masked settings, dirty-state and stale-read protection, channel status, system settings, signed Feishu, serialized tests, and explicit credential clearing');
 
   await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
   assert.equal(await page.getAttribute('html', 'lang'), 'en');
