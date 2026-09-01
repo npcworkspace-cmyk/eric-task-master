@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 import { isBehaviorMode, normalizeBehaviorMode, publicTask, TERMINAL_TASK_STATES } from '../contracts.mjs';
 import { normalizeAgentName } from '../lib/agent-token.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
-import { isReservedAgentClientId } from '../lib/principal.mjs';
 import { TaskTypeRegistry } from '../lib/task-type-registry.mjs';
 import { readCleanupReceipt, removeCleanupReceipt, verifyCleanupReceipt } from '../lib/cleanup-receipt.mjs';
 import { FULL_HUMAN_INTERACTION_CONTRACT } from '../lib/interaction-contract.mjs';
@@ -16,6 +15,44 @@ import {
   snapshotOutputTree
 } from '../lib/output-seal.mjs';
 import { sanitizePublicTaskFailure } from '../lib/public-task-failure.mjs';
+import { TaskServiceError } from './task-service-error.mjs';
+import {
+  artifactId,
+  createTaskArtifactStore,
+  declaredArtifactFiles,
+  inside,
+  MAX_ARTIFACTS
+} from './task-artifact-store.mjs';
+import {
+  appendTimeline,
+  boundedText,
+  buildTaskDisplayName,
+  callerIdentity,
+  canAccess,
+  canUseProfile,
+  clone,
+  COMMAND_ID_PATTERN,
+  decodeCursor,
+  encodeCursor,
+  filterTaskTypes,
+  isSamePrincipal,
+  isTaskOwner,
+  legacyExternalCostUnsupportedError,
+  MAX_TASK_COMMANDS,
+  migrateLegacyExternalCostState,
+  normalizeTaskCoordination,
+  normalizeTaskLabel,
+  normalizeTaskTiming,
+  profileCallerIdentity,
+  requestHash,
+  requireCoordinationBody,
+  requireProfileUse,
+  taskActor,
+  taskLeaseAccess,
+  validateTaskInput
+} from './task-record-policy.mjs';
+
+export { TaskServiceError } from './task-service-error.mjs';
 
 const TASK_WORKER = fileURLToPath(new URL('./task-worker.mjs', import.meta.url));
 const PROFILE_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
@@ -35,8 +72,6 @@ const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const BEHAVIOR_APPLY_TIMEOUT_MS = 5_000;
 const FOCUS_APPLY_TIMEOUT_MS = 5_000;
 const HANDOFF_CONTINUE_TIMEOUT_MS = 5_000;
-const MAX_ARTIFACTS = 100;
-const MAX_ARTIFACT_CHUNK_BYTES = 48 * 1024;
 const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const MAX_DIAGNOSTICS_MANIFEST_BYTES = 64 * 1024;
 const OUTPUT_SEAL_LIMITS = outputSealLimitsForBudget();
@@ -45,12 +80,6 @@ const MAX_ATTEMPTS = 100;
 const MAX_DIAGNOSTIC_ATTEMPTS = 16;
 const RESUME_KEY_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 const HANDOFF_ID_PATTERN = /^handoff_[a-f0-9]{32}$/;
-const LEGACY_EXTERNAL_COST_FIELDS = Object.freeze([
-  'externalCost',
-  'externalCostBudget',
-  'externalCostLedger',
-  'externalCostUsage'
-]);
 const PROFILE_CLEANUP_QUEUE_REASON = 'Waiting for confirmed Profile cleanup';
 const PROFILE_BUSY_QUEUE_REASON = 'Waiting for Profile to become idle';
 const CLEANUP_RECONCILE_INTERVAL_MS = 2_000;
@@ -58,11 +87,7 @@ const CLEANUP_RECONCILE_GRACE_MS = 60_000;
 const PROGRESS_PHASE_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const WORKER_ACTIVITY_PHASES = new Set(['navigating', 'clicking', 'typing', 'hovering', 'scrolling', 'working']);
 const WORKER_ACTIVITY_STATUSES = new Set(['active', 'succeeded', 'unknown']);
-const COMMAND_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 const REPORT_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
-const TASK_LABEL_MAX_LENGTH = 80;
-const MAX_TASK_COMMANDS = 200;
-const MAX_TASK_TIMELINE = 500;
 const MAX_TASK_ASSET_BATCH = 100;
 const MAX_TASK_ASSET_BLOCKING_TASKS = 8;
 const TRANSIENT_ASSET_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -107,33 +132,6 @@ export const TASK_SERVICE_DEADLINES = Object.freeze({
   profileCloseMs: 25_000,
   profileKillGraceMs: 5_000
 });
-
-const ARTIFACT_MIME_TYPES = Object.freeze({
-  '.csv': 'text/csv',
-  '.htm': 'text/html',
-  '.html': 'text/html',
-  '.jpeg': 'image/jpeg',
-  '.jpg': 'image/jpeg',
-  '.json': 'application/json',
-  '.jsonl': 'application/x-ndjson',
-  '.log': 'text/plain',
-  '.md': 'text/markdown',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.tsv': 'text/tab-separated-values',
-  '.txt': 'text/plain',
-  '.webp': 'image/webp'
-});
-
-export class TaskServiceError extends Error {
-  constructor(code, message, statusCode = 400, details) {
-    super(message);
-    this.name = 'TaskServiceError';
-    this.code = code;
-    this.statusCode = statusCode;
-    this.details = details;
-  }
-}
 
 function nowIso() {
   return new Date().toISOString();
@@ -206,436 +204,6 @@ function workerActivity(value) {
     !WORKER_ACTIVITY_STATUSES.has(value.status)
   ) return null;
   return { phase: value.phase, status: value.status, updatedAt: nowIso() };
-}
-
-function clone(value) {
-  return structuredClone(value);
-}
-
-function boundedText(value, { field, maximum = 2_000, required = true } = {}) {
-  if (typeof value !== 'string' || (required && !value.trim()) || value.length > maximum) {
-    throw new TaskServiceError(
-      'INVALID_TASK_COMMAND',
-      `${field || 'text'} must be ${required ? 'a non-empty ' : ''}string of at most ${maximum} characters`
-    );
-  }
-  return redactSensitiveText(value).slice(0, maximum);
-}
-
-function normalizeTaskLabel(value, fallback) {
-  if (value === undefined) {
-    const safeFallback = redactSensitiveText(typeof fallback === 'string' ? fallback.trim() : 'task')
-      .replace(/[\u0000-\u001f\u007f]/gu, ' ')
-      .trim()
-      .slice(0, TASK_LABEL_MAX_LENGTH);
-    return safeFallback || 'task';
-  }
-  const candidate = value;
-  if (
-    typeof candidate !== 'string' || !candidate.trim() || candidate.length > TASK_LABEL_MAX_LENGTH ||
-    /[\u0000-\u001f\u007f]/u.test(candidate)
-  ) {
-    throw new TaskServiceError(
-      'INVALID_TASK_LABEL',
-      `taskLabel must be a non-empty string of at most ${TASK_LABEL_MAX_LENGTH} characters without control characters`
-    );
-  }
-  return redactSensitiveText(candidate.trim()).slice(0, TASK_LABEL_MAX_LENGTH);
-}
-
-const AGENT_LABELS = Object.freeze({
-  codex: 'Codex',
-  'claude-desktop': 'Claude',
-  'claude-code': 'Claude',
-  workbuddy: 'WorkBuddy',
-  hermes: 'Hermes',
-  pi: 'Pi',
-  dsh: 'DSH',
-  openclaw: 'OpenClaw'
-});
-
-function stableAgentLabel(taskOrCaller) {
-  if (taskOrCaller?.role === 'manager-admin' || taskOrCaller?.ownerRole === 'manager-admin') return 'Manager';
-  const clientId = String(taskOrCaller?.clientId ?? taskOrCaller?.ownerClientId ?? 'agent');
-  const hostKey = clientId.includes(':')
-    ? clientId.slice(clientId.lastIndexOf(':') + 1)
-    : clientId.split(/[._]/u)[0];
-  if (AGENT_LABELS[hostKey]) return AGENT_LABELS[hostKey];
-  const safe = hostKey.replace(/[^a-zA-Z0-9-]/gu, '').slice(0, 24);
-  return safe || 'Agent';
-}
-
-function compactCreatedAt(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return 'unknown-time';
-  return date.toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z').replace('T', '-');
-}
-
-function buildTaskDisplayName(task) {
-  return `${stableAgentLabel(task)}-${task.taskLabel || task.taskType || 'task'}-${compactCreatedAt(task.createdAt)}`;
-}
-
-function normalizeTaskTiming(task) {
-  if (!task.timing || typeof task.timing !== 'object' || Array.isArray(task.timing) || task.timing.version !== 1) {
-    return null;
-  }
-  task.timing.cooldownDurationMs = Number.isFinite(task.timing.cooldownDurationMs)
-    ? Math.max(0, Math.round(task.timing.cooldownDurationMs))
-    : 0;
-  return task.timing;
-}
-
-function taskActor(caller) {
-  return {
-    role: caller.role,
-    clientId: caller.clientId,
-    ...(caller.role === 'agent' && caller.agentName ? { name: caller.agentName } : {})
-  };
-}
-
-function normalizeTaskCoordination(task) {
-  task.revision = Number.isSafeInteger(task.revision) && task.revision >= 1 ? task.revision : 1;
-  task.jobId = typeof task.jobId === 'string' && /^job_[a-f0-9]{32}$/.test(task.jobId)
-    ? task.jobId
-    : `job_${createHash('sha256').update(task.id).digest('hex').slice(0, 32)}`;
-  task.timeline = Array.isArray(task.timeline)
-    ? task.timeline.filter((entry) => entry && typeof entry === 'object').slice(-MAX_TASK_TIMELINE)
-    : [];
-  const latestTimelineSequence = task.timeline.reduce((maximum, entry) => (
-    Number.isSafeInteger(entry.sequence) && entry.sequence > maximum ? entry.sequence : maximum
-  ), 0);
-  task.timelineSequence = Number.isSafeInteger(task.timelineSequence) && task.timelineSequence >= 0
-    ? Math.max(task.timelineSequence, latestTimelineSequence)
-    : latestTimelineSequence;
-  task.commands = Array.isArray(task.commands)
-    ? task.commands.filter((entry) => (
-        entry && typeof entry === 'object' &&
-        typeof entry.commandId === 'string' && COMMAND_ID_PATTERN.test(entry.commandId)
-      )).slice(-MAX_TASK_COMMANDS)
-    : [];
-  task.reports = Array.isArray(task.reports)
-    ? task.reports.filter((entry) => entry && typeof entry === 'object').slice(-20)
-    : [];
-  if (!task.report || typeof task.report !== 'object' || Array.isArray(task.report)) task.report = null;
-  if (task.input && typeof task.input === 'object' && !Array.isArray(task.input)) {
-    task.inputRevisionHash ||= requestHash(task.input);
-  }
-}
-
-function appendTimeline(task, type, { actor = null, message = '', commandId = null, status = null } = {}) {
-  normalizeTaskCoordination(task);
-  task.timelineSequence += 1;
-  const entry = {
-    id: `event_${randomUUID().replaceAll('-', '')}`,
-    sequence: task.timelineSequence,
-    type,
-    at: nowIso(),
-    ...(actor ? { actor: clone(actor) } : {}),
-    ...(message ? { message: redactSensitiveText(message).slice(0, 2_000) } : {}),
-    ...(commandId ? { commandId } : {}),
-    ...(status ? { status } : {})
-  };
-  task.timeline.push(entry);
-  task.timeline = task.timeline.slice(-MAX_TASK_TIMELINE);
-  return entry;
-}
-
-function requireCoordinationBody(body, allowedFields) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    throw new TaskServiceError('INVALID_TASK_COMMAND', 'Task command body must be an object');
-  }
-  const unknown = Object.keys(body).filter((key) => !allowedFields.has(key));
-  if (unknown.length) {
-    throw new TaskServiceError('INVALID_TASK_COMMAND', `Unsupported task command fields: ${unknown.join(', ')}`);
-  }
-  if (typeof body.commandId !== 'string' || !COMMAND_ID_PATTERN.test(body.commandId)) {
-    throw new TaskServiceError(
-      'INVALID_TASK_COMMAND',
-      'commandId must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
-    );
-  }
-  if (!Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1) {
-    throw new TaskServiceError('INVALID_TASK_COMMAND', 'expectedRevision must be a positive integer');
-  }
-}
-
-function callerIdentity(caller = {}) {
-  if (caller.role === 'manager-admin') {
-    return { role: 'manager-admin', clientId: caller.clientId || 'manager-admin' };
-  }
-  if (
-    caller.role === 'agent' && typeof caller.clientId === 'string' && caller.clientId &&
-    !isReservedAgentClientId(caller.clientId)
-  ) {
-    let agentName;
-    try {
-      agentName = normalizeAgentName(caller.agentName ?? caller.clientId);
-    } catch {
-      throw new TaskServiceError('TASK_ACCESS_DENIED', 'Agent display identity is invalid', 403);
-    }
-    return { role: 'agent', clientId: caller.clientId, agentName };
-  }
-  throw new TaskServiceError('TASK_ACCESS_DENIED', 'Task operation is not allowed for this caller', 403);
-}
-
-function profileCallerIdentity(caller = {}) {
-  if (
-    ['manager-admin', 'agent'].includes(caller.role) &&
-    typeof caller.clientId === 'string' && caller.clientId &&
-    !(caller.role === 'agent' && isReservedAgentClientId(caller.clientId))
-  ) {
-    return { role: caller.role, clientId: caller.clientId };
-  }
-  throw new TaskServiceError('PROFILE_ACCESS_DENIED', 'Profile operation is not allowed for this caller', 403);
-}
-
-function canAccess(task, caller) {
-  return caller.role === 'manager-admin' || (
-    caller.role === 'agent' && task.ownerRole === 'agent' && task.ownerClientId === caller.clientId
-  );
-}
-
-function isTaskOwner(task, caller) {
-  return task.ownerRole === caller.role && task.ownerClientId === caller.clientId;
-}
-
-function isSamePrincipal(entry, caller) {
-  return entry?.ownerRole === caller.role && entry?.ownerClientId === caller.clientId;
-}
-
-function canUseProfile(profile, caller) {
-  if (caller.role === 'manager-admin') return true;
-  return caller.role === 'agent' && Boolean(profile);
-}
-
-function requireProfileUse(profile, caller) {
-  if (!canUseProfile(profile, caller)) {
-    throw new TaskServiceError(
-      'PROFILE_ACCESS_DENIED',
-      'This Agent is not authorized to use this Profile',
-      403
-    );
-  }
-  return profile;
-}
-
-function taskLeaseAccess(task) {
-  return task.ownerRole === 'manager-admin'
-    ? {}
-    : { authorizedClientId: task.ownerClientId };
-}
-
-function taskTypeMatchesDomain(taskType, domain) {
-  if (!domain) return true;
-  const candidate = domain.trim().toLowerCase();
-  return (taskType.domains || []).some((registered) => (
-    registered === candidate ||
-    (registered.startsWith('*.') && candidate.endsWith(registered.slice(1)))
-  ));
-}
-
-function filterTaskTypes(taskTypes, filters = {}) {
-  const query = typeof filters.query === 'string' ? filters.query.trim().toLowerCase() : '';
-  const domain = typeof filters.domain === 'string' ? filters.domain.trim().toLowerCase() : '';
-  const intent = typeof filters.intent === 'string' ? filters.intent.trim().toLowerCase() : '';
-  if (query.length > 120 || domain.length > 253 || intent.length > 80) {
-    throw new TaskServiceError('INVALID_TASK_TYPE_FILTER', 'Task type filters exceed their bounded length');
-  }
-  return taskTypes.filter((taskType) => {
-    const searchable = [
-      taskType.id,
-      taskType.name,
-      taskType.title,
-      taskType.description,
-      ...(taskType.tags || []),
-      ...(taskType.intents || [])
-    ].filter(Boolean).join(' ').toLowerCase();
-    return (!query || searchable.includes(query)) &&
-      (!intent || (taskType.intents || []).includes(intent)) &&
-      taskTypeMatchesDomain(taskType, domain);
-  });
-}
-
-function migrateLegacyExternalCostState(task) {
-  const wasResumable = task.supportsResume === true || task.resumeCheckpointValid === true || Boolean(task.checkpoint);
-  const paid = task.legacyPaidRuntime === true || LEGACY_EXTERNAL_COST_FIELDS.some((field) => (
-    Object.hasOwn(task, field) && task[field] !== null && task[field] !== undefined
-  ));
-  for (const field of LEGACY_EXTERNAL_COST_FIELDS) delete task[field];
-  if (paid) {
-    task.legacyPaidRuntime = true;
-    task.supportsResume = false;
-    if (Array.isArray(task.result?.evidence)) {
-      task.result.evidence = task.result.evidence.filter((item) => !(
-        item?.kind === 'count' &&
-        ['external-cost-estimated', 'external-cost-actual'].includes(item?.label)
-      ));
-    }
-  }
-  return { paid, wasResumable };
-}
-
-function legacyExternalCostUnsupportedError() {
-  return {
-    code: 'TASK_EXTERNAL_COST_UNSUPPORTED',
-    message: 'This task used the external-cost runtime removed in Task Master 2.8.0 and cannot run or resume.'
-  };
-}
-
-function stableValue(value) {
-  if (Array.isArray(value)) return value.map(stableValue);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.keys(value).sort().map((key) => [key, stableValue(value[key])])
-  );
-}
-
-function inputSchemaError(location, message, { expectedType, receivedType } = {}) {
-  throw new TaskServiceError(
-    'TASK_INPUT_SCHEMA_FAILED',
-    `Task input ${location} ${message}`,
-    400,
-    {
-      field: location,
-      reason: message,
-      ...(expectedType ? { expectedType } : {}),
-      ...(receivedType ? { receivedType } : {})
-    }
-  );
-}
-
-function jsonValueType(value) {
-  if (value === null) return 'null';
-  if (Array.isArray(value)) return 'array';
-  if (Number.isInteger(value)) return 'integer';
-  if (typeof value === 'number') return 'number';
-  return typeof value;
-}
-
-function validateTaskInput(value, schema, location = '$', depth = 0) {
-  if (!schema || typeof schema !== 'object') return;
-  if (depth > 20) inputSchemaError(location, 'is nested too deeply');
-  if (Array.isArray(schema.enum) && !schema.enum.some((item) => JSON.stringify(item) === JSON.stringify(value))) {
-    inputSchemaError(location, 'is not one of the allowed values');
-  }
-  const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
-  if (types.length) {
-    const actual = jsonValueType(value);
-    const matches = types.includes(actual) || (actual === 'integer' && types.includes('number'));
-    if (!matches) inputSchemaError(location, `must be ${types.join(' or ')}`, {
-      expectedType: types.join(' | '),
-      receivedType: actual
-    });
-  }
-  if (typeof value === 'string') {
-    if (Number.isSafeInteger(schema.minLength) && value.length < schema.minLength) {
-      inputSchemaError(location, `must contain at least ${schema.minLength} characters`);
-    }
-    if (Number.isSafeInteger(schema.maxLength) && value.length > schema.maxLength) {
-      inputSchemaError(location, `must contain at most ${schema.maxLength} characters`);
-    }
-    if (typeof schema.pattern === 'string' && !(new RegExp(schema.pattern, 'u')).test(value)) {
-      inputSchemaError(location, 'does not match the required pattern');
-    }
-  }
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    if (typeof schema.minimum === 'number' && value < schema.minimum) inputSchemaError(location, `must be at least ${schema.minimum}`);
-    if (typeof schema.maximum === 'number' && value > schema.maximum) inputSchemaError(location, `must be at most ${schema.maximum}`);
-  }
-  if (Array.isArray(value)) {
-    if (Number.isSafeInteger(schema.minItems) && value.length < schema.minItems) inputSchemaError(location, `must contain at least ${schema.minItems} items`);
-    if (Number.isSafeInteger(schema.maxItems) && value.length > schema.maxItems) inputSchemaError(location, `must contain at most ${schema.maxItems} items`);
-    if (schema.items && typeof schema.items === 'object') {
-      value.forEach((item, index) => validateTaskInput(item, schema.items, `${location}[${index}]`, depth + 1));
-    }
-  }
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
-    const required = Array.isArray(schema.required) ? schema.required : [];
-    for (const key of required) {
-      if (!Object.hasOwn(value, key)) inputSchemaError(`${location}.${key}`, 'is required');
-    }
-    for (const [key, item] of Object.entries(value)) {
-      if (Object.hasOwn(properties, key)) {
-        validateTaskInput(item, properties[key], `${location}.${key}`, depth + 1);
-      } else if (schema.additionalProperties === false) {
-        inputSchemaError(`${location}.${key}`, 'is not supported');
-      } else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
-        validateTaskInput(item, schema.additionalProperties, `${location}.${key}`, depth + 1);
-      }
-    }
-  }
-}
-
-function requestHash(value) {
-  return createHash('sha256').update(JSON.stringify(stableValue(value))).digest('hex');
-}
-
-function encodeCursor(task) {
-  return Buffer.from(JSON.stringify({ id: task.id }), 'utf8').toString('base64url');
-}
-
-function decodeCursor(value) {
-  if (typeof value !== 'string' || !value || value.length > 512) {
-    throw new TaskServiceError('INVALID_TASK_CURSOR', 'Task cursor is invalid');
-  }
-  try {
-    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
-    if (!decoded || typeof decoded.id !== 'string' || !/^task_[a-f0-9]{32}$/.test(decoded.id)) throw new Error();
-    return decoded.id;
-  } catch {
-    throw new TaskServiceError('INVALID_TASK_CURSOR', 'Task cursor is invalid');
-  }
-}
-
-function inside(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
-}
-
-function artifactId(taskIdValue, relativePath) {
-  return `artifact_${createHash('sha256')
-    .update(taskIdValue)
-    .update('\0')
-    .update(relativePath)
-    .digest('hex')
-    .slice(0, 32)}`;
-}
-
-function declaredArtifactFiles(task) {
-  const evidence = Array.isArray(task.result?.evidence) ? task.result.evidence : [];
-  const seen = new Set();
-  const files = [];
-  for (const item of evidence) {
-    if (
-      !item ||
-      item.kind !== 'artifact' ||
-      item.agentVisible === false ||
-      typeof item.file !== 'string' ||
-      !item.file ||
-      item.file.includes('\0') ||
-      path.isAbsolute(item.file)
-    ) continue;
-    const normalized = path.normalize(item.file);
-    if (normalized === '.' || normalized === '..' || normalized.startsWith(`..${path.sep}`)) continue;
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    files.push(normalized);
-    if (files.length >= MAX_ARTIFACTS) break;
-  }
-  return files;
-}
-
-function artifactMimeType(filePath) {
-  return ARTIFACT_MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
-}
-
-function isTextMimeType(mimeType) {
-  return mimeType.startsWith('text/') || [
-    'application/json',
-    'application/x-ndjson',
-    'image/svg+xml'
-  ].includes(mimeType);
 }
 
 function sanitizeError(error, fallbackCode = 'TASK_FAILED') {
@@ -827,7 +395,6 @@ export function createTaskService({
   const controlChains = new Map();
   const behaviorApplyChains = new Map();
   const cleanupReconcileTails = new Map();
-  const artifactDigestCache = new Map();
   const finalizationFailures = new Map();
   const registry = taskTypeRegistry || new TaskTypeRegistry({
     filePath: taskTypesFile || path.join(path.dirname(root), 'task-types.json'),
@@ -841,6 +408,26 @@ export function createTaskService({
   let closing = false;
   let closePromise;
   const ready = initialize();
+  const {
+    artifactDeclarations,
+    assertArtifactPathIdentity,
+    cacheArtifactDigest,
+    collectArtifacts,
+    hashOpenFile,
+    listArtifacts,
+    openValidatedArtifact,
+    readArtifact,
+    sameFileIdentity,
+    sameStableArtifactMetadata
+  } = createTaskArtifactStore({
+    root,
+    getTask: (id) => tasks.get(id),
+    awaitReady: () => ready,
+    awaitTaskPersistence,
+    reconcileTaskForRead,
+    normalizeDiagnosticHistory,
+    artifactValidationHook
+  });
   void ready.then(() => scheduleQueuedTasks()).catch(() => {});
 
   function requireServiceOpen() {
@@ -3572,393 +3159,6 @@ export function createTaskService({
     if (!task) throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
     await awaitTaskPersistence(id);
     return clone(task);
-  }
-
-  function artifactDeclarations(task, { includeUnverifiedResult = false } = {}) {
-    const resultVerified = task.state === 'completed' && task.completion?.integrity !== 'invalid' &&
-      typeof task.completion?.verifiedAt === 'string';
-    const results = resultVerified || includeUnverifiedResult
-      ? declaredArtifactFiles(task).map((relativePath) => ({ relativePath, kind: 'result' }))
-      : [];
-    normalizeDiagnosticHistory(task);
-    const diagnosticAttempts = [
-      ...task.diagnosticHistory,
-      {
-        attempt: task.attempt,
-        screenshot: task.lastScreenshot?.attempt === task.attempt ? task.lastScreenshot : null,
-        observation: task.lastObservation?.attempt === task.attempt ? task.lastObservation : null
-      }
-    ];
-    const byAttempt = new Map();
-    for (const entry of diagnosticAttempts) {
-      if (entry?.screenshot || entry?.observation) byAttempt.set(entry.attempt, entry);
-    }
-    const diagnostics = [];
-    const addDiagnostic = (pointer, kind, attempt, historical) => {
-      if (typeof pointer?.path !== 'string') return;
-      const relativePath = path.relative(task.outputDir, pointer.path);
-      if (
-        !relativePath || path.isAbsolute(relativePath) || relativePath === '..' ||
-        relativePath.startsWith(`..${path.sep}`) ||
-        diagnostics.some((item) => item.relativePath === relativePath) ||
-        results.some((item) => item.relativePath === relativePath)
-      ) return;
-      diagnostics.push({ relativePath, kind, attempt, historical });
-    };
-    for (const entry of [...byAttempt.values()].sort((left, right) => right.attempt - left.attempt)) {
-      const historical = entry.attempt !== task.attempt;
-      addDiagnostic(entry.observation, 'diagnostic-observation', entry.attempt, historical);
-      addDiagnostic(entry.screenshot, 'diagnostic-screenshot', entry.attempt, historical);
-    }
-    // Diagnostics are recovery evidence and stay ahead of result files while the
-    // total public artifact list remains bounded.
-    return [...diagnostics, ...results].slice(0, MAX_ARTIFACTS).map(({ relativePath, kind, attempt, historical }) => ({
-      id: artifactId(task.id, relativePath),
-      relativePath,
-      name: `${historical ? `attempt-${attempt}-` : ''}${path.basename(relativePath)}`.slice(0, 255),
-      kind,
-      mimeType: artifactMimeType(relativePath),
-      agentVisible: true
-    }));
-  }
-
-  function sameFileIdentity(left, right) {
-    return typeof left?.dev === 'bigint' && typeof left?.ino === 'bigint' &&
-      typeof right?.dev === 'bigint' && typeof right?.ino === 'bigint' &&
-      left.ino > 0n && right.ino > 0n &&
-      left.dev === right.dev && left.ino === right.ino;
-  }
-
-  function sameStableArtifactMetadata(left, right) {
-    return sameFileIdentity(left, right) &&
-      left.size === right.size && left.mtimeNs === right.mtimeNs &&
-      left.ctimeNs === right.ctimeNs && left.birthtimeNs === right.birthtimeNs;
-  }
-
-  function cacheableArtifactMetadata(stats) {
-    // ctime is the cross-platform generation signal for an in-place rewrite.
-    // If a filesystem cannot provide it, correctness wins over caching and the
-    // complete artifact is hashed on every verification.
-    return typeof stats?.ctimeNs === 'bigint' && stats.ctimeNs > 0n;
-  }
-
-  async function hashOpenFile(handle, sizeBytes) {
-    const digest = createHash('sha256');
-    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, sizeBytes)));
-    let offset = 0;
-    while (offset < sizeBytes) {
-      const length = Math.min(buffer.length, sizeBytes - offset);
-      const { bytesRead } = await handle.read(buffer, 0, length, offset);
-      if (bytesRead <= 0) throw new Error('artifact ended while hashing');
-      digest.update(buffer.subarray(0, bytesRead));
-      offset += bytesRead;
-    }
-    return digest.digest('hex');
-  }
-
-  function artifactDigestKey(task, declaration, stats, expectedDigest) {
-    if (!cacheableArtifactMetadata(stats)) return null;
-    return [
-      task.id,
-      task.attempt,
-      declaration.id,
-      expectedDigest,
-      stats.dev,
-      stats.ino,
-      stats.size,
-      stats.mtimeNs,
-      stats.ctimeNs,
-      stats.birthtimeNs
-    ].join(':');
-  }
-
-  function cacheArtifactDigest(task, declaration, stats, digest, expectedDigest = digest) {
-    const key = artifactDigestKey(task, declaration, stats, expectedDigest);
-    if (!key) return digest;
-    artifactDigestCache.delete(key);
-    artifactDigestCache.set(key, digest);
-    while (artifactDigestCache.size > 1_024) {
-      artifactDigestCache.delete(artifactDigestCache.keys().next().value);
-    }
-    return digest;
-  }
-
-  async function cachedArtifactDigest(task, declaration, handle, stats, expectedDigest) {
-    const key = artifactDigestKey(task, declaration, stats, expectedDigest);
-    const cached = artifactDigestCache.get(key);
-    if (cached) {
-      artifactDigestCache.delete(key);
-      artifactDigestCache.set(key, cached);
-      return cached;
-    }
-    const digest = await hashOpenFile(handle, Number(stats.size));
-    const afterHash = await handle.stat({ bigint: true });
-    if (!sameStableArtifactMetadata(stats, afterHash)) {
-      throw new TaskServiceError(
-        'ARTIFACT_INTEGRITY_FAILED',
-        'Completed task evidence changed while being verified',
-        409
-      );
-    }
-    try {
-      await assertArtifactPathIdentity(task, declaration, stats);
-    } catch {
-      throw new TaskServiceError(
-        'ARTIFACT_INTEGRITY_FAILED',
-        'Completed task evidence path changed after verification',
-        409
-      );
-    }
-    if (digest !== expectedDigest) {
-      throw new TaskServiceError(
-        'ARTIFACT_INTEGRITY_FAILED',
-        'Completed task evidence changed after verification',
-        409
-      );
-    }
-    return cacheArtifactDigest(task, declaration, afterHash, digest, expectedDigest);
-  }
-
-  async function validatedOutputRoot(task) {
-    const canonicalStateRoot = await realpath(root);
-    const taskRoot = path.join(root, task.id);
-    const taskRootStats = await lstat(taskRoot);
-    if (!taskRootStats.isDirectory() || taskRootStats.isSymbolicLink()) {
-      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-    }
-    const canonicalTaskRoot = await realpath(taskRoot);
-    if (!inside(canonicalStateRoot, canonicalTaskRoot)) {
-      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-    }
-    const outputRootStats = await lstat(task.outputDir);
-    if (!outputRootStats.isDirectory() || outputRootStats.isSymbolicLink()) {
-      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-    }
-    const canonicalOutputRoot = await realpath(task.outputDir);
-    if (!inside(canonicalTaskRoot, canonicalOutputRoot)) {
-      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-    }
-    return canonicalOutputRoot;
-  }
-
-  async function assertArtifactPathIdentity(task, declaration, expectedStats) {
-    const candidate = path.resolve(task.outputDir, declaration.relativePath);
-    const canonicalOutputRoot = await validatedOutputRoot(task);
-    const [current, canonical] = await Promise.all([
-      lstat(candidate, { bigint: true }),
-      realpath(candidate)
-    ]);
-    if (!inside(canonicalOutputRoot, canonical)) throw new Error('artifact path escaped output');
-    const canonicalStats = await lstat(canonical, { bigint: true });
-    if (
-      !current.isFile() || current.isSymbolicLink() || current.nlink !== 1n ||
-      !canonicalStats.isFile() || canonicalStats.isSymbolicLink() || canonicalStats.nlink !== 1n ||
-      !sameStableArtifactMetadata(expectedStats, current) ||
-      !sameStableArtifactMetadata(expectedStats, canonicalStats)
-    ) throw new Error('artifact path changed while being verified');
-  }
-
-  async function openValidatedArtifact(task, declaration, { verifyCompletionAnchor = true } = {}) {
-    let handle;
-    try {
-      const resolvedOutputRoot = path.resolve(task.outputDir);
-      const candidate = path.resolve(resolvedOutputRoot, declaration.relativePath);
-      if (!inside(resolvedOutputRoot, candidate)) {
-        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-      }
-      const canonicalOutputRoot = await validatedOutputRoot(task);
-      const before = await lstat(candidate, { bigint: true });
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.ino <= 0n) {
-        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-      }
-      await artifactValidationHook?.({ stage: 'after-lstat', taskId: task.id, candidate });
-
-      handle = await open(candidate, 'r');
-      const opened = await handle.stat({ bigint: true });
-      if (
-        !opened.isFile() || opened.nlink !== 1n || opened.ino <= 0n ||
-        opened.size > BigInt(Number.MAX_SAFE_INTEGER) || !sameStableArtifactMetadata(before, opened)
-      ) {
-        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-      }
-      const canonical = await realpath(candidate);
-      if (!inside(canonicalOutputRoot, canonical)) {
-        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-      }
-      const [current, canonicalStats] = await Promise.all([
-        lstat(candidate, { bigint: true }),
-        lstat(canonical, { bigint: true })
-      ]);
-      if (
-        !current.isFile() || current.isSymbolicLink() || current.nlink !== 1n ||
-        !canonicalStats.isFile() || canonicalStats.isSymbolicLink() || canonicalStats.nlink !== 1n ||
-        !sameStableArtifactMetadata(opened, current) ||
-        !sameStableArtifactMetadata(opened, canonicalStats)
-      ) {
-        throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-      }
-      await artifactValidationHook?.({ stage: 'after-validation', taskId: task.id, candidate });
-      if (
-        verifyCompletionAnchor && declaration.kind === 'result' &&
-        Array.isArray(task.completion?.artifacts)
-      ) {
-        const anchor = Array.isArray(task.completion?.artifacts)
-          ? task.completion.artifacts.find((item) => item?.artifactId === declaration.id)
-          : null;
-        if (
-          !anchor || !Number.isSafeInteger(anchor.sizeBytes) || anchor.sizeBytes !== Number(opened.size) ||
-          typeof anchor.sha256 !== 'string' ||
-          anchor.sha256 !== await cachedArtifactDigest(task, declaration, handle, opened, anchor.sha256)
-        ) {
-          throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed after verification', 409);
-        }
-        const afterHash = await handle.stat({ bigint: true });
-        if (
-          !sameStableArtifactMetadata(opened, afterHash)
-        ) {
-          throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed while being verified', 409);
-        }
-        try {
-          await assertArtifactPathIdentity(task, declaration, opened);
-        } catch {
-          throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence path changed after verification', 409);
-        }
-      }
-      const { relativePath: _relativePath, ...publicDeclaration } = declaration;
-      return {
-        handle,
-        stats: opened,
-        artifact: { ...publicDeclaration, sizeBytes: Number(opened.size) }
-      };
-    } catch (error) {
-      await handle?.close().catch(() => {});
-      if (error instanceof TaskServiceError) throw error;
-      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-    }
-  }
-
-  async function collectArtifacts(task) {
-    const artifacts = [];
-    for (const declaration of artifactDeclarations(task)) {
-      let opened;
-      try {
-        opened = await openValidatedArtifact(task, declaration);
-        artifacts.push(opened.artifact);
-      } catch (error) {
-        if (error?.code === 'ARTIFACT_INTEGRITY_FAILED') throw error;
-        // Missing or unstable declared artifacts are omitted rather than exposing a partial path.
-      } finally {
-        await opened?.handle.close().catch(() => {});
-      }
-    }
-    return artifacts;
-  }
-
-  async function listArtifacts(id, suppliedCaller = {}) {
-    await ready;
-    const caller = callerIdentity(suppliedCaller);
-    const task = tasks.get(id);
-    if (!task || task.deletedAt || !canAccess(task, caller)) {
-      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
-    }
-    await awaitTaskPersistence(id);
-    await reconcileTaskForRead(task);
-    await awaitTaskPersistence(id);
-    if (task.completion?.integrity === 'invalid') {
-      throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed after verification', 409);
-    }
-    const artifacts = await collectArtifacts(task);
-    return artifacts;
-  }
-
-  async function readArtifact(id, requestedArtifactId, options = {}, suppliedCaller = {}) {
-    await ready;
-    const caller = callerIdentity(suppliedCaller);
-    const task = tasks.get(id);
-    if (!task || task.deletedAt || !canAccess(task, caller)) {
-      throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
-    }
-    await awaitTaskPersistence(id);
-    await reconcileTaskForRead(task);
-    await awaitTaskPersistence(id);
-    if (task.completion?.integrity === 'invalid') {
-      throw new TaskServiceError('ARTIFACT_INTEGRITY_FAILED', 'Completed task evidence changed after verification', 409);
-    }
-    if (typeof requestedArtifactId !== 'string' || !/^artifact_[a-f0-9]{32}$/.test(requestedArtifactId)) {
-      throw new TaskServiceError('INVALID_ARTIFACT_ID', 'Artifact ID is invalid');
-    }
-    const offset = options.offset ?? 0;
-    const maxBytes = options.maxBytes ?? MAX_ARTIFACT_CHUNK_BYTES;
-    if (!Number.isSafeInteger(offset) || offset < 0) {
-      throw new TaskServiceError('INVALID_ARTIFACT_OFFSET', 'Artifact offset must be a non-negative integer');
-    }
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_ARTIFACT_CHUNK_BYTES) {
-      throw new TaskServiceError(
-        'INVALID_ARTIFACT_LIMIT',
-        `Artifact maxBytes must be from 1 to ${MAX_ARTIFACT_CHUNK_BYTES}`
-      );
-    }
-    const declaration = artifactDeclarations(task).find((candidate) => candidate.id === requestedArtifactId);
-    if (!declaration) {
-      throw new TaskServiceError('ARTIFACT_NOT_FOUND', 'Artifact was not found', 404);
-    }
-
-    let opened;
-    try {
-      opened = await openValidatedArtifact(task, declaration);
-      const { handle, stats, artifact } = opened;
-      const sizeBytes = Number(stats.size);
-      if (offset > sizeBytes) {
-        throw new TaskServiceError('ARTIFACT_OFFSET_OUT_OF_RANGE', 'Artifact offset exceeds its size', 416);
-      }
-      const requestedBytes = Math.min(maxBytes, sizeBytes - offset);
-      const buffer = Buffer.alloc(requestedBytes);
-      const { bytesRead } = requestedBytes
-        ? await handle.read(buffer, 0, requestedBytes, offset)
-        : { bytesRead: 0 };
-      const afterRead = await handle.stat({ bigint: true });
-      if (
-        !afterRead.isFile() || afterRead.nlink !== 1n ||
-        !sameStableArtifactMetadata(stats, afterRead)
-      ) {
-        const anchoredResult = declaration.kind === 'result' && Array.isArray(task.completion?.artifacts);
-        throw new TaskServiceError(
-          anchoredResult ? 'ARTIFACT_INTEGRITY_FAILED' : 'ARTIFACT_NOT_FOUND',
-          anchoredResult
-            ? 'Completed task evidence changed while it was being read'
-            : 'Artifact changed while it was being read',
-          anchoredResult ? 409 : 404
-        );
-      }
-      let consumed = bytesRead;
-      let encoding = 'base64';
-      let chunk = buffer.subarray(0, bytesRead).toString('base64');
-      if (isTextMimeType(artifact.mimeType)) {
-        for (let trim = 0; trim <= Math.min(3, bytesRead); trim += 1) {
-          const candidate = buffer.subarray(0, bytesRead - trim);
-          if (candidate.length === 0 && bytesRead > 0) continue;
-          try {
-            chunk = new TextDecoder('utf-8', { fatal: true }).decode(candidate);
-            consumed = candidate.length;
-            encoding = 'utf8';
-            break;
-          } catch {
-            // Back up to a UTF-8 boundary; arbitrary offsets fall back to bounded base64.
-          }
-        }
-      }
-      const nextOffset = offset + consumed;
-      return {
-        artifact,
-        offset,
-        nextOffset,
-        eof: nextOffset >= sizeBytes,
-        encoding,
-        chunk
-      };
-    } finally {
-      await opened?.handle.close().catch(() => {});
-    }
   }
 
   function serializeControl(id, operation) {
