@@ -18,7 +18,7 @@ test('task panel exposes Tasks, Profiles, Task Packs, and minimal notification s
     'view-tasks', 'view-profiles', 'view-assets', 'view-settings', 'tasks', 'profiles', 'assets',
     'tasks-error', 'profiles-error', 'assets-error', 'settings-error',
     'task-select-all', 'task-bulk-pause', 'task-bulk-resume', 'task-bulk-cancel', 'task-bulk-delete',
-    'task-load-more', 'asset-search', 'asset-filter', 'asset-select-all', 'notification-settings-form',
+    'task-load-more', 'asset-search', 'asset-filter', 'asset-select-all', 'asset-force-delete', 'notification-settings-form',
     'notification-system-settings', 'notification-feishu-signing-secret'
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
@@ -95,7 +95,7 @@ test('task panel keeps bounded same-origin reads, paged and batch task controls,
 
   assert.match(source, /\/actions`/);
   assert.match(source, /method:\s*'DELETE'/);
-  assert.match(source, /body:\s*\{ commandId: commandId\(\), expectedRevision: task\.revision \}/);
+  assert.match(source, /\.\.\.\(force \? \{ force: true, confirm: true \} : \{\}\)/);
   assert.match(source, /body:\s*\{ action, commandId: commandId\(\), expectedRevision: task\.revision \}/);
   assert.match(source, /error\.status === 409/);
   assert.match(source, /状态已变化，已刷新最新状态/);
@@ -125,7 +125,7 @@ test('task panel keeps bounded same-origin reads, paged and batch task controls,
   assert.match(source, /timing\.totalDurationMs/);
   assert.match(source, /scheduleDurationTick/);
   assert.match(source, /data-task-duration/);
-  assert.match(source, /cleanup\?\.settled === true/);
+  assert.match(source, /cleanup\?\.settled !== true/);
   assert.match(source, /quarantinedEphemeral/);
   assert.match(source, /quarantinedPersistent/);
   assert.match(source, /清理残留/);
@@ -135,6 +135,10 @@ test('task panel keeps bounded same-origin reads, paged and batch task controls,
   assert.match(source, /仅任务启动/);
   assert.match(source, /确定取消任务/);
   assert.match(source, /确定删除任务记录/);
+  assert.match(source, /确定强制删除任务记录/);
+  assert.match(source, /force-delete/);
+  assert.match(source, /assetForceDelete/);
+  assert.match(source, /canForceDeleteTask/);
   assert.match(source, /focusAfter/);
   assert.match(source, /runAssetAction/);
   assert.match(source, /assetIds/);

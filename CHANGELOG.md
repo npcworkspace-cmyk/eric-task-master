@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.9.2 - 2026-09-02
+
+- Added a direct Owner-only **Force delete** path for stale task records. Manager requires explicit confirmation and the current revision, refuses a tracked or live Worker/runtime, preserves generated files and the private idempotency tombstone, and leaves any quarantined Profile lease available for the separate Profile recovery control.
+- Added direct force deletion for non-system Task Packs, standalone modules, and historical executor snapshots. Related terminal task records and outputs remain available for audit, but their executor reference is detached and checkpoint resume is permanently disabled; protected system assets and assets referenced by an active runtime remain blocked.
+- Added bilingual per-task, blocker-row, batch-task, and batch-asset controls plus real Chromium Owner Console regression coverage for both stuck-task and stuck-Pack recovery paths.
+
 ## 2.9.1 - 2026-09-02
 
 - Added an Owner-only **Force-release lease** recovery action for cleanup-blocked persistent Profiles. Manager refuses active tasks, tracked browsers, or a possibly live lease process; successful recovery preserves the Profile directory and login state, keeps the original task failed with cleanup explicitly unconfirmed, and records the intervention.

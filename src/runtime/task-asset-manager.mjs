@@ -5,6 +5,7 @@ import { redactSensitiveText } from '../lib/redaction.mjs';
 import {
   callerIdentity,
   clone,
+  COMMAND_ID_PATTERN,
   filterTaskTypes
 } from './task-record-policy.mjs';
 import { TaskServiceError } from './task-service-error.mjs';
@@ -22,12 +23,14 @@ export function createTaskAssetManager({
   requireServiceOpen,
   serializeMutation,
   refreshResumeCheckpointState,
+  forceDetachTaskAssetReferences,
   persist
 }) {
   if (
     !registry || !tasks || !children || !finalizationFailures ||
     typeof awaitReady !== 'function' || typeof requireServiceOpen !== 'function' ||
     typeof serializeMutation !== 'function' || typeof refreshResumeCheckpointState !== 'function' ||
+    typeof forceDetachTaskAssetReferences !== 'function' ||
     typeof persist !== 'function'
   ) {
     throw new TypeError('Task asset manager dependencies are incomplete');
@@ -150,6 +153,7 @@ export function createTaskAssetManager({
   }
 
   function taskMatchesAsset(task, typeNames, hashes) {
+    if (task.taskTypeAssetDetached === true) return false;
     if (typeof task.taskTypeSha256 === 'string') return hashes.has(task.taskTypeSha256);
     return typeNames.has(task.taskType);
   }
@@ -195,10 +199,12 @@ export function createTaskAssetManager({
   function taskAssetBlocker(task, blockerCode) {
     return {
       taskId: task.id,
+      revision: task.revision,
       title: redactSensitiveText(task.displayName || task.taskLabel || task.id).slice(0, 200),
       state: task.state,
       blockerCode,
       cleanupSettled: task.cleanup?.settled === true,
+      canForceDeleteTask: TERMINAL_TASK_STATES.has(task.state) && !children.has(task.id),
       canDeleteRecord: TERMINAL_TASK_STATES.has(task.state) && task.cleanup?.settled === true &&
         !children.has(task.id) && task.leaseHeld !== true && !finalizationFailures.has(task.id)
     };
@@ -411,11 +417,11 @@ export function createTaskAssetManager({
   }
 
   function validateTaskAssetAction(input) {
-    const allowed = new Set(['action', 'assetIds', 'note']);
+    const allowed = new Set(['action', 'assetIds', 'note', 'confirm', 'commandId']);
     const unknown = Object.keys(input || {}).filter((key) => !allowed.has(key));
     if (unknown.length) throw new TaskServiceError('INVALID_TASK_ASSET_ACTION', `Unsupported fields: ${unknown.join(', ')}`);
-    if (!['deprecate', 'restore', 'delete', 'note'].includes(input?.action)) {
-      throw new TaskServiceError('INVALID_TASK_ASSET_ACTION', 'Action must be deprecate, restore, delete, or note');
+    if (!['deprecate', 'restore', 'delete', 'force-delete', 'note'].includes(input?.action)) {
+      throw new TaskServiceError('INVALID_TASK_ASSET_ACTION', 'Action must be deprecate, restore, delete, force-delete, or note');
     }
     if (
       !Array.isArray(input.assetIds) || input.assetIds.length < 1 || input.assetIds.length > MAX_TASK_ASSET_BATCH ||
@@ -425,6 +431,21 @@ export function createTaskAssetManager({
     }
     if (input.action === 'note' && (typeof input.note !== 'string' || input.note.length > 1_000)) {
       throw new TaskServiceError('INVALID_TASK_ASSET_NOTE', 'Asset note must contain at most 1000 characters');
+    }
+    if (input.action === 'force-delete') {
+      if (input.confirm !== true) {
+        throw new TaskServiceError(
+          'TASK_ASSET_FORCE_DELETE_CONFIRMATION_REQUIRED',
+          'Owner confirmation is required before executor assets can be force-deleted',
+          409
+        );
+      }
+      if (typeof input.commandId !== 'string' || !COMMAND_ID_PATTERN.test(input.commandId)) {
+        throw new TaskServiceError(
+          'INVALID_TASK_ASSET_ACTION',
+          'commandId must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
+        );
+      }
     }
     return { ...input, assetIds: [...new Set(input.assetIds)] };
   }
@@ -449,7 +470,32 @@ export function createTaskAssetManager({
     if (missingIndex >= 0) {
       throw new TaskServiceError('TASK_ASSET_NOT_FOUND', `Task asset ${request.assetIds[missingIndex]} was not found`, 404);
     }
-    if (request.action === 'delete') {
+    if (request.action === 'delete' || request.action === 'force-delete') {
+      if (request.action === 'force-delete') {
+        const protectedAsset = selected.find((asset) => asset.protected);
+        if (protectedAsset) {
+          throw new TaskServiceError(
+            'TASK_ASSET_PROTECTED',
+            `${protectedAsset.title} is a protected system asset`,
+            409
+          );
+        }
+        const taskIds = [...new Set(selected.flatMap((asset) => {
+          const typeNames = new Set(asset.typeNames);
+          const hashes = new Set(asset.hashes);
+          return [...tasks.values()]
+            .filter((task) => !task.deletedAt && taskMatchesAsset(task, typeNames, hashes))
+            .map((task) => task.id);
+        }))];
+        await forceDetachTaskAssetReferences(taskIds, {
+          commandId: request.commandId,
+          actor: { role: caller.role, clientId: caller.clientId }
+        });
+        const refreshedById = new Map((await buildTaskAssets()).map((asset) => [asset.id, asset]));
+        for (let index = 0; index < selected.length; index += 1) {
+          selected[index] = refreshedById.get(selected[index].id);
+        }
+      }
       const blocked = selected.find((asset) => !asset.deletable);
       if (blocked) {
         throw new TaskServiceError(
@@ -524,4 +570,3 @@ export function createTaskAssetManager({
     retireTransientTaskType
   });
 }
-

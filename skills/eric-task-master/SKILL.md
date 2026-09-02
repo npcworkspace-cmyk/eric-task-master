@@ -41,6 +41,8 @@ Every Profile is shared by all trusted local Agents connected to this Manager. C
 
 Treat one registered MCP client ID or one stable CLI `--agent-id` as one local Agent task principal. This identity names the Agent host or installation and must never be changed to a task name. Different IDs keep task records and Owner messages attributable; conversations or CLI processes using the same ID intentionally share that principal's task ledger. This is operational isolation between trusted processes under one OS user, not a hostile tenant boundary. Run mutually untrusted Agents under separate OS users, sandboxes, or machines.
 
+Task and executor deletion are Owner Console recovery actions, not Agent task-loop operations. The Owner may force-delete a stale task record or a non-system custom Task Pack only after Manager rejects any still-live Worker/runtime. Task output files remain preserved; force-deleting an executor detaches the retained terminal task from that code and permanently disables checkpoint resume. Agents must not emulate this through filesystem deletion or treat it as successful browser cleanup.
+
 ## Fixed MCP task loop
 
 1. Call `taskmaster_agent_inbox_claim` once after connecting. Acknowledge or resolve pending Owner commands before creating replacement work. Then call `taskmaster_task_types_list` with a narrow `query`, `domain`, or `intent`. This returns compact summaries only. Use `taskmaster_task_packs_list` only when Pack lifecycle, recommended version, or a deletion blocker matters; it is read-only and must not be used to mutate Owner assets.

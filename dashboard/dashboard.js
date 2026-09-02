@@ -70,7 +70,7 @@ const I18N = Object.freeze({
     'behavior.unassigned': '待分配', 'behavior.unapplied': '待应用', 'behavior.actual': '实际行为',
     'behavior.workerConfirmed': 'Worker 已确认 · {time}', 'behavior.workerWaiting': '等待 Worker 应用',
     'actions.pause': '暂停', 'actions.resume': '恢复', 'actions.cancel': '取消', 'actions.deleteRecord': '删除记录',
-    'actions.cleanupFirst': '任务清理完成后才能删除记录',
+    'actions.forceDeleteRecord': '强制删除', 'actions.cleanupFirst': '任务清理完成后可普通删除；Worker 已消失时可强制删除',
     'profiles.title': '浏览器 Profiles', 'profiles.description': '管理独立浏览器环境。任务按 Profile 串行，彼此不会抢占登录状态。',
     'profiles.new': '新建 Profile', 'profiles.createTitle': '创建浏览器环境', 'profiles.name': 'Profile 名称',
     'profiles.namePlaceholder': '例如：工作账号', 'profiles.kind': '类型', 'profiles.persistent': '持久登录',
@@ -95,7 +95,7 @@ const I18N = Object.freeze({
     'assets.toolbar': '执行器资产筛选和批量操作', 'assets.search': '搜索资产', 'assets.searchPlaceholder': '名称、用途、备注或任务类型',
     'assets.all': '全部资产', 'assets.discoverable': 'Agent 可发现', 'assets.deprecated': '已废弃', 'assets.history': '历史与孤立文件',
     'assets.protected': '系统保护', 'assets.selectAll': '全选当前结果', 'assets.bulk': '批量管理', 'assets.note': '批量备注',
-    'assets.deprecate': '废弃', 'assets.restore': '恢复', 'assets.noneSelected': '尚未选择资产', 'assets.loading': '正在读取执行器资产…',
+    'assets.deprecate': '废弃', 'assets.restore': '恢复', 'assets.forceDelete': '强制删除', 'assets.noneSelected': '尚未选择资产', 'assets.loading': '正在读取执行器资产…',
     'assets.selected': '已选择 {count} 项 · 删除动作仍会由 Manager 重新检查任务与恢复状态',
     'assets.authEmpty': '建立 Owner 会话后即可查看执行器资产。', 'assets.empty': '当前筛选没有匹配的执行器资产。',
     'assets.selectAria': '选择 {title}', 'assets.agentVisible': 'Agent 可发现', 'assets.agentHidden': 'Agent 不可发现',
@@ -103,7 +103,7 @@ const I18N = Object.freeze({
     'assets.version': '版本', 'assets.taskTypes': '任务类型', 'assets.runs': '运行次数', 'assets.successFailure': '成功 / 失败',
     'assets.lastUsed': '最后使用', 'assets.size': '文件体积', 'assets.fileCount': '{count} 个 · {size}', 'assets.assetNote': '资产备注',
     'assets.noNote': '暂无备注', 'assets.containsTypes': '包含 {count} 个任务类型', 'assets.blocked': '不可删除：{reasons}',
-    'assets.viewTask': '查看关联任务', 'assets.moreBlockers': '另有 {count} 个关联任务',
+    'assets.viewTask': '查看关联任务', 'assets.forceDeleteTask': '强制删除关联任务', 'assets.moreBlockers': '另有 {count} 个关联任务',
     'assets.blocker.active_task': '任务仍在运行', 'assets.blocker.cleanup_pending': '任务清理尚未确认',
     'assets.blocker.resume_available': '任务仍可从检查点恢复', 'assets.blocker.protected': '系统保护',
     'assets.count': '{visible} / {total} 项资产',
@@ -143,6 +143,7 @@ const I18N = Object.freeze({
     'toast.resumeSent': '恢复请求已发送', 'toast.cancelSent': '取消请求已发送', 'toast.taskDeleted': '任务记录已删除',
     'toast.noteSaved': '资产备注已保存', 'toast.assetsDeprecated': '所选资产已废弃，Agent 不再发现它们',
     'toast.assetsRestored': '所选资产已恢复为可发现', 'toast.assetsDeleted': '所选执行器资产已安全删除',
+    'toast.assetsForceDeleted': '所选自建执行器资产已强制删除；关联终态任务保留产物但不可再恢复',
     'toast.loggedOut': '已退出；后台任务仍在继续', 'toast.logoutFailed': '退出失败', 'toast.ownerFailed': '无法建立 Owner 会话',
     'prompt.renameProfile': '新的 Profile 名称', 'prompt.assetNote': '填写资产备注（留空可清除备注）',
     'confirm.cleanupProfile': '确定清理异常临时 Profile“{name}”？Manager 只会在 Worker 已退出且目录为空时执行。',
@@ -150,10 +151,12 @@ const I18N = Object.freeze({
     'confirm.deleteProfile': '确定删除 Profile“{name}”及其{description}？此操作无法撤销。',
     'confirm.ephemeralData': '临时任务设置', 'confirm.persistentData': '持久浏览器数据',
     'confirm.cancelTask': '确定取消任务“{title}”？Manager 会先关闭任务窗口并释放 Profile。',
+    'confirm.forceDeleteTask': '确定强制删除任务记录“{title}”？\n\nManager 只会在 Worker 已消失后执行。记录会从面板移除且不能恢复，已生成的数据文件会保留；若 Profile 仍有异常租约，可继续在 Profiles 中强制解除。',
     'confirm.deleteTask': '确定删除任务记录“{title}”？它会从面板消失且无法恢复，已生成的数据文件不会被删除。',
     'confirm.bulkCancelTasks': '确定取消选中的 {count} 个任务？Manager 会逐项安全关闭任务窗口并释放 Profile。',
-    'confirm.bulkDeleteTasks': '确定删除选中的 {count} 个任务记录？只有已结束且完成清理的记录会被删除。',
+    'confirm.bulkDeleteTasks': '确定删除选中的 {count} 个任务记录？清理未确认的记录会在 Worker 已消失后强制删除；已生成的数据文件不会删除。',
     'confirm.assetSuffix': '等 {count} 项', 'confirm.deleteAssets': '确定删除 {names}{suffix}？Manager 会再次校验任务引用；删除后的执行器文件无法恢复。',
+    'confirm.forceDeleteAssets': '确定强制删除 {names}{suffix}？\n\n仅限非系统自建资产。Manager 会拒绝仍有活跃 Worker 的资产；关联终态任务会保留记录和产物，但会永久失去检查点恢复能力。执行器文件无法恢复。',
     'confirm.logout': '退出这台浏览器的 Owner 会话？后台任务不会停止。',
     'confirm.clearChannel': '确定清除 {channel} 的已保存凭据并关闭该通知通道？'
   }),
@@ -199,7 +202,7 @@ const I18N = Object.freeze({
     'behavior.unassigned': 'Unassigned', 'behavior.unapplied': 'Not applied', 'behavior.actual': 'Effective behavior',
     'behavior.workerConfirmed': 'Worker confirmed · {time}', 'behavior.workerWaiting': 'Waiting for Worker',
     'actions.pause': 'Pause', 'actions.resume': 'Resume', 'actions.cancel': 'Cancel', 'actions.deleteRecord': 'Delete record',
-    'actions.cleanupFirst': 'The record can be deleted after task cleanup finishes',
+    'actions.forceDeleteRecord': 'Force delete', 'actions.cleanupFirst': 'Use normal delete after cleanup, or force delete after the Worker disappears',
     'profiles.title': 'Browser Profiles', 'profiles.description': 'Manage isolated browser environments. Tasks run serially per Profile and never compete for login state.',
     'profiles.new': 'New Profile', 'profiles.createTitle': 'Create browser environment', 'profiles.name': 'Profile name',
     'profiles.namePlaceholder': 'Example: Work account', 'profiles.kind': 'Type', 'profiles.persistent': 'Persistent login',
@@ -224,7 +227,7 @@ const I18N = Object.freeze({
     'assets.toolbar': 'Task Pack asset filters and batch actions', 'assets.search': 'Search assets', 'assets.searchPlaceholder': 'Name, purpose, note, or task type',
     'assets.all': 'All assets', 'assets.discoverable': 'Agent discoverable', 'assets.deprecated': 'Deprecated', 'assets.history': 'History and orphan files',
     'assets.protected': 'System protected', 'assets.selectAll': 'Select current results', 'assets.bulk': 'Batch management', 'assets.note': 'Batch note',
-    'assets.deprecate': 'Deprecate', 'assets.restore': 'Restore', 'assets.noneSelected': 'No assets selected', 'assets.loading': 'Loading Task Pack assets…',
+    'assets.deprecate': 'Deprecate', 'assets.restore': 'Restore', 'assets.forceDelete': 'Force delete', 'assets.noneSelected': 'No assets selected', 'assets.loading': 'Loading Task Pack assets…',
     'assets.selected': '{count} selected · Manager will recheck task and recovery references before deletion',
     'assets.authEmpty': 'Start an Owner session to view Task Pack assets.', 'assets.empty': 'No Task Pack assets match the current filters.',
     'assets.selectAria': 'Select {title}', 'assets.agentVisible': 'Agent discoverable', 'assets.agentHidden': 'Not Agent discoverable',
@@ -232,7 +235,7 @@ const I18N = Object.freeze({
     'assets.version': 'Version', 'assets.taskTypes': 'Task types', 'assets.runs': 'Runs', 'assets.successFailure': 'Success / failure',
     'assets.lastUsed': 'Last used', 'assets.size': 'File size', 'assets.fileCount': '{count} files · {size}', 'assets.assetNote': 'Asset note',
     'assets.noNote': 'No note', 'assets.containsTypes': 'Contains {count} task types', 'assets.blocked': 'Cannot delete: {reasons}',
-    'assets.viewTask': 'View related task', 'assets.moreBlockers': '{count} more related tasks',
+    'assets.viewTask': 'View related task', 'assets.forceDeleteTask': 'Force-delete related task', 'assets.moreBlockers': '{count} more related tasks',
     'assets.blocker.active_task': 'Task is still active', 'assets.blocker.cleanup_pending': 'Task cleanup is not confirmed',
     'assets.blocker.resume_available': 'Task can still resume from its checkpoint', 'assets.blocker.protected': 'System protected',
     'assets.count': '{visible} / {total} assets',
@@ -272,6 +275,7 @@ const I18N = Object.freeze({
     'toast.resumeSent': 'Resume request sent', 'toast.cancelSent': 'Cancel request sent', 'toast.taskDeleted': 'Task record deleted',
     'toast.noteSaved': 'Asset note saved', 'toast.assetsDeprecated': 'Selected assets deprecated and hidden from Agents',
     'toast.assetsRestored': 'Selected assets restored for Agent discovery', 'toast.assetsDeleted': 'Selected Task Pack assets safely deleted',
+    'toast.assetsForceDeleted': 'Selected custom executor assets force-deleted; related terminal tasks retain outputs but cannot resume',
     'toast.loggedOut': 'Signed out; background tasks are still running', 'toast.logoutFailed': 'Sign-out failed', 'toast.ownerFailed': 'Unable to start Owner session',
     'prompt.renameProfile': 'New Profile name', 'prompt.assetNote': 'Asset note (leave blank to clear)',
     'confirm.cleanupProfile': 'Clean abnormal temporary Profile “{name}”? Manager will proceed only after the Worker exits and the directory is empty.',
@@ -279,10 +283,12 @@ const I18N = Object.freeze({
     'confirm.deleteProfile': 'Delete Profile “{name}” and its {description}? This cannot be undone.',
     'confirm.ephemeralData': 'temporary task settings', 'confirm.persistentData': 'persistent browser data',
     'confirm.cancelTask': 'Cancel task “{title}”? Manager will close the task window and release the Profile first.',
+    'confirm.forceDeleteTask': 'Force-delete task record “{title}”?\n\nManager proceeds only after its Worker disappears. The record is removed permanently and generated files are preserved. If its Profile still has a stale lease, release that lease separately in Profiles.',
     'confirm.deleteTask': 'Delete task record “{title}”? It will disappear permanently, but generated data files are preserved.',
     'confirm.bulkCancelTasks': 'Cancel the {count} selected tasks? Manager will safely close each task window and release its Profile.',
-    'confirm.bulkDeleteTasks': 'Delete the {count} selected task records? Only terminal records with confirmed cleanup will be deleted.',
+    'confirm.bulkDeleteTasks': 'Delete the {count} selected task records? Records with unconfirmed cleanup will be force-deleted only after their Workers disappear; generated files are preserved.',
     'confirm.assetSuffix': ' and {count} total', 'confirm.deleteAssets': 'Delete {names}{suffix}? Manager will recheck task references. Deleted executor files cannot be recovered.',
+    'confirm.forceDeleteAssets': 'Force-delete {names}{suffix}?\n\nOnly non-system custom assets are eligible. Manager rejects assets with a live Worker. Related terminal tasks retain their records and outputs but permanently lose checkpoint resume. Executor files cannot be recovered.',
     'confirm.logout': 'Sign out this browser Owner session? Background tasks will continue.',
     'confirm.clearChannel': 'Clear the saved {channel} credentials and disable this notification channel?'
   })
@@ -368,6 +374,7 @@ const ui = Object.freeze({
   assetDeprecate: document.querySelector('#asset-deprecate'),
   assetRestore: document.querySelector('#asset-restore'),
   assetDelete: document.querySelector('#asset-delete'),
+  assetForceDelete: document.querySelector('#asset-force-delete'),
   toggleProfileCreate: document.querySelector('#toggle-profile-create'),
   closeProfileCreate: document.querySelector('#close-profile-create'),
   profileCreatePanel: document.querySelector('#profile-create-panel'),
@@ -886,7 +893,7 @@ function taskActionEligible(task, action) {
   if (action === 'pause') return PAUSABLE_TASK_STATES.has(status);
   if (action === 'resume') return status === 'paused';
   if (action === 'cancel') return !TERMINAL_TASK_STATES.has(status) && !['cancel_requested', 'cancelling'].includes(status);
-  if (action === 'delete') return TERMINAL_TASK_STATES.has(status) && task.cleanup?.settled === true;
+  if (action === 'delete') return TERMINAL_TASK_STATES.has(status);
   return false;
 }
 
@@ -953,10 +960,13 @@ function taskActionButtons(task) {
     cancel.disabled = pending || ['cancel_requested', 'cancelling'].includes(status);
     actions.append(cancel);
   } else {
-    const remove = focusKey(button(t('actions.deleteRecord'), 'npc-btn-danger compact-button', () => void deleteTaskRecord(task)), `${key}:delete`);
-    const settled = task.cleanup?.settled === true;
-    remove.disabled = pending || !settled;
-    if (!settled) remove.title = t('actions.cleanupFirst');
+    const force = task.cleanup?.settled !== true;
+    const remove = focusKey(button(
+      t(force ? 'actions.forceDeleteRecord' : 'actions.deleteRecord'),
+      'npc-btn-danger compact-button',
+      () => void deleteTaskRecord(task, { force })
+    ), `${key}:delete`);
+    remove.disabled = pending;
     actions.append(remove);
   }
   return actions;
@@ -1230,6 +1240,7 @@ function syncAssetBulkControls(visible = filteredAssets()) {
   ui.assetDeprecate.disabled = !selected.length || selected.some((asset) => !asset.canChangeLifecycle || asset.lifecycle !== 'active');
   ui.assetRestore.disabled = !selected.length || selected.some((asset) => !asset.canChangeLifecycle || asset.lifecycle !== 'deprecated');
   ui.assetDelete.disabled = !selected.length || selected.some((asset) => !asset.deletable);
+  ui.assetForceDelete.disabled = !selected.length || selected.some((asset) => asset.protected);
 }
 
 function renderAssets(force = false) {
@@ -1314,7 +1325,21 @@ function renderAssets(force = false) {
               element('small', '', assetBlockerLabel(blocker))
             );
             const viewTask = button(t('assets.viewTask'), 'npc-btn-secondary compact-button', () => void focusTaskById(blocker.taskId));
-            row.append(copy, viewTask);
+            const rowActions = element('div', 'asset-blocking-task-actions');
+            if (blocker.canForceDeleteTask === true && Number.isSafeInteger(blocker.revision)) {
+              rowActions.append(button(
+                t('assets.forceDeleteTask'),
+                'npc-btn-danger compact-button',
+                () => void deleteTaskRecord({
+                  id: blocker.taskId,
+                  revision: blocker.revision,
+                  displayName: blocker.title,
+                  cleanup: { settled: false }
+                }, { force: true, focusAfter: 'assets-title' })
+              ));
+            }
+            rowActions.append(viewTask);
+            row.append(copy, rowActions);
             list.append(row);
           }
           const total = Number(asset.blockingTaskCount) || blockingTasks.length;
@@ -2174,9 +2199,9 @@ async function sendTaskAction(task, action) {
   }), labels[action]);
 }
 
-async function deleteTaskRecord(task) {
+async function deleteTaskRecord(task, { force = false, focusAfter: requestedFocusAfter = null } = {}) {
   if (state.pendingMutations.has(`task:${task.id}`)) return;
-  if (!confirm(t('confirm.deleteTask', { title: taskTitle(task) }))) return;
+  if (!confirm(t(force ? 'confirm.forceDeleteTask' : 'confirm.deleteTask', { title: taskTitle(task) }))) return;
   if (!Number.isSafeInteger(task.revision) || task.revision < 1) {
     setToast(t('toast.taskNotReady'), 'error');
     await refreshAll({ force: true });
@@ -2185,10 +2210,14 @@ async function deleteTaskRecord(task) {
   const orderedIds = [...ui.tasks.querySelectorAll('.task-card[data-task-id]')].map((node) => node.dataset.taskId);
   const index = orderedIds.indexOf(task.id);
   const nextId = orderedIds[index + 1] || orderedIds[index - 1] || '';
-  const focusAfter = nextId ? `task:${nextId}:card` : 'tasks-title';
+  const focusAfter = requestedFocusAfter || (nextId ? `task:${nextId}:card` : 'tasks-title');
   const deleted = await runMutation(`task:${task.id}`, () => request(`/v1/tasks/${encodeURIComponent(task.id)}`, {
     method: 'DELETE',
-    body: { commandId: commandId(), expectedRevision: task.revision }
+    body: {
+      commandId: commandId(),
+      expectedRevision: task.revision,
+      ...(force ? { force: true, confirm: true } : {})
+    }
   }), t('toast.taskDeleted'), { focusAfter });
   if (deleted) {
     state.selectedTaskIds.delete(task.id);
@@ -2212,9 +2241,14 @@ async function executeTaskBatchItem(task, action) {
     throw new HttpError(t('toast.taskNotReady'), 409, 'TASK_REVISION_CONFLICT');
   }
   if (action === 'delete') {
+    const force = task.cleanup?.settled !== true;
     return request(`/v1/tasks/${encodeURIComponent(task.id)}`, {
       method: 'DELETE',
-      body: { commandId: commandId(), expectedRevision: task.revision }
+      body: {
+        commandId: commandId(),
+        expectedRevision: task.revision,
+        ...(force ? { force: true, confirm: true } : {})
+      }
     });
   }
   return request(`/v1/tasks/${encodeURIComponent(task.id)}/actions`, {
@@ -2296,20 +2330,26 @@ async function runAssetAction(action) {
     if (value === null) return;
     note = value;
   }
-  if (action === 'delete') {
+  if (action === 'delete' || action === 'force-delete') {
     const names = selected.slice(0, 5).map((asset) => `“${asset.title}”`).join('、');
     const suffix = selected.length > 5 ? t('confirm.assetSuffix', { count: selected.length }) : '';
-    if (!confirm(t('confirm.deleteAssets', { names, suffix }))) return;
+    if (!confirm(t(action === 'force-delete' ? 'confirm.forceDeleteAssets' : 'confirm.deleteAssets', { names, suffix }))) return;
   }
   const labels = {
     note: t('toast.noteSaved'),
     deprecate: t('toast.assetsDeprecated'),
     restore: t('toast.assetsRestored'),
-    delete: t('toast.assetsDeleted')
+    delete: t('toast.assetsDeleted'),
+    'force-delete': t('toast.assetsForceDeleted')
   };
   const result = await runMutation('asset:batch', () => request('/v1/task-assets/actions', {
     method: 'POST',
-    body: { action, assetIds, ...(note !== undefined ? { note } : {}) }
+    body: {
+      action,
+      assetIds,
+      ...(note !== undefined ? { note } : {}),
+      ...(action === 'force-delete' ? { confirm: true, commandId: commandId() } : {})
+    }
   }), labels[action], { focusAfter: 'assets-title' });
   if (result) {
     state.selectedAssetIds.clear();
@@ -2389,6 +2429,7 @@ ui.assetNote.addEventListener('click', () => void runAssetAction('note'));
 ui.assetDeprecate.addEventListener('click', () => void runAssetAction('deprecate'));
 ui.assetRestore.addEventListener('click', () => void runAssetAction('restore'));
 ui.assetDelete.addEventListener('click', () => void runAssetAction('delete'));
+ui.assetForceDelete.addEventListener('click', () => void runAssetAction('force-delete'));
 document.addEventListener('visibilitychange', () => {
   scheduleRefresh();
   scheduleDurationTick();

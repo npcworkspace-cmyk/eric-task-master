@@ -72,7 +72,7 @@ async function managerFixture(t, { profileProcessAlive } = {}) {
       const task = await this.get(id);
       calls.deletes.push({ id, body, caller });
       tasks.delete(id);
-      return { id, deletedAt: new Date().toISOString() };
+      return { id, deletedAt: new Date().toISOString(), forced: body.force === true };
     },
     async resume(id, body, caller) {
       const task = await this.get(id);
@@ -457,6 +457,31 @@ test('task record deletion is Owner-only and forwards revision-safe intent', asy
   assert.deepEqual(calls.deletes[0], {
     id: created.body.task.id,
     body: request,
+    caller: { role: 'manager-admin', clientId: 'manager-admin' }
+  });
+
+  const forceCreated = await json(await fetch(`${baseUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: headers(agentToken),
+    body: JSON.stringify({
+      profileId: 'profile_fixture', taskType: 'fixture', taskLabel: '强制删除契约测试',
+      idempotencyKey: 'task-force-delete-contract'
+    })
+  }));
+  const forceRequest = {
+    commandId: 'force-delete-contract-1',
+    expectedRevision: forceCreated.body.task.revision,
+    force: true,
+    confirm: true
+  };
+  const forceDeleted = await json(await fetch(`${baseUrl}/v1/tasks/${forceCreated.body.task.id}`, {
+    method: 'DELETE', headers: headers(manager.token), body: JSON.stringify(forceRequest)
+  }));
+  assert.equal(forceDeleted.response.status, 200);
+  assert.equal(forceDeleted.body.deleted.forced, true);
+  assert.deepEqual(calls.deletes[1], {
+    id: forceCreated.body.task.id,
+    body: forceRequest,
     caller: { role: 'manager-admin', clientId: 'manager-admin' }
   });
 });

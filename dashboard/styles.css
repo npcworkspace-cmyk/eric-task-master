@@ -384,6 +384,7 @@ button { color: inherit; }
 .asset-blocking-tasks { display: grid; gap: 7px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--npc-warning-line); }
 .asset-blocking-task { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .asset-blocking-task > span { min-width: 0; }
+.asset-blocking-task-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .asset-blocking-task strong, .asset-blocking-task small { display: block; overflow-wrap: anywhere; }
 .asset-blocking-task strong { color: var(--npc-ink); font-size: 11px; }
 .asset-blocking-task small { margin-top: 3px; color: var(--npc-warning-text); font-size: 10px; }
@@ -482,6 +483,7 @@ button { color: inherit; }
   .asset-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .asset-note { grid-template-columns: 1fr; gap: 5px; }
   .asset-blocking-task { align-items: stretch; flex-direction: column; }
+  .asset-blocking-task-actions { justify-content: flex-start; }
   .settings-footer { align-items: stretch; flex-direction: column; }
   .settings-footer .npc-btn { width: 100%; }
   .toast { right: 14px; bottom: 14px; max-width: calc(100vw - 28px); }

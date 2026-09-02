@@ -307,6 +307,12 @@ test('the protected built-in surface probe is discoverable by probe, surface, pr
   const surface = inventory.assets.find((asset) => asset.taskTypes.some((taskType) => taskType.name === 'surface-probe'));
   assert.equal(surface.protected, true);
   assert.equal(surface.discoverable, true);
+  await assert.rejects(service.applyTaskAssetAction({
+    action: 'force-delete',
+    assetIds: [surface.id],
+    confirm: true,
+    commandId: 'force-delete-protected-0001'
+  }, ADMIN), { code: 'TASK_ASSET_PROTECTED' });
 });
 
 test('task asset administration explains usage, blocks live deletion, retires transient modules, and removes them safely', async (t) => {
@@ -372,16 +378,24 @@ test('task asset administration explains usage, blocks live deletion, retires tr
     taskId: item.taskId,
     blockerCode: item.blockerCode,
     cleanupSettled: item.cleanupSettled,
+    canForceDeleteTask: item.canForceDeleteTask,
     canDeleteRecord: item.canDeleteRecord
   })), [{
     taskId: task.id,
     blockerCode: 'active_task',
     cleanupSettled: false,
+    canForceDeleteTask: false,
     canDeleteRecord: false
   }]);
   await assert.rejects(service.applyTaskAssetAction({
     action: 'delete', assetIds: [asset.id]
   }, ADMIN), { code: 'TASK_ASSET_DELETE_BLOCKED' });
+  await assert.rejects(service.applyTaskAssetAction({
+    action: 'force-delete',
+    assetIds: [asset.id],
+    confirm: true,
+    commandId: 'force-delete-live-asset-0001'
+  }, ADMIN), { code: 'TASK_ASSET_FORCE_DELETE_ACTIVE_TASK' });
 
   await service.applyTaskAssetAction({
     action: 'note', assetIds: [asset.id], note: 'Confirmed one-off; remove after cleanup'
@@ -473,11 +487,13 @@ test('Task Pack deletion revalidates cached resume checkpoints and ignores a cor
     taskId: item.taskId,
     blockerCode: item.blockerCode,
     cleanupSettled: item.cleanupSettled,
+    canForceDeleteTask: item.canForceDeleteTask,
     canDeleteRecord: item.canDeleteRecord
   })), [{
     taskId: created.id,
     blockerCode: 'resume_available',
     cleanupSettled: true,
+    canForceDeleteTask: true,
     canDeleteRecord: true
   }]);
   assert.equal(asset.usage.lastUsedAt, failed.finishedAt);
@@ -514,6 +530,75 @@ test('Task Pack deletion revalidates cached resume checkpoints and ignores a cor
   assert.equal(asset.deletable, true);
   assert.deepEqual(asset.deleteBlockerCodes, []);
   await service.applyTaskAssetAction({ action: 'delete', assetIds: [asset.id] }, ADMIN);
+});
+
+test('Owner force-deletes a custom executor asset after its terminal Worker disappears', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-force-delete-asset-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, 'task.mjs');
+  await writeFile(modulePath, [
+    'export const meta = { supportsResume: true };',
+    'export async function run() {}',
+    ''
+  ].join('\n'));
+  const store = fakeProfileStore(root);
+  store.releaseLease = async () => false;
+  const service = createTaskService({
+    stateDir: path.join(root, 'state'),
+    profileStore: store,
+    allowedTaskRoots: [root],
+    seedTaskTypes: [],
+    processAlive: async () => false,
+    workerFactory() {
+      const child = new FakeWorker();
+      child.send = () => {
+        throw new Error('injected start failure before executor asset cleanup');
+      };
+      return child;
+    }
+  });
+  await service.installTaskType({ name: 'stale.asset.v1', modulePath, transient: true }, ADMIN);
+  const created = await service.create({
+    profileId: 'profile_test',
+    taskType: 'stale.asset.v1',
+    idempotencyKey: 'force-delete-stale-custom-asset'
+  }, ADMIN);
+  await waitFor(async () => (await service.get(created.id, ADMIN)).state === 'failed');
+
+  let inventory = await service.listTaskAssets(ADMIN);
+  const asset = inventory.assets.find((item) => item.id === 'type:stale.asset.v1');
+  assert.equal(asset.deletable, false);
+  assert.deepEqual(asset.deleteBlockerCodes, ['cleanup_pending']);
+
+  await assert.rejects(service.applyTaskAssetAction({
+    action: 'force-delete',
+    assetIds: [asset.id],
+    commandId: 'missing-confirmation-0001'
+  }, ADMIN), { code: 'TASK_ASSET_FORCE_DELETE_CONFIRMATION_REQUIRED' });
+
+  await service.applyTaskAssetAction({
+    action: 'force-delete',
+    assetIds: [asset.id],
+    confirm: true,
+    commandId: 'force-delete-custom-asset-0001'
+  }, ADMIN);
+  inventory = await service.listTaskAssets(ADMIN);
+  assert.equal(inventory.assets.some((item) => item.id === asset.id), false);
+  const detached = await service.getInternal(created.id);
+  assert.equal(detached.taskTypeAssetDetached, true);
+  assert.equal(detached.cleanup.settled, false);
+  assert.equal(detached.resumeCheckpointValid, false);
+  await assert.rejects(service.resume(created.id, {
+    resumeKey: 'detached-task-cannot-resume'
+  }, ADMIN), { code: 'TASK_TYPE_ASSET_DETACHED_BY_OWNER' });
+
+  const blockedProfile = await store.get('profile_test');
+  await service.forceReleaseProfileLease('profile_test', {
+    confirm: true,
+    commandId: 'force-release-after-asset-delete',
+    expectedUpdatedAt: blockedProfile.updatedAt
+  }, ADMIN);
+  await service.close();
 });
 
 test('terminal finalization seals a valid current-attempt checkpoint when checkpoint IPC was lost', async (t) => {
@@ -1939,7 +2024,18 @@ test('Owner force release preserves the failed task, revokes its stale lease, an
   const originalError = failed.error.code;
   const blockedUpdatedAt = store.profile.updatedAt;
 
+  await assert.rejects(service.deleteTask(created.id, {
+    commandId: 'owner-force-delete-no-confirm',
+    expectedRevision: failed.revision,
+    force: true
+  }, ADMIN), { code: 'TASK_FORCE_DELETE_CONFIRMATION_REQUIRED' });
   liveLeasePids.add(store.profile.lease.pid);
+  await assert.rejects(service.deleteTask(created.id, {
+    commandId: 'owner-force-delete-live-task',
+    expectedRevision: failed.revision,
+    force: true,
+    confirm: true
+  }, ADMIN), { code: 'TASK_FORCE_DELETE_RUNTIME_ACTIVE' });
   await assert.rejects(service.forceReleaseProfileLease('profile_test', {
     confirm: true,
     commandId: 'owner-force-release-task-live',
@@ -1969,6 +2065,17 @@ test('Owner force release preserves the failed task, revokes its stale lease, an
     expectedUpdatedAt: blockedUpdatedAt
   }, ADMIN);
   assert.equal(replay.idempotent, true);
+  const forced = await service.deleteTask(created.id, {
+    commandId: 'owner-force-delete-dead-task',
+    expectedRevision: retained.revision,
+    force: true,
+    confirm: true
+  }, ADMIN);
+  assert.equal(forced.forced, true);
+  await assert.rejects(service.get(created.id, ADMIN), { code: 'TASK_NOT_FOUND' });
+  const tombstone = await service.getInternal(created.id);
+  assert.equal(tombstone.forcedDelete.commandId, 'owner-force-delete-dead-task');
+  assert.equal(tombstone.cleanup.settled, false);
   await service.close();
 });
 

@@ -93,13 +93,38 @@ function createTaskHarness(profileStore, tasks, control) {
       return { assets: structuredClone(control.assets), total: control.assets.length };
     },
     async applyTaskAssetAction(body) {
-      control.assetActions.push({ action: body.action, assetIds: [...body.assetIds], note: body.note });
+      control.assetActions.push({
+        action: body.action,
+        assetIds: [...body.assetIds],
+        note: body.note,
+        confirm: body.confirm,
+        commandId: body.commandId
+      });
       const selected = control.assets.filter((asset) => body.assetIds.includes(asset.id));
       if (selected.length !== body.assetIds.length) throw serviceError(404, 'TASK_ASSET_NOT_FOUND', 'Asset not found');
       if (body.action === 'delete' && selected.some((asset) => !asset.deletable)) {
         throw serviceError(409, 'TASK_ASSET_DELETE_BLOCKED', 'Asset is still referenced');
       }
-      if (body.action === 'delete') {
+      if (body.action === 'force-delete') {
+        assert.equal(body.confirm, true);
+        assert.match(body.commandId, /^dashboard:/u);
+        if (selected.some((asset) => asset.protected)) {
+          throw serviceError(409, 'TASK_ASSET_PROTECTED', 'System assets cannot be force-deleted');
+        }
+        for (const asset of selected) {
+          for (const blocker of asset.blockingTasks || []) {
+            const related = tasks.get(blocker.taskId);
+            if (related && !['completed', 'failed', 'cancelled', 'terminated'].includes(related.state)) {
+              throw serviceError(409, 'TASK_ASSET_FORCE_DELETE_ACTIVE_TASK', 'Task is still active');
+            }
+            if (related) {
+              related.taskTypeAssetDetached = true;
+              related.resumeAvailable = false;
+            }
+          }
+        }
+        control.assets = control.assets.filter((asset) => !body.assetIds.includes(asset.id));
+      } else if (body.action === 'delete') {
         control.assets = control.assets.filter((asset) => !body.assetIds.includes(asset.id));
       } else {
         for (const asset of selected) {
@@ -234,13 +259,18 @@ function createTaskHarness(profileStore, tasks, control) {
     },
     async deleteTask(id, body) {
       control.deleteRequests += 1;
+      control.taskDeleteRequests.push({ id, body: structuredClone(body) });
       const value = task(id);
       assertCommand(value, body);
-      if (!['completed', 'failed', 'cancelled', 'terminated'].includes(value.state) || value.cleanup?.settled !== true) {
+      const terminal = ['completed', 'failed', 'cancelled', 'terminated'].includes(value.state);
+      if (body.force === true) {
+        assert.equal(body.confirm, true);
+        if (!terminal) throw serviceError(409, 'TASK_FORCE_DELETE_RUNTIME_ACTIVE', 'Task is still active');
+      } else if (!terminal || value.cleanup?.settled !== true) {
         throw serviceError(409, 'TASK_DELETE_NOT_READY', 'Only settled terminal tasks can be deleted');
       }
       tasks.delete(id);
-      return { id, deletedAt: now() };
+      return { id, deletedAt: now(), forced: body.force === true };
     },
     async close() {
       for (const [id, ownerId] of openOwners) {
@@ -393,6 +423,7 @@ const control = {
   conflictNextPause: false,
   taskActions: [],
   deleteRequests: 0,
+  taskDeleteRequests: [],
   behaviorChanges: [],
   assetActions: [],
   notificationActions: [],
@@ -429,13 +460,13 @@ const control = {
       lifecycle: 'active', discoverable: true, protected: false, transient: false,
       taskTypes: [{ name: 'news.collect.v2', title: '新闻采集', lifecycle: 'active', discoverable: true }],
       fileCount: 1, sizeBytes: 4_096, installedAt: ago(86_400_000),
-      usage: { runCount: 12, successCount: 10, failureCount: 2, activeCount: 1, states: { completed: 10, failed: 2 }, lastUsedAt: now() },
+      usage: { runCount: 12, successCount: 10, failureCount: 2, activeCount: 0, states: { completed: 10, failed: 2 }, lastUsedAt: now() },
       canEditNote: true, canChangeLifecycle: true, deletable: false,
       deleteBlockers: ['任务 历史新闻采集 仍可从检查点恢复'],
       blockingTaskCount: 1,
       blockingTasks: [{
-        taskId: 'task_pack_blocker', title: '历史新闻采集', state: 'failed',
-        blockerCode: 'resume_available', cleanupSettled: true, canDeleteRecord: true
+        taskId: 'task_pack_blocker', revision: 2, title: '历史新闻采集', state: 'failed',
+        blockerCode: 'resume_available', cleanupSettled: true, canForceDeleteTask: true, canDeleteRecord: true
       }]
     },
     {
@@ -634,6 +665,19 @@ try {
     cleanup: { browserClosed: false, workerExited: false, leaseReleased: false, settled: false }
   });
 
+  tasks.set('task_stale_cleanup', {
+    id: 'task_stale_cleanup', jobId: 'job_stale_cleanup', revision: 3,
+    profileId: persistent.id, taskType: 'stale.cleanup.v1', taskLabel: '异常任务清理',
+    displayName: 'Hermes-异常任务清理-20260826-101550Z', state: 'failed', behavior: 'human',
+    createdAt: ago(58_000), startedAt: ago(56_000), finishedAt: ago(50_000), updatedAt: ago(50_000),
+    currentActivity: { phase: 'failed', status: 'failed', updatedAt: ago(50_000) },
+    progress: { current: 2, total: 10, message: 'Worker 已失联，清理回执缺失', updatedAt: ago(50_000) },
+    health: { status: 'failed', checkedAt: ago(50_000) },
+    timing: { version: 1, cooldownDurationMs: 0, activeCooldownStartedAt: null },
+    history: [{ attempt: 1, workerStartedAt: ago(56_000), finishedAt: ago(50_000) }],
+    cleanup: { browserClosed: false, workerExited: false, leaseReleased: false, settled: false }
+  });
+
   for (let index = 0; index < 102; index += 1) {
     const id = `task_history_${String(index).padStart(2, '0')}`;
     tasks.set(id, {
@@ -700,6 +744,23 @@ try {
   }
   assert.equal(await page.locator('.agent-card, dialog, [data-view-panel="agents"]').count(), 0);
   checks.push('Tasks, Profiles, Task Pack assets, and minimal Settings render without Agent or raw artifact APIs');
+
+  const staleTaskCard = page.locator('.task-card[data-task-id="task_stale_cleanup"]');
+  await staleTaskCard.getByRole('button', { name: '强制删除', exact: true }).waitFor();
+  page.once('dialog', (dialog) => dialog.accept());
+  await staleTaskCard.getByRole('button', { name: '强制删除', exact: true }).click();
+  await staleTaskCard.waitFor({ state: 'detached' });
+  assert.deepEqual(control.taskDeleteRequests.at(-1), {
+    id: 'task_stale_cleanup',
+    body: {
+      commandId: control.taskDeleteRequests.at(-1).body.commandId,
+      expectedRevision: 3,
+      force: true,
+      confirm: true
+    }
+  });
+  assert.match(control.taskDeleteRequests.at(-1).body.commandId, /^dashboard:/u);
+  checks.push('Owner can force-delete a dead terminal task with unconfirmed cleanup while preserving the runtime safety gate');
 
   await page.locator('#notification-badge').filter({ hasText: '2' }).waitFor();
   await page.getByRole('button', { name: '打开通知', exact: true }).click();
@@ -966,7 +1027,7 @@ try {
   await completedCard.getByRole('button', { name: '删除记录' }).click();
   await completedCard.waitFor({ state: 'detached' });
   assert.equal(tasks.has('task_completed'), false);
-  assert.equal(control.deleteRequests, 3);
+  assert.equal(control.deleteRequests, 4);
   assert.match(await page.evaluate(() => document.activeElement?.dataset.focusKey || document.activeElement?.id || ''), /^(?:task:|tasks-title)/u);
   checks.push('settled task record deletion and deterministic focus recovery');
 
@@ -1063,7 +1124,12 @@ try {
   const refreshedPackCard = page.locator('.asset-card').filter({ hasText: '新闻采集 Pack' });
   await refreshedPackCard.locator('input[type="checkbox"]').check();
   assert.equal(await page.getByRole('button', { name: '删除', exact: true }).isDisabled(), true);
-  await refreshedPackCard.locator('input[type="checkbox"]').uncheck();
+  assert.equal(await page.getByRole('button', { name: '强制删除', exact: true }).isEnabled(), true);
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '强制删除', exact: true }).click();
+  await refreshedPackCard.waitFor({ state: 'detached' });
+  assert.equal(tasks.get('task_pack_blocker').taskTypeAssetDetached, true);
+  checks.push('Owner can directly force-delete a custom Task Pack after terminal runtime checks; task history remains but resume is detached');
 
   await page.locator('#asset-search').fill('活动');
   assert.equal(await page.locator('.asset-card').count(), 1);
@@ -1093,9 +1159,11 @@ try {
   await page.getByRole('button', { name: '删除', exact: true }).click();
   await orphanCard.waitFor({ state: 'detached' });
   await page.locator('#asset-filter').selectOption('all');
-  assert.equal(await page.locator('.asset-card').count(), 2);
-  assert.deepEqual(control.assetActions.map((entry) => entry.action), ['note', 'restore', 'deprecate', 'delete', 'delete']);
-  checks.push('asset purpose, discovery, usage, notes, search, filters, protected state, and batch lifecycle deletion');
+  assert.equal(await page.locator('.asset-card').count(), 1);
+  assert.deepEqual(control.assetActions.map((entry) => entry.action), ['force-delete', 'note', 'restore', 'deprecate', 'delete', 'delete']);
+  assert.equal(control.assetActions[0].confirm, true);
+  assert.match(control.assetActions[0].commandId, /^dashboard:/u);
+  checks.push('asset purpose, discovery, usage, notes, search, filters, protected state, force deletion, and batch lifecycle deletion');
 
   if (screenshotPath) {
     await page.getByRole('button', { name: '任务', exact: true }).click();
