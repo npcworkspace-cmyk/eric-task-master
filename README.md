@@ -4,7 +4,7 @@
 
 **An always-on task automation system for AI agents.**
 
-Version: **2.9.1**
+Version: **2.9.2**
 
 AI agents can reason, plan, and write code, but browser execution is often their weakest link. Built-in agent browsers are convenient for short sessions yet commonly lose login state, task continuity, and recovery context. Thin CDP controllers offer fast low-level access, but leave every Agent to rebuild orchestration, progress tracking, cleanup, and error recovery for each job.
 
@@ -42,7 +42,7 @@ Task Master does not replace Agent reasoning. It keeps long-running work alive, 
 ## The three-layer model
 
 1. **Task Master runtime** — pure Playwright execution, persistent and ephemeral Profiles, queues, durable tasks, progress, recovery, evidence, cleanup, and a central Human Journey engine for visible browser interaction.
-2. **Owner Console** — one fixed local web address keeps human control simple: paginated task progress and batch controls, shared Profile management, a Task Pack asset catalog with direct blocker-to-task navigation, dedicated notification settings, Chinese/English switching, and a compact human-verification inbox. Users sign in directly inside isolated persistent Playwright Profiles.
+2. **Owner Console** — one fixed local web address keeps human control simple: paginated task progress and batch controls, shared Profile management, a Task Pack asset catalog with direct blocker recovery and force-delete controls for stale user-created work, dedicated notification settings, Chinese/English switching, and a compact human-verification inbox. Users sign in directly inside isolated persistent Playwright Profiles.
 3. **MCP + Skills + Task Packs** — Agents receive a compact, high-level task interface while reusable domain capabilities stay independent from the core runtime.
 
 This separation keeps the base universal: improve one execution engine, then define many specialized automation workers above it.
@@ -122,8 +122,8 @@ All three modes use smooth minimum-jerk pointer acceleration, one continuous lon
 - Profiles are shared by all trusted local Agents; there is no meaningless “Profile creator” field. A Profile still has one live lease, so two Agents cannot corrupt the same login state.
 - The Console keeps four focused work areas—Tasks, Profiles, Task Packs, and Settings—plus a compact verification drawer in the header. Task history is cursor-paginated, selected task records can be paused, resumed, cancelled, or safely deleted in bounded batches, and every Pack deletion blocker can jump to the exact retained task. It does not expose a confusing Agent registry, raw files, diagnostics, or a second messaging workbench.
 - Every task gets a stable `Agent-specific task-created time` name and shows its current action, Worker-confirmed runtime behavior, visual progress, execution time, cumulative cooldown time, and total time.
-- Pause, resume, cancel, and record deletion are revision-checked. Deletion hides only terminal records with confirmed cleanup and never makes an executed action replayable.
-- The Task Packs catalog explains what each executor does, whether Agents can discover it, when it was last used, and why it cannot yet be deleted. Owners can add notes and batch deprecate, restore, or safely remove stale assets. Deleted task history and invalid checkpoints do not create phantom blockers; system assets and modules needed by live, uncleaned, or verified-resumable tasks remain protected.
+- Pause, resume, cancel, and record deletion are revision-checked. Normal deletion waits for confirmed cleanup; an Owner can force-remove a stale record only after its Worker is gone. Generated files stay preserved and an executed action never becomes replayable.
+- The Task Packs catalog explains what each executor does, whether Agents can discover it, when it was last used, and why it cannot yet be deleted. Owners can add notes and batch deprecate, restore, safely delete, or force-delete their own stale assets. Force deletion never removes a live or protected system executor; retained task results remain available, but that removed code can no longer resume them.
 - The Console renders only the Agent's bounded final report; raw artifacts, logs, and specialized deliverables remain scoped protocol outputs that the originating Agent must interpret.
 
 ## Build specialized production workers

@@ -472,6 +472,7 @@ export function createTaskService({
     requireServiceOpen,
     serializeMutation: serializeTaskMutation,
     refreshResumeCheckpointState,
+    forceDetachTaskAssetReferences,
     persist
   });
   void ready.then(() => scheduleQueuedTasks()).catch(() => {});
@@ -2804,6 +2805,14 @@ export function createTaskService({
   }
 
   async function refreshResumeCheckpointState(task) {
+    if (task.taskTypeAssetDetached === true) {
+      task.resumeCheckpointValid = false;
+      task.resumeCheckpointError = {
+        code: 'TASK_TYPE_ASSET_DETACHED_BY_OWNER',
+        message: 'Owner force-deleted the task type asset; this task can no longer be resumed'
+      };
+      return false;
+    }
     if (
       task.supportsResume !== true || task.state !== 'failed' ||
       task.cleanup?.settled !== true
@@ -2889,6 +2898,13 @@ export function createTaskService({
       throw new TaskServiceError(
         'TASK_EXTERNAL_COST_UNSUPPORTED',
         'This task used the external-cost runtime removed in Task Master 2.8.0 and cannot be resumed.',
+        409
+      );
+    }
+    if (task.taskTypeAssetDetached === true) {
+      throw new TaskServiceError(
+        'TASK_TYPE_ASSET_DETACHED_BY_OWNER',
+        'Owner force-deleted the task type asset; this task can no longer be resumed',
         409
       );
     }
@@ -3622,13 +3638,60 @@ export function createTaskService({
       if (caller.role !== 'manager-admin') {
         throw new TaskServiceError('TASK_DELETE_FORBIDDEN', 'Only the Owner Dashboard can delete task records', 403);
       }
-      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision']));
+      requireCoordinationBody(body, new Set(['commandId', 'expectedRevision', 'force', 'confirm']));
+      if (body.force !== undefined && typeof body.force !== 'boolean') {
+        throw new TaskServiceError('INVALID_TASK_DELETE', 'force must be a boolean');
+      }
+      if (body.confirm !== undefined && typeof body.confirm !== 'boolean') {
+        throw new TaskServiceError('INVALID_TASK_DELETE', 'confirm must be a boolean');
+      }
       const task = tasks.get(id);
       if (!task || task.deletedAt) {
         throw new TaskServiceError('TASK_NOT_FOUND', `Task ${id} was not found`, 404);
       }
       requireTaskRevision(task, body.expectedRevision);
-      if (
+      const force = body.force === true;
+      if (force) {
+        if (body.confirm !== true) {
+          throw new TaskServiceError(
+            'TASK_FORCE_DELETE_CONFIRMATION_REQUIRED',
+            'Owner confirmation is required before a task record can be force-deleted',
+            409
+          );
+        }
+        const workerAlive = Number.isSafeInteger(task.workerPid) && task.workerPid > 0
+          ? await processAlive(task.workerPid)
+          : false;
+        if (children.has(task.id) || workerAlive || isKnownLiveLease(task.profileId, task.leaseOwner)) {
+          throw new TaskServiceError(
+            'TASK_FORCE_DELETE_RUNTIME_ACTIVE',
+            'The task runtime may still be active; terminate it before force deletion',
+            409
+          );
+        }
+        if (await taskLeaseIsAbsent(task)) {
+          task.leaseHeld = false;
+          task.cleanup = { ...(task.cleanup || {}), leaseReleased: true };
+          delete task.cleanup.leaseReleaseError;
+        }
+        task.resumeCheckpointValid = false;
+        task.resumeCheckpointError = {
+          code: 'TASK_RECORD_FORCE_DELETED_BY_OWNER',
+          message: 'Owner force-deleted this task record; checkpoint resume is disabled'
+        };
+        task.forcedDelete = {
+          at: nowIso(),
+          commandId: body.commandId,
+          cleanupSettled: task.cleanup?.settled === true
+        };
+        appendTimeline(task, 'task.record.force_deleted', {
+          actor: taskActor(caller),
+          commandId: body.commandId,
+          status: 'applied',
+          message: 'Owner force-deleted a task record after the runtime was proven absent; output files remain preserved'
+        });
+        finalizationFailures.delete(task.id);
+      } else if (
         !TERMINAL_TASK_STATES.has(task.state) || task.cleanup?.settled !== true ||
         children.has(task.id) || task.leaseHeld === true || finalizationFailures.has(task.id)
       ) {
@@ -3644,8 +3707,54 @@ export function createTaskService({
       task.updatedAt = task.deletedAt;
       await persist(task);
       await awaitTaskPersistence(task.id);
-      return { id: task.id, deletedAt: task.deletedAt };
+      return { id: task.id, deletedAt: task.deletedAt, forced: force };
     });
+  }
+
+  async function forceDetachTaskAssetReferences(taskIds = [], { commandId, actor } = {}) {
+    const selected = [...new Set(taskIds)].map((id) => tasks.get(id)).filter(Boolean);
+    const candidates = selected.filter((task) => !task.deletedAt && task.taskTypeAssetDetached !== true);
+    for (const task of candidates) {
+      if (!TERMINAL_TASK_STATES.has(task.state)) {
+        throw new TaskServiceError(
+          'TASK_ASSET_FORCE_DELETE_ACTIVE_TASK',
+          `Task ${task.displayName || task.id} must end before its executor asset can be force-deleted`,
+          409
+        );
+      }
+      const workerAlive = Number.isSafeInteger(task.workerPid) && task.workerPid > 0
+        ? await processAlive(task.workerPid)
+        : false;
+      if (children.has(task.id) || workerAlive || isKnownLiveLease(task.profileId, task.leaseOwner)) {
+        throw new TaskServiceError(
+          'TASK_ASSET_FORCE_DELETE_RUNTIME_ACTIVE',
+          `Task ${task.displayName || task.id} may still have a live Worker`,
+          409
+        );
+      }
+    }
+    const detachedAt = nowIso();
+    for (const task of candidates) {
+      task.taskTypeAssetDetached = true;
+      task.taskTypeAssetDetachedAt = detachedAt;
+      task.taskTypeAssetDetachCommandId = commandId;
+      task.resumeCheckpointValid = false;
+      task.resumeCheckpointError = {
+        code: 'TASK_TYPE_ASSET_DETACHED_BY_OWNER',
+        message: 'Owner force-deleted the task type asset; this task can no longer be resumed'
+      };
+      task.revision += 1;
+      task.updatedAt = detachedAt;
+      appendTimeline(task, 'task.type_asset.owner_detached', {
+        actor,
+        commandId,
+        status: 'applied',
+        message: 'Owner force-deleted the executor asset; task outputs remain preserved and resume is disabled'
+      });
+      await persist(task);
+    }
+    await Promise.all(candidates.map((task) => awaitTaskPersistence(task.id)));
+    return { detachedTaskCount: candidates.length };
   }
 
   async function cancel(id, suppliedCaller = {}) {
