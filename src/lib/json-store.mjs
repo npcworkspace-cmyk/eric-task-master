@@ -2,6 +2,31 @@ import { mkdir, open, readFile, rename, rm, chmod } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+const TRANSIENT_REPLACE_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function replaceFileWithRetry(source, destination, {
+  replace = rename,
+  delay = wait,
+  // Antivirus and indexers can briefly retain a Windows sharing lock. Keep
+  // replacement atomic and wait at most about 4.1 seconds before surfacing it.
+  attempts = 20,
+  baseDelayMs = 25
+} = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await replace(source, destination);
+      return;
+    } catch (error) {
+      if (!TRANSIENT_REPLACE_CODES.has(error?.code) || attempt === attempts) throw error;
+      await delay(Math.min(250, baseDelayMs * (2 ** (attempt - 1))));
+    }
+  }
+}
+
 function clone(value) {
   return structuredClone(value);
 }
@@ -86,7 +111,7 @@ export class JsonStore {
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await rename(temporaryPath, this.#filePath);
+      await replaceFileWithRetry(temporaryPath, this.#filePath);
       await chmod(this.#filePath, 0o600);
     } catch (error) {
       await handle?.close().catch(() => {});

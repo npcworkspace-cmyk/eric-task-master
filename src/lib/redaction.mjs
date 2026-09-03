@@ -31,6 +31,24 @@ export function redactSensitiveText(value) {
     .replace(BEARER_VALUE, '$1[REDACTED]');
 }
 
+function hasSecretNamedValueShape(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.hasOwn(value, 'value')) {
+    return false;
+  }
+  const descriptor = typeof value.name === 'string'
+    ? value.name
+    : typeof value.key === 'string'
+      ? value.key
+      : '';
+  const looksLikeCookie = typeof value.name === 'string' && (
+    typeof value.domain === 'string' || typeof value.path === 'string' ||
+    typeof value.httpOnly === 'boolean' || typeof value.secure === 'boolean' ||
+    typeof value.sameSite === 'string'
+  );
+  return looksLikeCookie || isSensitiveKey(descriptor) ||
+    /(?:^|[-_])(auth|authorization|bearer|cookie|credential|jwt|password|secret|session|token)(?:$|[-_])/iu.test(descriptor);
+}
+
 function sanitizePublicHttpUrl(value) {
   try {
     const url = new URL(value);
@@ -64,17 +82,40 @@ export function redactSensitiveValue(value, { depth = 0, maxDepth = 12, maxItems
   if (depth > maxDepth) return '[truncated]';
   if (typeof value === 'string') return redactSensitiveText(value);
   if (Array.isArray(value)) {
-    return value.slice(0, maxItems).map((item) => redactSensitiveValue(item, {
+    const redacted = value.slice(0, maxItems).map((item) => redactSensitiveValue(item, {
       depth: depth + 1,
       maxDepth,
       maxItems
     }));
+    if (value.length > maxItems) {
+      redacted.push({
+        __taskMasterTruncated: {
+          kind: 'array',
+          includedItems: maxItems,
+          omittedItems: value.length - maxItems
+        }
+      });
+    }
+    return redacted;
   }
   if (!value || typeof value !== 'object') return value;
+  const redactNamedValue = hasSecretNamedValueShape(value);
   const safe = {};
-  for (const [key, item] of Object.entries(value).slice(0, maxItems)) {
+  const entries = Object.entries(value);
+  for (const [key, item] of entries.slice(0, maxItems)) {
     if (isSensitiveKey(key)) continue;
+    if (redactNamedValue && key === 'value') {
+      safe.value = '[REDACTED]';
+      continue;
+    }
     safe[key] = redactSensitiveValue(item, { depth: depth + 1, maxDepth, maxItems });
+  }
+  if (entries.length > maxItems) {
+    safe.__taskMasterTruncated = {
+      kind: 'object',
+      includedItems: maxItems,
+      omittedItems: entries.length - maxItems
+    };
   }
   return safe;
 }
@@ -83,17 +124,40 @@ export function redactPublicValue(value, { depth = 0, maxDepth = 12, maxItems = 
   if (depth > maxDepth) return '[truncated]';
   if (typeof value === 'string') return redactPublicText(value);
   if (Array.isArray(value)) {
-    return value.slice(0, maxItems).map((item) => redactPublicValue(item, {
+    const redacted = value.slice(0, maxItems).map((item) => redactPublicValue(item, {
       depth: depth + 1,
       maxDepth,
       maxItems
     }));
+    if (value.length > maxItems) {
+      redacted.push({
+        __taskMasterTruncated: {
+          kind: 'array',
+          includedItems: maxItems,
+          omittedItems: value.length - maxItems
+        }
+      });
+    }
+    return redacted;
   }
   if (!value || typeof value !== 'object') return value;
+  const redactNamedValue = hasSecretNamedValueShape(value);
   const safe = {};
-  for (const [key, item] of Object.entries(value).slice(0, maxItems)) {
+  const entries = Object.entries(value);
+  for (const [key, item] of entries.slice(0, maxItems)) {
     if (isSensitiveKey(key)) continue;
+    if (redactNamedValue && key === 'value') {
+      safe.value = '[REDACTED]';
+      continue;
+    }
     safe[key] = redactPublicValue(item, { depth: depth + 1, maxDepth, maxItems });
+  }
+  if (entries.length > maxItems) {
+    safe.__taskMasterTruncated = {
+      kind: 'object',
+      includedItems: maxItems,
+      omittedItems: entries.length - maxItems
+    };
   }
   return safe;
 }

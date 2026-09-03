@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+app_root='/opt/eric-task-master'
+old_cli="${app_root}/bin/taskmaster"
+cli_link='/usr/bin/taskmaster'
+
+manager_pids() {
+  ps -ax -o pid= -o command= | awk \
+    -v node_path="${app_root}/runtime/node" \
+    -v cli_path="${app_root}/app/src/cli.mjs" '
+      index($0, node_path) && index($0, cli_path) &&
+      ($0 ~ / serve([[:space:]]|$)/ || $0 ~ / manager foreground([[:space:]]|$)/) { print $1 }
+    '
+}
+
+if [ -e "${app_root}" ]; then
+  if [ ! -x "${old_cli}" ]; then
+    echo 'Eric Task Master upgrade stopped: the previous application launcher is missing.' >&2
+    exit 1
+  fi
+  pids="$(manager_pids)"
+  if [ -n "${pids}" ]; then
+    kill -TERM ${pids}
+    attempts=0
+    while [ "${attempts}" -lt 300 ] && [ -n "$(manager_pids)" ]; do
+      sleep 0.1
+      attempts=$((attempts + 1))
+    done
+    if [ -n "$(manager_pids)" ]; then
+      echo 'Eric Task Master upgrade stopped: the previous Manager did not exit cleanly.' >&2
+      exit 1
+    fi
+  fi
+  rm -rf "${app_root}"
+fi
+
+if [ -L "${cli_link}" ] && [ "$(readlink "${cli_link}")" = "${old_cli}" ]; then
+  rm -f "${cli_link}"
+fi
+
+exit 0

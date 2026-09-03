@@ -34,16 +34,24 @@ export function normalizeOutputBudgetLimits(input = {}) {
   const allowed = new Set(Object.keys(DEFAULT_OUTPUT_BUDGET));
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length) throw new TypeError(`Unsupported outputBudget fields: ${unknown.join(', ')}`);
+  const maxFiles = boundedInteger(input.maxFiles, DEFAULT_OUTPUT_BUDGET.maxFiles, {
+    name: 'outputBudget.maxFiles', minimum: 1, maximum: 1_000_000
+  });
+  const derivedMaxEntries = input.maxFiles === undefined
+    ? DEFAULT_OUTPUT_BUDGET.maxEntries
+    : Math.min(2_000_000, Math.max(DEFAULT_OUTPUT_BUDGET.maxEntries, maxFiles * 2));
+  const maxEntries = boundedInteger(input.maxEntries, derivedMaxEntries, {
+    name: 'outputBudget.maxEntries', minimum: 1, maximum: 2_000_000
+  });
+  if (maxEntries < maxFiles) {
+    throw new TypeError('outputBudget.maxEntries must be greater than or equal to outputBudget.maxFiles');
+  }
   return Object.freeze({
     maxBytes: boundedInteger(input.maxBytes, DEFAULT_OUTPUT_BUDGET.maxBytes, {
       name: 'outputBudget.maxBytes', minimum: 1, maximum: 64 * 1024 * 1024 * 1024
     }),
-    maxFiles: boundedInteger(input.maxFiles, DEFAULT_OUTPUT_BUDGET.maxFiles, {
-      name: 'outputBudget.maxFiles', minimum: 1, maximum: 1_000_000
-    }),
-    maxEntries: boundedInteger(input.maxEntries, DEFAULT_OUTPUT_BUDGET.maxEntries, {
-      name: 'outputBudget.maxEntries', minimum: 1, maximum: 2_000_000
-    }),
+    maxFiles,
+    maxEntries,
     maxDepth: boundedInteger(input.maxDepth, DEFAULT_OUTPUT_BUDGET.maxDepth, {
       name: 'outputBudget.maxDepth', minimum: 1, maximum: 1_024
     }),
