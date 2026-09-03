@@ -227,7 +227,7 @@ async function main() {
     add('Profile create, rename, and default selection', profiles.length === 2 &&
       profiles.some((profile) => profile.id === profileB.id && profile.name === 'Acceptance Renamed' && profile.isDefault));
 
-    await cli(['profiles', 'open', profileA.id, '--json'], 60_000);
+    await cli(['profiles', 'open', profileA.id, '--json'], 120_000);
     const opened = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles.find((profile) => profile.id === profileA.id);
     await cli(['profiles', 'close', profileA.id, '--json'], 60_000);
     const closed = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles.find((profile) => profile.id === profileA.id);

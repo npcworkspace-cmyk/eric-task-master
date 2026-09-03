@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.1 - 2026-09-04
+
+- Fixed early Manager and Profile Worker exits being reported as unhandled promise rejections.
+- Aligned manual Chrome startup timeouts, maintained startup heartbeats, and preserved bounded underlying failure details.
+- Added Profile renaming to the bilingual Dashboard.
+- Resolved release tags explicitly and added read-only verification of immutable published assets.
+
 ## 3.0.0 - 2026-09-03
 
 Eric Task Master 3.0 is a clean CLI-first runtime.

@@ -119,6 +119,7 @@ const calls = {
   profileActions: [],
   profileDeletes: [],
   profileCreates: [],
+  profileRenames: [],
   defaultChanges: []
 };
 
@@ -252,8 +253,24 @@ async function handler(request, response) {
       return;
     }
     const body = await bodyFrom(request);
+    if (typeof body.name === 'string') {
+      const name = body.name.trim();
+      if (!name || name.length > 80) {
+        json(response, 400, { error: { code: 'INVALID_PROFILE_NAME', message: 'A name of 1–80 characters is required' } });
+        return;
+      }
+      if (profiles.some((candidate) => candidate.id !== profile.id && candidate.name.toLowerCase() === name.toLowerCase())) {
+        json(response, 409, { error: { code: 'PROFILE_NAME_EXISTS', message: 'Profile name already exists' } });
+        return;
+      }
+      profile.name = name;
+      profile.updatedAt = now();
+      calls.profileRenames.push({ id: profile.id, name });
+      json(response, 200, { profile: clone(profile) });
+      return;
+    }
     if (body.isDefault !== true) {
-      json(response, 400, { error: { code: 'INVALID_PROFILE_PATCH', message: 'Only isDefault is supported' } });
+      json(response, 400, { error: { code: 'INVALID_PROFILE_PATCH', message: 'Only name and isDefault are supported' } });
       return;
     }
     for (const candidate of profiles) candidate.isDefault = candidate.id === profile.id;
@@ -399,10 +416,46 @@ try {
   await page.getByRole('button', { name: '新建 Profile', exact: true }).click();
   await page.locator('#profile-name').fill('Research');
   await page.getByRole('button', { name: '创建 Profile', exact: true }).click();
-  const researchCard = page.locator('.profile-card').filter({ hasText: 'Research' });
+  const researchCard = page.locator('.profile-card[data-profile-id="profile_3"]');
   await researchCard.waitFor();
   assert.deepEqual(calls.profileCreates.at(-1), { name: 'Research' });
   assert.equal(Object.keys(calls.profileCreates.at(-1)).length, 1);
+
+  const renameButton = researchCard.getByRole('button', { name: '改名', exact: true });
+  const renameRequestsBefore = calls.requests.filter((entry) => entry.method === 'PATCH').length;
+  for (const name of [null, '   ', 'Research', 'x'.repeat(81)]) {
+    const dialogEvent = page.waitForEvent('dialog');
+    const click = renameButton.click();
+    const dialog = await dialogEvent;
+    assert.equal(dialog.type(), 'prompt');
+    assert.equal(dialog.defaultValue(), 'Research');
+    assert.match(dialog.message(), /新的 Profile 名称/u);
+    if (name === null) await dialog.dismiss();
+    else await dialog.accept(name);
+    await click;
+  }
+  assert.equal(calls.requests.filter((entry) => entry.method === 'PATCH').length, renameRequestsBefore);
+  assert.equal(await page.locator('.profile-card[data-profile-id="profile_busy"]').getByRole('button', { name: '改名', exact: true }).isDisabled(), true);
+
+  let finishRename;
+  const pendingRename = new Promise((resolve) => { finishRename = resolve; });
+  const holdRename = async (route) => {
+    if (route.request().method() === 'PATCH') await pendingRename;
+    await route.continue();
+  };
+  await page.route('**/v1/profiles/profile_3', holdRename);
+  page.once('dialog', (dialog) => dialog.accept('  Research renamed  '));
+  await renameButton.click();
+  assert.equal(await renameButton.isDisabled(), true);
+  await renameButton.evaluate((node) => node.click());
+  finishRename();
+  await waitUntil(() => profileById('profile_3')?.name === 'Research renamed', 'Profile rename');
+  await researchCard.getByRole('heading', { name: 'Research renamed', exact: true }).waitFor();
+  await page.unroute('**/v1/profiles/profile_3', holdRename);
+  assert.deepEqual(calls.profileRenames, [{ id: 'profile_3', name: 'Research renamed' }]);
+  assert.equal(profileById('profile_3').state, 'closed');
+  assert.match(await page.locator('#dashboard-message').textContent(), /Profile 已改名/u);
+  checks.push('Profile rename trims names, preserves identity, ignores cancel/empty/unchanged/overlong input, and disables busy or pending actions');
 
   await researchCard.getByRole('button', { name: '设为默认', exact: true }).click();
   await waitUntil(() => profileById('profile_3')?.isDefault === true, 'default Profile change');
@@ -429,6 +482,16 @@ try {
 
   await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
   await page.getByRole('heading', { name: 'Browser Profiles', exact: true }).waitFor();
+  const englishRename = page.locator('.profile-card[data-profile-id="profile_work"]').getByRole('button', { name: 'Rename', exact: true });
+  const englishDialogEvent = page.waitForEvent('dialog');
+  const englishClick = englishRename.click();
+  const englishDialog = await englishDialogEvent;
+  assert.match(englishDialog.message(), /new Profile name/u);
+  assert.equal(englishDialog.defaultValue(), 'Work');
+  await englishDialog.accept('Work renamed');
+  await englishClick;
+  await page.getByRole('heading', { name: 'Work renamed', exact: true }).waitFor();
+  assert.match(await page.locator('#dashboard-message').textContent(), /Profile renamed/u);
   await page.setViewportSize({ width: 390, height: 844 });
   const mobile = await page.evaluate(() => ({
     width: window.innerWidth,
@@ -472,6 +535,7 @@ try {
     taskActions: calls.taskActions,
     taskDeletes: calls.taskDeletes,
     profileActions: calls.profileActions,
+    profileRenames: calls.profileRenames,
     profileDeletes: calls.profileDeletes,
     screenshots: screenshotPath ? { tasks: screenshotPath, profiles: profilesScreenshotPath } : null,
     pageErrors

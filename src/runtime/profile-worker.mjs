@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { PROFILE_LAUNCH_TIMEOUT_MS } from '../contracts.mjs';
 import { launchChromeProfile } from './browser-engine.mjs';
 import { redactSensitiveText } from '../lib/redaction.mjs';
 
@@ -59,18 +60,26 @@ async function closeContext(context, timeoutMs = 10_000) {
 
 export async function runProfileWorker(profile, {
   loadPlaywright = () => import('playwright'),
+  sendMessage = send,
+  sendCleanup = sendCleanupWithAck,
   signal
 } = {}) {
   processCleanupConfirmed = false;
   let context;
   let heartbeat;
+  let stage = 'load-playwright';
+  const sendHeartbeat = () => sendMessage({ type: 'heartbeat', stage, at: new Date().toISOString() });
   try {
-    const playwright = await loadPlaywright();
-    context = await launchChromeProfile(playwright, profile);
-    if (context.pages().length === 0) await context.newPage();
-    send({ type: 'ready', at: new Date().toISOString() });
-    heartbeat = setInterval(() => send({ type: 'heartbeat', at: new Date().toISOString() }), 10_000);
+    sendHeartbeat();
+    heartbeat = setInterval(sendHeartbeat, 10_000);
     heartbeat.unref?.();
+    const playwright = await loadPlaywright();
+    stage = 'launch-chrome';
+    context = await launchChromeProfile(playwright, profile, { timeout: PROFILE_LAUNCH_TIMEOUT_MS });
+    stage = 'open-page';
+    if (context.pages().length === 0) await context.newPage();
+    stage = 'ready';
+    sendMessage({ type: 'ready', at: new Date().toISOString() });
     if (!signal?.aborted) {
       await new Promise((resolve) => {
         signal?.addEventListener('abort', resolve, { once: true });
@@ -79,18 +88,25 @@ export async function runProfileWorker(profile, {
     }
     return { ok: true };
   } catch (error) {
-    send({
+    sendMessage({
       type: 'error',
       error: {
-        code: error?.code || 'PROFILE_OPEN_FAILED',
-        message: redactSensitiveText(error?.message || 'Profile failed to open').slice(0, 4_000)
+        code: redactSensitiveText(error?.code || 'PROFILE_OPEN_FAILED').slice(0, 128),
+        message: redactSensitiveText(error?.message || 'Profile failed to open').slice(0, 4_000),
+        details: {
+          stage,
+          ...(error?.cause ? { cause: {
+            code: redactSensitiveText(error.cause?.code || error.cause?.name || 'ERROR').slice(0, 128),
+            message: redactSensitiveText(error.cause?.message || error.cause).slice(0, 2_000)
+          } } : {})
+        }
       }
     });
     return { ok: false, error };
   } finally {
     clearInterval(heartbeat);
     const browserClosed = await closeContext(context);
-    const cleanupAcknowledged = await sendCleanupWithAck({
+    const cleanupAcknowledged = await sendCleanup({
       type: 'closed', browserClosed, at: new Date().toISOString()
     });
     processCleanupConfirmed = browserClosed && cleanupAcknowledged;
