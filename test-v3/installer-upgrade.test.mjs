@@ -24,6 +24,9 @@ test('Windows upgrade stops the managed installation and replaces only managed a
   assert.match(installer, /function PrepareToInstall\(var NeedsRestart: Boolean\): String;/u);
   assert.match(installer, /taskmaster\.cmd/u);
   assert.match(installer, /manager stop --json/u);
+  assert.match(installer, /StopStarted := Exec\(/u);
+  assert.match(installer, /ExpandConstant\('\{cmd\}'\)/u);
+  assert.doesNotMatch(installer, /StopStarted := ShellExec\(/u);
   assert.match(installer, /waituntilterminated/u);
   assert.match(installer, /previous Eric Task Master Manager could not be stopped safely/u);
   assert.doesNotMatch(installer, /ERIC_TASK_MASTER_HOME|\\eric-task-master(?:\\|')/u);
@@ -64,6 +67,8 @@ test('native installer smoke tests simulate stale v2 payload while preserving ex
     assert.match(smoke, /userStatePreserved/u);
   }
   assert.ok(occurrences(windows, 'Start-Process -FilePath $installerPath') >= 2);
+  assert.match(windows, /windows-installer-first-install\.log/u);
+  assert.match(windows, /windows-installer-upgrade\.log/u);
   assert.ok(occurrences(mac, 'installer -pkg "${package}" -target /') >= 2);
   assert.ok(occurrences(linux, 'dpkg -i "${package}"') >= 2);
 });

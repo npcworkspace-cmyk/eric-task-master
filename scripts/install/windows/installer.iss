@@ -95,7 +95,14 @@ begin
     Result := 'The installer could not prepare the previous Manager shutdown helper.';
     Exit;
   end;
-  StopStarted := ShellExec('', StopScript, '', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  StopStarted := Exec(
+    ExpandConstant('{cmd}'),
+    '/d /s /c ""' + StopScript + '""',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
   DeleteFile(StopScript);
   if not StopStarted or
      (ResultCode <> 0) then

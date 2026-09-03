@@ -11,12 +11,16 @@ $allowedPrefix = $runnerTemp.TrimEnd('\') + '\'
 if (-not $root.StartsWith($allowedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
   throw "InstallRoot must be inside RUNNER_TEMP: $root"
 }
+$artifactRoot = Join-Path (Get-Location) 'artifacts'
+New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
+$installLog = Join-Path $artifactRoot 'windows-installer-first-install.log'
+$upgradeLog = Join-Path $artifactRoot 'windows-installer-upgrade.log'
 $state = Join-Path $runnerTemp 'eric-task-master-installed-smoke-state'
 $job = (Resolve-Path (Join-Path $PSScriptRoot '..\build\fixtures\bare-playwright-task.mjs')).Path
 Remove-Item -LiteralPath $root,$state -Recurse -Force -ErrorAction SilentlyContinue
 
 $install = Start-Process -FilePath $installerPath -ArgumentList @(
-  '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`""
+  '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$installLog`""
 ) -Wait -PassThru
 if ($install.ExitCode -ne 0) { throw "Installer exited with $($install.ExitCode)" }
 
@@ -48,7 +52,7 @@ if (-not (Test-Path -LiteralPath $managerFile)) { throw 'Pre-upgrade Manager PID
 $preUpgradeManagerProcessId = (Get-Content -LiteralPath $managerFile -Raw | ConvertFrom-Json).pid
 
 $upgrade = Start-Process -FilePath $installerPath -ArgumentList @(
-  '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`""
+  '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$upgradeLog`""
 ) -Wait -PassThru
 if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer exited with $($upgrade.ExitCode)" }
 $deadline = [DateTime]::UtcNow.AddSeconds(20)
