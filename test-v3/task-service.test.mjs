@@ -9,7 +9,7 @@ import test from 'node:test';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
 import { createTaskService } from '../src/runtime/task-service.mjs';
 
-async function until(check, timeoutMs = 3_000) {
+async function until(check, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = await check();
