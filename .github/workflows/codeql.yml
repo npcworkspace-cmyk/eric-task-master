@@ -2,7 +2,7 @@ name: code-scanning
 
 on:
   push:
-    branches: [main, "stability/**", "upgrade/**"]
+    branches: [main, "v*", "stability/**", "upgrade/**"]
   pull_request:
   schedule:
     - cron: "17 19 * * 1"

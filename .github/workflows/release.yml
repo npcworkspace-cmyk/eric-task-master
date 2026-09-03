@@ -1,18 +1,22 @@
-name: manual-release-after-cross-platform-gate
+name: publish-tested-native-installers
 
 on:
   workflow_dispatch:
     inputs:
       release_sha:
-        description: Exact 40-character main commit that passed the push CI
+        description: Exact current main commit with successful CI and CodeQL push runs
         required: true
         type: string
       confirm_version:
-        description: Exact package version to publish, without the v prefix
+        description: Exact semantic version without the v prefix
         required: true
         type: string
+      confirm_unsigned:
+        description: Publish clearly marked unsigned Windows and macOS packages
+        required: true
+        type: boolean
       confirm_immutable:
-        description: Confirm an administrator verified Release immutability is enabled
+        description: Confirm Release immutability is enabled
         required: true
         type: boolean
 
@@ -21,17 +25,18 @@ permissions:
   contents: write
 
 concurrency:
-  group: manual-release-${{ github.repository }}
+  group: native-release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_SHA: ${{ inputs.release_sha }}
       CONFIRM_VERSION: ${{ inputs.confirm_version }}
+      CONFIRM_UNSIGNED: ${{ inputs.confirm_unsigned }}
       CONFIRM_IMMUTABLE: ${{ inputs.confirm_immutable }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,147 +46,107 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-      - name: Verify immutable Release enforcement before creating any Release
+          node-version: 22.22.3
+      - name: Verify exact main SHA, version, CI, CodeQL, and immutable Release policy
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -n "${GH_TOKEN}" || {
-            echo "RELEASE_ADMIN_TOKEN with repository Administration:read is required." >&2
-            exit 1
-          }
-          IMMUTABLE_ENABLED="$(gh api \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)"
-          test "${IMMUTABLE_ENABLED}" = true || {
-            echo "Repository Release immutability is not enabled; no Release was created." >&2
-            exit 1
-          }
-      - name: Verify manual release authority and immutable version
-        shell: bash
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
           [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
           [[ "${CONFIRM_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          test "${CONFIRM_UNSIGNED}" = true
           test "${CONFIRM_IMMUTABLE}" = true
           test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          test "$(node -p "JSON.parse(require('node:fs').readFileSync('package.json','utf8')).version")" = "${CONFIRM_VERSION}"
 
           MAIN_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
-          test "${MAIN_SHA}" = "${RELEASE_SHA}" || {
-            echo "Release SHA must be the current main head (${MAIN_SHA})." >&2
-            exit 1
+          test "${MAIN_SHA}" = "${RELEASE_SHA}" || { echo "Release SHA is not current main" >&2; exit 1; }
+          TAG="v${CONFIRM_VERSION}"
+          ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || {
+            echo "Release ${TAG} already exists" >&2; exit 1;
           }
-
-          VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
-          test "${VERSION}" = "${CONFIRM_VERSION}" || {
-            echo "Confirmed version ${CONFIRM_VERSION} does not match package version ${VERSION}." >&2
-            exit 1
+          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1 || {
+            echo "Tag ${TAG} already exists" >&2; exit 1;
           }
-          TAG="v${VERSION}"
-
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists. Published versions are never reused." >&2
-            exit 1
-          fi
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists. Published assets are never overwritten." >&2
-            exit 1
-          fi
-
           gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
             --jq '.[] | select(.draft == false) | .tag_name' \
-            | node scripts/assert-release-version.mjs "${VERSION}"
+            | node scripts/assert-release-version.mjs "${CONFIRM_VERSION}"
 
-          CI_RUN="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&head_sha=${RELEASE_SHA}&per_page=20" \
-            --jq '.workflow_runs[] | select(.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .conclusion == "success") | [.id, .head_sha, .head_branch, .event, .conclusion] | @tsv' \
+          CI_RUN_ID="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&per_page=100" \
+            --jq '.workflow_runs[] | select(.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .status == "completed" and .conclusion == "success") | .id' \
             | head -n 1)"
-          test -n "${CI_RUN}" || {
-            echo "No successful main push CI exists for ${RELEASE_SHA}." >&2
-            exit 1
-          }
-          read -r CI_RUN_ID CI_SHA CI_BRANCH CI_EVENT CI_CONCLUSION <<< "${CI_RUN}"
-          test "${CI_SHA}" = "${RELEASE_SHA}"
-          test "${CI_BRANCH}" = main
-          test "${CI_EVENT}" = push
-          test "${CI_CONCLUSION}" = success
-
-          printf '%s\n' "VERSION=${VERSION}" "TAG=${TAG}" "CI_RUN_ID=${CI_RUN_ID}" >> "${GITHUB_ENV}"
-      - name: Build reproducible release archives
+          test -n "${CI_RUN_ID}" || { echo "No successful exact-SHA main CI run" >&2; exit 1; }
+          CODEQL_RUN_ID="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/codeql.yml/runs?branch=main&event=push&status=completed&per_page=100" \
+            --jq '.workflow_runs[] | select(.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .status == "completed" and .conclusion == "success") | .id' \
+            | head -n 1)"
+          test -n "${CODEQL_RUN_ID}" || { echo "No successful exact-SHA main CodeQL run" >&2; exit 1; }
+          test -n "${RELEASE_ADMIN_TOKEN}" || { echo "RELEASE_ADMIN_TOKEN is required" >&2; exit 1; }
+          IMMUTABLE="$(GH_TOKEN="${RELEASE_ADMIN_TOKEN}" gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)"
+          test "${IMMUTABLE}" = true || { echo "Release immutability is not enabled" >&2; exit 1; }
+          printf '%s\n' "TAG=${TAG}" "CI_RUN_ID=${CI_RUN_ID}" "CODEQL_RUN_ID=${CODEQL_RUN_ID}" >> "${GITHUB_ENV}"
+      - name: Download the exact installer bytes tested by CI
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
-          mkdir -p dist
+          rm -rf downloaded
+          gh run download "${CI_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --pattern 'release-*' --dir downloaded
+          node scripts/build/collect-release-assets.mjs \
+            --input downloaded --output dist --version "${CONFIRM_VERSION}" --sha "${RELEASE_SHA}"
+      - name: Build the versioned Agent Skill archive
+        shell: bash
+        run: |
+          set -euo pipefail
           ARCHIVE_MTIME="@$(git show -s --format=%ct "${RELEASE_SHA}")"
-          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-v${VERSION}/" \
-            --output="dist/eric-task-master-v${VERSION}.zip" HEAD
-          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-v${VERSION}/" \
-            --output="dist/eric-task-master-v${VERSION}.repro.zip" HEAD
-          cmp "dist/eric-task-master-v${VERSION}.zip" "dist/eric-task-master-v${VERSION}.repro.zip"
-          rm "dist/eric-task-master-v${VERSION}.repro.zip"
-          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-skill-v${VERSION}/" \
-            --output="dist/eric-task-master-skill-v${VERSION}.zip" HEAD:skills/eric-task-master
-          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="eric-task-master-skill-v${VERSION}/" \
-            --output="dist/eric-task-master-skill-v${VERSION}.repro.zip" HEAD:skills/eric-task-master
-          cmp "dist/eric-task-master-skill-v${VERSION}.zip" "dist/eric-task-master-skill-v${VERSION}.repro.zip"
-          rm "dist/eric-task-master-skill-v${VERSION}.repro.zip"
-          SKILL_PREFIX="eric-task-master-skill-v${VERSION}"
-          unzip -Z1 "dist/eric-task-master-skill-v${VERSION}.zip" | grep -Fx "${SKILL_PREFIX}/LICENSE"
-          unzip -Z1 "dist/eric-task-master-skill-v${VERSION}.zip" | grep -Fx "${SKILL_PREFIX}/runtime.json"
-          diff -u \
-            <(unzip -p "dist/eric-task-master-skill-v${VERSION}.zip" "${SKILL_PREFIX}/LICENSE" | tr -d '\r') \
-            <(tr -d '\r' < LICENSE)
-          test "$(unzip -p "dist/eric-task-master-skill-v${VERSION}.zip" "${SKILL_PREFIX}/runtime.json" \
-            | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).runtimeVersion))')" = "${VERSION}"
-          (cd dist && sha256sum ./*.zip > SHA256SUMS)
-      - name: Reverify immutable Release enforcement immediately before publication
+          PREFIX="eric-task-master-skill-v${CONFIRM_VERSION}/"
+          git archive --format=zip --mtime="${ARCHIVE_MTIME}" --prefix="${PREFIX}" \
+            --output="dist/eric-task-master-skill-v${CONFIRM_VERSION}.zip" HEAD:skills/eric-task-master
+          unzip -Z1 "dist/eric-task-master-skill-v${CONFIRM_VERSION}.zip" | grep -Fx "${PREFIX}SKILL.md"
+          node scripts/build/checksums.mjs --dir dist --output dist/SHA256SUMS
+      - name: Reverify main, exact CI, CodeQL, and immutable policy before publication
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -n "${GH_TOKEN}" || {
-            echo "RELEASE_ADMIN_TOKEN with repository Administration:read is required." >&2
-            exit 1
-          }
-          IMMUTABLE_ENABLED_NOW="$(gh api \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)"
-          test "${IMMUTABLE_ENABLED_NOW}" = true || {
-            echo "Repository Release immutability changed after preflight; no Release was created." >&2
-            exit 1
-          }
-      - name: Create complete draft and publish immutable Release
-        shell: bash
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
-          MAIN_SHA_NOW="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
-          test "${MAIN_SHA_NOW}" = "${RELEASE_SHA}" || {
-            echo "Main moved to ${MAIN_SHA_NOW} after release preflight; no Release was created." >&2
-            exit 1
-          }
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq '.[] | select(.draft == false) | .tag_name' \
-            | node scripts/assert-release-version.mjs "${VERSION}"
-          CI_RUN_NOW="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&head_sha=${RELEASE_SHA}&per_page=20" \
-            --jq '.workflow_runs[] | select(.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .conclusion == "success") | .id' \
-            | head -n 1)"
-          test -n "${CI_RUN_NOW}" || {
-            echo "Exact-SHA main push CI is no longer verifiable; no Release was created." >&2
-            exit 1
-          }
-          gh release create "${TAG}" dist/* --draft --target "${RELEASE_SHA}" --generate-notes \
-            --title "Eric Task Master ${TAG}" --repo "${GITHUB_REPOSITORY}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)" = "${RELEASE_SHA}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" \
+            --jq '.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .status == "completed" and .conclusion == "success"')" = true
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CODEQL_RUN_ID}" \
+            --jq '.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .status == "completed" and .conclusion == "success"')" = true
+          test "$(GH_TOKEN="${RELEASE_ADMIN_TOKEN}" gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)" = true
+      - name: Publish one immutable unsigned Release
+        shell: bash
+        env:
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)" = "${RELEASE_SHA}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" \
+            --jq '.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .status == "completed" and .conclusion == "success"')" = true
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CODEQL_RUN_ID}" \
+            --jq '.head_sha == "'"${RELEASE_SHA}"'" and .head_branch == "main" and .event == "push" and .status == "completed" and .conclusion == "success"')" = true
+          test "$(GH_TOKEN="${RELEASE_ADMIN_TOKEN}" gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)" = true
+          ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1
+          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1
+          gh release create "${TAG}" dist/* \
+            --draft \
+            --target "${RELEASE_SHA}" \
+            --title "Eric Task Master ${TAG}" \
+            --generate-notes \
+            --notes "Native packages are unsigned; verify SHA256SUMS and read UNSIGNED-BUILD.txt before installation." \
+            --repo "${GITHUB_REPOSITORY}"
           gh release edit "${TAG}" --draft=false --repo "${GITHUB_REPOSITORY}"
-
-          TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha)"
-          test "${TAG_SHA}" = "${RELEASE_SHA}"
-          RELEASE_IMMUTABLE="$(gh api \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .immutable)"
-          test "${RELEASE_IMMUTABLE}" = true
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha)" = "${RELEASE_SHA}"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .immutable)" = true

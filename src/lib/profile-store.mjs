@@ -1,13 +1,15 @@
-import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { isDeepStrictEqual } from 'node:util';
-import { isBehaviorMode, isBrowserEngine, isProfileKind, normalizeBehaviorMode } from '../contracts.mjs';
+import { lstat, mkdir, rename, rm } from 'node:fs/promises';
+import path from 'node:path';
 import { JsonStore } from './json-store.mjs';
+import {
+  isProcessAlive as defaultProcessAlive,
+  probeChromeProfileUsage as defaultProfileUsageProbe
+} from './process-tree.mjs';
 
-const DEFAULT_LEASE_TTL_MS = 60_000;
-const CLIENT_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/u;
-const FORCE_RELEASE_COMMAND_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/u;
+const PROFILE_ID = /^profile_[a-f0-9]{32}$/u;
+const DELETION_ID = /^delete_[a-f0-9]{32}$/u;
+const DEFAULT_LEASE_TTL_MS = 45_000;
 
 export class ProfileStoreError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -18,237 +20,83 @@ export class ProfileStoreError extends Error {
   }
 }
 
-export async function isProcessAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === 'EPERM') return true;
-    if (error?.code === 'ESRCH') return false;
-    throw error;
-  }
+function nowIso(now) {
+  return new Date(now()).toISOString();
 }
 
 function normalizeName(value) {
   if (typeof value !== 'string') {
-    throw new ProfileStoreError('INVALID_PROFILE_NAME', 'Profile name must be a string');
+    throw new ProfileStoreError('INVALID_PROFILE_NAME', 'Profile name is required');
   }
   const name = value.trim();
-  if (!name || name.length > 80) {
+  if (!name || name.length > 80 || /[\u0000-\u001f\u007f]/u.test(name)) {
     throw new ProfileStoreError(
       'INVALID_PROFILE_NAME',
-      'Profile name must contain 1 to 80 characters'
+      'Profile name must contain 1-80 visible characters'
     );
   }
   return name;
 }
 
-function ensureBehaviorMode(value) {
-  if (!isBehaviorMode(value)) {
-    throw new ProfileStoreError(
-      'INVALID_BEHAVIOR_MODE',
-      'Behavior mode must be fast, auto, or human'
-    );
+function safeProfilePath(root, profileId, recordedPath = null) {
+  if (!PROFILE_ID.test(profileId)) {
+    throw new ProfileStoreError('INVALID_PROFILE_ID', 'Profile ID is invalid');
   }
-  return value;
+  const expected = path.resolve(root, profileId);
+  if (recordedPath !== null && path.resolve(recordedPath) !== expected) {
+    throw new ProfileStoreError('INVALID_PROFILE_PATH', 'Profile data path is invalid', 500);
+  }
+  const relative = path.relative(path.resolve(root), expected);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new ProfileStoreError('INVALID_PROFILE_PATH', 'Profile data path is invalid', 500);
+  }
+  return expected;
 }
 
-function ensureHeadless(value) {
-  if (typeof value !== 'boolean') {
-    throw new ProfileStoreError('INVALID_HEADLESS', 'headless must be a boolean');
+function safeDeletionPath(root, profileId, deletionId, recordedPath = null) {
+  if (!PROFILE_ID.test(profileId) || !DELETION_ID.test(deletionId)) {
+    throw new ProfileStoreError('INVALID_PROFILE_DELETION', 'Profile deletion record is invalid', 500);
   }
-  return value;
+  const expected = path.resolve(root, `.deleting-${profileId}-${deletionId}`);
+  if (recordedPath !== null && path.resolve(recordedPath) !== expected) {
+    throw new ProfileStoreError('INVALID_PROFILE_DELETION', 'Profile deletion path is invalid', 500);
+  }
+  const relative = path.relative(path.resolve(root), expected);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new ProfileStoreError('INVALID_PROFILE_DELETION', 'Profile deletion path is invalid', 500);
+  }
+  return expected;
 }
 
-function ensureExtensionsEnabled(value) {
-  if (typeof value !== 'boolean') {
-    throw new ProfileStoreError(
-      'INVALID_PROFILE_EXTENSIONS_POLICY',
-      'extensionsEnabled must be a boolean'
-    );
-  }
-  return value;
-}
-
-function ensureProfileKind(value) {
-  if (!isProfileKind(value)) {
-    throw new ProfileStoreError(
-      'INVALID_PROFILE_KIND',
-      'Profile kind must be persistent or ephemeral'
-    );
-  }
-  return value;
-}
-
-function ensureBrowserEngine(value) {
-  if (!isBrowserEngine(value)) {
-    throw new ProfileStoreError(
-      'INVALID_BROWSER_ENGINE',
-      'browserEngine must be chrome or chromium'
-    );
-  }
-  return value;
-}
-
-function migrateBrowserEngine(profile, { allowLegacyChannel }) {
-  if (!allowLegacyChannel) {
-    if (profile.browserEngine === undefined || Object.hasOwn(profile, 'browserChannel')) {
-      throw new ProfileStoreError(
-        'PROFILE_ENGINE_MIGRATION_REQUIRED',
-        `Profile ${profile.id || '[unknown]'} has invalid browser engine metadata for this store version`,
-        409
-      );
-    }
-    profile.browserEngine = ensureBrowserEngine(profile.browserEngine);
-    return;
-  }
-  if (profile.browserEngine !== undefined && !Object.hasOwn(profile, 'browserChannel')) {
-    profile.browserEngine = ensureBrowserEngine(profile.browserEngine);
-    return;
-  }
-  const legacyChannel = profile.browserChannel;
-  let migratedEngine;
-  if (legacyChannel === undefined || legacyChannel === null || legacyChannel === '' || legacyChannel === 'chromium') {
-    migratedEngine = 'chromium';
-  } else if (legacyChannel === 'chrome') {
-    migratedEngine = 'chrome';
-  } else {
-    throw new ProfileStoreError(
-      'PROFILE_ENGINE_MIGRATION_REQUIRED',
-      `Profile ${profile.id || '[unknown]'} uses unsupported legacy browser channel ${String(legacyChannel)}`,
-      409
-    );
-  }
-  if (profile.browserEngine !== undefined && profile.browserEngine !== migratedEngine) {
-    throw new ProfileStoreError(
-      'PROFILE_ENGINE_MIGRATION_REQUIRED',
-      `Profile ${profile.id || '[unknown]'} has conflicting browser engine metadata`,
-      409
-    );
-  }
-  profile.browserEngine = ensureBrowserEngine(profile.browserEngine ?? migratedEngine);
-  delete profile.browserChannel;
-}
-
-function migrateProfileBehavior(profile, { allowLegacy }) {
-  if (profile.defaultBehavior === undefined || profile.defaultBehavior === null || profile.defaultBehavior === '') {
-    profile.defaultBehavior = profile.kind === 'persistent' ? 'human' : 'auto';
-    return;
-  }
-  const normalized = normalizeBehaviorMode(profile.defaultBehavior, { allowLegacy });
-  profile.defaultBehavior = ensureBehaviorMode(normalized);
-}
-
-function migrateProfileExtensions(profile, { allowLegacy }) {
-  if (profile.extensionsEnabled === undefined) {
-    if (!allowLegacy) {
-      throw new ProfileStoreError(
-        'PROFILE_EXTENSIONS_MIGRATION_REQUIRED',
-        `Profile ${profile.id || '[unknown]'} has invalid extension policy metadata`,
-        409
-      );
-    }
-    profile.extensionsEnabled = profile.kind === 'persistent' && profile.headless !== true;
-  }
-  profile.extensionsEnabled = ensureExtensionsEnabled(profile.extensionsEnabled);
-  if (profile.kind === 'ephemeral' && profile.extensionsEnabled) {
-    throw new ProfileStoreError(
-      'EPHEMERAL_PROFILE_EXTENSIONS_UNSUPPORTED',
-      `Ephemeral Profile ${profile.id || '[unknown]'} cannot retain browser extensions`,
-      409
-    );
-  }
-  if (profile.kind === 'persistent' && profile.extensionsEnabled && profile.headless === true) {
-    throw new ProfileStoreError(
-      'PROFILE_EXTENSIONS_HEADLESS_CONFLICT',
-      `Persistent Profile ${profile.id || '[unknown]'} cannot enable extensions in background mode`,
-      409
-    );
-  }
-}
-
-function ensureOwnerClientId(value) {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== 'string' || !CLIENT_ID_PATTERN.test(value)) {
-    throw new ProfileStoreError('INVALID_PROFILE_OWNER', 'Profile ownerClientId is invalid');
-  }
-  return value;
-}
-
-function ensureLeaseGeneration(value, { field = 'Lease generation', allowZero = false } = {}) {
-  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
-    throw new ProfileStoreError(
-      'INVALID_LEASE_GENERATION',
-      `${field} must be a ${allowZero ? 'non-negative' : 'positive'} safe integer`,
-      409
-    );
-  }
-  return value;
-}
-
-function nextLeaseGeneration(profile) {
-  const current = ensureLeaseGeneration(profile.leaseGeneration ?? 0, {
-    field: 'Profile lease generation',
-    allowZero: true
-  });
-  if (current >= Number.MAX_SAFE_INTEGER) {
-    throw new ProfileStoreError(
-      'LEASE_GENERATION_EXHAUSTED',
-      `Profile ${profile.id || '[unknown]'} exhausted its lease generation`,
-      409
-    );
-  }
-  profile.leaseGeneration = current + 1;
-  return profile.leaseGeneration;
-}
-
-function migrateLeaseFence(profile, { allowLegacy }) {
-  if (profile.leaseGeneration === undefined) {
-    if (!allowLegacy) {
-      throw new ProfileStoreError(
-        'PROFILE_LEASE_MIGRATION_REQUIRED',
-        `Profile ${profile.id || '[unknown]'} has no lease generation`,
-        409
-      );
-    }
-    profile.leaseGeneration = profile.lease ? 1 : 0;
-  }
-  ensureLeaseGeneration(profile.leaseGeneration, {
-    field: `Profile ${profile.id || '[unknown]'} lease generation`,
-    allowZero: true
-  });
-  if (!profile.lease) return;
-  if (profile.lease.generation === undefined) {
-    if (!allowLegacy) {
-      throw new ProfileStoreError(
-        'PROFILE_LEASE_MIGRATION_REQUIRED',
-        `Profile ${profile.id || '[unknown]'} has an unfenced lease`,
-        409
-      );
-    }
-    profile.leaseGeneration = Math.max(1, profile.leaseGeneration);
-    profile.lease.generation = profile.leaseGeneration;
-    return;
-  }
-  ensureLeaseGeneration(profile.lease.generation, {
-    field: `Profile ${profile.id || '[unknown]'} active lease generation`
-  });
-  if (profile.lease.generation !== profile.leaseGeneration) {
-    throw new ProfileStoreError(
-      'PROFILE_LEASE_MIGRATION_REQUIRED',
-      `Profile ${profile.id || '[unknown]'} lease generation is inconsistent`,
-      409
-    );
-  }
-}
-
-function findProfile(data, profileId) {
-  const profile = data.profiles.find((item) => item.id === profileId);
-  if (!profile) {
-    throw new ProfileStoreError('PROFILE_NOT_FOUND', `Profile ${profileId} was not found`, 404);
-  }
+function findProfile(data, identifier) {
+  const key = String(identifier ?? '').trim();
+  const profile = data.profiles.find((item) => (
+    item.id === key || item.name.toLowerCase() === key.toLowerCase()
+  ));
+  if (!profile) throw new ProfileStoreError('PROFILE_NOT_FOUND', `Profile ${key || '(empty)'} was not found`, 404);
   return profile;
+}
+
+function validLease(lease) {
+  return Boolean(
+    lease && typeof lease === 'object' &&
+    typeof lease.ownerId === 'string' && lease.ownerId &&
+    ['task', 'manual'].includes(lease.kind) &&
+    (
+      (Number.isSafeInteger(lease.pid) && lease.pid > 0) ||
+      (lease.identityUntrusted === true && lease.pid === null)
+    ) &&
+    typeof lease.nonce === 'string' && lease.nonce.length >= 8 &&
+    Number.isSafeInteger(lease.generation) && lease.generation >= 1 &&
+    Number.isFinite(Date.parse(lease.expiresAt))
+  );
+}
+
+function sameLease(lease, { ownerId, nonce, generation } = {}) {
+  return Boolean(
+    lease && lease.ownerId === ownerId && lease.nonce === nonce &&
+    lease.generation === generation
+  );
 }
 
 export class ProfileStore {
@@ -256,143 +104,210 @@ export class ProfileStore {
   #profilesRoot;
   #now;
   #processAlive;
-  #renamePath;
-  #removePath;
+  #profileUsageProbe;
 
   constructor({
     filePath,
     profilesRoot,
-    now = () => Date.now(),
-    processAlive = isProcessAlive,
-    renamePath = rename,
-    removePath = rm
-  }) {
-    if (!profilesRoot) throw new TypeError('profilesRoot is required');
-    this.#store = new JsonStore(filePath, { version: 7, profiles: [] });
-    this.#profilesRoot = profilesRoot;
+    now = Date.now,
+    processAlive = defaultProcessAlive,
+    profileUsageProbe = defaultProfileUsageProbe
+  } = {}) {
+    if (!filePath || !profilesRoot) throw new TypeError('filePath and profilesRoot are required');
+    if (
+      typeof now !== 'function' || typeof processAlive !== 'function' ||
+      typeof profileUsageProbe !== 'function'
+    ) {
+      throw new TypeError('now, processAlive, and profileUsageProbe must be functions');
+    }
+    this.#store = new JsonStore(filePath, {
+      version: 1, defaultProfileId: null, profiles: [], deletions: []
+    });
+    this.#profilesRoot = path.resolve(profilesRoot);
     this.#now = now;
     this.#processAlive = processAlive;
-    this.#renamePath = renamePath;
-    this.#removePath = removePath;
+    this.#profileUsageProbe = profileUsageProbe;
   }
 
   async init() {
     await mkdir(this.#profilesRoot, { recursive: true, mode: 0o700 });
     await this.#store.init();
-    // v0.x Profile records predate explicit persistence semantics. Preserve
-    // their existing browser state by migrating them to persistent Profiles.
     await this.#store.update((data) => {
-      if (data.version !== undefined && ![1, 2, 3, 4, 5, 6, 7].includes(data.version)) {
-        throw new ProfileStoreError(
-          'PROFILE_STORE_VERSION_UNSUPPORTED',
-          `Profile store version ${String(data.version)} is unsupported`,
-          409
-        );
-      }
-      const allowLegacyChannel = data.version === undefined || data.version === 1;
-      const allowLegacyBehavior = data.version === undefined || data.version <= 4;
-      const allowLegacyExtensions = data.version === undefined || data.version <= 5;
-      const allowLegacyLeaseFence = data.version === undefined || data.version <= 6;
-      for (const profile of data.profiles) {
-        profile.kind ||= 'persistent';
-        ensureProfileKind(profile.kind);
-        migrateBrowserEngine(profile, { allowLegacyChannel });
-        migrateProfileBehavior(profile, { allowLegacy: allowLegacyBehavior });
-        migrateProfileExtensions(profile, { allowLegacy: allowLegacyExtensions });
-        // v4 makes Profiles machine-local shared resources. Remove only the
-        // obsolete authorization metadata; userDataDir and browser state stay
-        // byte-for-byte in their existing location.
-        delete profile.ownerClientId;
-        delete profile.createdBy;
-        delete profile.access;
-        if (
-          profile.lease &&
-          /^(?:task:|profile-open:|session-import:)/u.test(profile.lease.ownerId || '') &&
-          profile.lease.cleanupRequired === undefined
-        ) {
-          profile.lease.cleanupRequired = true;
+      const source = Array.isArray(data.profiles) ? data.profiles : [];
+      const migrated = [];
+      const names = new Set();
+      for (const candidate of source) {
+        // v3 has one Profile kind. Old ephemeral records are intentionally not
+        // adopted because they never represented durable login state.
+        if (!candidate || candidate.kind === 'ephemeral' || !PROFILE_ID.test(candidate.id || '')) continue;
+        let name;
+        try {
+          name = normalizeName(candidate.name);
+          safeProfilePath(this.#profilesRoot, candidate.id, candidate.userDataDir);
+        } catch {
+          continue;
         }
-        migrateLeaseFence(profile, { allowLegacy: allowLegacyLeaseFence });
+        if (names.has(name.toLowerCase())) continue;
+        names.add(name.toLowerCase());
+        const lease = validLease(candidate.lease)
+          ? {
+              ownerId: candidate.lease.ownerId,
+              kind: candidate.lease.ownerId.startsWith('profile-open:') ? 'manual' : 'task',
+              taskId: /^task:(task_[a-f0-9]{32})$/u.exec(candidate.lease.ownerId)?.[1] ?? null,
+              pid: candidate.lease.pid,
+              nonce: candidate.lease.nonce || `legacy-${candidate.lease.generation}`,
+              generation: candidate.lease.generation,
+              acquiredAt: candidate.lease.acquiredAt,
+              heartbeatAt: candidate.lease.heartbeatAt || candidate.lease.acquiredAt,
+              expiresAt: candidate.lease.expiresAt,
+              ...(candidate.lease.identityUntrusted === true ? { identityUntrusted: true } : {}),
+              ...(typeof candidate.lease.cleanupConfirmedAt === 'string'
+                ? { cleanupConfirmedAt: candidate.lease.cleanupConfirmedAt }
+                : {})
+            }
+          : candidate.lease
+            ? {
+                ownerId: `legacy-quarantine:${candidate.id}`,
+                kind: 'task',
+                taskId: /^task:(task_[a-f0-9]{32})$/u.exec(String(candidate.lease.ownerId || ''))?.[1] ?? null,
+                pid: Number.isSafeInteger(candidate.lease.pid) && candidate.lease.pid > 0
+                  ? candidate.lease.pid
+                  : null,
+                nonce: `legacy-${randomUUID().replaceAll('-', '')}`,
+                generation: Number.isSafeInteger(candidate.lease.generation) && candidate.lease.generation >= 1
+                  ? candidate.lease.generation
+                  : 1,
+                acquiredAt: candidate.lease.acquiredAt || nowIso(this.#now),
+                heartbeatAt: candidate.lease.heartbeatAt || candidate.lease.acquiredAt || nowIso(this.#now),
+                expiresAt: candidate.lease.expiresAt || nowIso(this.#now),
+                identityUntrusted: true
+              }
+            : null;
+        migrated.push({
+          id: candidate.id,
+          name,
+          userDataDir: safeProfilePath(this.#profilesRoot, candidate.id),
+          state: lease
+            ? (lease.identityUntrusted === true || candidate.state === 'error'
+                ? 'error'
+                : (lease.kind === 'manual' ? 'open' : 'leased'))
+            : 'idle',
+          lease,
+          leaseGeneration: Number.isSafeInteger(candidate.leaseGeneration)
+            ? Math.max(0, candidate.leaseGeneration)
+            : lease?.generation ?? 0,
+          createdAt: candidate.createdAt || nowIso(this.#now),
+          updatedAt: candidate.updatedAt || nowIso(this.#now),
+          lastUsedAt: candidate.lastUsedAt || null
+        });
       }
-      data.version = 7;
+      data.version = 1;
+      data.profiles = migrated;
+      data.deletions = (Array.isArray(data.deletions) ? data.deletions : []).filter((record) => {
+        try {
+          safeProfilePath(this.#profilesRoot, record.profileId, record.userDataDir);
+          safeDeletionPath(this.#profilesRoot, record.profileId, record.id, record.tombstonePath);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      data.defaultProfileId = migrated.some((item) => item.id === data.defaultProfileId)
+        ? data.defaultProfileId
+        : migrated[0]?.id ?? null;
     });
-    await this.#recoverInterruptedDeletions();
+    await this.#recoverPendingDeletions();
     await this.recoverExpiredLeases();
   }
 
-  async list() {
+  async #recoverPendingDeletions() {
     const data = await this.#store.read();
-    return data.profiles;
-  }
-
-  async get(profileId) {
-    const data = await this.#store.read();
-    return structuredClone(findProfile(data, profileId));
-  }
-
-  async create(input = {}, ownership = {}) {
-    if (!input || typeof input !== 'object' || Array.isArray(input)) {
-      throw new ProfileStoreError('INVALID_PROFILE', 'Profile input must be an object');
-    }
-    const allowed = new Set(['name', 'kind', 'defaultBehavior', 'headless', 'browserEngine']);
-    const unknown = Object.keys(input).filter((key) => !allowed.has(key));
-    if (unknown.length) {
-      throw new ProfileStoreError(
-        'INVALID_PROFILE_CREATE',
-        `Unsupported profile fields: ${unknown.join(', ')}`
+    for (const record of Array.isArray(data.deletions) ? data.deletions : []) {
+      const sourcePath = safeProfilePath(this.#profilesRoot, record.profileId, record.userDataDir);
+      const tombstonePath = safeDeletionPath(
+        this.#profilesRoot,
+        record.profileId,
+        record.id,
+        record.tombstonePath
       );
+      const [source, tombstone] = await Promise.all([
+        lstat(sourcePath).catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error)),
+        lstat(tombstonePath).catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error))
+      ]);
+      if (source && tombstone) {
+        throw new ProfileStoreError(
+          'PROFILE_DELETE_RECOVERY_AMBIGUOUS',
+          'Both the Profile and its deletion tombstone exist; cleanup stopped safely',
+          500
+        );
+      }
+      if (source) await rename(sourcePath, tombstonePath);
+      await this.#store.update((draft) => {
+        const current = draft.profiles.find((profile) => profile.id === record.profileId);
+        if (current?.lease) {
+          throw new ProfileStoreError(
+            'PROFILE_LEASED',
+            `Profile ${current.name} became active during deletion recovery`,
+            409
+          );
+        }
+        draft.profiles = draft.profiles.filter((profile) => profile.id !== record.profileId);
+        if (draft.defaultProfileId === record.profileId) {
+          draft.defaultProfileId = draft.profiles[0]?.id ?? null;
+        }
+      });
+      await rm(tombstonePath, { recursive: true, force: true });
+      await this.#store.update((draft) => {
+        draft.deletions = (Array.isArray(draft.deletions) ? draft.deletions : [])
+          .filter((deletion) => deletion.id !== record.id);
+      });
     }
-    const {
-      name,
-      kind = 'persistent',
-      defaultBehavior: requestedBehavior,
-      headless = false,
-      browserEngine: requestedBrowserEngine
-    } = input;
-    const normalizedName = normalizeName(name);
-    ensureProfileKind(kind);
-    const defaultBehavior = ensureBehaviorMode(
-      requestedBehavior ?? (kind === 'persistent' ? 'human' : 'auto')
-    );
-    ensureHeadless(headless);
-    const browserEngine = ensureBrowserEngine(
-      requestedBrowserEngine ?? (kind === 'persistent' ? 'chrome' : 'chromium')
-    );
-    // Keep the second argument as a compatibility sink for 2.0 clients. Profile
-    // ownership/access was removed in v4, so these legacy values are ignored.
-    void ownership;
-    const now = new Date(this.#now()).toISOString();
-    const profileId = `profile_${randomUUID().replaceAll('-', '')}`;
-    const userDataDir = join(this.#profilesRoot, profileId);
-    await mkdir(userDataDir, { recursive: false, mode: 0o700 });
+  }
 
+  async snapshot() {
+    return this.#store.read();
+  }
+
+  async list() {
+    return (await this.#store.read()).profiles;
+  }
+
+  async get(identifier) {
+    const data = await this.#store.read();
+    return structuredClone(findProfile(data, identifier));
+  }
+
+  async getDefault() {
+    const data = await this.#store.read();
+    if (!data.defaultProfileId) return null;
+    return structuredClone(findProfile(data, data.defaultProfileId));
+  }
+
+  async create({ name } = {}) {
+    const normalizedName = normalizeName(name);
+    const id = `profile_${randomUUID().replaceAll('-', '')}`;
+    const userDataDir = safeProfilePath(this.#profilesRoot, id);
+    await mkdir(userDataDir, { recursive: false, mode: 0o700 });
     try {
       let created;
       await this.#store.update((data) => {
         if (data.profiles.some((item) => item.name.toLowerCase() === normalizedName.toLowerCase())) {
-          throw new ProfileStoreError(
-            'PROFILE_NAME_EXISTS',
-            `A profile named ${normalizedName} already exists`,
-            409
-          );
+          throw new ProfileStoreError('PROFILE_NAME_EXISTS', `Profile ${normalizedName} already exists`, 409);
         }
+        const timestamp = nowIso(this.#now);
         created = {
-          id: profileId,
+          id,
           name: normalizedName,
-          kind,
           userDataDir,
-          defaultBehavior,
-          headless,
-          browserEngine,
-          extensionsEnabled: kind === 'persistent' && !headless,
           state: 'idle',
           lease: null,
           leaseGeneration: 0,
-          createdAt: now,
-          updatedAt: now,
+          createdAt: timestamp,
+          updatedAt: timestamp,
           lastUsedAt: null
         };
         data.profiles.push(created);
+        data.defaultProfileId ||= id;
       });
       return structuredClone(created);
     } catch (error) {
@@ -401,719 +316,255 @@ export class ProfileStore {
     }
   }
 
-  async update(profileId, patch = {}) {
-    const allowed = new Set(['name', 'defaultBehavior', 'headless', 'extensionsEnabled', 'access']);
+  async update(identifier, patch = {}) {
+    const allowed = new Set(['name', 'isDefault']);
     const unknown = Object.keys(patch).filter((key) => !allowed.has(key));
     if (unknown.length) {
-      throw new ProfileStoreError(
-        'INVALID_PROFILE_PATCH',
-        `Unsupported profile fields: ${unknown.join(', ')}`
-      );
-    }
-    if ('name' in patch) patch = { ...patch, name: normalizeName(patch.name) };
-    if ('defaultBehavior' in patch) {
-      patch = { ...patch, defaultBehavior: ensureBehaviorMode(patch.defaultBehavior) };
-    }
-    if ('headless' in patch) patch = { ...patch, headless: ensureHeadless(patch.headless) };
-    if ('extensionsEnabled' in patch) {
-      patch = { ...patch, extensionsEnabled: ensureExtensionsEnabled(patch.extensionsEnabled) };
-    }
-    // A cached 2.0 client may still send access. Accept it as a no-op while the
-    // public contract and persisted record remain globally shared.
-    if ('access' in patch) {
-      const { access: _obsoleteAccess, ...currentPatch } = patch;
-      patch = currentPatch;
+      throw new ProfileStoreError('INVALID_PROFILE_PATCH', `Unsupported fields: ${unknown.join(', ')}`);
     }
     let updated;
     await this.#store.update((data) => {
-      const profile = findProfile(data, profileId);
-      if (profile.kind === 'ephemeral' && patch.extensionsEnabled === true) {
-        throw new ProfileStoreError(
-          'EPHEMERAL_PROFILE_EXTENSIONS_UNSUPPORTED',
-          `Ephemeral Profile ${profileId} cannot retain browser extensions`,
-          409
-        );
+      const profile = findProfile(data, identifier);
+      if (profile.state === 'deleting') {
+        throw new ProfileStoreError('PROFILE_DELETING', `Profile ${profile.name} is being deleted`, 409);
       }
-      const nextExtensionsEnabled = patch.extensionsEnabled ?? profile.extensionsEnabled;
-      const nextHeadless = patch.headless ?? profile.headless;
-      if (profile.kind === 'persistent' && nextExtensionsEnabled && nextHeadless) {
-        throw new ProfileStoreError(
-          'PROFILE_EXTENSIONS_HEADLESS_CONFLICT',
-          'Browser extensions require a visible persistent Profile; disable background mode first',
-          409
-        );
+      if (Object.hasOwn(patch, 'name')) {
+        const name = normalizeName(patch.name);
+        if (data.profiles.some((item) => item.id !== profile.id && item.name.toLowerCase() === name.toLowerCase())) {
+          throw new ProfileStoreError('PROFILE_NAME_EXISTS', `Profile ${name} already exists`, 409);
+        }
+        profile.name = name;
       }
-      if (
-        patch.name &&
-        data.profiles.some(
-          (item) => item.id !== profileId && item.name.toLowerCase() === patch.name.toLowerCase()
-        )
-      ) {
-        throw new ProfileStoreError(
-          'PROFILE_NAME_EXISTS',
-          `A profile named ${patch.name} already exists`,
-          409
-        );
+      if (patch.isDefault === true) data.defaultProfileId = profile.id;
+      if (patch.isDefault === false && data.defaultProfileId === profile.id) {
+        throw new ProfileStoreError('DEFAULT_PROFILE_REQUIRED', 'Choose another default Profile first', 409);
       }
-      Object.assign(profile, patch, { updatedAt: new Date(this.#now()).toISOString() });
+      profile.updatedAt = nowIso(this.#now);
       updated = profile;
     });
     return structuredClone(updated);
   }
 
-  async remove(profileId, { discardQuarantinedEphemeral = false } = {}) {
-    if (typeof discardQuarantinedEphemeral !== 'boolean') {
-      throw new ProfileStoreError(
-        'INVALID_PROFILE_DELETE',
-        'discardQuarantinedEphemeral must be a boolean'
-      );
+  async acquireLease(identifier, { ownerId, kind, taskId = null, pid, nonce, ttlMs = DEFAULT_LEASE_TTL_MS } = {}) {
+    if (typeof ownerId !== 'string' || !ownerId || !['task', 'manual'].includes(kind)) {
+      throw new ProfileStoreError('INVALID_LEASE', 'Lease owner and kind are required');
     }
-    const profile = await this.get(profileId);
-    const expectedPath = resolve(this.#profilesRoot, profileId);
-    const resolvedRoot = resolve(this.#profilesRoot);
-    if (
-      !/^profile_[a-f0-9]{32}$/.test(profileId) ||
-      resolve(profile.userDataDir) !== expectedPath ||
-      !expectedPath.startsWith(`${resolvedRoot}\\`) && !expectedPath.startsWith(`${resolvedRoot}/`)
-    ) {
-      throw new ProfileStoreError(
-        'INVALID_PROFILE_PATH',
-        `Profile ${profileId} has an invalid data path`,
-        500
-      );
+    if (!Number.isSafeInteger(pid) || pid <= 0 || typeof nonce !== 'string' || nonce.length < 8) {
+      throw new ProfileStoreError('INVALID_LEASE', 'Lease process identity is invalid');
     }
-    const ordinaryRemoval = !profile.lease && profile.state === 'idle';
-    const quarantinedEphemeral = discardQuarantinedEphemeral === true &&
-      profile.kind === 'ephemeral' &&
-      profile.state === 'error' &&
-      profile.lease?.cleanupRequired === true &&
-      /^task:/u.test(profile.lease.ownerId || '') &&
-      typeof profile.cleanupUnknownAt === 'string';
-    if (!ordinaryRemoval && !quarantinedEphemeral) {
-      const cleanupBlocked = discardQuarantinedEphemeral === true && profile.state === 'error';
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 2_000) {
+      throw new ProfileStoreError('INVALID_LEASE', 'Lease ttlMs must be at least 2000');
+    }
+
+    const existing = await this.get(identifier);
+    if (existing.state === 'deleting') {
+      throw new ProfileStoreError('PROFILE_DELETING', `Profile ${existing.name} is being deleted`, 409);
+    }
+    if (existing.lease) {
       throw new ProfileStoreError(
-        cleanupBlocked ? 'PROFILE_CLEANUP_UNCONFIRMED' : 'PROFILE_IN_USE',
-        cleanupBlocked
-          ? `Profile ${profileId} cleanup is not confirmed`
-          : `Profile ${profileId} must be idle before it can be removed`,
+        existing.state === 'error' ? 'PROFILE_CLEANUP_UNCONFIRMED' : 'PROFILE_LEASED',
+        existing.state === 'error'
+          ? `Profile ${existing.name} cleanup is not confirmed`
+          : `Profile ${existing.name} is already in use`,
         409
       );
-    }
-    if (quarantinedEphemeral) {
-      if (await this.#processAlive(profile.lease.pid)) {
-        throw new ProfileStoreError(
-          'PROFILE_IN_USE',
-          `Profile ${profileId} still has a live task owner`,
-          409
-        );
-      }
-      let retainedEntries;
-      try {
-        retainedEntries = await readdir(expectedPath);
-      } catch (error) {
-        throw new ProfileStoreError(
-          'PROFILE_DELETE_IO_FAILED',
-          `Profile ${profileId} data could not be inspected: ${error?.message || 'filesystem error'}`,
-          500
-        );
-      }
-      if (retainedEntries.length > 0) {
-        throw new ProfileStoreError(
-          'EPHEMERAL_PROFILE_NOT_EMPTY',
-          `Profile ${profileId} retained unexpected browser data and cannot be discarded`,
-          409
-        );
-      }
-    }
-    const restorableState = profile.state;
-    const restorableLease = structuredClone(profile.lease);
-    const restorableCleanupUnknownAt = profile.cleanupUnknownAt;
-    const tombstonePath = resolve(this.#profilesRoot, `.deleting-${profileId}-${randomUUID()}`);
-    const tombstoneName = tombstonePath.slice(resolve(this.#profilesRoot).length + 1);
-    const deletionOwner = `profile-delete:${randomUUID().replaceAll('-', '')}`;
-    let removed = profile;
-    let moved = false;
-    let movedPhasePersisted = false;
-    try {
-      await this.#store.update((data) => {
-        const current = findProfile(data, profileId);
-        const stillOrdinary = !current.lease && current.state === 'idle';
-        const stillQuarantined = quarantinedEphemeral &&
-          current.kind === 'ephemeral' &&
-          current.state === 'error' &&
-          current.cleanupUnknownAt === profile.cleanupUnknownAt &&
-          isDeepStrictEqual(current.lease, profile.lease);
-        if (!stillOrdinary && !stillQuarantined) {
-          throw new ProfileStoreError(
-            'PROFILE_IN_USE',
-            `Profile ${profileId} deletion state changed concurrently`,
-            409
-          );
-        }
-        const nowMs = this.#now();
-        const deletionGeneration = nextLeaseGeneration(current);
-        current.state = 'deleting';
-        current.lease = {
-          ownerId: deletionOwner,
-          pid: process.pid,
-          generation: deletionGeneration,
-          acquiredAt: new Date(nowMs).toISOString(),
-          heartbeatAt: new Date(nowMs).toISOString(),
-          expiresAt: new Date(nowMs + 5 * 60_000).toISOString()
-        };
-        current.deletion = {
-          tombstoneName,
-          startedAt: new Date(nowMs).toISOString(),
-          phase: 'prepared'
-        };
-        current.updatedAt = new Date(nowMs).toISOString();
-      });
-      await this.#renamePath(expectedPath, tombstonePath);
-      moved = true;
-      await this.#store.update((data) => {
-        const current = findProfile(data, profileId);
-        if (
-          current.state !== 'deleting' ||
-          current.lease?.ownerId !== deletionOwner ||
-          current.deletion?.tombstoneName !== tombstoneName
-        ) {
-          throw new ProfileStoreError('PROFILE_DELETE_RACE', 'Profile deletion state changed concurrently', 409);
-        }
-        current.deletion.phase = 'moved';
-        current.updatedAt = new Date(this.#now()).toISOString();
-      });
-      movedPhasePersisted = true;
-      try {
-        await this.#removePath(tombstonePath, { recursive: true, force: true });
-      } catch (error) {
-        throw new ProfileStoreError(
-          'PROFILE_DELETE_IO_FAILED',
-          `Profile ${profileId} data could not be removed: ${error?.message || 'filesystem error'}`,
-          500
-        );
-      }
-      if (await this.#pathStats(tombstonePath)) {
-        throw new ProfileStoreError(
-          'PROFILE_DELETE_IO_FAILED',
-          `Profile ${profileId} data still exists after deletion`,
-          500
-        );
-      }
-      await this.#store.update((data) => {
-        const index = data.profiles.findIndex((item) => item.id === profileId);
-        if (index === -1) {
-          throw new ProfileStoreError('PROFILE_NOT_FOUND', `Profile ${profileId} was not found`, 404);
-        }
-        const current = data.profiles[index];
-        if (
-          current.state !== 'deleting' ||
-          current.lease?.ownerId !== deletionOwner ||
-          current.deletion?.tombstoneName !== tombstoneName ||
-          current.deletion?.phase !== 'moved'
-        ) {
-          throw new ProfileStoreError('PROFILE_DELETE_RACE', 'Profile deletion state changed concurrently', 409);
-        }
-        [removed] = data.profiles.splice(index, 1);
-      });
-    } catch (error) {
-      if (!movedPhasePersisted && moved) {
-        await this.#renamePath(tombstonePath, expectedPath).catch(() => {});
-      }
-      if (!movedPhasePersisted) {
-        const expectedExists = Boolean(await this.#pathStats(expectedPath));
-        const tombstoneExists = Boolean(await this.#pathStats(tombstonePath));
-        await this.#store.update((data) => {
-          const current = data.profiles.find((item) => item.id === profileId);
-          if (current?.lease?.ownerId !== deletionOwner) return;
-          if (expectedExists && !tombstoneExists) {
-            current.state = restorableState;
-            current.lease = structuredClone(restorableLease);
-            if (restorableCleanupUnknownAt) current.cleanupUnknownAt = restorableCleanupUnknownAt;
-            else delete current.cleanupUnknownAt;
-            delete current.deletion;
-          } else {
-            current.state = 'error';
-            current.lease = null;
-          }
-          current.updatedAt = new Date(this.#now()).toISOString();
-        }).catch(() => {});
-      }
-      throw error;
-    }
-    return structuredClone(removed);
-  }
-
-  async #recoverInterruptedDeletions() {
-    const snapshot = await this.#store.read();
-    for (const profile of snapshot.profiles) {
-      if (!profile.deletion?.tombstoneName) continue;
-      const expectedPath = resolve(this.#profilesRoot, profile.id);
-      const tombstonePath = resolve(this.#profilesRoot, profile.deletion.tombstoneName);
-      const valid = /^profile_[a-f0-9]{32}$/.test(profile.id) &&
-        /^\.deleting-profile_[a-f0-9]{32}-[a-f0-9-]{36}$/.test(profile.deletion.tombstoneName) &&
-        tombstonePath.startsWith(`${resolve(this.#profilesRoot)}${sep}`);
-      if (!valid) {
-        await this.#store.update((data) => {
-          const current = data.profiles.find((item) => item.id === profile.id);
-          if (current?.deletion?.tombstoneName === profile.deletion.tombstoneName) {
-            current.state = 'error';
-            current.lease = null;
-          }
-        });
-        continue;
-      }
-      const expectedExists = Boolean(await this.#pathStats(expectedPath));
-      const tombstoneExists = Boolean(await this.#pathStats(tombstonePath));
-      if (profile.deletion.phase === 'moved') {
-        if (!expectedExists && tombstoneExists) {
-          try {
-            await this.#removePath(tombstonePath, { recursive: true, force: true });
-          } catch (error) {
-            throw new ProfileStoreError(
-              'PROFILE_DELETE_RECOVERY_FAILED',
-              `Profile ${profile.id} tombstone could not be removed: ${error?.message || 'filesystem error'}`,
-              500
-            );
-          }
-        }
-        const canonicalAfter = Boolean(await this.#pathStats(expectedPath));
-        const tombstoneAfter = Boolean(await this.#pathStats(tombstonePath));
-        if (!canonicalAfter && !tombstoneAfter) {
-          await this.#store.update((data) => {
-            const index = data.profiles.findIndex((item) => item.id === profile.id);
-            if (index === -1) return;
-            const current = data.profiles[index];
-            if (
-              current.deletion?.tombstoneName === profile.deletion.tombstoneName &&
-              current.deletion?.phase === 'moved'
-            ) {
-              data.profiles.splice(index, 1);
-            }
-          });
-          continue;
-        }
-        if (canonicalAfter && !tombstoneAfter) {
-          await this.#markDeletionRecovered(profile);
-          continue;
-        }
-        await this.#markDeletionError(profile);
-        continue;
-      }
-
-      let recovered = expectedExists && !tombstoneExists;
-      if (!expectedExists && tombstoneExists) {
-        await this.#renamePath(tombstonePath, expectedPath);
-        recovered = true;
-      }
-      if (recovered) await this.#markDeletionRecovered(profile);
-      else await this.#markDeletionError(profile);
-    }
-    await this.#recoverOrphanTombstones();
-  }
-
-  async #pathStats(filePath) {
-    try {
-      return await lstat(filePath);
-    } catch (error) {
-      if (error?.code === 'ENOENT') return null;
-      throw error;
-    }
-  }
-
-  async #markDeletionRecovered(profile) {
-    await this.#store.update((data) => {
-      const current = data.profiles.find((item) => item.id === profile.id);
-      if (current?.deletion?.tombstoneName !== profile.deletion.tombstoneName) return;
-      current.state = 'idle';
-      current.lease = null;
-      delete current.deletion;
-      current.updatedAt = new Date(this.#now()).toISOString();
-    });
-  }
-
-  async #markDeletionError(profile) {
-    await this.#store.update((data) => {
-      const current = data.profiles.find((item) => item.id === profile.id);
-      if (current?.deletion?.tombstoneName !== profile.deletion.tombstoneName) return;
-      current.state = 'error';
-      current.lease = null;
-      current.updatedAt = new Date(this.#now()).toISOString();
-    });
-  }
-
-  async #recoverOrphanTombstones() {
-    const entries = await readdir(this.#profilesRoot, { withFileTypes: true });
-    for (const entry of entries) {
-      const match = /^\.deleting-(profile_[a-f0-9]{32})-[a-f0-9-]{36}$/.exec(entry.name);
-      if (!match) continue;
-      const tombstonePath = resolve(this.#profilesRoot, entry.name);
-      const tombstoneStats = await this.#pathStats(tombstonePath);
-      if (!tombstoneStats) continue;
-      if (!tombstoneStats.isDirectory() || tombstoneStats.isSymbolicLink()) {
-        throw new ProfileStoreError(
-          'PROFILE_DELETE_RECOVERY_FAILED',
-          `Profile deletion tombstone ${entry.name} is not a regular directory`,
-          500
-        );
-      }
-      const data = await this.#store.read();
-      const profile = data.profiles.find((item) => item.id === match[1]);
-      if (profile?.deletion?.tombstoneName === entry.name) continue;
-      const expectedPath = resolve(this.#profilesRoot, match[1]);
-      const expectedExists = Boolean(await this.#pathStats(expectedPath));
-      if (profile && !expectedExists) {
-        await this.#renamePath(tombstonePath, expectedPath);
-        await this.#store.update((currentData) => {
-          const current = currentData.profiles.find((item) => item.id === profile.id);
-          if (!current || current.deletion) return;
-          current.state = 'idle';
-          current.lease = null;
-          current.updatedAt = new Date(this.#now()).toISOString();
-        });
-        continue;
-      }
-      try {
-        await this.#removePath(tombstonePath, { recursive: true, force: true });
-      } catch (error) {
-        throw new ProfileStoreError(
-          'PROFILE_DELETE_RECOVERY_FAILED',
-          `Orphan Profile tombstone ${entry.name} could not be removed: ${error?.message || 'filesystem error'}`,
-          500
-        );
-      }
-      if (await this.#pathStats(tombstonePath)) {
-        throw new ProfileStoreError(
-          'PROFILE_DELETE_RECOVERY_FAILED',
-          `Orphan Profile tombstone ${entry.name} still exists after cleanup`,
-          500
-        );
-      }
-    }
-  }
-
-  async acquireLease(profileId, ownerId, options = {}) {
-    if (typeof ownerId !== 'string' || !ownerId.trim()) {
-      throw new ProfileStoreError('INVALID_LEASE_OWNER', 'Lease ownerId is required');
-    }
-    const pid = options.pid ?? process.pid;
-    if (!Number.isSafeInteger(pid) || pid <= 0) {
-      throw new ProfileStoreError('INVALID_LEASE_PID', 'Lease pid must be a positive integer');
-    }
-    const ttlMs = options.ttlMs ?? DEFAULT_LEASE_TTL_MS;
-    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1_000) {
-      throw new ProfileStoreError('INVALID_LEASE_TTL', 'Lease ttlMs must be at least 1000');
-    }
-    if (options.cleanupRequired !== undefined && typeof options.cleanupRequired !== 'boolean') {
-      throw new ProfileStoreError('INVALID_LEASE_CLEANUP', 'Lease cleanupRequired must be a boolean');
-    }
-    if (options.expectedGeneration !== undefined) {
-      ensureLeaseGeneration(options.expectedGeneration, { field: 'Expected lease generation' });
-    }
-    // Validate legacy caller metadata to retain the old fail-closed input
-    // boundary, but do not use it for authorization: every Profile is shared.
-    if (options.authorizedClientId !== undefined) ensureOwnerClientId(options.authorizedClientId);
-
-    const existing = await this.get(profileId);
-    if (existing.state === 'deleting' || existing.deletion) {
-      throw new ProfileStoreError('PROFILE_IN_USE', `Profile ${profileId} is being deleted`, 409);
-    }
-    if (existing.state === 'error') {
-      throw new ProfileStoreError(
-        'PROFILE_CLEANUP_UNCONFIRMED',
-        `Profile ${profileId} is blocked because browser cleanup was not confirmed`,
-        409
-      );
-    }
-    const renewing = existing.lease?.ownerId === ownerId;
-    if (renewing && options.expectedGeneration === undefined) {
-      throw new ProfileStoreError(
-        'LEASE_FENCE_REQUIRED',
-        `Profile ${profileId} lease renewal requires its generation`,
-        409
-      );
-    }
-    if (
-      options.expectedGeneration !== undefined &&
-      (!renewing || existing.lease?.generation !== options.expectedGeneration)
-    ) {
-      throw new ProfileStoreError(
-        'LEASE_FENCE_MISMATCH',
-        `Profile ${profileId} lease generation changed`,
-        409
-      );
-    }
-    if (existing.lease && existing.lease.ownerId !== ownerId) {
-      const expired = Date.parse(existing.lease.expiresAt) <= this.#now();
-      const alive = await this.#processAlive(existing.lease.pid);
-      if (!expired || alive || existing.lease.cleanupRequired === true) {
-        throw new ProfileStoreError(
-          existing.lease.cleanupRequired === true && expired && !alive
-            ? 'PROFILE_CLEANUP_UNCONFIRMED'
-            : 'PROFILE_LEASED',
-          existing.lease.cleanupRequired === true && expired && !alive
-            ? `Profile ${profileId} cleanup is not confirmed`
-            : `Profile ${profileId} is leased by ${existing.lease.ownerId}`,
-          409
-        );
-      }
     }
 
     let leased;
     await this.#store.update((data) => {
-      const profile = findProfile(data, profileId);
-      if (!isDeepStrictEqual(profile.lease, existing.lease)) {
-        throw new ProfileStoreError(
-          'PROFILE_LEASED',
-          `Profile ${profileId} lease changed concurrently`,
-          409
-        );
+      const profile = findProfile(data, existing.id);
+      if (JSON.stringify(profile.lease) !== JSON.stringify(existing.lease)) {
+        throw new ProfileStoreError('PROFILE_LEASED', `Profile ${profile.name} lease changed`, 409);
       }
-      const nowMs = this.#now();
-      const continuingLease = profile.lease?.ownerId === ownerId;
-      if (
-        options.expectedGeneration !== undefined &&
-        (!continuingLease || profile.lease?.generation !== options.expectedGeneration)
-      ) {
-        throw new ProfileStoreError(
-          'LEASE_FENCE_MISMATCH',
-          `Profile ${profileId} lease generation changed`,
-          409
-        );
-      }
-      const generation = continuingLease
-        ? profile.lease.generation
-        : nextLeaseGeneration(profile);
+      const timestamp = nowIso(this.#now);
+      const generation = Math.max(0, profile.leaseGeneration || 0) + 1;
+      profile.leaseGeneration = generation;
       profile.lease = {
         ownerId,
+        kind,
+        taskId: kind === 'task' ? taskId : null,
         pid,
+        nonce,
         generation,
-        acquiredAt: profile.lease?.ownerId === ownerId
-          ? profile.lease.acquiredAt
-          : new Date(nowMs).toISOString(),
-        heartbeatAt: new Date(nowMs).toISOString(),
-        expiresAt: new Date(nowMs + ttlMs).toISOString(),
-        cleanupRequired: options.cleanupRequired === true || profile.lease?.cleanupRequired === true
+        acquiredAt: timestamp,
+        heartbeatAt: timestamp,
+        expiresAt: new Date(this.#now() + ttlMs).toISOString()
       };
-      profile.state = ownerId.startsWith('profile-open:') ? 'open' : 'leased';
-      profile.updatedAt = new Date(nowMs).toISOString();
-      profile.lastUsedAt = new Date(nowMs).toISOString();
+      profile.state = kind === 'manual' ? 'open' : 'leased';
+      profile.lastUsedAt = timestamp;
+      profile.updatedAt = timestamp;
       leased = profile;
     });
     return structuredClone(leased);
   }
 
-  async releaseLease(profileId, ownerId, options = {}) {
-    if (options.cleanupConfirmed !== undefined && typeof options.cleanupConfirmed !== 'boolean') {
-      throw new ProfileStoreError('INVALID_CLEANUP_PROOF', 'cleanupConfirmed must be a boolean');
-    }
-    if (options.expectedGeneration !== undefined) {
-      ensureLeaseGeneration(options.expectedGeneration, { field: 'Expected lease generation' });
-    }
-    let released = false;
+  async renewLease(identifier, { ownerId, nonce, generation, ttlMs = DEFAULT_LEASE_TTL_MS } = {}) {
+    let renewed = false;
     await this.#store.update((data) => {
-      const profile = findProfile(data, profileId);
-      if (!profile.lease) return;
-      if (profile.lease.ownerId !== ownerId) {
-        throw new ProfileStoreError(
-          'LEASE_OWNER_MISMATCH',
-          `Profile ${profileId} is leased by another owner`,
-          409
-        );
-      }
-      if (options.expectedGeneration === undefined) {
-        throw new ProfileStoreError(
-          'LEASE_FENCE_REQUIRED',
-          `Profile ${profileId} lease release requires its generation`,
-          409
-        );
-      }
+      const profile = findProfile(data, identifier);
       if (
-        profile.lease.generation !== options.expectedGeneration
-      ) {
-        throw new ProfileStoreError(
-          'LEASE_FENCE_MISMATCH',
-          `Profile ${profileId} lease generation changed`,
-          409
-        );
-      }
-      if (profile.lease.cleanupRequired === true && options.cleanupConfirmed !== true) {
-        throw new ProfileStoreError(
-          'CLEANUP_PROOF_REQUIRED',
-          `Profile ${profileId} requires confirmed browser cleanup before lease release`,
-          409
-        );
-      }
-      profile.state = 'idle';
-      profile.lease = null;
-      delete profile.cleanupUnknownAt;
-      profile.updatedAt = new Date(this.#now()).toISOString();
-      released = true;
+        !profile.lease || profile.lease.ownerId !== ownerId || profile.lease.nonce !== nonce ||
+        profile.lease.generation !== generation
+      ) return;
+      const timestamp = nowIso(this.#now);
+      profile.lease.heartbeatAt = timestamp;
+      profile.lease.expiresAt = new Date(this.#now() + ttlMs).toISOString();
+      profile.updatedAt = timestamp;
+      renewed = true;
     });
-    return released;
+    return renewed;
   }
 
-  async forceReleaseLease(profileId, options = {}) {
-    const {
-      commandId,
-      expectedOwnerId,
-      expectedGeneration,
-      expectedUpdatedAt
-    } = options;
-    if (typeof commandId !== 'string' || !FORCE_RELEASE_COMMAND_PATTERN.test(commandId)) {
-      throw new ProfileStoreError(
-        'INVALID_PROFILE_FORCE_RELEASE',
-        'Force release commandId must contain 8-128 letters, numbers, dots, underscores, colons, or hyphens'
-      );
-    }
-    if (typeof expectedOwnerId !== 'string' || !expectedOwnerId) {
-      throw new ProfileStoreError('INVALID_PROFILE_FORCE_RELEASE', 'Expected lease owner is required');
-    }
-    ensureLeaseGeneration(expectedGeneration, { field: 'Expected lease generation' });
-    if (typeof expectedUpdatedAt !== 'string' || !Number.isFinite(Date.parse(expectedUpdatedAt))) {
-      throw new ProfileStoreError('INVALID_PROFILE_FORCE_RELEASE', 'Expected Profile update time is required');
-    }
-
-    let outcome;
+  async confirmLeaseCleanup(identifier, { ownerId, nonce, generation } = {}) {
+    let confirmed = false;
     await this.#store.update((data) => {
-      const profile = findProfile(data, profileId);
-      if (
-        profile.lastForcedLeaseRelease?.commandId === commandId &&
-        profile.state === 'idle' && !profile.lease
-      ) {
-        outcome = {
-          profile,
-          audit: profile.lastForcedLeaseRelease,
-          idempotent: true
-        };
-        return;
-      }
-      if (profile.kind !== 'persistent') {
-        throw new ProfileStoreError(
-          'PROFILE_FORCE_RELEASE_UNSUPPORTED',
-          'Only a quarantined persistent Profile can have its retained lease force-released',
-          409
-        );
-      }
-      if (
-        profile.state !== 'error' ||
-        profile.lease?.cleanupRequired !== true ||
-        typeof profile.cleanupUnknownAt !== 'string'
-      ) {
-        throw new ProfileStoreError(
-          'PROFILE_FORCE_RELEASE_NOT_ALLOWED',
-          `Profile ${profileId} does not have a quarantined cleanup lease`,
-          409
-        );
-      }
-      if (
-        profile.updatedAt !== expectedUpdatedAt ||
-        profile.lease.ownerId !== expectedOwnerId ||
-        profile.lease.generation !== expectedGeneration
-      ) {
-        throw new ProfileStoreError(
-          'PROFILE_FORCE_RELEASE_CONFLICT',
-          `Profile ${profileId} quarantine changed; refresh before retrying`,
-          409
-        );
-      }
-
-      const releasedAt = new Date(this.#now()).toISOString();
-      const revokedLease = structuredClone(profile.lease);
-      const fenceGeneration = nextLeaseGeneration(profile);
-      const taskId = /^task:(task_[a-f0-9]{32})$/u.exec(revokedLease.ownerId)?.[1] ?? null;
-      profile.state = 'idle';
-      profile.lease = null;
-      delete profile.cleanupUnknownAt;
-      profile.updatedAt = releasedAt;
-      profile.lastForcedLeaseRelease = {
-        commandId,
-        releasedAt,
-        ownerType: taskId
-          ? 'task'
-          : revokedLease.ownerId.startsWith('profile-open:')
-            ? 'profile-open'
-            : revokedLease.ownerId.startsWith('session-import:')
-              ? 'legacy-session-import'
-              : 'unknown',
-        ...(taskId ? { taskId } : {}),
-        ownerId: revokedLease.ownerId,
-        revokedGeneration: revokedLease.generation,
-        fenceGeneration,
-        cleanupConfirmed: false
-      };
-      outcome = {
-        profile,
-        audit: profile.lastForcedLeaseRelease,
-        idempotent: false
-      };
+      const profile = findProfile(data, identifier);
+      if (!sameLease(profile.lease, { ownerId, nonce, generation })) return;
+      profile.lease.cleanupConfirmedAt ||= nowIso(this.#now);
+      profile.updatedAt = nowIso(this.#now);
+      confirmed = true;
     });
-    return structuredClone(outcome);
+    return confirmed;
   }
 
-  async markCleanupUnknown(profileId, ownerId, options = {}) {
-    if (options.expectedGeneration !== undefined) {
-      ensureLeaseGeneration(options.expectedGeneration, { field: 'Expected lease generation' });
-    }
+  async markLeaseError(identifier, { ownerId, nonce, generation } = {}) {
     let marked = false;
     await this.#store.update((data) => {
-      const profile = findProfile(data, profileId);
-      if (!profile.lease || profile.lease.ownerId !== ownerId) return;
-      if (options.expectedGeneration === undefined) {
-        throw new ProfileStoreError(
-          'LEASE_FENCE_REQUIRED',
-          `Profile ${profileId} cleanup update requires its generation`,
-          409
-        );
-      }
-      if (
-        profile.lease.generation !== options.expectedGeneration
-      ) return;
-      if (
-        profile.state === 'error' &&
-        profile.lease.cleanupRequired === true &&
-        typeof profile.cleanupUnknownAt === 'string'
-      ) return;
+      const profile = findProfile(data, identifier);
+      if (!sameLease(profile.lease, { ownerId, nonce, generation })) return;
       profile.state = 'error';
-      profile.lease.cleanupRequired = true;
-      profile.cleanupUnknownAt = new Date(this.#now()).toISOString();
-      profile.updatedAt = profile.cleanupUnknownAt;
+      profile.updatedAt = nowIso(this.#now);
       marked = true;
     });
     return marked;
   }
 
+  async releaseLease(identifier, { ownerId, nonce, generation } = {}) {
+    let released = false;
+    await this.#store.update((data) => {
+      const profile = findProfile(data, identifier);
+      if (!profile.lease) {
+        released = true;
+        return;
+      }
+      if (!profile.lease.cleanupConfirmedAt) {
+        throw new ProfileStoreError(
+          'PROFILE_CLEANUP_UNCONFIRMED',
+          `Profile ${profile.name} cleanup is not confirmed`,
+          409
+        );
+      }
+      if (
+        profile.lease.ownerId !== ownerId || profile.lease.nonce !== nonce ||
+        profile.lease.generation !== generation
+      ) {
+        throw new ProfileStoreError('LEASE_OWNER_MISMATCH', `Profile ${profile.name} lease changed`, 409);
+      }
+      profile.lease = null;
+      profile.state = 'idle';
+      profile.updatedAt = nowIso(this.#now);
+      released = true;
+    });
+    return released;
+  }
+
   async recoverExpiredLeases() {
-    const snapshot = await this.#store.read();
-    const recoverable = [];
-    for (const profile of snapshot.profiles) {
-      if (!profile.lease || Date.parse(profile.lease.expiresAt) > this.#now()) continue;
-      if (profile.lease.cleanupRequired === true) continue;
-      if (!(await this.#processAlive(profile.lease.pid))) {
-        recoverable.push({
-          id: profile.id,
-          ownerId: profile.lease.ownerId,
-          pid: profile.lease.pid,
-          expiresAt: profile.lease.expiresAt
+    const data = await this.#store.read();
+    const recoverable = new Map();
+    for (const profile of data.profiles) {
+      const lease = profile.lease;
+      if (!lease) continue;
+      if (lease.identityUntrusted === true) {
+        const usage = await this.#profileUsageProbe(profile.userDataDir).catch(() => 'unknown');
+        if (usage === false || usage === 'inactive') {
+          recoverable.set(profile.id, {
+            ownerId: lease.ownerId,
+            nonce: lease.nonce,
+            generation: lease.generation
+          });
+        }
+        continue;
+      }
+      if (this.#processAlive(lease.pid)) continue;
+      if (lease.cleanupConfirmedAt) {
+        recoverable.set(profile.id, {
+          ownerId: lease.ownerId,
+          nonce: lease.nonce,
+          generation: lease.generation
+        });
+        continue;
+      }
+      if (Date.parse(lease.expiresAt) > this.#now()) continue;
+      const usage = await this.#profileUsageProbe(profile.userDataDir).catch(() => 'unknown');
+      if (usage === false || usage === 'inactive') {
+        recoverable.set(profile.id, {
+          ownerId: lease.ownerId,
+          nonce: lease.nonce,
+          generation: lease.generation
         });
       }
     }
-    if (!recoverable.length) return [];
-
-    await this.#store.update((data) => {
-      for (const profile of data.profiles) {
-        const expected = recoverable.find((item) => item.id === profile.id);
-        if (!expected || !profile.lease) continue;
+    const recoveredIds = [];
+    await this.#store.update((draft) => {
+      for (const profile of draft.profiles) {
+        if (!profile.lease) continue;
+        const identity = recoverable.get(profile.id);
         if (
-          profile.lease.ownerId !== expected.ownerId ||
-          profile.lease.pid !== expected.pid ||
-          profile.lease.expiresAt !== expected.expiresAt
-        ) continue;
-        profile.state = 'idle';
-        profile.lease = null;
-        delete profile.cleanupUnknownAt;
-        profile.updatedAt = new Date(this.#now()).toISOString();
+          identity && sameLease(profile.lease, identity) &&
+          (
+            profile.lease.identityUntrusted === true ||
+            (
+              !this.#processAlive(profile.lease.pid) && (
+                profile.lease.cleanupConfirmedAt || Date.parse(profile.lease.expiresAt) <= this.#now()
+              )
+            )
+          )
+        ) {
+          profile.lease = null;
+          profile.state = 'idle';
+          profile.updatedAt = nowIso(this.#now);
+          recoveredIds.push(profile.id);
+        } else if (
+          profile.lease.identityUntrusted === true ||
+          (!profile.lease.cleanupConfirmedAt && !this.#processAlive(profile.lease.pid))
+        ) {
+          profile.state = 'error';
+          profile.updatedAt = nowIso(this.#now);
+        }
       }
     });
-    return recoverable.map((item) => item.id);
+    return recoveredIds;
+  }
+
+  async remove(identifier) {
+    const profile = await this.get(identifier);
+    if (profile.state === 'deleting') {
+      await this.#recoverPendingDeletions();
+      return profile;
+    }
+    if (profile.lease || profile.state !== 'idle') {
+      throw new ProfileStoreError('PROFILE_LEASED', `Profile ${profile.name} is still in use`, 409);
+    }
+    const profilePath = safeProfilePath(this.#profilesRoot, profile.id, profile.userDataDir);
+    const deletionId = `delete_${randomUUID().replaceAll('-', '')}`;
+    const tombstonePath = safeDeletionPath(this.#profilesRoot, profile.id, deletionId);
+    await this.#store.update((data) => {
+      const current = findProfile(data, profile.id);
+      if (current.lease || current.state !== 'idle') {
+        throw new ProfileStoreError('PROFILE_LEASED', `Profile ${current.name} is still in use`, 409);
+      }
+      current.state = 'deleting';
+      current.updatedAt = nowIso(this.#now);
+      data.deletions ||= [];
+      data.deletions.push({
+        id: deletionId,
+        profileId: profile.id,
+        userDataDir: profilePath,
+        tombstonePath,
+        createdAt: nowIso(this.#now)
+      });
+    });
+    await this.#recoverPendingDeletions();
+    return profile;
   }
 }

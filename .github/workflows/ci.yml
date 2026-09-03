@@ -2,61 +2,114 @@ name: cross-platform-release-gate
 
 on:
   push:
-    branches: [main, "upgrade/**"]
+    branches: [main, "v*", "upgrade/**"]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  NODE_VERSION: "22.22.3"
+
 jobs:
   verify:
-    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-24.04]
-        node: [20, 22]
+        include:
+          - target: windows-x64
+            os: windows-2025
+          - target: macos-arm64
+            os: macos-15
+          - target: macos-x64
+            os: macos-15-intel
+          - target: linux-x64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ matrix.node }}
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
-      - run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Install Chromium on Linux
-        if: runner.os == 'Linux'
-        run: npx playwright install --with-deps chromium
-      - name: Install Chromium on Windows or macOS
-        if: runner.os != 'Linux'
-        run: npx playwright install chromium
-      - name: Run release gate with a visible-browser display
-        if: runner.os == 'Linux'
-        run: xvfb-run --auto-servernum npm run check
-        env:
-          TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
-          TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
-          TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
-          TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
-          TASKMASTER_BACKUP_RESTORE_REPORT: ${{ github.workspace }}/artifacts/backup-restore.json
-          TASKMASTER_EXTENSION_REPORT: ${{ github.workspace }}/artifacts/extension-acceptance.json
-          TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
-      - name: Run release gate
+      - name: Install stable Google Chrome on Linux arm64 runner
+        if: matrix.target == 'linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(dpkg --print-architecture)" = arm64
+          chrome_deb="${RUNNER_TEMP}/google-chrome-stable_current_arm64.deb"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "${chrome_deb}" \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.deb
+          sudo apt-get install --yes "${chrome_deb}"
+          google-chrome-stable --version
+      - name: Install source dependencies without a browser payload
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify distribution policy
+        run: node scripts/build/check-distribution.mjs
+      - name: Run complete source gate with stable Chrome
         if: runner.os != 'Linux'
         run: npm run check
         env:
+          TASKMASTER_BROWSER_CHANNEL: chrome
           TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
           TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
           TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
-          TASKMASTER_COMMERCIAL_REPORT: ${{ github.workspace }}/artifacts/commercial.json
-          TASKMASTER_BACKUP_RESTORE_REPORT: ${{ github.workspace }}/artifacts/backup-restore.json
-          TASKMASTER_EXTENSION_REPORT: ${{ github.workspace }}/artifacts/extension-acceptance.json
-          TASKMASTER_ACCEPTANCE_PERSISTENT_ENGINE: chrome
+      - name: Run complete source gate with stable Chrome and a display
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum npm run check
+        env:
+          TASKMASTER_BROWSER_CHANNEL: chrome
+          TASKMASTER_ACCEPTANCE_REPORT: ${{ github.workspace }}/artifacts/acceptance.json
+          TASKMASTER_DASHBOARD_REPORT: ${{ github.workspace }}/artifacts/dashboard.json
+          TASKMASTER_DASHBOARD_SCREENSHOT: ${{ github.workspace }}/artifacts/dashboard.png
+      - name: Stage self-contained runtime
+        run: node scripts/build/stage-runtime.mjs --target ${{ matrix.target }} --out dist/stage/${{ matrix.target }}
+        env:
+          SOURCE_DATE_ISO: "1970-01-01T00:00:00.000Z"
+      - name: Verify bundled Node, dependency tree, and no bundled browser
+        run: node scripts/build/verify-bundle.mjs --bundle dist/stage/${{ matrix.target }}/eric-task-master
+      - name: Build Windows portable bundle and installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/build/package-windows.ps1 -StageRoot dist/stage/${{ matrix.target }} -OutputDir dist/release
+      - name: Build macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/build/package-macos.sh dist/stage/${{ matrix.target }} dist/release
+      - name: Build Linux package and portable bundle
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/build/package-linux.sh dist/stage/${{ matrix.target }} dist/release
+      - name: Export target manifest and SPDX inventory
+        run: node scripts/build/export-metadata.mjs --bundle dist/stage/${{ matrix.target }}/eric-task-master --out dist/release
+      - name: Install, start, stop, and uninstall Windows package
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/install/smoke-windows.ps1 -Installer (Get-Item dist/release/*-setup.exe) -InstallRoot (Join-Path $env:RUNNER_TEMP 'Eric Task Master')
+      - name: Install, start, stop, and uninstall macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/install/smoke-macos.sh "$(find dist/release -maxdepth 1 -name '*.pkg' -print -quit)"
+      - name: Install, start, stop, and uninstall Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: xvfb-run --auto-servernum bash scripts/install/smoke-linux.sh "$(find dist/release -maxdepth 1 -name '*.deb' -print -quit)"
+      - name: Write target checksums
+        run: node scripts/build/checksums.mjs --dir dist/release --output dist/release/SHA256SUMS-${{ matrix.target }}
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: taskmaster-${{ runner.os }}-node-${{ matrix.node }}
-          path: artifacts
-          if-no-files-found: ignore
+          name: release-${{ matrix.target }}
+          path: |
+            dist/release
+            artifacts
+          if-no-files-found: warn
+          retention-days: 14

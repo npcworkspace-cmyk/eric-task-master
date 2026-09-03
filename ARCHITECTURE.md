@@ -1,216 +1,76 @@
-# eric-task-master architecture
+# Architecture
 
-## Invariants
+Eric Task Master 3.0 is a trusted local task runner, not a browser-policy engine.
 
-1. Browser work is executed only through Playwright APIs.
-2. The same-origin Web Dashboard is the only human control plane. Login state and any user-installed extension state are created directly inside a persistent Playwright Profile; extensions never become a Task Master control plane.
-3. Profiles are shared resources for trusted local Agents. Every Profile has at most one live lease, so same-Profile work queues instead of colliding. A persistent Profile owns browser state; an ephemeral Profile is a clean task-scoped context template and retains none after confirmed cleanup.
-4. Every task has a state, heartbeat, progress record, output directory, and fail-closed cleanup proof. An unconfirmed browser close blocks the Profile lease.
-5. Unknown action outcomes are inspected before retrying.
-6. Authentication material never appears in agent-visible responses or logs.
-7. Core runtime remains site-agnostic; specialized Skills provide site behavior.
-8. Each Agent host starts its own STDIO MCP bridge with a stable scoped identity; all bridges reuse the same Manager, and no host configuration contains Manager, browser, or account credentials.
-9. Agent-visible task results contain bounded summaries and declared artifacts only after completion verification, never local execution paths.
-10. A persistent Ed25519 Manager identity authenticates the loopback endpoint before an admin or scoped Agent credential is sent.
-11. The Owner Console is a deliberately small human workbench with four views: task progress and lifecycle controls, Profile management, Task Pack/executor asset management, and human-verification notification settings. Human-readable final reports may appear on task cards; raw artifacts, diagnostics, and Agent coordination remain protocol capabilities rather than Dashboard surfaces.
-12. Owner commands are durable and revision-checked. An offline Agent can receive them when it reconnects, but Manager does not claim to wake an arbitrary closed host process.
-13. Every Agent bridge request declares its compiled Task Master runtime version. A missing or stale version fails before scoped task routing with `AGENT_HOST_RELOAD_REQUIRED`; an upgrade cannot fall through as a task-schema error.
-14. Manager owns one bounded allowlist-only operational journal. It rotates locally, strips credentials, query strings, request bodies, and paths, and is summarized by `doctor` without starting another Manager or browser rather than exposed as task output. MCP errors carry the same request ID for correlation without adding a second writer.
-15. Human attention notifications are an allowlist, not a generic event bus. Only a pending `human_verification` handoff may notify; ordinary failure, stall, cooldown, cleanup, completion, login ambiguity, and instruction waits never do. The Owner claim stops reminders without continuing the task and cannot be forged through MCP.
-16. Every Task Master page action crosses one Worker FIFO. A Journey step holds that boundary through action, transition verification, and settling; `Promise.all` cannot interleave its substeps.
+## Fixed product path
+
+```text
+Agent -> taskmaster CLI -> loopback Manager -> Worker -> stable local Chrome
+Human -> fixed Dashboard -> same Manager
+```
+
+The CLI is the only Agent integration. There is no MCP adapter, browser extension, Task Type registry, Pack asset catalog, behavior engine, mandatory probe, or special challenge workflow.
 
 ## Components
 
-- `src/manager.mjs`: loopback HTTP manager and API.
-- `src/runtime/task-service.mjs`: sole task-lifecycle state writer and scheduler boundary.
-- `src/runtime/task-record-policy.mjs`: task record validation, normalization, and caller visibility policy.
-- `src/runtime/task-artifact-store.mjs`: bounded artifact identity, hashing, listing, and read policy.
-- `src/runtime/task-asset-manager.mjs`: serialized Task Pack and task-type lifecycle management.
-- `src/runtime/task-checkpoint-store.mjs`: checkpoint and diagnostic-file inspection and integrity verification; lifecycle sealing decisions remain in `task-service.mjs`.
-- `src/runtime/profile-runtime.mjs`: Profile open/close, lease renewal, cleanup receipts, and shutdown coordination through the injected Profile store.
-- `src/runtime/task-worker.mjs`: isolated Playwright task process.
-- `src/operations/state-backup.mjs`: offline, hash-verified state snapshot and absent-target restore primitives.
-- `src/cli.mjs`: fixed Agent entrypoint.
-- `src/mcp/`: standard STDIO MCP server and scoped Manager client.
-- `src/registration/`: transactional, per-host MCP configuration adapters.
-- `dashboard/`: full management interface served by the manager.
-- `skills/eric-task-master/`: progressive-disclosure Agent instructions.
+- **CLI:** auto-starts Manager, submits one local `.mjs`, follows progress, and controls tasks and Profiles.
+- **Manager:** owns durable state, HTTP Dashboard/API, queues, leases, Worker processes, cleanup, and task output metadata.
+- **Worker:** opens the selected persistent Profile with stable local Chrome, imports the copied task script, and exposes direct Playwright objects.
+- **Dashboard:** two views only: Tasks and Profiles.
+- **Skill:** one short, platform-neutral CLI guide.
 
-The split runtime modules do not own competing task state. `task-service.mjs` remains the only lifecycle transition writer and the only scheduler. The extracted modules accept narrow injected capabilities and return validated results; they cannot launch a second Manager, Worker, browser, queue, or task registry.
+## Task contract
 
-## Manager API v1
-
-All responses are JSON. Loopback is the only supported bind address. Manager admin, scoped Agent, and persistent Owner Console sessions have separate credentials. The Owner Console acts with local Manager authority while Agent task histories remain principal-scoped.
-
-The first Manager state initialization persists an Ed25519 key pair beside the protected admin credential. `POST /v1/identity/challenge` signs a caller-generated 256-bit nonce together with the exact service, version, API version, host, and listening port. CLI and MCP verify that proof against the public key pinned in local state before sending the Manager admin credential. A port occupant, wrong key, stale signature, or binding mismatch fails closed.
-
-### Health and authorization
-
-- `GET /v1/health`
-- `POST /v1/identity/challenge`
-- `POST /v1/agents/issue`
-- `GET /v1/agents`
-- `POST /v1/agents/:id/actions`
-- `POST /v1/dashboard/authorize`
-- `POST /v1/dashboard/session`
-- `POST /v1/dashboard/logout`
-- `GET /v1/dashboard/summary`
-
-`connect` verifies the Manager identity pinned in local state, uses the protected Manager credential to mint one short-lived Dashboard bootstrap code, and returns a Dashboard URL containing only that one-use code. The page exchanges it once for a hashed, restart-persistent Owner session delivered as an `HttpOnly`, `SameSite=Strict` cookie, then removes the code from browser history. The fixed bookmark is `http://127.0.0.1:19946/dashboard`; no user-visible code entry or repeated binding step exists. State-changing cookie requests require the exact Manager origin. Logout revokes the server-side session.
-
-### Profiles
-
-- `GET /v1/profiles`
-- `POST /v1/profiles`
-- `PATCH /v1/profiles/:id`
-- `DELETE /v1/profiles/:id`
-- `POST /v1/profiles/:id/open`
-- `POST /v1/profiles/:id/close`
-- `POST /v1/profiles/:id/force-release` (Owner/Manager only; explicit confirmation and compare-and-set state required)
-
-`kind` and `browserEngine` are immutable. A new persistent Profile defaults to the locally installed stable Chrome channel plus `human`; a new ephemeral Profile defaults to lockfile-pinned Playwright Chromium plus `auto`. Both kinds may select `fast`, `auto`, or `human` at Profile level. A persistent Profile also stores an Owner-controlled `extensionsEnabled` next-launch policy. Visible persistent Profiles default to enabled; an explicitly headless persistent Profile keeps headless and defaults to disabled. Extensions and headless execution are mutually exclusive because Chromium does not reliably run installed extensions headlessly. A busy Profile may save a changed extension policy without restarting its current browser; the next manual open, task launch, or resumed attempt reads it. Ephemeral Profiles always keep extensions disabled. Legacy `adaptive` values migrate in place to `auto`; Profile browser data is not moved. Legacy `browserChannel` values migrate only through the explicit map `null|chromium -> chromium` and `chrome -> chrome`; every other value fails closed. Workers use one resolver and never fall back to another engine. A manually opened persistent Profile is always visible; `headless` affects task launches only.
-
-All Profiles are visible and usable by every trusted local Agent registered with this Manager. Profile records have no creator or access-owner concept. The v4 migration removes legacy `ownerClientId`, `createdBy`, and `access` fields in place without moving `userDataDir`, so existing browser state remains intact. Task records and artifacts remain scoped to the Agent that started them; Profile sharing does not merge task histories. A `persistent` Profile can be opened from the Owner Console so the user can sign in or manually install a trusted extension directly in its Playwright window; its native `userDataDir` retains that state. Task Master only decides whether Playwright preserves those already-installed extensions at the next launch. It never installs, inventories, copies, syncs, configures, or authenticates extensions. An `ephemeral` Profile cannot be opened manually, never loads extensions, and launches `browser.newContext()` inside each task; cleanup closes the context and owning browser.
-
-Extension coordination has two explicit levels. A trusted extension that implements the opt-in `taskmaster-cooperative-v2` request/grant/release lease shares the Worker action FIFO with Task Master and is strongly serialized for click, input, DOM, and navigation work. Participant-scoped request IDs cannot create a second lease after settlement, every grant carries the matching participant and request ID, navigation releases the old-document lease, lease expiry poisons the coordinator fail-closed, and completion seals new requests before draining the queue. The DOM event bridge is a trusted coordination convention, not an extension-authentication boundary. Arbitrary third-party extensions cannot be forced to use it, and synthetic page events cannot reliably distinguish extension code from ordinary website code; the runtime therefore makes no universal serialization or automatic-conflict-detection claim for unintegrated extensions. Pause the task before such an extension is operated. If a primitive is durably succeeded but Journey verification or settling later fails, the Worker appends a new unknown effect so resume cannot replay that action without inspection.
-
-Agent authorization is scoped to one stable registered MCP client ID and role tuple. Internal and legacy-reserved Manager, Dashboard, extension, task, Profile, and session principal names/prefixes cannot be issued as Agent IDs. Manager persists an Agent Registry with display name, presence, last-seen time, current work, Profiles in use, and queue depth—never Agent tokens or token hashes. The Owner can revoke or restore an Agent; restore grants permission but does not fake online presence. Different host registrations/client IDs are separate task principals, while all share the Profile catalog. The bridge sends `X-Taskmaster-Runtime-Version` on agent issuance and every scoped request; Manager rejects missing or mismatched versions with a correlated request ID before entering task routes. Processes under the same OS user are trusted peers; mutually untrusted tenants require separate OS users, sandboxes, or machines. Manager credential rotation still invalidates every scoped Agent token.
-
-### Tasks
-
-- `GET /v1/task-types`
-- `GET /v1/task-types/:id`
-- `POST /v1/task-types/:id/actions` (deprecate or restore; Manager/Owner only)
-- `POST /v1/task-types/install` (Manager admin only)
-- `POST /v1/task-packs/install` (Manager admin only, transactional batch)
-- `GET /v1/task-packs` (bounded read-only lifecycle visibility)
-- `GET /v1/tasks`
-- `POST /v1/tasks`
-- `GET /v1/tasks/:id`
-- `DELETE /v1/tasks/:id` (safe or explicitly forced logical record deletion; Manager/Owner only)
-- `POST /v1/tasks/:id/continue`
-- `POST /v1/tasks/:id/focus`
-- `POST /v1/tasks/:id/user-request/claim` (Owner/Manager only for human verification)
-- `POST /v1/tasks/:id/resume`
-- `POST /v1/tasks/:id/cancel`
-- `POST /v1/tasks/:id/actions` (pause, resume, terminate)
-- `POST /v1/tasks/:id/commands` (ask or modify)
-- `POST /v1/tasks/:id/commands/:commandId` (Agent response)
-- `GET /v1/tasks/:id/timeline`
-- `POST /v1/tasks/:id/revision` (queued input only)
-- `POST /v1/tasks/:id/report` (Agent-authored human report)
-- `POST /v1/agent/inbox/claim`
-- `GET /v1/tasks/:id/artifacts`
-- `GET /v1/tasks/:id/artifacts/:artifactId`
-
-### Dashboard
-
-- `GET /dashboard`
-- `GET /dashboard/*`
-- `POST /v1/dashboard/authorize`
-- `POST /v1/dashboard/session`
-- `POST /v1/dashboard/logout`
-- `GET /v1/dashboard/summary`
-
-Dashboard URLs never contain the Manager admin credential. The first authorized link creates the persistent Owner cookie; after that the fixed Dashboard URL works directly across Manager restarts until logout, expiry, or revocation. A `401` requests a new bootstrap link. A `403` is shown inline and does not discard the valid session or the last rendered state.
-
-The Dashboard has exactly four primary views: Tasks, Profiles, Task Packs, and Settings. Task history uses bounded cursor pagination instead of loading an unbounded registry. Task cards expose the immutable display name, state, current progress, Profile, active execution time, cumulative cooldown time, total elapsed time, applicable lifecycle controls, and the Agent's bounded final report when one exists. Revision-checked batch controls apply pause, resume, cancel, or safe logical deletion independently and report every success, conflict, and skipped record. It does not fetch or render the Agent Registry, raw artifacts, timeline, diagnostics, or Agent inbox.
-
-A compact header drawer shows only durable human-verification notices; its dedicated Settings view manages native, Telegram, and Feishu/Lark delivery. The interface switches between Chinese and English without reload; only that language preference is stored in browser local storage. Notification secrets and optional Feishu signing material remain write-only in Manager state. The UI retains an unsaved settings draft across background refreshes, serializes save/test/clear operations, shows bounded capability and last-test state, and can open the operating system's notification settings where supported. An alert fires immediately and every 30 seconds until the Owner claims the exact request. Claim is persisted before a best-effort browser focus and never continues the task. Resolution continues the same request only after task revalidation. TaskService is authoritative: if the notification sidecar cannot persist the matching claim/resolve marker after the task transition, the main operation still returns success with an explicit degraded-sync receipt and Manager retries reconciliation.
-
-The Task Packs view groups registered modules into Task Pack, standalone, transient, or protected system assets and also identifies unregistered history/orphan snapshots. It shows purpose, human notes, Agent discoverability, lifecycle, usage counts, last use, file count/size, and a backend-derived deletion decision. Notes and lifecycle changes support bounded batches. Owner-only asset detail includes a bounded list of the exact blocking tasks so the Console can load, select, highlight, or force-delete that task even when it was not on the first history page; Agent MCP inventory exposes blocker classes but not cross-owner task IDs. Deletion is never a client-side file operation: Manager serializes it against task creation and re-resolves every selected ID. Normal deletion rejects protected assets, live or cleanup-unsettled task references, and failed resumable tasks only after the current on-disk checkpoint passes integrity validation. Explicit Owner force deletion still rejects protected assets or any referenced active runtime, but may detach terminal task references before removing a user-created executor; retained task records and outputs remain auditable while checkpoint resume is permanently disabled. Deleted task records and stale/invalid checkpoints do not create phantom blockers; a valid checkpoint recovered after lost IPC still does. CLI one-off standalone installs are transient by default, retire after their first settled task, and are garbage-collected after a seven-day recovery window. Installing a newer semantic Task Pack version retires older versions and a downgrade is rejected.
-
-## Profile states
-
-`idle -> starting -> open -> idle`; an unconfirmed browser close becomes `error` and retains its cleanup-required lease.
-
-An active task changes the state to `leased`. A stale non-browser lock is recovered only after the recorded process is proven absent. Browser-bearing task/Profile leases additionally require a matching private cleanup receipt; Worker PID disappearance alone never proves browser closure.
-
-A quarantined persistent Profile remains blocked until cleanup proof is recovered or the Owner explicitly force-releases only its stale lease. Force release is refused while its task is non-terminal, a managed browser/Worker is live, or the recorded lease process may still be alive. It uses the Profile update time, lease owner, and monotonic lease generation as one compare-and-set boundary, then advances the generation so an old Worker cannot renew, release, or remark the Profile. The Profile directory and login state remain intact; the original task remains failed and cleanup-unconfirmed, and the intervention is audited. No process is killed from a persisted PID. The Owner may explicitly discard a quarantined ephemeral Profile because it owns no retained browser state, but only after Manager proves the task Worker is absent and the Profile template directory is empty. This removes the unusable Profile record without rewriting the associated failed task as cleanup-settled.
-
-## Task states
-
-`queued -> acquiring_profile -> starting_browser -> running -> verifying -> completed`
-
-Manager owns a bounded FIFO scheduler. Different Profiles may occupy independent slots; work for the same Profile remains queued until the previous Worker exits and its lease is released. Queue position/reason are public. Manager restart preserves never-started queued tasks and fails interrupted active work closed.
-
-Task and manually opened Profile leases renew through a serialized barrier. Finalization first stops new renewals, drains the in-flight renewal, then releases exactly once. A manually opened Profile is treated as busy; a dead owner without cleanup proof blocks queued work instead of being mistaken for ordinary contention. Legacy `session-import:*` leases are migration-only: a matching cleanup receipt may release them, while missing proof keeps the Profile quarantined.
-
-Side states are `waiting_user`, `cooling_down`, `recovering`, `pause_requested`, `paused`, `cancel_requested`, `failed`, and `cancelled`. Pause is cooperative: the in-flight Journey/action FIFO entry settles, later action/progress/checkpoint/completion boundaries wait, diagnostics are captured, and resume first checks that the live page is responsive. The Owner must wait for `paused` before manually operating an extension; resume revalidates the page before later actions. A running terminate request becomes `cancel_requested` and reaches terminal `cancelled` only after browser closure, Worker exit, and lease release are all proved. Terminal tasks always pass through cleanup.
-
-Direct `action.goto()` is the one bounded automatic recovery exception because it is an idempotent top-level GET. Transient connection failures use 1/3/7-second retries; HTTP 429/502/503/504 enters the normal durable cooldown state, honors `Retry-After`, and retries up to three times. The Dashboard therefore shows cooldown time and the task resumes without a human `resume` cycle. Click-triggered navigation, form submission, typing, downloads, and every other possibly mutating action are never replayed automatically.
-
-Every task has a stable `jobId` and monotonic `revision`. Owner commands use `commandId + expectedRevision`, making retries idempotent and concurrent edits explicit. Running input is immutable; only queued input can be revised. Ask/modify messages live in a durable Agent inbox and can be acknowledged, applied, or rejected. Active waits return early when commands arrive; an offline Agent sees them after reconnecting and claiming its inbox.
-
-Task creation accepts one bounded `taskLabel` containing only the concrete action, object, and scope. Manager combines a stable host identity, that label, and its own UTC creation timestamp into the immutable `displayName` (`Agent-task-createdAt`); the Agent display identity must never be changed per task. Timing is Manager-derived: total time spans creation to terminal completion (or now), execution time spans browser attempts with cumulative cooldown removed, and cooldown time accumulates actual elapsed cooldown periods, including interrupted ones.
-
-Dashboard deletion is a logical record deletion, never task cancellation. The normal path requires terminal state plus confirmed browser, Worker, and Profile cleanup. The Owner may instead explicitly force-delete a stale record after Manager confirms that no tracked child, recorded Worker process, or managed Profile runtime is still alive. Force deletion never kills a process, never rewrites unconfirmed cleanup as successful, and does not silently release a quarantined Profile lease; that lease remains available through the separate Profile recovery control. Both paths are serialized with task controls, require the current revision, hide the public record, preserve generated files, and retain a private idempotency tombstone so deleting history cannot make an external action replayable with the same key.
-
-The Agent may publish a bounded, human-readable task report with a title, summary, and sections. The Owner Console renders that bounded report on the task card without exposing raw code, local paths, or artifact contents. Full artifacts remain available only through scoped protocol methods.
-
-Heartbeat and progress are separate clocks. Heartbeat proves Worker liveness. `progressAt` proves application work advanced. The default stall detector requests screenshot plus semantic diagnostics after two minutes without progress and fails/cleans up after ten minutes of continued silence; explicit `waiting_user` and `cooling_down` states are exempt. Diagnostic capture is best-effort when the Worker or page event loop is itself unresponsive.
-
-`waiting_user` is an in-process handoff, not a new task. The Worker captures diagnostics, publishes one bounded request ID and explicit `instruction` or `human_verification` kind, and waits. Only `human_verification` enters the notification center. Its Owner claim is a separate state transition that stops reminders and may focus the browser but never resumes work; an Agent principal cannot claim it or continue it while still pending. Human verification has no ordinary short handoff deadline, while an explicit task cancellation or configured task lifetime still fails closed and cleans up. Only a later matching continuation from the owning Agent/authorized Dashboard resumes the same Worker.
-
-`completed` is never accepted directly from a Worker. A Worker completion claim first enters `verifying`; Manager then validates the bounded result shape, every declared agent-visible artifact, confirmed browser closure, Worker exit, and Profile lease release. The verified artifact size and SHA-256 anchors are rechecked on reads and idempotent replays. Until this succeeds, result data and result artifacts remain private; a changed anchor becomes `TASK_COMPLETION_INTEGRITY_FAILED`. A failed initial gate becomes `TASK_COMPLETION_GATE_FAILED`.
-
-A failed task with a stable checkpoint can be resumed only by its original role/client owner through an explicit request with a stable `resumeKey`. After Worker IPC is drained and before Worker-exit cleanup becomes observable, Manager seals the attempt's final checkpoint hash, size, and timestamp; a private cleanup receipt carries the same pointer across a Manager crash. Terminal reads, asset governance, and resume only verify that immutable seal and never adopt a later file generation, even when its JSON timestamp is backdated. Resume keeps the same task ID, input, timeout, output directory, checkpoint, and original module snapshot; increments `attempt`; and appends bounded attempt history. Manager freezes the verified checkpoint into a private attempt-scoped input. The resumed Worker must consume that exact snapshot before any browser action, checkpoint replacement, or unknown-effect resolution. The same key is idempotent. A non-failed task, unsettled cleanup, missing/unstable checkpoint, missing persisted context, or changed module hash fails closed. Modules must inspect current site state before repeating any external action whose outcome was unknown.
-
-## Behavior policies
-
-- `fast`: the complete visible action path with compressed central timing.
-- `human`: the same complete visible action path at natural central timing.
-- `auto`: balances speed and caution, uses a short cautious tier for ordinary dynamic signals, and uses bounded guarded human pacing after occlusion, timeout, uncertain navigation, action failure, or rate limiting. Stronger signals retain a larger guarded-action budget; successful actions decay back toward fast. No tier retries an unknown mutating effect automatically; only the idempotent direct-GET navigation recovery above is automatic.
-
-Behavior is owned by the Profile and task creation accepts no override. Both Profile kinds expose all three modes. Every visible action facade in every mode uses rendered traversal, minimum-jerk pointer acceleration with distance/target-size sampling and correction, safe in-target click offsets and press duration, explicit per-character keyboard events with a non-zero cadence floor, keyboard-driven native selection, fine-grained inertial wheel motion, bounded rapid page survey with visible backtracking, and explicit reading dwell. A static-page survey is one continuous downward wheel stream followed by one continuous return stream; the fine wheel events inside each stream are motion frames, not separately paused gestures. A growing or partially consumed page may use one immediate continuation only. Far rendered targets use one continuous long approach before precision acquisition; document-edge targets remain clickable when further centering is physically impossible. Modes change timing and guard depth, not this topology; even `human` keeps long motion fast and reserves slower pacing for target acquisition and ambiguity. Task-supplied click or typing delays cannot override the Profile policy. A Profile update is serialized, persisted, sent to its active Worker, and considered successful only after a matching application receipt. The Worker wakes any current pacing delay and applies the mode at the next JavaScript scheduling, pointer, key, or scroll boundary without replacing the task, attempt, Worker, browser, or Profile lease. If acknowledgement fails, the task fails closed instead of silently continuing under a stale policy. A live mode change never cancels a site-required cooldown. Public task state distinguishes an unconfirmed Profile selection from a Manager-received Worker receipt; the Dashboard renders only the latter as the actual running mode.
-
-One Worker action arbiter wraps every `journey` step and every legacy `action` call. It serializes concurrent callers and keeps each Journey slot until transition verification and settling finish. When extensions are enabled, legacy modules receive observation-only `page` and `context` surfaces and must route every page mutation through the `action` facade; direct Playwright mutation fails closed.
-
-Every `full-human-v1` task type additionally makes those universal mechanics fail-closed and auditable: transition verification and the complete journey remain mandatory, and a ten-check interaction audit gates completion. The selected mode controls pacing and guard depth, not whether mechanics happen.
-Pacing applies to visible interaction primitives such as pointer movement, clicking, typing, scrolling, navigation, and explicit reading dwell. Direct DOM extraction and file I/O remain unpaced and may read many nodes in one `evaluate` call. Reading properties such as `value`, `textContent`, or attributes is allowed; assigning those properties or invoking browser actions from an observation callback is rejected. Task logic identifies the content and sequence; Human Journey centrally owns the physical action mechanics. It observes the rendered viewport after entries, traverses toward offscreen controls through continuous wheel motion instead of instant locator positioning, and verifies page-changing clicks before continuing.
-
-Each task output is bounded by a worker-enforced default budget of 512 MiB and 10,000 files. The worker checks it periodically and before progress, checkpoint, and completion; exceeding it fails the task without deleting existing output. A separate small reserve remains available for controlled diagnostic screenshots. Each automatic diagnostic screenshot is a complete, viewport-wide JPEG capped at 48 KiB, so MCP can return it as one valid image instead of mislabeled image fragments. The scanner never follows links and has independent entry/depth bounds. Checkpoint envelopes have an independent 8 MiB cap and are atomically rejected before replacing the last valid checkpoint; bulk records belong under `outputDir`.
-
-Actions made through the task-scoped facade append an internal metadata-only effect journal (`started`, `succeeded`, or explicitly observed `failed`). Records contain only a sequence, fixed operation name, and timestamp—never selectors, values, URLs, or credentials. A Playwright exception leaves `started` pending because it cannot prove the website did nothing. That outcome must be inspected and must not be replayed blindly, except for the explicitly bounded direct-GET navigation retry whose side-effect contract is known.
-
-## Task module contract
-
-A task module is a trusted, bounded single-file `.mjs` that exports `run(runtime)` and may export `meta`. Manager snapshots the source before execution and binds task idempotency to that snapshot hash.
-
-Manager never imports a task module while installing it. A short-lived inspector child loads the snapshot, returns bounded JSON metadata, and is force-stopped on exit, error, or timeout; Manager hashes the snapshot again before registering it. This protects Manager availability from accidental top-level exits or waits, but it is not a sandbox for untrusted code. External installation is idempotent for the same SHA and returns `409 TASK_TYPE_CONFLICT` for a same-name different SHA. Only the internal seed path may explicitly replace a built-in task during an application upgrade.
+A task exports `run(ctx)` or a default function. The context contains:
 
 ```js
-export const meta = {
-  name: 'example',
-  version: '1.0.0',
-  interactionContract: 'full-human-v1'
-};
-
-export async function run({
-  page, context, input, outputDir,
-  journey, cooldown, effects, semantic, handoff,
-  progress, checkpoint, signal
-}) {
-  await journey.open(input.url, { waitUntil: 'domcontentloaded' });
-  await progress({ current: 1, total: 1, message: 'Loaded target' });
-  return { summary: 'Done', evidence: [{ kind: 'url', value: page.url() }] };
+{
+  page,
+  context,
+  browser,
+  playwright,
+  input,
+  outputDir,
+  signal,
+  progress,
+  wait
 }
 ```
 
-Every Task Pack manifest and module declares `full-human-v1`. Contracted modules use `journey` for visible state changes; their `page`, `context`, Locator, Frame, and FrameLocator surfaces are observation-only proxies, and the legacy mutation facade is unavailable. Observation callbacks reject common DOM mutation such as value assignment, programmatic click, dispatch, scrolling, storage writes, and attribute changes, closing the accidental `evaluate` bypass while retaining deterministic extraction. Pack preflight also rejects common direct-action bypasses. This is defense in depth for trusted local modules, not an adversarial JavaScript sandbox.
+Scripts are free to use Playwright, evaluate, CDP, network and filesystem APIs. Manager copies the submitted script into the task directory, records its SHA-256, and executes that frozen copy. It never deletes the Agent's source file.
 
-Journey completion emits `interaction-audit.json` and reserves one evidence slot. Ten checks cover entry establishment, viewport observation, measurable visible target acquisition, pointer/click mechanics, keyboard cadence when input exists, continuous wheel-frame density and survey reversal, verified pagination, absence of bypass violations, and settled steps. A failed audit rejects the task's completion claim. The contract improves repeatability and reviewability; it does not spoof fingerprints, bypass CAPTCHA, or guarantee that sites cannot identify automation.
+Current task state is stored atomically, and the Manager retains a bounded event history for progress and diagnostics. Output files are available while the task is running and remain useful after stop or error. A task that needs checkpoints writes them incrementally under `outputDir` and decides how a later task consumes them.
 
-Each attempt replays the same internal effect journal. State-changing operations flow through `journey` for contracted modules or `action` for legacy standalone modules. A `started` record without a durable terminal record is carried into the next attempt and blocks every new action until trusted task logic consumes its frozen checkpoint, inspects external state, and explicitly resolves that exact sequence as observed succeeded or observed not applied. Resume never clears an unknown outcome implicitly. A successful primitive followed by failed transition proof, settling, pause validation, or outer coordination receives a second `started/custom` proof-boundary record and is likewise never replayed automatically. Timeout covers setup, Playwright/browser/module startup, and task execution. Timeout, cancellation, and output-budget failure abort the task signal before bounded screenshot diagnostics, so the action facade rejects late operations before cleanup.
+## Profiles and concurrency
 
-`semantic.snapshot()` builds one bounded, redacted ref/text view across up to sixteen Playwright Frames. A ref resolves only while its snapshot and page URL are current; navigation invalidates it. `semantic.click/fill/navigate` route through the same action/effect policy. Diagnostics persist the semantic view beside the viewport screenshot, allowing an Agent to inspect structure first and use pixels only where structure is ambiguous. Scale preparation fails closed when a relevant visible frame is unreadable, omitted, or errors; a dense main document or hidden/decorative child frame that merely reaches the observation budget is explicitly reported as incomplete warning evidence after a bounded challenge scan, never as complete coverage.
+Every Profile is a Task Master-owned persistent Chrome user-data directory. One Profile is the default.
 
-Task-type list responses contain compact metadata (`domains`, `intents`, `tags`, outputs, risk, resume support, interaction contract, Pack provenance, and lifecycle) without the input schema. The full schema is returned only by describe; a separate MCP read exposes bounded Task Pack lifecycle state without mutation authority. The base runtime deliberately has no paid-provider budget or billing contract; provider authorization and cost governance belong to the specialized business layer. Deprecated task types disappear from ordinary discovery, reject new execution, and may point to one active replacement; their immutable snapshots remain auditable. A Task Pack validates the Human Journey contract and inspects every candidate before one registry commit; conflicts cannot partially install a Pack. Five built-in scaffolds cover `single-page`, `paginated-list`, `list-detail`, `resumable-batch`, and `form-workflow`, and preflight validates modules in isolation without installing them. `surface-probe` is both ordinarily discoverable and the one high-level `taskmaster_scale_prepare` dispatch for requests with no specialized capability. It samples one representative surface and merges bounded main-document, open-shadow, and multi-frame semantic signals. Unreadable, omitted, or errored relevant visible frames fail scale closed; a dense main document or hidden/decorative child that merely reaches the observation budget remains a warning after a bounded challenge scan. CAPTCHA or press-and-hold requests manual continuation without solving or bypassing it. One bounded pilot must pass before volume increases. This is sampling evidence, not a coverage or authorization claim.
+- one browser writer per Profile;
+- different Profiles may run concurrently;
+- a task may parallelize stable DOM reads, pages, HTTP, and local processing;
+- Manager does not serialize code inside a task;
+- heartbeat, process liveness, nonce, and lease generation recover stale leases.
 
-Task Master 2.8.0 removes the generic paid-provider metadata, task budget, Worker facade, ledger, and MCP/HTTP inputs. New declarations fail closed with `TASK_EXTERNAL_COST_UNSUPPORTED`. Startup strips legacy cost fields from public and persisted task state; completed history remains readable, while a legacy task that depended on the removed runtime cannot start or resume. Provider authorization, budgets, idempotency, receipts, and stop conditions belong to the reviewed specialized Pack/Skill and its external business orchestration, not the site-agnostic browser core.
+## Waiting and recovery
 
-`checkpoint(data)` persists an internal task/attempt/timestamp envelope capped at 8 MiB, while task code sees only the exact prior `data` from `checkpoint.read()`. Output and checkpoint are not one filesystem transaction; resumable modules therefore use deterministic per-unit outputs or stable-key deduplication instead of blind append-only writes. Diagnostic manifests are also attempt-bound so a recovered screenshot from an earlier failure cannot replace the current attempt's result artifact.
+`wait()` is generic. Manager does not interpret why the task waits. A waiting task keeps its Worker and Profile until the Agent resumes, stops, or deletes it. If the Worker dies, its lease is reclaimed automatically. Scripts that need restartable recovery persist their own checkpoint files under `outputDir`.
 
-Returned business data is not streamed implicitly. Modules persist large results under `outputDir`, declare agent-visible relative artifacts in evidence, and return a compact summary. Public task views expose opaque artifact references instead of local paths. Declared artifact chunks are byte-preserving so structured files and hashes remain valid; declaring a file Agent-visible is therefore an explicit disclosure decision by trusted task code.
+Manager never replays an entire failed script automatically. Resume is an explicit Agent or human action.
 
-Authenticated Manager shutdown first rejects new mutations, keeps never-started queued work durable, marks active work interrupted, then drives Worker/browser cleanup. Hard operating-system termination, power loss, or a trusted synchronous infinite loop cannot be made equivalent to graceful shutdown by pure Node.js. Without a matching cleanup receipt, the Profile remains quarantined; persisted PIDs are observation evidence and are never used alone as a kill target. A task-owned persistent quarantine that already existed when Manager started and whose Worker is proven absent is retained as historical blocked state rather than preventing a later idle shutdown or version upgrade; it remains unusable until cleanup proof or explicit Owner force release.
+## Deletion
+
+Delete is always available. The task disappears from the public API immediately. Cleanup then follows a private, durable tombstone:
+
+```text
+remove public task -> request stop -> contain owned process tree -> release proven lease -> remove output and tombstone
+```
+
+If process death or browser cleanup cannot yet be proved, the private tombstone and Profile lease remain quarantined and the reaper retries. Output is removed only after the old Worker can no longer write. A Manager restart reloads pending tombstones and continues recovery; public deletion never forces an unsafe Profile release.
+
+User-selected output files outside Manager state are not removed.
+
+## Trust boundary
+
+Task scripts are trusted code running as the current OS user. Manager provides no domain or API permission sandbox. Web content remains data: only an Agent-authored local module is imported as executable code.
+
+The Manager binds to loopback, checks same-origin mutations from the Dashboard, protects CLI mutations with a local token, and redacts credentials from Manager-owned logs.

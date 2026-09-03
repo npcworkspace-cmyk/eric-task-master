@@ -1,7 +1,7 @@
 {
   "name": "eric-task-master",
-  "version": "2.9.2",
-  "description": "Playwright browser automation runtime for AI agents with MCP, persistent Profiles, durable tasks, and unattended workflows.",
+  "version": "3.0.0",
+  "description": "A local, durable Chrome task runner for AI agents: write one script, run one command, stream results.",
   "license": "MIT",
   "type": "module",
   "private": true,
@@ -12,27 +12,15 @@
     "taskmaster": "./src/cli.mjs"
   },
   "scripts": {
-    "start": "node src/cli.mjs serve",
-    "connect": "node src/cli.mjs connect",
+    "start": "node src/cli.mjs manager foreground",
     "acceptance": "node scripts/acceptance.mjs",
     "acceptance:dashboard": "node scripts/dashboard-acceptance.mjs",
-    "acceptance:commercial": "node scripts/commercial-acceptance.mjs",
-    "acceptance:backup-restore": "node scripts/backup-restore-drill.mjs",
-    "acceptance:extensions": "node scripts/check.mjs --extensions-only",
+    "build:bundle": "node scripts/build/build-bundle.mjs",
     "check": "node scripts/check.mjs",
-    "mcp": "node src/mcp/stdio.mjs",
-    "mcp:register": "node scripts/register-mcp.mjs install --json",
-    "mcp:status": "node scripts/register-mcp.mjs status --json",
-    "mcp:unregister": "node scripts/register-mcp.mjs uninstall --json",
     "version:bump": "node scripts/bump-version.mjs",
-    "test": "node --test --test-concurrency=1"
+    "test": "node --test --test-concurrency=1 test-v3/*.test.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0",
-    "playwright": "1.62.1",
-    "zod": "4.4.3"
-  },
-  "devDependencies": {
-    "@modelcontextprotocol/client": "2.0.0"
+    "playwright": "1.62.1"
   }
 }

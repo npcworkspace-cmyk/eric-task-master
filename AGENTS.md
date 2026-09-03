@@ -1,11 +1,22 @@
-# Agent rules
+# Repository instructions
 
-Read `ARCHITECTURE.md` before changing code.
+Keep Eric Task Master on one path:
 
-- Keep browser execution pure Playwright. Do not add CDP, Puppeteer, Chrome debugger, or a second browser-control plane.
-- Keep Profile and task management in the same-origin Web Dashboard. User-installed extensions may run only in persistent Profiles when the Owner enables them. The sole action-coordination surface is the bounded cooperative Worker FIFO; it is not extension authentication. Do not add extension installation/inventory payloads, a second extension control plane, session transfer, or extension-state copying.
-- Keep site-specific behavior in task modules or specialized Skills.
-- Preserve Profile exclusive leases, task heartbeat/progress, diagnostic screenshots, and deterministic cleanup.
-- Never expose cookies, tokens, authentication headers, or profile paths in public API responses or logs.
-- Increment the version for every delivered iteration with `npm run version:bump -- patch|minor|major`.
-- Run `npm run check` before delivery. This gate includes static boundaries, all tests with real Chromium, and the full acceptance suite.
+> Receive the task, write the smallest free `.mjs`, run one CLI command, stream results.
+
+## Scope
+
+- Agent integration is CLI only.
+- Use stable local Chrome with Task Master-owned persistent Profiles.
+- Manager owns process lifetime, Profile leases, progress, output metadata, stop, resume, and delete.
+- Task scripts own browser actions, selectors, waits, retries, checkpoints, HTTP, CDP, and data processing.
+- Do not add MCP, Task Type registration, Task Pack assets, mandatory probes, behavior modes, Journey facades, or special challenge policy.
+
+## Engineering
+
+- Prefer the smallest implementation that proves the requested outcome.
+- Keep Dashboard limited to Tasks and Profiles.
+- Any new required pre-run step needs explicit product justification.
+- Add a regression test for every bug fix.
+- Run `npm run check` before commit.
+- Use SemVer; the public “3.00” release is `3.0.0`.

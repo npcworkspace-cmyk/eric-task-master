@@ -1,104 +1,99 @@
+import { randomUUID } from 'node:crypto';
+import { launchChromeProfile } from './browser-engine.mjs';
 import { redactSensitiveText } from '../lib/redaction.mjs';
-import { writeCleanupReceipt } from '../lib/cleanup-receipt.mjs';
-import { resolveBrowserEngine } from './browser-engine.mjs';
 
-function safeSend(message) {
-  if (typeof process.send !== 'function' || !process.connected) return;
+let processCleanupConfirmed = true;
+let activeCleanupAck = null;
+
+function send(message) {
+  if (!process.connected || typeof process.send !== 'function') return;
   try {
     process.send(message, undefined, undefined, () => {});
   } catch {
-    // Parent-side exit handling is authoritative.
+    // Parent exit is also observed through disconnect.
   }
 }
 
-async function withDeadline(promise, timeoutMs) {
+function sendCleanupWithAck(message, timeoutMs = 2_000) {
+  return new Promise((resolve) => {
+    if (!process.connected || typeof process.send !== 'function') return resolve(false);
+    const cleanupId = `cleanup_${randomUUID().replaceAll('-', '')}`;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (activeCleanupAck?.id === cleanupId) activeCleanupAck = null;
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    activeCleanupAck = { id: cleanupId, finish };
+    try {
+      process.send({ ...message, cleanupId }, undefined, undefined, (error) => {
+        if (error) finish(false);
+      });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+async function closeContext(context, timeoutMs = 10_000) {
+  if (!context) return false;
   let timer;
   try {
-    return await Promise.race([
-      promise,
+    await Promise.race([
+      context.close(),
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('Profile browser cleanup timed out')), timeoutMs);
+        timer = setTimeout(() => reject(new Error('close timeout')), timeoutMs);
       })
     ]);
+    return true;
+  } catch {
+    return false;
   } finally {
     clearTimeout(timer);
   }
 }
 
-export async function closeProfileBrowserSession(context, timeoutMs = 10_000) {
-  if (!context) return true;
-  const browser = context.browser?.() || null;
-  try {
-    await withDeadline(context.close(), timeoutMs);
-    return true;
-  } catch {
-    if (!browser) return false;
-  }
-  if (typeof browser.close !== 'function') return false;
-  try {
-    await withDeadline(browser.close(), timeoutMs);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export async function runOpenProfile(profile, {
+export async function runProfileWorker(profile, {
   loadPlaywright = () => import('playwright'),
-  signal,
-  cleanupReceiptPath = null,
-  cleanupReceipt = null
+  signal
 } = {}) {
-  let context = null;
-  let heartbeat = null;
+  processCleanupConfirmed = false;
+  let context;
+  let heartbeat;
   try {
     const playwright = await loadPlaywright();
-    const { browserType, launchOptions } = resolveBrowserEngine(playwright, profile);
-    if (!browserType?.launchPersistentContext) throw new Error('Unsupported Playwright browser');
-    context = await browserType.launchPersistentContext(profile.userDataDir, {
-      ...launchOptions,
-      headless: false
-    });
+    context = await launchChromeProfile(playwright, profile);
     if (context.pages().length === 0) await context.newPage();
-    safeSend({ type: 'ready' });
-    heartbeat = setInterval(() => safeSend({ type: 'heartbeat', at: new Date().toISOString() }), 20_000);
-
-    if (signal?.aborted) return;
-    await new Promise((resolve) => {
-      signal?.addEventListener('abort', resolve, { once: true });
-      context.once?.('close', resolve);
-    });
+    send({ type: 'ready', at: new Date().toISOString() });
+    heartbeat = setInterval(() => send({ type: 'heartbeat', at: new Date().toISOString() }), 10_000);
+    heartbeat.unref?.();
+    if (!signal?.aborted) {
+      await new Promise((resolve) => {
+        signal?.addEventListener('abort', resolve, { once: true });
+        context.once?.('close', resolve);
+      });
+    }
+    return { ok: true };
   } catch (error) {
-    safeSend({
+    send({
       type: 'error',
       error: {
         code: error?.code || 'PROFILE_OPEN_FAILED',
-        message: redactSensitiveText(error?.message || 'Profile failed to open').slice(0, 2_000)
+        message: redactSensitiveText(error?.message || 'Profile failed to open').slice(0, 4_000)
       }
     });
+    return { ok: false, error };
   } finally {
     clearInterval(heartbeat);
-    const browserClosed = await closeProfileBrowserSession(context);
-    let cleanupReceiptWritten = false;
-    if (browserClosed && cleanupReceiptPath && cleanupReceipt) {
-      try {
-        await writeCleanupReceipt(cleanupReceiptPath, cleanupReceipt);
-        cleanupReceiptWritten = true;
-      } catch {
-        // The parent can still confirm a live IPC cleanup. A restarted Manager
-        // deliberately refuses to release the Profile without this receipt.
-      }
-    }
-    if (!browserClosed) {
-      safeSend({
-        type: 'error',
-        error: {
-          code: 'PROFILE_CLEANUP_UNCONFIRMED',
-          message: 'Profile browser cleanup could not be confirmed'
-        }
-      });
-    }
-    safeSend({ type: 'closed', browserClosed, cleanupReceiptWritten });
+    const browserClosed = await closeContext(context);
+    const cleanupAcknowledged = await sendCleanupWithAck({
+      type: 'closed', browserClosed, at: new Date().toISOString()
+    });
+    processCleanupConfirmed = browserClosed && cleanupAcknowledged;
   }
 }
 
@@ -108,17 +103,18 @@ if (typeof process.send === 'function') {
   process.on('message', (message) => {
     if (message?.type === 'open' && !started) {
       started = true;
-      void runOpenProfile(message.profile, {
-        signal: controller.signal,
-        cleanupReceiptPath: message.cleanupReceiptPath,
-        cleanupReceipt: message.cleanupReceipt
-      }).finally(() => {
-        setTimeout(() => {
+      void runProfileWorker(message.profile, { signal: controller.signal }).finally(() => {
+        if (processCleanupConfirmed) {
           if (process.connected) process.disconnect();
-        }, 10);
+          const timer = setTimeout(() => process.exit(0), 25);
+          timer.unref?.();
+        }
       });
     }
     if (message?.type === 'close') controller.abort();
+    if (message?.type === 'closed_ack' && activeCleanupAck?.id === message.cleanupId) {
+      activeCleanupAck.finish(true);
+    }
   });
   process.on('disconnect', () => controller.abort());
 }

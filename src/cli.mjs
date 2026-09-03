@@ -1,72 +1,39 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { appendFile, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startManager } from './manager.mjs';
-import { createTaskService } from './runtime/task-service.mjs';
-import { createRegistrar } from './registration/index.mjs';
-import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, isSettledTerminalTask, VERSION } from './contracts.mjs';
-import {
-  createIdentityNonce,
-  MANAGER_SERVICE,
-  validateManagerIdentityPin,
-  verifyManagerIdentityProof
-} from './lib/manager-identity.mjs';
-import { redactPublicText, redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
-import { waitForManagerShutdownProof } from './lib/manager-shutdown-proof.mjs';
-import { OperationalJournal } from './lib/operational-journal.mjs';
-import { shutdownManagerProcess } from './lib/manager-process-shutdown.mjs';
-import {
-  finalizeQuarantinedProfilesAfterShutdown,
-  inspectQuarantinedProfileUpgrade,
-  recoverLegacyDiscardedQuarantineTasksAfterShutdown
-} from './lib/quarantined-profile-upgrade.mjs';
-import { preflightTaskPack, readTaskPack, scaffoldTaskPack } from './lib/task-pack.mjs';
-import { assertSafeTaskInput, HttpTaskMasterClient } from './mcp/taskmaster-client.mjs';
+import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
+import { defaultDataDirectory, startManager } from './manager.mjs';
+import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = fileURLToPath(import.meta.url);
-const HELP = `eric-task-master ${VERSION}
+const HELP = `Eric Task Master ${VERSION}
 
-Usage:
-  taskmaster connect [--force-acceptance] [--json]
-  taskmaster doctor [--json]
-  taskmaster status [--json]
-  taskmaster dashboard-open [TASK_ID] [--json]
-  taskmaster manager stop [--json]
-  taskmaster profiles list [--json]
-  taskmaster profiles create --name NAME [--kind persistent|ephemeral] [--engine chrome|chromium] [--behavior fast|auto|human] [--headless]
-  taskmaster profiles update PROFILE_ID [--name NAME] [--behavior MODE]
-  taskmaster profiles open|close PROFILE_ID
-  taskmaster task-types list [--query TEXT] [--domain HOST] [--intent INTENT] [--json]
-  taskmaster task-types describe TASK_TYPE [--json]
-  taskmaster task-types install --type NAME --module PATH [--persistent] [--note TEXT] [--json]
-  taskmaster task-types deprecate TASK_TYPE [--replacement TASK_TYPE] [--json]
-  taskmaster task-types restore TASK_TYPE [--json]
-  taskmaster task-packs validate PATH [--json]
-  taskmaster task-packs scaffold PATH --name PACK_NAME [--recipe RECIPE] [--json]
-  taskmaster task-packs install PATH [--json]
-  taskmaster task list [--json]
-  taskmaster task inbox [--limit N] [--json]
-  taskmaster task start --profile ID --type TYPE --request-key KEY [--label TEXT] [--input JSON_OR_@FILE] [--json]
-  taskmaster task prepare-scale --profile ID --url URL --request-key KEY [--label TEXT] [--json]
-  taskmaster task run --profile ID --type TYPE [--module PATH] [--label TEXT] [--input JSON_OR_@FILE] [--request-key KEY]
-  taskmaster task status|wait|follow|cancel TASK_ID [--json]
-  taskmaster task continue TASK_ID [--request-id ID] [--note TEXT] [--json]
-  taskmaster task command-respond TASK_ID --command-id ID --revision N --status acknowledged|applied|rejected [--message TEXT] [--json]
-  taskmaster task report TASK_ID --report-id ID --revision N --status draft|final --title TEXT --summary TEXT [--sections JSON_OR_@FILE] [--json]
-  taskmaster task resume TASK_ID --resume-key KEY [--detach] [--json]
-  taskmaster artifacts list TASK_ID [--json]
-  taskmaster artifacts read TASK_ID --artifact ARTIFACT_ID [--offset N] [--max-bytes N]
-  taskmaster mcp status|register|unregister|rollback [--json]
+Fast path:
+  taskmaster run JOB.mjs [--profile NAME_OR_ID] [--input JSON_OR_@FILE] [--label TEXT] [--detach]
 
-Task start accepts registered task types only and returns immediately. Task wait is bounded to 30 seconds.
-Agent-scoped commands require --agent-id STABLE_ID (or ERIC_TASK_MASTER_CLIENT_ID). Use a distinct stable ID per independent Agent; Profiles are global while task histories stay Agent-scoped.
-Task run follows progress until terminal state by default.`;
+Tasks:
+  taskmaster follow TASK_ID
+  taskmaster status [TASK_ID]
+  taskmaster stop TASK_ID
+  taskmaster resume TASK_ID [--value JSON_OR_@FILE]
+  taskmaster delete TASK_ID
+  taskmaster files TASK_ID [--read RELATIVE_PATH]
+
+Profiles:
+  taskmaster profiles list
+  taskmaster profiles create NAME
+  taskmaster profiles default NAME_OR_ID
+  taskmaster profiles rename NAME_OR_ID --name NEW_NAME
+  taskmaster profiles open|close|delete NAME_OR_ID
+
+Manager:
+  taskmaster panel
+  taskmaster manager start|foreground|status|stop
+
+All commands accept --json. Manager starts automatically when needed.`;
 
 function parseArgs(argv) {
   const positionals = [];
@@ -78,7 +45,7 @@ function parseArgs(argv) {
       continue;
     }
     const equals = value.indexOf('=');
-    if (equals !== -1) {
+    if (equals > 2) {
       options[value.slice(2, equals)] = value.slice(equals + 1);
       continue;
     }
@@ -94,171 +61,99 @@ function parseArgs(argv) {
   return { positionals, options };
 }
 
-function defaultStateDir() {
-  return resolve(process.env.ERIC_TASK_MASTER_HOME || join(homedir(), '.eric-task-master'));
+const COMMON_OPTIONS = Object.freeze(['help', 'host', 'json', 'port', 'state-dir']);
+
+function assertAllowedOptions(options, allowed = []) {
+  const accepted = new Set([...COMMON_OPTIONS, ...allowed]);
+  const unknown = Object.keys(options).filter((key) => !accepted.has(key));
+  if (unknown.length) {
+    throw cliError(
+      'UNKNOWN_OPTION',
+      `Unknown option${unknown.length === 1 ? '' : 's'}: ${unknown.map((key) => `--${key}`).join(', ')}`
+    );
+  }
 }
 
-function settings(options) {
-  const port = Number(options.port ?? process.env.ERIC_TASK_MASTER_PORT ?? DEFAULT_PORT);
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw cliError('INVALID_PORT', 'Port must be an integer from 1 to 65535');
-  }
-  const host = options.host || process.env.ERIC_TASK_MASTER_HOST || DEFAULT_HOST;
-  if (host !== '127.0.0.1') {
-    throw cliError('LOOPBACK_REQUIRED', 'Task Master binds only to 127.0.0.1');
-  }
-  const stateDir = resolve(options['state-dir'] || defaultStateDir());
-  return { host, port, stateDir, baseUrl: `http://${host}:${port}` };
+function cliError(code, message, nextAction = null) {
+  return Object.assign(new Error(message), { code, nextAction });
 }
 
-function cliError(code, message, nextAction, details) {
-  return Object.assign(new Error(message), {
-    code,
-    nextAction,
-    ...(details === undefined ? {} : { details })
-  });
+export function parseIntegerOption(value, {
+  name,
+  minimum = 0,
+  maximum = Number.MAX_SAFE_INTEGER,
+  defaultValue
+} = {}) {
+  const missing = value === undefined || value === null;
+  if (missing && defaultValue !== undefined) return defaultValue;
+  const isNumber = typeof value === 'number';
+  const text = typeof value === 'string' ? value.trim() : null;
+  const supplied = isNumber || (text !== null && text.length > 0);
+  const parsed = isNumber ? value : Number(text);
+  if (!supplied || !Number.isFinite(parsed) || !Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw cliError(
+      'INVALID_NUMERIC_OPTION',
+      `${name || 'numeric option'} must be a safe integer from ${minimum} to ${maximum}`
+    );
+  }
+  return parsed;
 }
 
-const SAFE_REGISTRATION_REASONS = new Set([
-  'No verified native registration contract is enabled for this host.',
-  'Skipped: adapter is not verified.',
-  'Named entry exists but no TaskMaster ownership state is available.',
-  'The owned entry changed after installation.'
-]);
-
-function safeRegistrationReason(result, code) {
-  const hostKey = typeof result?.hostKey === 'string' && /^[a-z0-9-]{1,80}$/u.test(result.hostKey)
-    ? result.hostKey
-    : 'host';
-  if (code === 'REGISTRATION_CONFLICT') {
-    return `Unowned ${hostKey} entry uses the name eric-task-master.`;
+export function parseOutputBudgetOptions(options = {}) {
+  const maxBytes = options['max-bytes'] === undefined
+    ? undefined
+    : parseIntegerOption(options['max-bytes'], {
+        name: '--max-bytes', minimum: 1, maximum: 64 * 1024 * 1024 * 1024
+      });
+  const maxFiles = options['max-files'] === undefined
+    ? undefined
+    : parseIntegerOption(options['max-files'], {
+        name: '--max-files', minimum: 1, maximum: 1_000_000
+      });
+  const suppliedMaxEntries = options['max-entries'] === undefined
+    ? undefined
+    : parseIntegerOption(options['max-entries'], {
+        name: '--max-entries', minimum: 1, maximum: 2_000_000
+      });
+  const maxEntries = suppliedMaxEntries ?? (maxFiles === undefined
+    ? undefined
+    : Math.min(2_000_000, Math.max(20_000, maxFiles * 2)));
+  if (maxFiles !== undefined && maxEntries < maxFiles) {
+    throw cliError('INVALID_OUTPUT_BUDGET', '--max-entries must be greater than or equal to --max-files');
   }
-  if (code === 'OWNED_ENTRY_CHANGED') {
-    return 'The owned entry changed after installation; it was not overwritten.';
-  }
-  if (code === 'INVALID_HOST_CONFIG') {
-    return 'The host configuration is not valid and was not modified.';
-  }
-  if (code === 'INVALID_REGISTRATION_STATE') {
-    return 'The registration state is not valid and was not modified.';
-  }
-  if (typeof result?.reason === 'string' && SAFE_REGISTRATION_REASONS.has(result.reason)) {
-    return result.reason;
-  }
-  if (result?.status === 'conflict') return 'The host registration conflicts with existing local state.';
-  if (result?.status === 'failed') {
-    return code ? `Host registration failed with ${code}.` : 'Host registration failed.';
-  }
-  return '';
-}
-
-function registrationFailureDetails(registration) {
+  if (maxBytes === undefined && maxFiles === undefined && maxEntries === undefined) return undefined;
   return {
-    ok: false,
-    command: registration?.command === 'install' ? 'install' : 'registration',
-    changed: false,
-    results: Array.isArray(registration?.results)
-      ? registration.results.slice(0, 32).map((result) => {
-          const code = typeof result?.error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/u.test(result.error.code)
-            ? result.error.code
-            : '';
-          const reason = safeRegistrationReason(result, code);
-          return {
-            ...(typeof result?.hostKey === 'string' ? { hostKey: result.hostKey.slice(0, 80) } : {}),
-            ...(typeof result?.displayName === 'string' ? { displayName: result.displayName.slice(0, 120) } : {}),
-            ...(typeof result?.support === 'string' ? { support: result.support.slice(0, 32) } : {}),
-            ...(typeof result?.mcpCapability === 'string' ? { mcpCapability: result.mcpCapability.slice(0, 64) } : {}),
-            ...(typeof result?.autoRegistration === 'string' ? { autoRegistration: result.autoRegistration.slice(0, 64) } : {}),
-            ...(typeof result?.registrationMode === 'string' ? { registrationMode: result.registrationMode.slice(0, 64) } : {}),
-            ...(typeof result?.detected === 'boolean' ? { detected: result.detected } : {}),
-            ...(typeof result?.status === 'string' ? { status: result.status.slice(0, 64) } : {}),
-            ...(typeof result?.configurationStatus === 'string' ? { configurationStatus: result.configurationStatus.slice(0, 64) } : {}),
-            ...(typeof result?.activationStatus === 'string' ? { activationStatus: result.activationStatus.slice(0, 64) } : {}),
-            ...(typeof result?.configPath === 'string' ? { configPath: result.configPath.slice(0, 4_096) } : {}),
-            ...(typeof result?.changed === 'boolean' ? { changed: result.changed } : {}),
-            ...(reason ? { reason } : {}),
-            ...(code ? { error: { code, message: reason || `Host registration failed with ${code}.` } } : {})
-          };
-        })
-      : []
+    ...(maxBytes === undefined ? {} : { maxBytes }),
+    ...(maxFiles === undefined ? {} : { maxFiles }),
+    ...(maxEntries === undefined ? {} : { maxEntries })
   };
+}
+
+function settings(options = {}) {
+  const host = options.host || process.env.ERIC_TASK_MASTER_HOST || DEFAULT_HOST;
+  if (host !== DEFAULT_HOST) throw cliError('LOOPBACK_REQUIRED', `Manager must use ${DEFAULT_HOST}`);
+  const port = parseIntegerOption(
+    options.port ?? process.env.ERIC_TASK_MASTER_PORT ?? DEFAULT_PORT,
+    { name: '--port', minimum: 1, maximum: 65_535 }
+  );
+  const stateDir = path.resolve(options['state-dir'] || defaultDataDirectory());
+  return { host, port, stateDir, baseUrl: `http://${host}:${port}` };
 }
 
 function emit(value, json = false) {
   if (json) {
     process.stdout.write(`${JSON.stringify(value)}\n`);
-    return;
+  } else if (typeof value === 'string') {
+    process.stdout.write(`${value}\n`);
+  } else {
+    process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
   }
-  process.stdout.write(`${formatHuman(value)}\n`);
 }
 
-function formatHuman(value) {
-  if (typeof value === 'string') return value;
-  if (Array.isArray(value)) return value.map(formatHuman).join('\n');
-  return JSON.stringify(value, null, 2);
-}
-
-async function readManagerCredentials(stateDir) {
-  let config;
-  try {
-    config = JSON.parse(await readFile(join(stateDir, 'config.json'), 'utf8'));
-  } catch {
-    // The caller reports a stable connection error below.
-  }
-  if (typeof config?.managerToken !== 'string' || config.managerToken.length < 32) {
-    throw cliError(
-      'MANAGER_TOKEN_UNAVAILABLE',
-      'Manager authentication token is unavailable',
-      'Restore the state directory that belongs to the running Manager, or stop it from its verified owning installation; then retry the fixed connect command once. Do not invent another controller or production port.'
-    );
-  }
-  let identity;
-  try {
-    identity = validateManagerIdentityPin(config.managerIdentity);
-  } catch {
-    throw cliError(
-      'MANAGER_IDENTITY_INVALID',
-      'Manager public identity pin is unavailable or invalid',
-      'Restore the original Manager state or run the fixed connect command with a fresh state directory.'
-    );
-  }
-  return { token: config.managerToken, identity };
-}
-
-async function verifyManagerEndpoint(config, identity, timeoutMs = 2_500, expectedVersion = VERSION) {
-  const nonce = createIdentityNonce();
-  let proof;
-  try {
-    proof = await requestJson(config.baseUrl, '/v1/identity/challenge', {
-      method: 'POST',
-      body: { nonce },
-      timeoutMs
-    });
-    verifyManagerIdentityProof(proof, identity, {
-      service: MANAGER_SERVICE,
-      version: expectedVersion,
-      apiVersion: API_VERSION,
-      host: config.host,
-      port: config.port,
-      nonce
-    });
-  } catch (error) {
-    if (error?.code === 'MANAGER_UNREACHABLE') throw error;
-    throw cliError(
-      typeof error?.code === 'string' && error.code.startsWith('MANAGER_IDENTITY_')
-        ? error.code
-        : 'MANAGER_IDENTITY_UNVERIFIED',
-      'The service on the Manager port did not prove the pinned Manager identity.',
-      'Stop the untrusted local service or restore the original Manager state, then retry.'
-    );
-  }
-  return proof;
-}
-
-async function requestJson(baseUrl, pathname, { method = 'GET', body, token, timeoutMs = 10_000 } = {}) {
+async function requestJson(config, pathname, { method = 'GET', body, token, timeoutMs = 30_000 } = {}) {
   let response;
   try {
-    response = await fetch(new URL(pathname, baseUrl), {
+    response = await fetch(new URL(pathname, config.baseUrl), {
       method,
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -268,44 +163,43 @@ async function requestJson(baseUrl, pathname, { method = 'GET', body, token, tim
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
-    throw cliError(
-      'MANAGER_UNREACHABLE',
-      redactSensitiveText(`Manager request failed: ${error.message}`),
-      'Retry the fixed connect command once.'
-    );
+    throw cliError('MANAGER_UNREACHABLE', `Manager request failed: ${error.message}`);
   }
-  const text = await response.text();
+  const source = await response.text();
   let payload = {};
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      throw cliError('INVALID_MANAGER_RESPONSE', `Manager returned non-JSON status ${response.status}`);
-    }
+  try {
+    payload = source ? JSON.parse(source) : {};
+  } catch {
+    throw cliError('INVALID_MANAGER_RESPONSE', `Manager returned invalid JSON (${response.status})`);
   }
   if (!response.ok) {
-    const detail = payload.error || payload;
-    throw cliError(
-      detail.code || `HTTP_${response.status}`,
-      redactSensitiveText(detail.message || `Manager returned ${response.status}`)
+    const error = cliError(
+      payload.error?.code || `HTTP_${response.status}`,
+      payload.error?.message || `Manager returned ${response.status}`,
+      payload.nextAction ?? payload.error?.nextAction ?? null
     );
+    const details = payload.error?.details ?? payload.details;
+    if (details !== undefined) error.details = details;
+    error.statusCode = response.status;
+    throw error;
   }
   return payload;
 }
 
-async function health(config, timeoutMs = 1_500, expectedVersion = VERSION) {
-  const result = await requestJson(config.baseUrl, '/v1/health', { timeoutMs });
-  if (result.service !== 'eric-task-master') {
-    throw cliError('PORT_OCCUPIED', `Port ${config.port} belongs to another service`);
-  }
-  if (expectedVersion !== null && result.version !== expectedVersion) {
-    throw cliError(
-      'MANAGER_VERSION_MISMATCH',
-      `Manager ${result.version} does not match project ${VERSION}`,
-      'Stop the older Manager process and rerun connect.'
-    );
-  }
+async function health(config, timeoutMs = 1_500) {
+  const result = await requestJson(config, '/v1/health', { timeoutMs });
+  if (result.service !== 'eric-task-master') throw cliError('PORT_OCCUPIED', 'Manager port belongs to another service');
   return result;
+}
+
+async function readToken(config) {
+  try {
+    const value = JSON.parse(await readFile(path.join(config.stateDir, 'config.json'), 'utf8'));
+    if (typeof value.managerToken !== 'string' || value.managerToken.length < 32) throw new Error();
+    return value.managerToken;
+  } catch {
+    throw cliError('MANAGER_TOKEN_UNAVAILABLE', 'Manager local token is unavailable');
+  }
 }
 
 async function waitForManager(config, timeoutMs = 20_000) {
@@ -313,1007 +207,543 @@ async function waitForManager(config, timeoutMs = 20_000) {
   let lastError;
   while (Date.now() < deadline) {
     try {
-      return await health(config);
+      const current = await health(config);
+      if (current.apiVersion !== API_VERSION) {
+        throw cliError('MANAGER_API_INCOMPATIBLE', `Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`);
+      }
+      if (current.version !== VERSION) {
+        throw cliError('MANAGER_VERSION_MISMATCH', `Manager ${current.version || 'unknown'} does not match CLI ${VERSION}`);
+      }
+      return current;
     } catch (error) {
       lastError = error;
-      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
   }
-  throw cliError(
-    'MANAGER_START_TIMEOUT',
-    `Manager did not become ready: ${lastError?.message || 'timeout'}`,
-    'Retry the fixed connect command once.'
+  throw cliError('MANAGER_START_TIMEOUT', lastError?.message || 'Manager did not start');
+}
+
+async function startupError({ startupLog, code = null, signal = null, cause = null }) {
+  const logSource = await readFile(startupLog, 'utf8').catch(() => '');
+  const logTail = logSource.trim().slice(-8_000);
+  let managerCode = null;
+  for (const line of logSource.split(/\r?\n/u).reverse()) {
+    try {
+      const record = JSON.parse(line);
+      if (typeof record?.error?.code === 'string') {
+        managerCode = record.error.code;
+        break;
+      }
+    } catch {
+      // Startup markers are intentionally not JSON records.
+    }
+  }
+  const exitReason = cause?.message || (signal ? `signal ${signal}` : `exit code ${code ?? 'unknown'}`);
+  const error = cliError(
+    'MANAGER_START_FAILED',
+    `Manager exited before it became ready: ${exitReason}${logTail ? `\n${logTail}` : ''}`,
+    `Inspect ${startupLog}, fix the reported startup error, then retry.`
   );
+  error.managerCode = managerCode;
+  error.details = {
+    startupLog,
+    exitCode: code,
+    signal,
+    ...(managerCode ? { managerCode } : {}),
+    ...(logTail ? { logTail } : {})
+  };
+  return error;
 }
 
-async function ensureManager(config) {
-  let migratedFrom;
-  let recoveredQuarantinedProfiles = 0;
-  let retainedQuarantinedProfiles = 0;
-  let recoveredQuarantinedTasks = 0;
+export async function startBackgroundManager(config, {
+  spawnProcess = spawn,
+  waitForReady = waitForManager,
+  executable = process.execPath,
+  cliPath = CLI_PATH
+} = {}) {
+  const cleanEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => key.toUpperCase() !== 'NODE_OPTIONS')
+  );
+  cleanEnvironment.NODE_OPTIONS = '';
+  const startupDirectory = path.join(config.stateDir, 'logs');
+  const startupLog = path.join(
+    startupDirectory,
+    `manager-startup-${process.pid}-${randomUUID()}.log`
+  );
+  await mkdir(startupDirectory, { recursive: true, mode: 0o700 });
+  const logHandle = await open(startupLog, 'a', 0o600);
+  await logHandle.chmod(0o600).catch(() => {});
+  await logHandle.appendFile(`\n[${new Date().toISOString()}] starting Manager\n`, 'utf8');
+  let child;
   try {
-    return { health: await health(config), started: false };
-  } catch (error) {
-    if (error.code === 'MANAGER_VERSION_MISMATCH') {
-      const stopped = await shutdownManager(config, { requireIdle: true });
-      migratedFrom = stopped.version;
-      recoveredQuarantinedProfiles = stopped.recoveredQuarantinedProfiles || 0;
-      retainedQuarantinedProfiles = stopped.retainedQuarantinedProfiles || 0;
-      recoveredQuarantinedTasks = stopped.recoveredQuarantinedTasks || 0;
-    } else if (error.code !== 'MANAGER_UNREACHABLE') {
-      throw error;
-    } else {
-      let recorded;
-      try {
-        recorded = JSON.parse(await readFile(join(config.stateDir, 'manager.json'), 'utf8'));
-      } catch (readError) {
-        if (readError?.code !== 'ENOENT') throw readError;
-      }
-      if (recorded) {
-        recoveredQuarantinedTasks = await recoverLegacyDiscardedQuarantineTasksAfterShutdown({
-          stateDir: config.stateDir,
-          expectedManager: recorded
-        });
-        if (recoveredQuarantinedTasks > 0) migratedFrom = recorded.version;
-      }
-    }
-  }
-  await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
-  const child = spawn(process.execPath, [
-    CLI_PATH,
-    'serve',
-    '--host', config.host,
-    '--port', String(config.port),
-    '--state-dir', config.stateDir
-  ], {
-    cwd: ROOT,
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true
-  });
-  const spawnFailure = new Promise((_, reject) => {
-    child.once('error', () => reject(cliError(
-      'MANAGER_START_FAILED',
-      'Manager process could not be started',
-      'Check the Node.js runtime and retry the fixed connect command once.'
-    )));
-  });
-  child.unref();
-  return {
-    health: await Promise.race([waitForManager(config), spawnFailure]),
-    started: true,
-    ...(migratedFrom ? { migratedFrom } : {}),
-    ...(recoveredQuarantinedProfiles > 0 ? { recoveredQuarantinedProfiles } : {}),
-    ...(retainedQuarantinedProfiles > 0 ? { retainedQuarantinedProfiles } : {}),
-    ...(recoveredQuarantinedTasks > 0 ? { recoveredQuarantinedTasks } : {})
-  };
-}
-
-async function serve(config, json) {
-  const manager = await startManager({
-    host: config.host,
-    port: config.port,
-    dataDir: config.stateDir,
-    dashboardDir: resolve(ROOT, 'dashboard'),
-    taskServiceFactory(taskOptions) {
-      return createTaskService(taskOptions);
-    }
-  });
-  await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
-  const pidFile = join(config.stateDir, 'manager.json');
-  const shutdownFailureFile = join(config.stateDir, 'manager-shutdown-failure.json');
-  const pidRecord = { pid: process.pid, version: VERSION, baseUrl: manager.baseUrl };
-  await rm(shutdownFailureFile, { force: true }).catch(() => {});
-  await writeFile(pidFile, `${JSON.stringify(pidRecord)}\n`, { mode: 0o600 });
-  emit({ ok: true, event: 'manager-ready', version: VERSION, pid: process.pid, baseUrl: manager.baseUrl }, json);
-
-  let stopPromise;
-  const stop = (trigger) => {
-    if (stopPromise) return stopPromise;
-    stopPromise = shutdownManagerProcess({
-      manager,
-      pidFile,
-      failureFile: shutdownFailureFile,
-      pidRecord,
-      trigger
+    child = spawnProcess(executable, [
+      cliPath,
+      'serve',
+      '--host', config.host,
+      '--port', String(config.port),
+      '--state-dir', config.stateDir,
+      '--json'
+    ], {
+      detached: true,
+      stdio: ['ignore', logHandle.fd, logHandle.fd],
+      windowsHide: true,
+      env: cleanEnvironment
     });
-    return stopPromise;
-  };
-  const stopAndExit = (trigger) => {
-    void stop(trigger).then(
-      () => process.exit(0),
-      (error) => {
-        process.stderr.write(`${JSON.stringify({
-          ok: false,
-          error: {
-            code: error?.code || 'MANAGER_STOP_FAILED',
-            message: redactSensitiveText(error?.message || 'Manager shutdown failed').slice(0, 2_000)
-          }
-        })}\n`);
-        process.exit(1);
+  } catch (cause) {
+    await logHandle.close();
+    await appendFile(startupLog, `${cause?.stack || cause}\n`, { mode: 0o600 }).catch(() => {});
+    throw await startupError({ startupLog, cause });
+  }
+  const earlyExit = new Promise((resolve, reject) => {
+    let settled = false;
+    child.once('error', async (cause) => {
+      if (settled) return;
+      settled = true;
+      await appendFile(startupLog, `${cause?.stack || cause}\n`, { mode: 0o600 }).catch(() => {});
+      reject(await startupError({ startupLog, cause }));
+    });
+    child.once('exit', async (code, signal) => {
+      if (settled) return;
+      settled = true;
+      const error = await startupError({ startupLog, code, signal });
+      if (error.managerCode === 'MANAGER_ALREADY_RUNNING' || error.managerCode === 'MANAGER_LOCK_BUSY') {
+        resolve({ kind: 'contended' });
+      } else {
+        reject(error);
       }
-    );
-  };
-  process.once('SIGINT', () => stopAndExit('SIGINT'));
-  process.once('SIGTERM', () => stopAndExit('SIGTERM'));
-  await manager.shutdownRequested;
-  stopAndExit('api');
-  await new Promise(() => {});
-}
-
-async function loadInput(raw) {
-  if (raw === undefined) return {};
-  if (raw.startsWith('@')) {
-    return JSON.parse(await readFile(resolve(raw.slice(1)), 'utf8'));
-  }
-  return JSON.parse(raw);
-}
-
-async function stageTaskModule(config, modulePath) {
-  const requested = isAbsolute(modulePath) ? modulePath : resolve(modulePath);
-  const metadata = await lstat(requested).catch(() => null);
-  if (!metadata?.isFile() || metadata.isSymbolicLink() || !requested.toLowerCase().endsWith('.mjs')) {
-    throw cliError('INVALID_TASK_MODULE', 'Task module must be a regular .mjs file');
-  }
-  if (metadata.size < 1 || metadata.size > 2 * 1024 * 1024) {
-    throw cliError('INVALID_TASK_MODULE_SIZE', 'Task module must contain 1 byte to 2 MiB');
-  }
-  const source = await readFile(requested);
-  const sha256 = createHash('sha256').update(source).digest('hex');
-  const inbox = join(config.stateDir, 'task-inbox');
-  const staged = join(inbox, `${sha256}.mjs`);
-  await mkdir(inbox, { recursive: true, mode: 0o700 });
-  await writeFile(staged, source, { flag: 'wx', mode: 0o600 }).catch((error) => {
-    if (error?.code !== 'EEXIST') throw error;
+    });
   });
-  const stagedSource = await readFile(staged);
-  if (createHash('sha256').update(stagedSource).digest('hex') !== sha256) {
-    throw cliError('TASK_MODULE_STAGE_CONFLICT', 'Staged task module failed its integrity check');
+  const readiness = Promise.resolve().then(() => waitForReady(config));
+  const readyOrFailed = Promise.race([
+    readiness.then((value) => ({ kind: 'ready', value })),
+    earlyExit
+  ]);
+  await logHandle.close();
+  child.unref();
+  try {
+    const outcome = await readyOrFailed;
+    if (outcome.kind === 'ready') return outcome.value;
+    // This child lost the state lock to a sibling auto-start. It is not a
+    // startup failure: wait for the winning Manager on the same loopback port.
+    return await readiness;
+  } catch (error) {
+    if (error?.code === 'MANAGER_START_FAILED') throw error;
+    const logSource = await readFile(startupLog, 'utf8').catch(() => '');
+    const logTail = logSource.trim().slice(-8_000);
+    error.nextAction ||= `Inspect ${startupLog}, stop any stuck Manager process, then retry.`;
+    error.details = {
+      ...(error.details && typeof error.details === 'object' ? error.details : {}),
+      startupLog,
+      ...(logTail ? { logTail } : {})
+    };
+    throw error;
   }
-  return staged;
+}
+
+async function waitForManagerStop(config, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await health(config, 500);
+    } catch (error) {
+      if (error.code === 'MANAGER_UNREACHABLE') return true;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
+export async function ensureManager(config, { startManager = startBackgroundManager } = {}) {
+  try {
+    const current = await health(config);
+    if (current.apiVersion !== API_VERSION) {
+      throw cliError(
+        'MANAGER_API_INCOMPATIBLE',
+        `Running Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`,
+        'Stop the older Manager once, then retry.'
+      );
+    }
+    if (current.version === VERSION) return current;
+
+    const token = await readToken(config);
+    const status = await requestJson(config, '/v1/status', { token });
+    const activeTasks = Number(status.tasks?.running || 0) + Number(status.tasks?.queued || 0);
+    if (activeTasks > 0) {
+      throw cliError(
+        'MANAGER_VERSION_MISMATCH',
+        `Manager ${current.version || 'unknown'} has ${activeTasks} active task(s) and cannot be replaced by CLI ${VERSION}`,
+        'Let the active tasks finish or stop them, then run the command again.'
+      );
+    }
+    await requestJson(config, '/v1/manager/stop', { method: 'POST', body: {}, token });
+    if (!(await waitForManagerStop(config))) {
+      throw cliError(
+        'MANAGER_VERSION_MISMATCH',
+        `Manager ${current.version || 'unknown'} did not stop for the CLI ${VERSION} upgrade`,
+        'Stop the old Manager manually, then run the command again.'
+      );
+    }
+    return startManager(config);
+  } catch (error) {
+    if (error.code !== 'MANAGER_UNREACHABLE') throw error;
+    return startManager(config);
+  }
 }
 
 async function apiContext(options) {
   const config = settings(options);
   await ensureManager(config);
-  const credentials = await readManagerCredentials(config.stateDir);
-  await verifyManagerEndpoint(config, credentials.identity);
-  return { config, token: credentials.token, identity: credentials.identity };
+  return { config, token: await readToken(config) };
 }
 
-async function agentContext(options) {
-  const clientId = options['agent-id'] || process.env.ERIC_TASK_MASTER_CLIENT_ID;
-  if (!clientId) {
-    throw cliError(
-      'AGENT_ID_REQUIRED',
-      'Agent-scoped CLI commands require --agent-id STABLE_ID or ERIC_TASK_MASTER_CLIENT_ID.',
-      'Choose one stable ID for this Agent, add --agent-id STABLE_ID, and reuse it on every scoped command.'
-    );
+async function parseJsonInput(value, field = 'input') {
+  if (value === undefined) return {};
+  let source = String(value);
+  if (source.startsWith('@')) source = await readFile(path.resolve(source.slice(1)), 'utf8');
+  try {
+    const parsed = JSON.parse(source);
+    if (parsed === undefined) throw new Error();
+    return parsed;
+  } catch {
+    throw cliError('INVALID_JSON', `${field} is not valid JSON`);
   }
-  const config = settings(options);
-  await ensureManager(config);
-  const clientName = options['agent-name'] || process.env.ERIC_TASK_MASTER_CLIENT_NAME || 'Task Master CLI';
-  return {
-    config,
-    client: new HttpTaskMasterClient({
-      baseUrl: config.baseUrl,
-      stateDir: config.stateDir,
-      clientId,
-      clientName
-    })
-  };
 }
 
-async function dashboardOpenCommand(args, options, json) {
-  const context = await agentContext(options);
-  const taskId = args[0];
-  const result = await context.client.openDashboard(taskId);
-  emit({ ok: true, ...result }, json);
-}
-
-async function waitTask(context, taskId, options) {
-  const waitMs = Number(options['wait-ms'] ?? 30_000);
-  return context.client.waitTask(taskId, { waitMs });
-}
-
-async function followTask(context, taskId, json, options = {}) {
-  const pollMs = Number(options['poll-ms'] ?? 1_000);
-  const timeoutMs = Number(options['wait-ms'] ?? 24 * 60 * 60 * 1_000);
-  if (!Number.isInteger(pollMs) || pollMs < 100 || pollMs > 30_000) {
-    throw cliError('INVALID_POLL_INTERVAL', '--poll-ms must be an integer from 100 to 30000');
-  }
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 7 * 24 * 60 * 60 * 1_000) {
-    throw cliError('INVALID_FOLLOW_TIMEOUT', '--wait-ms for task follow must be an integer from 1000 to 604800000');
-  }
-  const deadline = Date.now() + timeoutMs;
-  let previous;
-  while (Date.now() < deadline) {
-    const task = await context.client.getTask(taskId);
-    const signature = JSON.stringify([task.state, task.progress, task.heartbeatAt, task.error]);
-    if (signature !== previous) {
-      emit({ event: 'task-progress', task }, json);
-      previous = signature;
-    }
-    if (isSettledTerminalTask(task)) return task;
-    await new Promise((resolveWait) => setTimeout(resolveWait, pollMs));
-  }
-  throw cliError(
-    'TASK_FOLLOW_TIMEOUT',
-    `Task ${taskId} is still running after the follow timeout`,
-    `Run task follow ${taskId}; do not submit a duplicate.`
-  );
-}
-
-async function connect(options, json) {
-  const config = settings(options);
-  const connection = await ensureManager(config);
-  const credentials = await readManagerCredentials(config.stateDir);
-  await verifyManagerEndpoint(config, credentials.identity);
-  const token = credentials.token;
-  const acceptanceFile = join(config.stateDir, `acceptance-${VERSION}.json`);
-  let acceptance;
-  if (!options['force-acceptance'] && existsSync(acceptanceFile)) {
-    try {
-      acceptance = JSON.parse(await readFile(acceptanceFile, 'utf8'));
-      if (!acceptance.ok || acceptance.version !== VERSION) acceptance = null;
-    } catch {
-      acceptance = null;
-    }
-  }
-  if (!acceptance) {
-    const { runAcceptance } = await import('../scripts/acceptance.mjs');
-    acceptance = await runAcceptance({ baseUrl: config.baseUrl, token, stateDir: config.stateDir });
-    if (!acceptance.ok) {
-      const firstFailed = acceptance.checks?.find((check) => !check.passed);
-      const failure = firstFailed
-        ? `${firstFailed.name}${firstFailed.detail ? `: ${firstFailed.detail}` : ''}`
-        : 'unknown check';
-      throw cliError(
-        'ACCEPTANCE_FAILED',
-        `Built-in acceptance failed at ${failure}`,
-        acceptance.nextAction
-      );
-    }
-    await writeFile(acceptanceFile, `${JSON.stringify(acceptance, null, 2)}\n`, { mode: 0o600 });
-  } else {
-    acceptance = { ...acceptance, cached: true };
-  }
-  const registration = options['skip-mcp-registration']
-    ? { ok: true, command: 'install', skipped: true, results: [] }
-    : await createRegistrar({
-      home: options.home,
-      stateDir: options['registration-state-dir'],
-      entrypoint: resolve(ROOT, 'src', 'mcp', 'stdio.mjs')
-    }).install();
-  if (!registration.ok) {
-    throw cliError(
-      'MCP_REGISTRATION_FAILED',
-      'Task Master could not safely register one or more detected Agent hosts.',
-      'Run node scripts/taskmaster.mjs mcp status --json, resolve the named conflict reported for that host, and rerun connect once.',
-      { mcpRegistration: registrationFailureDetails(registration) }
-    );
-  }
-  const agentHostReloadRequired = Boolean(
-    connection.migratedFrom || registration.agentHostReloadRequired
-  );
-  const dashboardAuthorization = await requestJson(config.baseUrl, '/v1/dashboard/authorize', {
-    method: 'POST', body: {}, token
+async function followTask(taskId, options, json) {
+  let after = parseIntegerOption(options.after ?? 0, {
+    name: '--after', minimum: 0, maximum: Number.MAX_SAFE_INTEGER
   });
-  const result = {
-    ok: true,
-    version: VERSION,
-    state: agentHostReloadRequired ? 'agent_host_reload_required' : 'ready',
-    readyForTasks: !agentHostReloadRequired,
-    ...(agentHostReloadRequired ? {
-      blockingAction: {
-        code: 'AGENT_HOST_RELOAD_REQUIRED',
-        message: 'The installed MCP runtime changed and this Agent host must reload before it can send tasks safely.',
-        nextAction: 'Reload this Agent host once, then run connect again and verify taskmaster_status.'
-      }
-    } : {}),
-    manager: {
-      ...connection.health,
-      startedNow: connection.started,
-      agentHostReloadRequired,
-      ...(connection.migratedFrom ? { migratedFrom: connection.migratedFrom } : {}),
-      ...(connection.recoveredQuarantinedProfiles > 0
-        ? { recoveredQuarantinedProfiles: connection.recoveredQuarantinedProfiles }
-        : {}),
-      ...(connection.retainedQuarantinedProfiles > 0
-        ? { retainedQuarantinedProfiles: connection.retainedQuarantinedProfiles }
-        : {}),
-      ...(connection.recoveredQuarantinedTasks > 0
-        ? { recoveredQuarantinedTasks: connection.recoveredQuarantinedTasks }
-        : {})
-    },
-    acceptance,
-    mcpRegistration: registration,
-    dashboard: `${config.baseUrl}/dashboard#${new URLSearchParams({ code: dashboardAuthorization.code })}`,
-    nextAction: `${agentHostReloadRequired ? 'Task Master runtime changed; reload this Agent host once before MCP verification. ' : ''}Match this Agent host in mcpRegistration.results. MCP is the default path. For any registered_pending_* status, complete the named host approval or reload once, then verify the live connection with taskmaster_status and taskmaster_profiles_list. For registered_disabled, enable eric-task-master in that host and reload once before verification. For registered or adopted, perform the same live MCP verification. Only when this run reports adapter_pending, extension_required, or the current host cannot reload, run node scripts/taskmaster.mjs status --agent-id STABLE_ID --agent-name AGENT_NAME --json and profiles list with the same identity; switch future tasks to MCP after that prerequisite is resolved. Never mix MCP and CLI identities inside one task. After status and Profile discovery succeed, ask for the browser task.`
+  const context = await apiContext(options);
+  let lastState = null;
+  let historyWarningEmitted = false;
+  while (true) {
+    const result = await requestJson(
+      context.config,
+      `/v1/tasks/${encodeURIComponent(taskId)}/events?after=${after}&limit=500`,
+      { token: context.token }
+    );
+    if (result.truncated && !historyWarningEmitted) {
+      emit(json
+        ? {
+            ok: true,
+            taskId,
+            warning: {
+              code: 'TASK_EVENT_HISTORY_TRUNCATED',
+              message: 'Older task events are no longer available; current state and remaining events are complete.'
+            }
+          }
+        : {
+            type: 'warning',
+            code: 'TASK_EVENT_HISTORY_TRUNCATED',
+            message: 'Older task events are no longer available; current state and remaining events are complete.'
+          }, json);
+      historyWarningEmitted = true;
+    }
+    for (const event of result.events) {
+      after = Math.max(after, event.sequence);
+      emit(json ? { ok: true, taskId, event } : event, json);
+    }
+    lastState = result.task;
+    if (TERMINAL_TASK_STATES.has(result.task.state)) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  emit(json ? { ok: true, task: lastState } : lastState, json);
+  if (lastState.state === 'error' || lastState.state === 'stopped') process.exitCode = 1;
+  return lastState;
+}
+
+async function runCommand(args, options, json) {
+  const moduleArg = args[0];
+  if (!moduleArg) throw cliError('TASK_MODULE_REQUIRED', 'run requires JOB.mjs');
+  const modulePath = path.resolve(moduleArg);
+  const timeoutMs = options.timeout === undefined
+    ? undefined
+    : parseIntegerOption(options.timeout, {
+        name: '--timeout', minimum: 1_000, maximum: 30 * 24 * 60 * 60_000
+      });
+  const outputBudget = parseOutputBudgetOptions(options);
+  const body = {
+    modulePath,
+    ...(options.profile ? { profileId: options.profile } : {}),
+    ...(options.label ? { label: options.label } : {}),
+    input: await parseJsonInput(options.input),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(outputBudget === undefined ? {} : { outputBudget })
   };
+  const context = await apiContext(options);
+  const created = await requestJson(context.config, '/v1/tasks', {
+    method: 'POST',
+    body,
+    token: context.token,
+    timeoutMs: 60_000
+  });
+  emit(json ? created : created.task, json);
+  if (options.detach === true || options.detach === 'true') return created.task;
+  return followTask(created.task.id, options, json);
+}
+
+async function taskAction(action, taskId, options, json) {
+  if (!taskId) throw cliError('TASK_ID_REQUIRED', `${action} requires TASK_ID`);
+  const context = await apiContext(options);
+  let result;
+  if (action === 'delete') {
+    result = await requestJson(context.config, `/v1/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'DELETE', token: context.token, timeoutMs: 30_000
+    });
+  } else {
+    result = await requestJson(context.config, `/v1/tasks/${encodeURIComponent(taskId)}/actions`, {
+      method: 'POST',
+      body: {
+        action,
+        ...(action === 'resume' && options.value !== undefined
+          ? { value: await parseJsonInput(options.value, 'resume value') }
+          : {})
+      },
+      token: context.token,
+      timeoutMs: 30_000
+    });
+  }
   emit(result, json);
   return result;
 }
 
-async function shutdownManager(config, { requireIdle = false } = {}) {
-  let running;
-  let quarantinedProfileIds = [];
-  let discardQuarantinedProfileIds = [];
-  let retainedQuarantinedProfileIds = [];
-  try {
-    running = await health(config, 1_500, null);
-  } catch (error) {
-    if (error.code === 'MANAGER_UNREACHABLE') {
-      const pidFile = join(config.stateDir, 'manager.json');
-      let recorded;
-      try {
-        recorded = JSON.parse(await readFile(pidFile, 'utf8'));
-      } catch (readError) {
-        if (readError?.code === 'ENOENT') {
-          return { ok: true, stopped: false, message: 'Manager is not running' };
-        }
-        throw cliError('MANAGER_PID_UNAVAILABLE', 'Manager PID record is unreadable; shutdown status is unconfirmed.');
-      }
-      throw cliError(
-        'MANAGER_SHUTDOWN_UNCONFIRMED',
-        `Recorded Manager process ${recorded.pid || 'unknown'} is unreachable without a clean shutdown proof.`,
-        `Keep ${pidFile} intact, inspect manager-shutdown-failure.json, and recover explicitly; Task Master will never signal a persisted PID.`
-      );
-    }
-    throw error;
-  }
-  const credentials = await readManagerCredentials(config.stateDir);
-  await verifyManagerEndpoint(config, credentials.identity, 2_500, running.version);
-  if (requireIdle) {
-    const counts = running.counts;
-    const countKeys = ['active', 'queued', 'waitingUser', 'stalled'];
-    if (
-      !counts ||
-      countKeys.some((key) => !Number.isInteger(counts[key]) || counts[key] < 0)
-    ) {
-      throw cliError(
-        'MANAGER_UPGRADE_STATUS_UNAVAILABLE',
-        `Manager ${running.version} did not provide a trustworthy idle-state summary.`,
-        'Finish or stop the older Manager explicitly, then rerun connect once.'
-      );
-    }
-    const { profiles } = await requestJson(config.baseUrl, '/v1/profiles', {
-      token: credentials.token
-    });
-    if (!Array.isArray(profiles)) {
-      throw cliError(
-        'MANAGER_UPGRADE_STATUS_UNAVAILABLE',
-        `Manager ${running.version} did not provide a trustworthy Profile summary.`,
-        'Finish or stop the older Manager explicitly, then rerun connect once.'
-      );
-    }
-    const busyTasks = countKeys.reduce((total, key) => total + counts[key], 0);
-    const busyProfiles = profiles.filter((profile) => profile?.state !== 'idle').length;
-    if (busyTasks === 0 && busyProfiles > 0) {
-      const inspection = await inspectQuarantinedProfileUpgrade({
-        stateDir: config.stateDir,
-        publicProfiles: profiles
-      });
-      if (inspection.eligible) {
-        quarantinedProfileIds = inspection.profileIds;
-        discardQuarantinedProfileIds = inspection.discardProfileIds;
-        retainedQuarantinedProfileIds = inspection.retainedProfileIds;
-      }
-    }
-    if (busyTasks > 0 || busyProfiles > quarantinedProfileIds.length) {
-      throw cliError(
-        'MANAGER_UPGRADE_BUSY',
-        `Manager ${running.version} still has ${busyTasks} active/queued tasks and ${busyProfiles} non-idle Profiles.`,
-        'Wait for those tasks and Profiles to settle, then rerun the exact same connect command once.'
-      );
-    }
-  }
-  let recorded;
-  try {
-    recorded = JSON.parse(await readFile(join(config.stateDir, 'manager.json'), 'utf8'));
-  } catch {
-    throw cliError('MANAGER_PID_UNAVAILABLE', 'Manager PID record is unavailable; refusing to stop an unverified process.');
-  }
-  if (
-    recorded.pid !== running.pid ||
-    recorded.version !== running.version ||
-    recorded.baseUrl !== config.baseUrl
-  ) {
-    throw cliError('MANAGER_PID_MISMATCH', 'Manager PID record does not match the live service; refusing to stop it.');
-  }
-  const pidFile = join(config.stateDir, 'manager.json');
-  let gracefulRequested = false;
-  try {
-    const accepted = await requestJson(config.baseUrl, '/v1/manager/shutdown', {
-      method: 'POST',
-      body: {},
-      token: credentials.token,
-      timeoutMs: 10_000
-    });
-    if (
-      accepted?.accepted !== true ||
-      accepted?.state !== 'stopping' ||
-      accepted?.pid !== recorded.pid ||
-      accepted?.identityFingerprint !== credentials.identity.fingerprint
-    ) {
-      throw cliError(
-        'INVALID_MANAGER_SHUTDOWN_RESPONSE',
-        'Manager returned an invalid graceful-shutdown acknowledgement.'
-      );
-    }
-    gracefulRequested = true;
-  } catch (error) {
-    // A persisted PID is not a process identity: it may have been reused after
-    // the authenticated endpoint disappeared. Fail closed instead of ever
-    // signaling an unrelated process on macOS/Linux.
-    throw error;
-  }
-  const deadline = Date.now() + 270_000;
-  while (Date.now() < deadline) {
-    try {
-      const observed = await health(config, 500, null);
-      if (
-        observed.pid !== recorded.pid ||
-        observed.version !== recorded.version ||
-        (observed.baseUrl !== undefined && observed.baseUrl !== recorded.baseUrl)
-      ) {
-        throw cliError(
-          'MANAGER_SHUTDOWN_REPLACED',
-          'The Manager endpoint changed identity while shutdown was in progress.'
-        );
-      }
-    } catch (error) {
-      if (error.code === 'MANAGER_UNREACHABLE') {
-        const cleanShutdown = await waitForManagerShutdownProof(pidFile, recorded);
-        if (!cleanShutdown && quarantinedProfileIds.length === 0) {
-          const recoveredQuarantinedTasks = await recoverLegacyDiscardedQuarantineTasksAfterShutdown({
-            stateDir: config.stateDir,
-            expectedManager: recorded
-          });
-          if (recoveredQuarantinedTasks > 0) {
-            return {
-              ok: true,
-              stopped: true,
-              graceful: gracefulRequested,
-              pid: recorded.pid,
-              version: running.version,
-              recoveredQuarantinedTasks
-            };
-          }
-          throw cliError(
-            'MANAGER_SHUTDOWN_UNCONFIRMED',
-            `Manager process ${recorded.pid} became unreachable without publishing a clean shutdown proof`,
-            `Keep the Manager state directory intact and inspect ${join(config.stateDir, 'manager-shutdown-failure.json')} before restarting.`
-          );
-        }
-        const quarantineRecovery = quarantinedProfileIds.length > 0
-          ? await finalizeQuarantinedProfilesAfterShutdown({
-            stateDir: config.stateDir,
-            discardProfileIds: discardQuarantinedProfileIds,
-            retainedProfileIds: retainedQuarantinedProfileIds,
-            expectedManager: recorded
-          })
-          : { recoveredQuarantinedProfiles: 0, retainedQuarantinedProfiles: 0 };
-        return {
-          ok: true,
-          stopped: true,
-          graceful: gracefulRequested,
-          pid: recorded.pid,
-          version: running.version,
-          ...(quarantineRecovery.recoveredQuarantinedProfiles > 0
-            ? { recoveredQuarantinedProfiles: quarantineRecovery.recoveredQuarantinedProfiles }
-            : {}),
-          ...(quarantineRecovery.retainedQuarantinedProfiles > 0
-            ? { retainedQuarantinedProfiles: quarantineRecovery.retainedQuarantinedProfiles }
-            : {})
-        };
-      }
-      throw error;
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-  }
-  throw cliError('MANAGER_STOP_TIMEOUT', `Manager process ${recorded.pid} did not stop in time`);
-}
-
-async function stopManager(options, json) {
-  const result = await shutdownManager(settings(options));
+async function statusCommand(taskId, options, json) {
+  const context = await apiContext(options);
+  const pathname = taskId ? `/v1/tasks/${encodeURIComponent(taskId)}` : '/v1/status';
+  const result = await requestJson(context.config, pathname, { token: context.token });
   emit(result, json);
   return result;
 }
 
 async function profileCommand(action, args, options, json) {
-  const context = await agentContext(options);
+  const context = await apiContext(options);
   if (action === 'list') {
-    emit({ ok: true, profiles: await context.client.listProfiles() }, json);
-    return;
+    const result = await requestJson(context.config, '/v1/profiles', { token: context.token });
+    emit(result, json);
+    return result;
   }
   if (action === 'create') {
-    if (!options.name) throw cliError('PROFILE_NAME_REQUIRED', '--name is required');
-    if (options.access !== undefined) throw cliError('UNKNOWN_ARGUMENT', '--access was removed because all Profiles are shared');
-    const body = {
-      name: options.name,
-      kind: options.kind || 'persistent',
-      headless: options.headless === true || options.headless === 'true',
-      ...(options.behavior ? { defaultBehavior: options.behavior } : {}),
-      ...(options.engine ? { browserEngine: options.engine } : {})
-    };
-    emit({ ok: true, profile: await context.client.createProfile(body) }, json);
-    return;
-  }
-  const profileId = args[0];
-  if (!profileId) throw cliError('PROFILE_ID_REQUIRED', `profiles ${action} requires a profile ID`);
-  if (action === 'update') {
-    if (options.access !== undefined) throw cliError('UNKNOWN_ARGUMENT', '--access was removed because all Profiles are shared');
-    const body = {};
-    if (options.name !== undefined) body.name = options.name;
-    if (options.behavior !== undefined) body.defaultBehavior = options.behavior;
-    if (options.headless !== undefined) body.headless = options.headless === true || options.headless === 'true';
-    emit({ ok: true, profile: await context.client.updateProfile(profileId, body) }, json);
-    return;
-  }
-  if (action === 'open' || action === 'close') {
-    const profile = action === 'open'
-      ? await context.client.openProfile(profileId)
-      : await context.client.closeProfile(profileId);
-    emit({ ok: true, profile }, json);
-    return;
-  }
-  throw cliError('UNKNOWN_COMMAND', `Unknown profiles command: ${action}`);
-}
-
-async function taskCommand(action, args, options, json) {
-  const context = await agentContext(options);
-  if (action === 'list') {
-    emit({ ok: true, ...await context.client.listTasks() }, json);
-    return;
-  }
-  if (action === 'run' || action === 'start') {
-    if (!options.profile) throw cliError('PROFILE_ID_REQUIRED', '--profile is required');
-    if (!options.type) throw cliError('TASK_TYPE_REQUIRED', '--type is required');
-    if (action === 'start' && options.module) {
-      throw cliError(
-        'REGISTERED_TASK_TYPE_REQUIRED',
-        'task start accepts registered task types only; --module is not supported'
-      );
-    }
-    if (action === 'start' && !options['request-key']) {
-      throw cliError('REQUEST_KEY_REQUIRED', 'task start requires a stable --request-key KEY');
-    }
-    if (options.module) {
-      const admin = await apiContext(options);
-      const modulePath = await stageTaskModule(admin.config, options.module);
-      await requestJson(admin.config.baseUrl, '/v1/task-types/install', {
-        method: 'POST',
-        body: { name: options.type, modulePath },
-        token: admin.token
-      });
-    }
-    const idempotencyKey = options['request-key'] || `cli-${randomUUID()}`;
-    if (action === 'run') emit({ event: 'task-submitting', taskType: options.type, idempotencyKey }, json);
-    const input = await loadInput(options.input);
-    assertSafeTaskInput(input);
-    const body = {
-      profileId: options.profile,
-      taskType: options.type,
-      ...(options.label ? { taskLabel: options.label } : {}),
-      input,
-      idempotencyKey,
-      ...(options.timeout ? { timeoutMs: Number(options.timeout) } : {})
-    };
-    const { taskId, dashboardUrl, task } = await context.client.startTask(body);
-    emit({ ok: true, event: 'task-started', taskId, dashboardUrl, task }, json);
-    if (action === 'start' || options.detach) return;
-    const terminal = await followTask(context, task.id, json, options);
-    emit({ ok: terminal.state === 'completed', event: 'task-finished', task: terminal }, json);
-    if (terminal.state !== 'completed') process.exitCode = 1;
-    return;
-  }
-  if (action === 'prepare-scale') {
-    if (!options.profile) throw cliError('PROFILE_ID_REQUIRED', '--profile is required');
-    if (!options.url) throw cliError('URL_REQUIRED', '--url is required');
-    if (!options['request-key']) {
-      throw cliError('REQUEST_KEY_REQUIRED', 'task prepare-scale requires a stable --request-key KEY');
-    }
-    let url;
-    try {
-      url = new URL(options.url);
-    } catch {
-      throw cliError('INVALID_URL', '--url must be a valid HTTP(S) URL');
-    }
-    if (!['http:', 'https:'].includes(url.protocol)) {
-      throw cliError('INVALID_URL', '--url must be a valid HTTP(S) URL');
-    }
-    const started = await context.client.startTask({
-      profileId: options.profile,
-      taskType: 'surface-probe',
-      ...(options.label ? { taskLabel: options.label } : {}),
-      input: { url: url.href },
-      idempotencyKey: options['request-key']
+    const name = options.name || args[0];
+    if (!name) throw cliError('PROFILE_NAME_REQUIRED', 'profiles create requires NAME');
+    const result = await requestJson(context.config, '/v1/profiles', {
+      method: 'POST', body: { name }, token: context.token
     });
-    emit({ ok: true, event: 'surface-probe-started', ...started }, json);
-    return;
+    emit(result, json);
+    return result;
   }
-  if (action === 'inbox') {
-    const limit = options.limit === undefined ? 100 : Number(options.limit);
-    emit({ ok: true, ...await context.client.claimInbox({ limit }) }, json);
-    return;
-  }
-  const taskId = args[0];
-  if (!taskId) throw cliError('TASK_ID_REQUIRED', `task ${action} requires a task ID`);
-  if (action === 'resume') {
-    if (!options['resume-key']) throw cliError('RESUME_KEY_REQUIRED', 'task resume requires --resume-key KEY');
-    const result = await context.client.resumeTask({ taskId, resumeKey: options['resume-key'] });
-    emit({ ok: true, event: 'task-resumed', ...result }, json);
-    if (options.detach) return;
-    const terminal = await followTask(context, taskId, json, options);
-    emit({ ok: terminal.state === 'completed', event: 'task-finished', task: terminal }, json);
-    if (terminal.state !== 'completed') process.exitCode = 1;
-    return;
-  }
-  if (action === 'status') {
-    emit({ ok: true, task: await context.client.getTask(taskId) }, json);
-    return;
-  }
-  if (action === 'wait') {
-    emit({ ok: true, ...await waitTask(context, taskId, options) }, json);
-    return;
-  }
-  if (action === 'follow') {
-    const terminal = await followTask(context, taskId, json, options);
-    emit({ ok: terminal.state === 'completed', event: 'task-finished', task: terminal }, json);
-    if (terminal.state !== 'completed') process.exitCode = 1;
-    return;
-  }
-  if (action === 'cancel') {
-    emit({ ok: true, task: await context.client.cancelTask(taskId) }, json);
-    return;
-  }
-  if (action === 'continue') {
-    const task = await context.client.continueTask({
-      taskId,
-      ...(options['request-id'] ? { requestId: options['request-id'] } : {}),
-      ...(options.note ? { note: options.note } : {})
+  const identifier = args[0];
+  if (!identifier) throw cliError('PROFILE_REQUIRED', `profiles ${action} requires NAME_OR_ID`);
+  let result;
+  if (action === 'default' || action === 'rename') {
+    const body = action === 'default'
+      ? { isDefault: true }
+      : { name: options.name || args[1] };
+    if (action === 'rename' && !body.name) throw cliError('PROFILE_NAME_REQUIRED', 'profiles rename requires --name');
+    result = await requestJson(context.config, `/v1/profiles/${encodeURIComponent(identifier)}`, {
+      method: 'PATCH', body, token: context.token
     });
-    emit({ ok: true, task }, json);
-    return;
-  }
-  if (action === 'command-respond') {
-    if (!options['command-id']) throw cliError('TASK_COMMAND_ID_REQUIRED', '--command-id is required');
-    if (!options.revision) throw cliError('TASK_REVISION_REQUIRED', '--revision is required');
-    if (!options.status) throw cliError('TASK_COMMAND_STATUS_REQUIRED', '--status is required');
-    const result = await context.client.respondTaskCommand({
-      taskId,
-      commandId: options['command-id'],
-      expectedRevision: Number(options.revision),
-      status: options.status,
-      ...(options.message === undefined ? {} : { message: options.message })
+  } else if (action === 'delete') {
+    result = await requestJson(context.config, `/v1/profiles/${encodeURIComponent(identifier)}`, {
+      method: 'DELETE', token: context.token, timeoutMs: 30_000
     });
-    emit({ ok: true, ...result }, json);
-    return;
-  }
-  if (action === 'report') {
-    for (const [option, code] of [
-      ['report-id', 'TASK_REPORT_ID_REQUIRED'],
-      ['revision', 'TASK_REVISION_REQUIRED'],
-      ['status', 'TASK_REPORT_STATUS_REQUIRED'],
-      ['title', 'TASK_REPORT_TITLE_REQUIRED'],
-      ['summary', 'TASK_REPORT_SUMMARY_REQUIRED']
-    ]) {
-      if (options[option] === undefined) throw cliError(code, `--${option} is required`);
-    }
-    const sections = options.sections === undefined ? [] : await loadInput(options.sections);
-    const result = await context.client.publishTaskReport({
-      taskId,
-      reportId: options['report-id'],
-      expectedRevision: Number(options.revision),
-      status: options.status,
-      title: options.title,
-      summary: options.summary,
-      sections
+  } else if (action === 'open' || action === 'close') {
+    result = await requestJson(context.config, `/v1/profiles/${encodeURIComponent(identifier)}/actions`, {
+      method: 'POST', body: { action }, token: context.token, timeoutMs: 45_000
     });
-    emit({ ok: true, ...result }, json);
-    return;
+  } else {
+    throw cliError('UNKNOWN_COMMAND', `Unknown profiles command: ${action}`);
   }
-  throw cliError('UNKNOWN_COMMAND', `Unknown task command: ${action}`);
-}
-
-async function taskTypeCommand(action, args, options, json) {
-  if (action === 'list') {
-    const context = await agentContext(options);
-    const taskTypes = await context.client.listTaskTypes({
-      ...(options.query ? { query: options.query } : {}),
-      ...(options.domain ? { domain: options.domain } : {}),
-      ...(options.intent ? { intent: options.intent } : {})
-    });
-    emit({ ok: true, taskTypes }, json);
-    return;
-  }
-  if (action === 'describe') {
-    const context = await agentContext(options);
-    const taskType = args[0];
-    if (!taskType) throw cliError('TASK_TYPE_REQUIRED', 'task-types describe requires a task type');
-    emit({ ok: true, taskType: await context.client.describeTaskType(taskType) }, json);
-    return;
-  }
-  if (action === 'install') {
-    if (!options.type) throw cliError('TASK_TYPE_REQUIRED', '--type is required');
-    if (!options.module) throw cliError('TASK_MODULE_REQUIRED', '--module is required');
-    const admin = await apiContext(options);
-    const modulePath = await stageTaskModule(admin.config, options.module);
-    const result = await requestJson(admin.config.baseUrl, '/v1/task-types/install', {
-      method: 'POST',
-      body: {
-        name: options.type,
-        modulePath,
-        transient: options.persistent !== true,
-        ...(typeof options.note === 'string' ? { note: options.note } : {})
-      },
-      token: admin.token
-    });
-    emit({ ok: true, ...result }, json);
-    return;
-  }
-  if (action === 'deprecate' || action === 'restore') {
-    const taskType = args[0];
-    if (!taskType) throw cliError('TASK_TYPE_REQUIRED', `task-types ${action} requires a task type`);
-    const admin = await apiContext(options);
-    const result = await requestJson(
-      admin.config.baseUrl,
-      `/v1/task-types/${encodeURIComponent(taskType)}/actions`,
-      {
-        method: 'POST',
-        token: admin.token,
-        body: action === 'deprecate'
-          ? { action, ...(options.replacement ? { replacedBy: options.replacement } : {}) }
-          : { action }
-      }
-    );
-    emit({ ok: true, ...result }, json);
-    return;
-  }
-  throw cliError('UNKNOWN_COMMAND', `Unknown task-types command: ${action}`);
-}
-
-function publicPack(pack) {
-  return {
-    name: pack.name,
-    version: pack.version,
-    interactionContract: pack.interactionContract,
-    ...(pack.title ? { title: pack.title } : {}),
-    ...(pack.description ? { description: pack.description } : {}),
-    tasks: pack.tasks
-  };
-}
-
-async function taskPackCommand(action, args, options, json) {
-  const location = args[0];
-  if (!location) throw cliError('TASK_PACK_PATH_REQUIRED', `task-packs ${action} requires a path`);
-  if (action === 'validate') {
-    const result = await preflightTaskPack(location);
-    emit({ ...result, taskPack: publicPack(result.taskPack) }, json);
-    if (!result.ok) process.exitCode = 1;
-    return;
-  }
-  if (action === 'scaffold') {
-    if (!options.name) throw cliError('TASK_PACK_NAME_REQUIRED', '--name is required');
-    const created = await scaffoldTaskPack(location, { name: options.name, recipe: options.recipe });
-    emit({ ok: true, taskPack: publicPack(created.pack) }, json);
-    return;
-  }
-  if (action === 'install') {
-    const loaded = await readTaskPack(location);
-    const context = await apiContext(options);
-    const modules = [];
-    for (const module of loaded.modules) {
-      modules.push({ name: module.name, modulePath: await stageTaskModule(context.config, module.modulePath) });
-    }
-    const result = await requestJson(context.config.baseUrl, '/v1/task-packs/install', {
-      method: 'POST',
-      token: context.token,
-      body: {
-        name: loaded.pack.name,
-        version: loaded.pack.version,
-        interactionContract: loaded.pack.interactionContract,
-        ...(loaded.pack.title ? { title: loaded.pack.title } : {}),
-        ...(loaded.pack.description ? { description: loaded.pack.description } : {}),
-        modules
-      }
-    });
-    emit({ ok: true, ...result }, json);
-    return;
-  }
-  throw cliError('UNKNOWN_COMMAND', `Unknown task-packs command: ${action}`);
-}
-
-async function artifactCommand(action, args, options, json) {
-  const taskId = args[0];
-  if (!taskId) throw cliError('TASK_ID_REQUIRED', `artifacts ${action} requires a task ID`);
-  const context = await agentContext(options);
-  if (action === 'list') {
-    emit({ ok: true, artifacts: await context.client.listArtifacts(taskId) }, json);
-    return;
-  }
-  if (action === 'read') {
-    const artifactId = options.artifact || args[1];
-    if (!artifactId) throw cliError('ARTIFACT_ID_REQUIRED', 'artifacts read requires --artifact ARTIFACT_ID');
-    const result = await context.client.readArtifact({
-      taskId,
-      artifactId,
-      offset: Number(options.offset ?? 0),
-      maxBytes: Number(options['max-bytes'] ?? 48 * 1024)
-    });
-    emit({ ok: true, ...result }, json);
-    return;
-  }
-  throw cliError('UNKNOWN_COMMAND', `Unknown artifacts command: ${action}`);
-}
-
-async function mcpCommand(action, options, json) {
-  const registrar = createRegistrar({
-    ...(options.home ? { home: options.home } : {}),
-    ...(options['registration-state-dir'] ? { stateDir: options['registration-state-dir'] } : {}),
-    entrypoint: resolve(ROOT, 'src', 'mcp', 'stdio.mjs')
-  });
-  const common = {
-    dryRun: options['dry-run'] === true || options['dry-run'] === 'true',
-    ...(options.hosts ? { hostKeys: options.hosts } : {})
-  };
-  const result = action === 'status'
-    ? await registrar.status(common)
-    : action === 'register'
-      ? await registrar.install(common)
-      : action === 'unregister'
-        ? await registrar.uninstall(common)
-        : action === 'rollback'
-          ? await registrar.rollback({
-            dryRun: common.dryRun,
-            ...(options.transaction ? { transactionId: options.transaction } : {})
-          })
-          : (() => { throw cliError('UNKNOWN_COMMAND', `Unknown mcp command: ${action}`); })();
-  emit(result, json);
-  if (!result.ok) process.exitCode = 2;
-}
-
-async function doctor(options, json) {
-  const config = settings(options);
-  const journal = new OperationalJournal({ stateDir: config.stateDir });
-  let manager;
-  let managerError;
-  try {
-    const current = await health(config, 1_500, null);
-    manager = {
-      service: current.service,
-      version: current.version,
-      apiVersion: current.apiVersion,
-      state: current.state,
-      host: current.host,
-      port: current.port,
-      pid: current.pid
-    };
-  } catch (error) {
-    managerError = {
-      code: error.code || 'MANAGER_UNAVAILABLE',
-      message: redactPublicText(error.message).slice(0, 512)
-    };
-  }
-  let registration;
-  try {
-    const status = await createRegistrar({
-      home: options.home,
-      stateDir: options['registration-state-dir'],
-      entrypoint: resolve(ROOT, 'src', 'mcp', 'stdio.mjs')
-    }).status();
-    registration = {
-      ok: status.ok,
-      agentHostReloadRequired: status.agentHostReloadRequired === true,
-      results: Array.isArray(status.results) ? status.results.slice(0, 32).map((item) => ({
-        ...(typeof item.hostKey === 'string' ? { hostKey: item.hostKey.slice(0, 80) } : {}),
-        ...(typeof item.displayName === 'string' ? { displayName: item.displayName.slice(0, 120) } : {}),
-        ...(typeof item.detected === 'boolean' ? { detected: item.detected } : {}),
-        ...(typeof item.status === 'string' ? { status: item.status.slice(0, 64) } : {}),
-        ...(typeof item.configurationStatus === 'string' ? { configurationStatus: item.configurationStatus.slice(0, 64) } : {}),
-        ...(typeof item.activationStatus === 'string' ? { activationStatus: item.activationStatus.slice(0, 64) } : {})
-      })) : []
-    };
-  } catch (error) {
-    registration = {
-      ok: false,
-      error: { code: error.code || 'MCP_STATUS_FAILED', message: redactPublicText(error.message).slice(0, 512) }
-    };
-  }
-  let recentErrors = [];
-  let diagnosticsError;
-  try {
-    recentErrors = await journal.readRecent({ limit: 20, level: 'error' });
-  } catch {
-    diagnosticsError = {
-      code: 'OPERATIONAL_JOURNAL_UNAVAILABLE',
-      message: 'The local Manager diagnostic journal is unavailable or unsafe; no log content was read.'
-    };
-  }
-  const ready = manager?.version === VERSION && registration.ok && !registration.agentHostReloadRequired;
-  const result = {
-    ok: ready,
-    state: ready
-      ? 'ready'
-      : registration.agentHostReloadRequired
-        ? 'agent_host_reload_required'
-        : manager
-          ? 'registration_attention_required'
-          : 'manager_unavailable',
-    runtime: { version: VERSION, node: process.version, platform: process.platform, arch: process.arch },
-    ...(manager ? { manager } : { managerError }),
-    mcpRegistration: registration,
-    diagnostics: {
-      log: journal.relativePath,
-      recentErrors,
-      bounded: true,
-      redacted: true,
-      ...(diagnosticsError ? { error: diagnosticsError } : {})
-    },
-    nextAction: ready
-      ? 'Task Master is ready. Use MCP status and Profile discovery before accepting a browser task.'
-      : registration.agentHostReloadRequired
-        ? 'Reload this Agent host once, then run doctor again.'
-        : 'Run the fixed connect command once, follow its single blocking action, then run doctor again.'
-  };
   emit(result, json);
   return result;
 }
 
-async function main() {
-  const { positionals, options } = parseArgs(process.argv.slice(2));
-  const json = options.json === true || options.json === 'true';
-  const command = positionals.shift() || 'connect';
-  if (options.help || command === 'help') {
-    emit(HELP, false);
+async function filesCommand(taskId, options, json) {
+  if (!taskId) throw cliError('TASK_ID_REQUIRED', 'files requires TASK_ID');
+  const offset = parseIntegerOption(options.offset ?? 0, {
+    name: '--offset', minimum: 0, maximum: Number.MAX_SAFE_INTEGER
+  });
+  const maxBytes = parseIntegerOption(options['max-bytes'] ?? 262144, {
+    name: '--max-bytes', minimum: 1, maximum: 4 * 1024 * 1024
+  });
+  const limit = parseIntegerOption(options.limit ?? 10_000, {
+    name: '--limit', minimum: 1, maximum: 10_000
+  });
+  const context = await apiContext(options);
+  if (options.read && !json) {
+    let currentOffset = offset;
+    let result;
+    do {
+      result = await requestJson(
+        context.config,
+        `/v1/tasks/${encodeURIComponent(taskId)}/artifacts?path=${encodeURIComponent(options.read)}&offset=${currentOffset}&maxBytes=${maxBytes}`,
+        { token: context.token }
+      );
+      process.stdout.write(Buffer.from(result.artifact.data, 'base64'));
+      if (!result.artifact.eof && result.artifact.nextOffset <= currentOffset) {
+        throw cliError('INVALID_ARTIFACT_RESPONSE', 'Manager did not advance the artifact read offset');
+      }
+      currentOffset = result.artifact.nextOffset;
+    } while (!result.artifact.eof);
+    return result;
+  }
+
+  const query = options.read
+    ? `?path=${encodeURIComponent(options.read)}&offset=${offset}&maxBytes=${maxBytes}`
+    : `?offset=${offset}&limit=${limit}`;
+  const result = await requestJson(
+    context.config,
+    `/v1/tasks/${encodeURIComponent(taskId)}/artifacts${query}`,
+    { token: context.token }
+  );
+  if (options.read) {
+    emit(result, json);
+  } else {
+    emit(result.truncated && result.nextOffset !== null
+      ? {
+          ...result,
+          nextAction: `Run taskmaster files ${taskId} --offset ${result.nextOffset} to read the next page.`
+        }
+      : result, json);
+  }
+  return result;
+}
+
+function openUrl(url) {
+  const command = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+  const child = spawn(command, [url], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+}
+
+async function serveCommand(config, json) {
+  const manager = await startManager({ host: config.host, port: config.port, dataDir: config.stateDir });
+  const pidFile = path.join(config.stateDir, 'manager.json');
+  await writeFile(pidFile, `${JSON.stringify({ pid: process.pid, version: VERSION, baseUrl: manager.baseUrl })}\n`, {
+    mode: 0o600
+  });
+  emit({ ok: true, event: 'manager-ready', version: VERSION, pid: process.pid, baseUrl: manager.baseUrl }, json);
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    try {
+      await manager.stop();
+    } catch {
+      // Keep the foreground Manager alive so a later stop can retry cleanup.
+      stopping = false;
+    }
+  };
+  process.once('SIGINT', () => void stop());
+  process.once('SIGTERM', () => void stop());
+  while (!manager.stopped) await new Promise((resolve) => setTimeout(resolve, 200));
+  await rm(pidFile, { force: true }).catch(() => {});
+}
+
+async function managerCommand(action, options, json) {
+  const config = settings(options);
+  if (action === 'foreground') return serveCommand(config, json);
+  if (action === 'start') {
+    const current = await ensureManager(config);
+    emit({ ok: true, manager: current }, json);
     return;
   }
-  if (command === 'serve') return serve(settings(options), json);
-  if (command === 'connect') return connect(options, json);
-  if (command === 'doctor') return doctor(options, json);
-  if (command === 'dashboard-open') return dashboardOpenCommand(positionals, options, json);
-  if (command === 'manager') {
-    const action = positionals.shift() || 'status';
-    if (action === 'stop') return stopManager(options, json);
-    if (action === 'status') {
-      const config = settings(options);
-      emit({ ok: true, manager: await health(config) }, json);
+  if (action === 'status') {
+    const current = await health(config);
+    emit({ ok: true, manager: current }, json);
+    return;
+  }
+  if (action === 'stop') {
+    const current = await health(config).catch((error) => {
+      if (error.code === 'MANAGER_UNREACHABLE') return null;
+      throw error;
+    });
+    if (!current) {
+      emit({ ok: true, state: 'stopped' }, json);
       return;
     }
-    throw cliError('UNKNOWN_COMMAND', `Unknown manager command: ${action}`);
+    const token = await readToken(config);
+    await requestJson(config, '/v1/manager/stop', { method: 'POST', body: {}, token });
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      try {
+        await health(config, 500);
+      } catch (error) {
+        if (error.code === 'MANAGER_UNREACHABLE') {
+          emit({ ok: true, state: 'stopped' }, json);
+          return;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    throw cliError('MANAGER_STOP_TIMEOUT', 'Manager did not stop in time');
   }
-  if (command === 'profiles') return profileCommand(positionals.shift() || 'list', positionals, options, json);
-  if (command === 'task-types') return taskTypeCommand(positionals.shift() || 'list', positionals, options, json);
-  if (command === 'task-packs') return taskPackCommand(positionals.shift() || 'validate', positionals, options, json);
-  if (command === 'task') return taskCommand(positionals.shift() || 'list', positionals, options, json);
-  if (command === 'artifacts') return artifactCommand(positionals.shift() || 'list', positionals, options, json);
-  if (command === 'mcp') return mcpCommand(positionals.shift() || 'status', options, json);
+  throw cliError('UNKNOWN_COMMAND', `Unknown manager command: ${action}`);
+}
+
+async function main() {
+  const parsed = parseArgs(process.argv.slice(2));
+  const options = parsed.options;
+  const args = parsed.positionals;
+  const json = options.json === true || options.json === 'true';
+  const command = args.shift() || 'status';
+  if (command === 'help' || options.help) {
+    assertAllowedOptions(options);
+    return emit(HELP);
+  }
+  if (command === 'serve') {
+    assertAllowedOptions(options);
+    return serveCommand(settings(options), json);
+  }
+  if (command === 'run') {
+    assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'timeout']);
+    return runCommand(args, options, json);
+  }
+  if (command === 'follow') {
+    assertAllowedOptions(options, ['after']);
+    return followTask(args[0], options, json);
+  }
   if (command === 'status') {
-    const context = await agentContext(options);
-    emit({ ok: true, status: await context.client.getStatus() }, json);
-    return;
+    assertAllowedOptions(options);
+    return statusCommand(args[0], options, json);
+  }
+  if (command === 'stop' || command === 'resume' || command === 'delete') {
+    assertAllowedOptions(options, command === 'resume' ? ['value'] : []);
+    return taskAction(command, args[0], options, json);
+  }
+  if (command === 'files') {
+    assertAllowedOptions(options, ['limit', 'max-bytes', 'offset', 'read']);
+    return filesCommand(args[0], options, json);
+  }
+  if (command === 'profiles') {
+    const action = args.shift() || 'list';
+    assertAllowedOptions(options, action === 'create' || action === 'rename' ? ['name'] : []);
+    return profileCommand(action, args, options, json);
+  }
+  if (command === 'manager') {
+    assertAllowedOptions(options);
+    return managerCommand(args.shift() || 'status', options, json);
+  }
+  if (command === 'panel') {
+    assertAllowedOptions(options);
+    const context = await apiContext(options);
+    openUrl(`${context.config.baseUrl}/dashboard`);
+    return emit({ ok: true, url: `${context.config.baseUrl}/dashboard` }, json);
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown command: ${command}`);
 }
 
-main().catch((error) => {
-  const { options } = parseArgs(process.argv.slice(2));
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(CLI_PATH)) main().catch((error) => {
+  const parsed = parseArgs(process.argv.slice(2));
+  const json = parsed.options.json === true || parsed.options.json === 'true';
   const payload = {
     ok: false,
     error: {
       code: error.code || 'TASKMASTER_FAILED',
-      message: redactSensitiveText(error.message),
+      message: redactSensitiveText(error.message || 'Task Master failed'),
       ...(error.details === undefined ? {} : { details: redactSensitiveValue(error.details) })
     },
-    nextAction: redactSensitiveText(
-      error.nextAction || 'Read the error, correct the stated cause, and retry the same command once.'
-    )
+    ...(error.nextAction ? { nextAction: redactSensitiveText(error.nextAction) } : {})
   };
-  if (options.json === true || options.json === 'true') {
-    process.stderr.write(`${JSON.stringify(payload)}\n`);
-  } else {
-    process.stderr.write(`${JSON.stringify(payload, null, 2)}\n`);
-  }
+  process.stderr.write(`${json ? JSON.stringify(payload) : JSON.stringify(payload, null, 2)}\n`);
   process.exitCode = 1;
 });

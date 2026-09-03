@@ -19,8 +19,6 @@
       <nav class="primary-nav" aria-label="主要导航" data-i18n-aria-label="nav.primary">
         <button class="nav-link is-active" type="button" data-view="tasks" aria-current="page" data-i18n="nav.tasks">任务</button>
         <button class="nav-link" type="button" data-view="profiles" data-i18n="nav.profiles">Profiles</button>
-        <button class="nav-link" type="button" data-view="assets" data-i18n="nav.assets">Task Packs</button>
-        <button class="nav-link" type="button" data-view="settings" data-i18n="nav.settings">设置</button>
       </nav>
 
       <div class="header-actions">
@@ -29,149 +27,45 @@
           <span><strong id="connection-label" data-i18n="connection.connecting">正在连接本机 Manager</strong><small id="last-refresh" data-i18n="connection.never">尚未刷新</small></span>
         </div>
         <button id="language-toggle" class="npc-btn npc-btn-ghost language-button" type="button" aria-label="Switch to English" title="Switch to English">EN</button>
-        <div class="notification-shell">
-          <button id="notification-button" class="npc-btn npc-btn-secondary icon-button notification-button" type="button" aria-expanded="false" aria-controls="notification-drawer" aria-label="打开通知" title="打开通知" data-i18n-aria-label="notifications.open" data-i18n-title="notifications.open">
-            <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>
-            <span id="notification-badge" class="notification-badge hidden" aria-hidden="true">0</span>
-          </button>
-        </div>
-        <button id="refresh-all" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="刷新任务、Profiles 和执行器资产" title="刷新全部面板数据" data-i18n-aria-label="refresh.aria" data-i18n-title="refresh.title"><span aria-hidden="true">↻</span></button>
-        <button id="logout-button" class="npc-btn npc-btn-ghost compact-button hidden" type="button" data-i18n="auth.logout">退出</button>
+        <button id="refresh-all" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="刷新任务和 Profiles" title="刷新任务和 Profiles" data-i18n-aria-label="refresh.aria" data-i18n-title="refresh.title"><span aria-hidden="true">↻</span></button>
       </div>
     </header>
 
-    <div id="notification-backdrop" class="notification-backdrop hidden" aria-hidden="true"></div>
-    <aside id="notification-drawer" class="notification-drawer npc-glass-light hidden" role="dialog" aria-modal="true" aria-labelledby="notification-title" aria-hidden="true" tabindex="-1">
-      <div class="notification-drawer-heading">
-        <div><p class="npc-eyebrow">NOTIFICATIONS</p><h2 id="notification-title" data-i18n="notifications.title">通知</h2><p id="notification-summary" data-i18n="notifications.loading">正在读取通知…</p></div>
-        <button id="notification-close" class="npc-btn npc-btn-ghost icon-button" type="button" aria-label="关闭通知" title="关闭通知" data-i18n-aria-label="notifications.close" data-i18n-title="notifications.close">×</button>
-      </div>
-      <div class="notification-toolbar">
-        <button id="notification-mark-all" class="npc-btn npc-btn-secondary compact-button" type="button" data-i18n="notifications.markAll">全部标为已读</button>
-      </div>
-      <div id="notifications" class="notification-list" aria-live="polite"><p class="empty-state" data-i18n="notifications.loading">正在读取通知…</p></div>
-      <p id="notifications-error" class="inline-error hidden" role="status"></p>
-    </aside>
-
-    <div id="auth-banner" class="system-banner auth-banner hidden" role="alert">
-      <div><strong data-i18n="auth.requiredTitle">此浏览器尚未建立 Owner 会话</strong><p data-i18n="auth.requiredBody">请从部署完成页打开一次面板。首次可信连接后，这个固定地址可以直接收藏使用。</p></div>
-      <button id="retry-auth" class="npc-btn npc-btn-dark" type="button" data-i18n="auth.retry">重新检查连接</button>
-    </div>
-
-    <div id="stale-banner" class="system-banner stale-banner hidden" role="status">
-      <div><strong data-i18n="stale.title">实时连接暂时中断</strong><p data-i18n="stale.body">正在保留上次成功状态并自动重试，不会中断后台任务。</p></div>
-      <button id="retry-stale" class="npc-btn npc-btn-secondary" type="button" data-i18n="stale.retry">立即重试</button>
+    <div id="offline-banner" class="system-banner hidden" role="status">
+      <div><strong data-i18n="offline.title">暂时无法连接 Manager</strong><p data-i18n="offline.body">面板会保留上次状态并自动重试，后台任务不受影响。</p></div>
+      <button id="retry-offline" class="npc-btn npc-btn-secondary" type="button" data-i18n="offline.retry">立即重试</button>
     </div>
 
     <main id="main-content" class="workspace" tabindex="-1">
       <section id="view-tasks" class="view is-active" data-view-panel="tasks" aria-labelledby="tasks-title">
         <div class="section-heading page-heading">
-          <div><p class="npc-eyebrow">TASKS</p><h1 id="tasks-title" tabindex="-1" data-i18n="tasks.title">任务进度</h1><p data-i18n="tasks.description">查看 Agent 正在做什么，并可暂停、恢复、取消或删除已结束的任务记录。</p></div>
+          <div><p class="npc-eyebrow">TASKS</p><h1 id="tasks-title" tabindex="-1" data-i18n="tasks.title">任务进度</h1><p data-i18n="tasks.description">实时查看处理数量与当前动作；需要时可停止、恢复或删除任务。</p></div>
           <span id="task-count-chip" class="npc-chip npc-chip-info" aria-live="polite" data-i18n="common.loading">读取中</span>
         </div>
-        <div class="task-toolbar surface-card" aria-label="任务批量管理" data-i18n-aria-label="tasks.bulk">
-          <label class="check-field task-select-all"><input id="task-select-all" type="checkbox"><span data-i18n="tasks.selectAll">全选已加载任务</span></label>
-          <div class="task-bulk-actions" role="group" aria-label="任务批量操作" data-i18n-aria-label="tasks.bulkActions">
-            <button id="task-bulk-pause" class="npc-btn npc-btn-secondary compact-button" type="button" disabled data-i18n="tasks.bulkPause">批量暂停</button>
-            <button id="task-bulk-resume" class="npc-btn npc-btn-secondary compact-button" type="button" disabled data-i18n="tasks.bulkResume">批量恢复</button>
-            <button id="task-bulk-cancel" class="npc-btn npc-btn-danger compact-button" type="button" disabled data-i18n="tasks.bulkCancel">批量取消</button>
-            <button id="task-bulk-delete" class="npc-btn npc-btn-danger compact-button" type="button" disabled data-i18n="tasks.bulkDelete">批量删除记录</button>
-          </div>
-        </div>
-        <p id="task-selection-summary" class="task-selection-summary" aria-live="polite" data-i18n="tasks.noneSelected">尚未选择任务</p>
-        <div id="task-batch-feedback" class="task-batch-feedback hidden" role="status" aria-live="polite"></div>
         <div id="tasks" class="task-list" aria-live="polite"><p class="empty-state" data-i18n="tasks.loading">正在读取任务…</p></div>
-        <div class="task-pagination">
-          <button id="task-load-more" class="npc-btn npc-btn-secondary" type="button" hidden data-i18n="tasks.loadMore">加载更多任务</button>
-          <span id="task-page-status" class="task-page-status" aria-live="polite"></span>
-        </div>
         <p id="tasks-error" class="inline-error hidden" role="status"></p>
       </section>
 
       <section id="view-profiles" class="view" data-view-panel="profiles" aria-labelledby="profiles-title" hidden>
         <div class="section-heading page-heading">
-          <div><p class="npc-eyebrow">PROFILES</p><h1 id="profiles-title" tabindex="-1" data-i18n="profiles.title">浏览器 Profiles</h1><p data-i18n="profiles.description">管理独立浏览器环境。任务按 Profile 串行，彼此不会抢占登录状态。</p></div>
+          <div><p class="npc-eyebrow">PROFILES</p><h1 id="profiles-title" tabindex="-1" data-i18n="profiles.title">浏览器 Profiles</h1><p data-i18n="profiles.description">管理独立 Chrome 环境，并指定未声明任务使用的默认 Profile。</p></div>
           <button id="toggle-profile-create" class="npc-btn npc-btn-primary" type="button" aria-expanded="false" aria-controls="profile-create-panel" data-i18n="profiles.new">新建 Profile</button>
         </div>
 
         <section id="profile-create-panel" class="surface-card create-profile-panel hidden" aria-labelledby="profile-create-title">
-          <div class="compact-heading"><div><p class="npc-eyebrow">NEW PROFILE</p><h2 id="profile-create-title" data-i18n="profiles.createTitle">创建浏览器环境</h2></div><button id="close-profile-create" class="npc-btn npc-btn-ghost compact-button" type="button" data-i18n="common.close">关闭</button></div>
+          <div class="compact-heading">
+            <div><p class="npc-eyebrow">NEW PROFILE</p><h2 id="profile-create-title" data-i18n="profiles.createTitle">创建浏览器环境</h2></div>
+            <button id="close-profile-create" class="npc-btn npc-btn-ghost compact-button" type="button" data-i18n="common.close">关闭</button>
+          </div>
           <form id="create-profile-form" class="profile-form">
             <label><span data-i18n="profiles.name">Profile 名称</span><input id="profile-name" class="npc-field" maxlength="80" autocomplete="off" placeholder="例如：工作账号" data-i18n-placeholder="profiles.namePlaceholder" required></label>
-            <label><span data-i18n="profiles.kind">类型</span><select id="profile-kind" class="npc-field"><option value="persistent" data-i18n="profiles.persistent">持久登录</option><option value="ephemeral" data-i18n="profiles.ephemeral">临时无登录</option></select></label>
-            <label><span data-i18n="profiles.browser">浏览器</span><select id="profile-engine" class="npc-field"><option value="chrome" data-i18n="profiles.chrome">本机稳定版 Chrome</option><option value="chromium" data-i18n="profiles.chromium">项目锁定 Chromium</option></select></label>
-            <label><span data-i18n="profiles.speed">操作速度</span><select id="profile-mode" class="npc-field"><option value="human" data-i18n="behavior.human">深度拟人</option><option value="auto" data-i18n="behavior.autoBalanced">自动平衡</option><option value="fast" data-i18n="behavior.fast">快速</option></select></label>
-            <label class="check-field"><input id="profile-headless" type="checkbox"><span data-i18n="profiles.background">任务在后台运行</span></label>
-            <button class="npc-btn npc-btn-primary" type="submit" data-i18n="profiles.create">创建 Profile</button>
+            <button id="create-profile-submit" class="npc-btn npc-btn-primary" type="submit" data-i18n="profiles.create">创建 Profile</button>
           </form>
-          <p class="form-note" data-i18n="profiles.formNote">持久 Profile 默认允许已安装扩展在可见浏览器中运行；临时 Profile 不加载扩展，并在任务结束后销毁浏览器状态。</p>
+          <p class="form-note" data-i18n="profiles.formNote">Profile 使用本机 Chrome，并长期保留登录状态。第一个 Profile 会自动成为默认项。</p>
         </section>
 
         <div id="profiles" class="profile-grid" aria-live="polite"><p class="empty-state span-all" data-i18n="profiles.loading">正在读取 Profiles…</p></div>
         <p id="profiles-error" class="inline-error hidden" role="status"></p>
-      </section>
-
-      <section id="view-assets" class="view" data-view-panel="assets" aria-labelledby="assets-title" hidden>
-        <div class="section-heading page-heading">
-          <div><p class="npc-eyebrow">TASK PACK ASSETS</p><h1 id="assets-title" tabindex="-1" data-i18n="assets.title">执行器资产</h1><p data-i18n="assets.description">看清每个 Task Pack 或脚本能做什么、Agent 能否发现、使用情况与清理风险；支持备注和批量管理。</p></div>
-          <span id="asset-count-chip" class="npc-chip npc-chip-info" aria-live="polite" data-i18n="common.loading">读取中</span>
-        </div>
-
-        <div class="asset-toolbar surface-card" aria-label="执行器资产筛选和批量操作" data-i18n-aria-label="assets.toolbar">
-          <label class="asset-search"><span data-i18n="assets.search">搜索资产</span><input id="asset-search" class="npc-field" type="search" autocomplete="off" placeholder="名称、用途、备注或任务类型" data-i18n-placeholder="assets.searchPlaceholder"></label>
-          <label><span data-i18n="common.status">状态</span><select id="asset-filter" class="npc-field"><option value="all" data-i18n="assets.all">全部资产</option><option value="discoverable" data-i18n="assets.discoverable">Agent 可发现</option><option value="deprecated" data-i18n="assets.deprecated">已废弃</option><option value="history" data-i18n="assets.history">历史与孤立文件</option><option value="protected" data-i18n="assets.protected">系统保护</option></select></label>
-          <label class="check-field asset-select-all"><input id="asset-select-all" type="checkbox"><span data-i18n="assets.selectAll">全选当前结果</span></label>
-          <div class="asset-bulk-actions" role="group" aria-label="批量管理" data-i18n-aria-label="assets.bulk">
-            <button id="asset-note" class="npc-btn npc-btn-secondary compact-button" type="button" disabled data-i18n="assets.note">批量备注</button>
-            <button id="asset-deprecate" class="npc-btn npc-btn-secondary compact-button" type="button" disabled data-i18n="assets.deprecate">废弃</button>
-            <button id="asset-restore" class="npc-btn npc-btn-secondary compact-button" type="button" disabled data-i18n="assets.restore">恢复</button>
-            <button id="asset-delete" class="npc-btn npc-btn-danger compact-button" type="button" disabled data-i18n="common.delete">删除</button>
-            <button id="asset-force-delete" class="npc-btn npc-btn-danger compact-button" type="button" disabled data-i18n="assets.forceDelete">强制删除</button>
-          </div>
-        </div>
-        <p id="asset-selection-summary" class="asset-selection-summary" aria-live="polite" data-i18n="assets.noneSelected">尚未选择资产</p>
-        <div id="assets" class="asset-list" aria-live="polite"><p class="empty-state" data-i18n="assets.loading">正在读取执行器资产…</p></div>
-        <p id="assets-error" class="inline-error hidden" role="status"></p>
-      </section>
-
-      <section id="view-settings" class="view" data-view-panel="settings" aria-labelledby="settings-title" hidden>
-        <div class="section-heading page-heading">
-          <div><p class="npc-eyebrow">SETTINGS</p><h1 id="settings-title" tabindex="-1" data-i18n="settings.title">通知设置</h1><p data-i18n="settings.description">只管理需要人工验证时的三种通知方式。</p></div>
-        </div>
-
-        <form id="notification-settings-form" class="settings-form">
-          <div class="settings-grid">
-            <section class="setting-card" data-channel-card="system" aria-labelledby="settings-system-title">
-              <div class="setting-card-heading"><div><p class="npc-eyebrow">SYSTEM</p><h2 id="settings-system-title" data-i18n="settings.system">系统通知</h2></div><label class="switch-field"><input id="notification-system-enabled" type="checkbox"><span data-i18n="settings.enable">启用</span></label></div>
-              <p class="setting-description" data-i18n="settings.systemDescription">通过本机系统弹窗提醒人工接手验证。</p>
-              <span id="notification-system-status" class="channel-status"></span>
-              <div class="setting-card-actions"><button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="system" data-i18n="settings.test">发送测试</button><button id="notification-system-settings" class="npc-btn npc-btn-ghost compact-button" type="button" data-i18n="settings.openSystem">打开系统设置</button></div>
-            </section>
-
-            <section class="setting-card" data-channel-card="telegram" aria-labelledby="settings-telegram-title">
-              <div class="setting-card-heading"><div><p class="npc-eyebrow">TELEGRAM</p><h2 id="settings-telegram-title">Telegram</h2></div><label class="switch-field"><input id="notification-telegram-enabled" type="checkbox"><span data-i18n="settings.enable">启用</span></label></div>
-              <p class="setting-description" data-i18n="settings.telegramDescription">将人工验证提醒发送到指定 Telegram 会话。</p>
-              <span id="notification-telegram-status" class="channel-status"></span>
-              <label><span data-i18n="settings.telegramToken">Bot Token（留空保留原配置）</span><input id="notification-telegram-token" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
-              <label><span data-i18n="settings.telegramChat">Chat ID（留空保留原配置）</span><input id="notification-telegram-chat" class="npc-field" type="text" autocomplete="off" data-i18n-placeholder="settings.destinationPlaceholder" placeholder="不会回填已保存目标"></label>
-              <div class="setting-card-actions"><button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="telegram" data-i18n="settings.test">发送测试</button><button class="npc-btn npc-btn-ghost compact-button channel-clear" type="button" data-channel="telegram" data-i18n="settings.clearCredentials">清除凭据</button></div>
-            </section>
-
-            <section class="setting-card" data-channel-card="feishu" aria-labelledby="settings-feishu-title">
-              <div class="setting-card-heading"><div><p class="npc-eyebrow">FEISHU / LARK</p><h2 id="settings-feishu-title" data-i18n="settings.feishu">飞书</h2></div><label class="switch-field"><input id="notification-feishu-enabled" type="checkbox"><span data-i18n="settings.enable">启用</span></label></div>
-              <p class="setting-description" data-i18n="settings.feishuDescription">通过飞书或 Lark Webhook 提醒人工接手验证。</p>
-              <span id="notification-feishu-status" class="channel-status"></span>
-              <label><span data-i18n="settings.feishuWebhook">Webhook（留空保留原配置）</span><input id="notification-feishu-webhook" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
-              <label><span data-i18n="settings.feishuSigningSecret">签名密钥（可选，留空保留原配置）</span><input id="notification-feishu-signing-secret" class="npc-field" type="password" autocomplete="new-password" data-i18n-placeholder="settings.secretPlaceholder" placeholder="不会回填已保存密钥"></label>
-              <div class="setting-card-actions"><button class="npc-btn npc-btn-secondary compact-button channel-test" type="button" data-channel="feishu" data-i18n="settings.test">发送测试</button><button class="npc-btn npc-btn-ghost compact-button channel-clear" type="button" data-channel="feishu" data-i18n="settings.clearCredentials">清除凭据</button></div>
-            </section>
-          </div>
-          <div class="settings-footer">
-            <p class="form-note" data-i18n="settings.maskedNote">已保存的密钥只显示掩码，面板永远不会回填原文。</p>
-            <button id="notification-settings-save" class="npc-btn npc-btn-primary" type="submit" data-i18n="settings.save">保存通知设置</button>
-          </div>
-        </form>
-        <p id="settings-error" class="inline-error hidden" role="status"></p>
       </section>
 
       <p id="dashboard-message" class="toast hidden" role="status" aria-live="polite"></p>
