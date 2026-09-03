@@ -143,6 +143,57 @@ test('worker returns bounded structured errors and redacts their secrets', async
   assert.equal(JSON.stringify(result).includes(secret), false);
 });
 
+test('failure capture falls back to raw CDP and tries another live page', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-error-capture-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const outputDir = path.join(root, 'output');
+  await mkdir(outputDir);
+  const modulePath = path.join(root, 'job.mjs');
+  await writeFile(modulePath, `
+    export async function run() {
+      throw Object.assign(new Error('capture me'), { code: 'CAPTURE_TEST' });
+    }
+  `);
+  const closedPage = { isClosed: () => true };
+  const livePage = {
+    isClosed: () => false,
+    screenshot: async () => { throw new Error('high-level screenshot unavailable'); }
+  };
+  let detached = false;
+  const context = {
+    pages: () => [closedPage, livePage],
+    newPage: async () => livePage,
+    browser: () => null,
+    newCDPSession: async (page) => {
+      assert.equal(page, livePage);
+      return {
+        send: async (method) => {
+          assert.equal(method, 'Page.captureScreenshot');
+          return { data: Buffer.from('png-via-cdp').toString('base64') };
+        },
+        detach: async () => { detached = true; }
+      };
+    },
+    close: async () => {}
+  };
+  const result = await runTaskWorker({
+    taskId: 'task_capture_fallback',
+    modulePath,
+    profile: { userDataDir: path.join(root, 'profile') },
+    input: {},
+    outputDir,
+    outputBudget: {},
+    timeoutMs: 5_000
+  }, {
+    loadPlaywright: async () => ({ chromium: { launchPersistentContext: async () => context } })
+  });
+  assert.equal(result.state, 'error');
+  assert.equal(result.error.code, 'CAPTURE_TEST');
+  assert.equal(result.error.screenshot, 'failure.png');
+  assert.equal(await readFile(path.join(outputDir, 'failure.png'), 'utf8'), 'png-via-cdp');
+  assert.equal(detached, true);
+});
+
 test('Chrome launch failures preserve a bounded underlying cause', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-launch-error-'));
   t.after(() => rm(root, { recursive: true, force: true }));

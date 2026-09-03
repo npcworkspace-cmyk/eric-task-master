@@ -122,15 +122,36 @@ async function closeContext(context, timeoutMs = 10_000) {
   }
 }
 
-async function captureFailure(page, outputDir) {
-  if (!page || page.isClosed?.()) return null;
+async function captureFailure(context, outputDir) {
+  const pages = context?.pages?.().filter((page) => !page.isClosed?.()).reverse() ?? [];
+  if (pages.length === 0) return null;
   const filePath = path.join(outputDir, 'failure.png');
-  try {
-    await page.screenshot({ path: filePath, fullPage: false });
-    return 'failure.png';
-  } catch {
-    return null;
+  for (const page of pages) {
+    try {
+      await page.screenshot({ path: filePath, fullPage: false, timeout: 10_000 });
+      return 'failure.png';
+    } catch {
+      // Stable Chrome can occasionally reject the higher-level screenshot
+      // while its target is still readable. CDP is the bounded fallback.
+    }
+    let session;
+    try {
+      session = await context.newCDPSession(page);
+      const captured = await session.send('Page.captureScreenshot', {
+        format: 'png',
+        fromSurface: true,
+        captureBeyondViewport: false
+      });
+      if (!captured?.data) continue;
+      await writeFile(filePath, Buffer.from(captured.data, 'base64'), { mode: 0o600 });
+      return 'failure.png';
+    } catch {
+      // Try another live page before accepting that no image is available.
+    } finally {
+      await session?.detach?.().catch(() => {});
+    }
   }
+  return null;
 }
 
 export async function runTaskWorker(config, {
@@ -279,7 +300,7 @@ export async function runTaskWorker(config, {
     return { state: 'finished', result: normalized };
   } catch (error) {
     const stopped = error instanceof TaskStoppedError || error?.code === 'TASK_STOPPED';
-    const screenshot = stopped ? null : await captureFailure(context?.pages?.()[0], config.outputDir);
+    const screenshot = stopped ? null : await captureFailure(context, config.outputDir);
     const payload = normalizeTaskError(error, { stopped, screenshot });
     send({ type: 'error', state: stopped ? 'stopped' : 'error', error: payload, at: new Date().toISOString() });
     send({ type: 'state', state: stopped ? 'stopped' : 'error', at: new Date().toISOString() });
