@@ -1,6 +1,6 @@
 # Release gate
 
-Eric Task Master publishes only artifacts that were built and exercised by CI from the exact commit being released. A green branch, pull request, manual run, older `main` commit, or different commit is not release evidence.
+Eric Task Master publishes only artifacts that were built and exercised by CI from the exact commit being released. For new publication, a green branch, pull request, manual run, older `main` commit, or different commit is not release evidence.
 
 ## Required evidence for one commit
 
@@ -39,6 +39,24 @@ gh workflow run release.yml \
 ```
 
 The workflow downloads `release-*` from the proven CI run; it does not rebuild the native Manager packages. It checks every manifest against the requested version and SHA, creates the small Agent Skill archive, regenerates `SHA256SUMS`, and revalidates current `main`, both exact workflow runs, release immutability, and tag absence immediately before publication. A `RELEASE_ADMIN_TOKEN` secret with read-only repository Administration access is required to verify the immutable-release policy. Published versions and assets are never replaced.
+
+## Read-only verification of an existing Release
+
+If publication succeeded but its final verification failed, do not republish or replace that version. Dispatch the same workflow with `verify_existing=true`, `release_sha=<original-release-sha>`, and `confirm_version=<published-version>`. The two required publication confirmation inputs can be `false` in this mode; no publication is attempted:
+
+```bash
+gh workflow run release.yml \
+  --repo npcworkspace-cmyk/eric-task-master \
+  -f release_sha=<40-character-original-release-sha> \
+  -f confirm_version=<published-version> \
+  -f confirm_unsigned=false \
+  -f confirm_immutable=false \
+  -f verify_existing=true
+```
+
+This separate job has only `contents: read` and `actions: read` permissions. It never creates, edits, deletes, or uploads a Release.
+
+The original SHA need not still be current `main`, but it must have successful exact-SHA `main` push CI and CodeQL runs. Verification resolves `refs/tags/v<version>` explicitly so a same-name branch cannot shadow the tag, requires the published Release to be immutable, downloads its original CI artifacts, and recreates only the Skill ZIP and checksums using the original source and archive timestamp. Every published filename and SHA-256 (including `SHA256SUMS`) must match. Missing or expired original CI artifacts fail verification rather than silently rebuilding installers or weakening the proof. New publication remains the default (`verify_existing=false`) and retains every current-main gate above.
 
 ## Signing boundary
 

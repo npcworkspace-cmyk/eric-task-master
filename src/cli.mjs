@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
+import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, PROFILE_ACTION_TIMEOUT_MS, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
 import { isProcessAlive } from './lib/process-tree.mjs';
 import { defaultDataDirectory, startManager } from './manager.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
@@ -319,6 +319,8 @@ export async function startBackgroundManager(config, {
     readiness.then((value) => ({ kind: 'ready', value })),
     earlyExit
   ]);
+  // Observe early rejection while descriptor cleanup yields; the await below still propagates it.
+  readyOrFailed.catch(() => {});
   await logHandle.close();
   child.unref();
   try {
@@ -554,7 +556,8 @@ async function profileCommand(action, args, options, json) {
     });
   } else if (action === 'open' || action === 'close') {
     result = await requestJson(context.config, `/v1/profiles/${encodeURIComponent(identifier)}/actions`, {
-      method: 'POST', body: { action }, token: context.token, timeoutMs: 45_000
+      method: 'POST', body: { action }, token: context.token,
+      timeoutMs: action === 'open' ? PROFILE_ACTION_TIMEOUT_MS : 45_000
     });
   } else {
     throw cliError('UNKNOWN_COMMAND', `Unknown profiles command: ${action}`);

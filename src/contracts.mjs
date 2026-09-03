@@ -1,9 +1,12 @@
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
-export const VERSION = '3.0.0';
+export const VERSION = '3.0.1';
 export const API_VERSION = 3;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
+export const PROFILE_LAUNCH_TIMEOUT_MS = 60_000;
+export const PROFILE_OPEN_TIMEOUT_MS = 75_000;
+export const PROFILE_ACTION_TIMEOUT_MS = 100_000;
 
 export const TASK_STATES = Object.freeze([
   'queued',

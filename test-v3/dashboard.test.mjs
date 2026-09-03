@@ -38,11 +38,18 @@ test('v3 Dashboard is a two-page task and Profile control surface', async () => 
   }
   assert.match(source, /body:\s*\{ action \}/u);
   assert.match(source, /body:\s*\{ isDefault: true \}/u);
+  assert.match(source, /rename\.disabled = pending \|\| status === 'inUse'/u);
+  assert.match(source, /prompt\(t\('profiles\.renamePrompt'\), profile\.name \|\| ''\)\?\.trim\(\)/u);
+  assert.match(source, /if \(!name \|\| name === profile\.name\) return/u);
+  assert.match(source, /'profiles\.rename': '改名'/u);
+  assert.match(source, /'profiles\.rename': 'Rename'/u);
   assert.match(source, /method:\s*'DELETE'/u);
   assert.match(source, /state\.pending\.has\(key\)/u);
   assert.match(source, /credentials:\s*'same-origin'/u);
   assert.match(source, /READ_REQUEST_TIMEOUT_MS = 10_000/u);
   assert.match(source, /MUTATION_REQUEST_TIMEOUT_MS = 60_000/u);
+  assert.match(source, /PROFILE_OPEN_REQUEST_TIMEOUT_MS = 100_000/u);
+  assert.match(source, /action === 'open' \? PROFILE_OPEN_REQUEST_TIMEOUT_MS : MUTATION_REQUEST_TIMEOUT_MS/u);
   assert.match(source, /upperMethod === 'GET' \? READ_REQUEST_TIMEOUT_MS : MUTATION_REQUEST_TIMEOUT_MS/u);
   assert.match(source, /永久删除该任务记录和 Manager 内的全部产物/u);
   assert.match(source, /permanently removes the task record and every artifact stored by Manager/u);
@@ -74,6 +81,8 @@ test('portable Skill contains only one CLI guide and its license', async () => {
   assert.match(skill, /taskmaster resume TASK_ID/u);
   assert.match(skill, /taskmaster delete TASK_ID/u);
   assert.match(skill, /Do not add a preflight check to a normal task/u);
+  assert.match(skill, /%LOCALAPPDATA%\\Programs\\Eric Task Master\\bin\\taskmaster\.cmd/u);
+  assert.match(skill, /macOS `\/usr\/local\/bin\/taskmaster`; Linux `\/usr\/bin\/taskmaster`/u);
   assert.doesNotMatch(skill, /task type|surface-probe|full-human|journey|ephemeral/iu);
   assert.ok(skill.split(/\r?\n/u).length <= 70, 'Skill should stay one-page and cheap to read');
 });

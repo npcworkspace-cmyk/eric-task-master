@@ -1,5 +1,6 @@
 const READ_REQUEST_TIMEOUT_MS = 10_000;
 const MUTATION_REQUEST_TIMEOUT_MS = 60_000;
+const PROFILE_OPEN_REQUEST_TIMEOUT_MS = 100_000;
 const READ_RETRY_DELAY_MS = 300;
 const LANGUAGE_STORAGE_KEY = 'eric-task-master-language';
 const VIEWS = new Set(['tasks', 'profiles']);
@@ -70,6 +71,8 @@ const I18N = Object.freeze({
     'profiles.recent': '最近使用',
     'profiles.open': '打开',
     'profiles.close': '关闭',
+    'profiles.rename': '改名',
+    'profiles.renamePrompt': '请输入新的 Profile 名称（最多 80 个字符）',
     'profiles.inUse': '任务使用中',
     'profileState.closed': '已关闭',
     'profileState.open': '已打开',
@@ -81,10 +84,12 @@ const I18N = Object.freeze({
     'error.read': '读取失败',
     'error.operation': '操作失败',
     'error.nameExists': 'Profile 名称已存在，请换一个名称。',
+    'error.nameTooLong': 'Profile 名称不能超过 80 个字符。',
     'toast.taskStopped': '任务已停止',
     'toast.taskResumed': '任务已恢复',
     'toast.taskDeleted': '任务已删除',
     'toast.profileCreated': 'Profile 已创建',
+    'toast.profileRenamed': 'Profile 已改名',
     'toast.profileDefault': '默认 Profile 已更新',
     'toast.profileOpened': 'Profile 已打开',
     'toast.profileClosed': 'Profile 已关闭',
@@ -156,6 +161,8 @@ const I18N = Object.freeze({
     'profiles.recent': 'Last used',
     'profiles.open': 'Open',
     'profiles.close': 'Close',
+    'profiles.rename': 'Rename',
+    'profiles.renamePrompt': 'Enter a new Profile name (up to 80 characters)',
     'profiles.inUse': 'Task in progress',
     'profileState.closed': 'Closed',
     'profileState.open': 'Open',
@@ -167,10 +174,12 @@ const I18N = Object.freeze({
     'error.read': 'Could not load data',
     'error.operation': 'Operation failed',
     'error.nameExists': 'That Profile name already exists. Choose another name.',
+    'error.nameTooLong': 'Profile names cannot exceed 80 characters.',
     'toast.taskStopped': 'Task stopped',
     'toast.taskResumed': 'Task resumed',
     'toast.taskDeleted': 'Task deleted',
     'toast.profileCreated': 'Profile created',
+    'toast.profileRenamed': 'Profile renamed',
     'toast.profileDefault': 'Default Profile updated',
     'toast.profileOpened': 'Profile opened',
     'toast.profileClosed': 'Profile closed',
@@ -282,10 +291,10 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function request(path, { method = 'GET', body } = {}) {
+async function request(path, { method = 'GET', body, requestTimeoutMs } = {}) {
   const upperMethod = method.toUpperCase();
   const attempts = upperMethod === 'GET' ? 2 : 1;
-  const timeoutMs = upperMethod === 'GET' ? READ_REQUEST_TIMEOUT_MS : MUTATION_REQUEST_TIMEOUT_MS;
+  const timeoutMs = requestTimeoutMs ?? (upperMethod === 'GET' ? READ_REQUEST_TIMEOUT_MS : MUTATION_REQUEST_TIMEOUT_MS);
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const controller = new AbortController();
@@ -576,6 +585,7 @@ function renderProfiles() {
     const status = profileState(profile);
     const pending = state.pending.has(`profile:${profile.id}`);
     const card = element('article', `profile-card profile-state-${status}`);
+    card.dataset.profileId = profile.id;
 
     const heading = element('div', 'card-heading');
     const headingCopy = element('div', 'card-title');
@@ -592,6 +602,9 @@ function renderProfiles() {
     );
 
     const actions = element('div', 'profile-actions');
+    const rename = button(t('profiles.rename'), 'npc-btn-secondary compact-button', () => void renameProfile(profile));
+    rename.disabled = pending || status === 'inUse';
+    actions.append(rename);
     if (!isDefaultProfile(profile)) {
       const makeDefault = button(t('profiles.setDefault'), 'npc-btn-secondary compact-button', () => void setDefaultProfile(profile));
       makeDefault.disabled = pending;
@@ -801,9 +814,23 @@ async function setDefaultProfile(profile) {
   }), t('toast.profileDefault'));
 }
 
+async function renameProfile(profile) {
+  if (state.pending.has(`profile:${profile.id}`) || profileState(profile) === 'inUse') return;
+  const name = prompt(t('profiles.renamePrompt'), profile.name || '')?.trim();
+  if (!name || name === profile.name) return;
+  if (name.length > 80) {
+    setToast(t('error.nameTooLong'), 'error');
+    return;
+  }
+  await runMutation(`profile:${profile.id}`, 'profiles', () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
+    method: 'PATCH', body: { name }
+  }), t('toast.profileRenamed'));
+}
+
 async function setProfileWindow(profile, action) {
   await runMutation(`profile:${profile.id}`, 'profiles', () => request(`/v1/profiles/${encodeURIComponent(profile.id)}/actions`, {
-    method: 'POST', body: { action }
+    method: 'POST', body: { action },
+    requestTimeoutMs: action === 'open' ? PROFILE_OPEN_REQUEST_TIMEOUT_MS : MUTATION_REQUEST_TIMEOUT_MS
   }), t(action === 'open' ? 'toast.profileOpened' : 'toast.profileClosed'));
 }
 

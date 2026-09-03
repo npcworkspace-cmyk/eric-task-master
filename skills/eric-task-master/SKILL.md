@@ -20,7 +20,7 @@ Use the installed `taskmaster` command. For a normal request, do not inspect the
 4. Follow it with `taskmaster follow TASK_ID --json`. Report meaningful processed counts during a long run.
 5. Read the output files and deliver every usable result, including partial results from a stopped or failed run.
 
-Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. If `taskmaster` is missing, tell the user to install Eric Task Master Manager. If Manager reports `DEFAULT_PROFILE_REQUIRED`, ask the user to create or choose a Profile in `taskmaster panel`; do not install another controller.
+Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. If `taskmaster` is not on PATH after installation, use the installed launcher directly: Windows `%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`; macOS `/usr/local/bin/taskmaster`; Linux `/usr/bin/taskmaster`. Only request installation if that launcher is also missing. If Manager reports `DEFAULT_PROFILE_REQUIRED`, ask the user to create or choose a Profile in `taskmaster panel`; do not install another controller.
 
 ## Minimal task module
 

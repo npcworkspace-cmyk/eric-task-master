@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { writeSync } from 'node:fs';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import fsPromises, { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import http from 'node:http';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -10,6 +11,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { removeTestTree } from './test-fs.mjs';
 import { isProcessAlive } from '../src/lib/process-tree.mjs';
+import { VERSION } from '../src/contracts.mjs';
 import {
   ensureManager,
   parseIntegerOption,
@@ -131,7 +133,7 @@ test('CLI preserves terminal task payloads, exit status, and Manager error detai
   const server = http.createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
     if (request.url === '/v1/health') {
-      response.end(JSON.stringify({ service: 'eric-task-master', version: '3.0.0', apiVersion: 3 }));
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
       return;
     }
     if (request.url === '/v1/tasks/task_passthrough') {
@@ -213,7 +215,7 @@ test('non-JSON artifact reads stream every chunk to EOF', async (t) => {
   const server = http.createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
     if (request.url === '/v1/health') {
-      response.end(JSON.stringify({ service: 'eric-task-master', version: '3.0.0', apiVersion: 3 }));
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
       return;
     }
     const url = new URL(request.url, 'http://127.0.0.1');
@@ -261,7 +263,7 @@ test('manager stop waits for the exact Manager process to exit after its port cl
     response.setHeader('content-type', 'application/json');
     if (request.url === '/v1/health') {
       response.end(JSON.stringify({
-        service: 'eric-task-master', version: '3.0.0', apiVersion: 3, pid: managerProcess.pid
+        service: 'eric-task-master', version: VERSION, apiVersion: 3, pid: managerProcess.pid
       }));
       return;
     }
@@ -294,12 +296,41 @@ test('background Manager startup reports an early exit immediately with a persis
   const child = new EventEmitter();
   child.pid = 43210;
   child.unref = () => {};
+  let finishExit;
+  const exitFinished = new Promise((resolve) => { finishExit = resolve; });
+  const originalOpen = fsPromises.open;
+  let delayedClose = 0;
+  const openMock = t.mock.method(fsPromises, 'open', async (...args) => {
+    const handle = await originalOpen(...args);
+    if (/manager-startup-[^\\/]+\.log$/u.test(String(args[0]))) {
+      const close = handle.close.bind(handle);
+      handle.close = async (...closeArgs) => {
+        delayedClose += 1;
+        // Complete the exit handler before releasing the descriptor: no disk-timing race in this regression.
+        await exitFinished;
+        await new Promise((resolve) => setImmediate(resolve));
+        return close(...closeArgs);
+      };
+    }
+    return handle;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    openMock.mock.restore();
+    syncBuiltinESMExports();
+  });
   const startedAt = Date.now();
   const promise = startBackgroundManager({
     host: '127.0.0.1', port: 19846, stateDir: root, baseUrl: 'http://127.0.0.1:19846'
   }, {
     spawnProcess: () => {
-      setImmediate(() => child.emit('exit', 23, null));
+      queueMicrotask(async () => {
+        try {
+          await child.rawListeners('exit')[0](23, null);
+        } finally {
+          finishExit();
+        }
+      });
       return child;
     },
     waitForReady: () => new Promise(() => {})
@@ -314,6 +345,7 @@ test('background Manager startup reports an early exit immediately with a persis
     startupLog = error.details.startupLog;
     return true;
   });
+  assert.equal(delayedClose, 1);
   assert.ok(Date.now() - startedAt < 2_000, 'early exit should not wait for the 20 second readiness timeout');
   assert.match(await readFile(startupLog, 'utf8'), /starting Manager/u);
 });
@@ -400,7 +432,7 @@ test('CLI replaces an idle same-API old Manager only after its process exits and
     baseUrl: `http://127.0.0.1:${idle.address().port}`
   };
   let starts = 0;
-  const replacement = { service: 'eric-task-master', version: '3.0.0', apiVersion: 3 };
+  const replacement = { service: 'eric-task-master', version: VERSION, apiVersion: 3 };
   assert.deepEqual(await ensureManager(idleConfig, {
     startManager: async () => {
       assert.equal(isProcessAlive(idleProcess.pid), false, 'replacement started before old Manager exited');

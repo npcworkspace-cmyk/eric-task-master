@@ -66,6 +66,31 @@ test('release requires successful CI and CodeQL runs for the exact current main 
   assert.ok(publish.indexOf('actions/runs/${CODEQL_RUN_ID}') < create, 'CodeQL proof must precede release creation');
   assert.ok(publish.indexOf('git/ref/heads/main') < create, 'current main must be rechecked before release creation');
   assert.ok(publish.indexOf('git/ref/tags/${TAG}') < create, 'tag absence must be rechecked before release creation');
+  assert.match(publish, /commits\/refs\/tags\/\$\{TAG\}/u);
+  assert.ok(!release.includes('commits/${TAG}'), 'same-name branches must never shadow release tags');
+});
+
+test('existing release verification is explicit, read-only, and checks original exact-SHA evidence and bytes', async () => {
+  const release = await source('.github/workflows/release.yml');
+  assert.match(release, /verify_existing:[\s\S]*?type: boolean\r?\n\s+default: false/u);
+  assert.match(release, /release:\r?\n\s+if: \$\{\{ !inputs\.verify_existing \}\}/u);
+  const verify = release.slice(release.indexOf('\n  verify-existing:'));
+  assert.match(verify, /if: \$\{\{ inputs\.verify_existing \}\}/u);
+  assert.match(verify, /permissions:\r?\n\s+actions: read\r?\n\s+contents: read/u);
+  assert.doesNotMatch(verify, /gh release (?:create|edit|delete|upload)|contents: write|RELEASE_ADMIN_TOKEN|git\/ref\/heads\/main/u);
+  assert.match(verify, /ref: \$\{\{ inputs\.release_sha \}\}\r?\n\s+path: release-source/u);
+  assert.ok(count(verify, 'commits/refs/tags/${TAG}') >= 2);
+  assert.ok(count(verify, '.immutable == true') >= 2);
+  assert.match(verify, /actions\/workflows\/ci\.yml\/runs\?branch=main&event=push/u);
+  assert.match(verify, /actions\/workflows\/codeql\.yml\/runs\?branch=main&event=push/u);
+  assert.ok(count(verify, '.head_sha == "\'"${RELEASE_SHA}"\'"') >= 3);
+  assert.match(verify, /working-directory: release-source/u);
+  assert.match(verify, /node scripts\/build\/collect-release-assets\.mjs/u);
+  assert.match(verify, /git archive --format=zip --mtime="\$\{ARCHIVE_MTIME\}" --prefix="\$\{PREFIX\}"/u);
+  assert.match(verify, /HEAD:skills\/eric-task-master/u);
+  assert.match(verify, /node scripts\/build\/checksums\.mjs --dir dist --output dist\/SHA256SUMS/u);
+  assert.match(verify, /gh release download/u);
+  assert.match(verify, /verify-release-assets\.mjs --expected release-source\/dist --published published/u);
 });
 
 test('release documentation describes the enforced proof and artifact contract', async () => {

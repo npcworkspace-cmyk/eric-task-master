@@ -1,6 +1,7 @@
 import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { PROFILE_OPEN_TIMEOUT_MS } from '../contracts.mjs';
 import { isProcessAlive, terminateProcessTree } from '../lib/process-tree.mjs';
 import { TaskServiceError } from './task-service-error.mjs';
 
@@ -42,7 +43,7 @@ export function createProfileRuntime({
   processAlive = isProcessAlive,
   leaseTtlMs = 45_000,
   heartbeatTimeoutMs = 35_000,
-  openTimeoutMs = 30_000,
+  openTimeoutMs = PROFILE_OPEN_TIMEOUT_MS,
   closeTimeoutMs = 12_000,
   onProfileAvailable = () => {}
 } = {}) {
@@ -212,6 +213,8 @@ export function createProfileRuntime({
       closedPromise: new Promise((resolve) => { resolveClosed = resolve; }),
       readyPromise: new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; })
     };
+    // A worker can fail while acquireLease is still pending; observe now, await below.
+    entry.readyPromise.catch(() => {});
     entries.set(profile.id, entry);
 
     child.once('exit', () => {
@@ -228,7 +231,8 @@ export function createProfileRuntime({
         rejectReady(new TaskServiceError(
           message.error?.code || 'PROFILE_OPEN_FAILED',
           message.error?.message || 'Profile failed to open',
-          500
+          500,
+          message.error?.details
         ));
       }
       if (message?.type === 'closed') {

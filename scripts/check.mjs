@@ -66,12 +66,13 @@ async function staticChecks() {
 
   invariant(packageJson.version === VERSION, 'package.json and runtime versions differ');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock version differs');
-  invariant(/^3\.0\.0$/u.test(VERSION), 'v3 release must be exactly 3.0.0');
+  invariant(/^3\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(VERSION), 'v3 release must use a stable semantic version');
   invariant(packageJson.bin?.taskmaster === './src/cli.mjs', 'CLI binary contract changed');
   invariant(JSON.stringify(Object.keys(packageJson.dependencies || {})) === JSON.stringify(['playwright']),
     'Playwright must be the only production dependency');
   invariant(Object.keys(packageJson.devDependencies || {}).length === 0, 'v3 has no development dependency requirement');
-  invariant(/^# Changelog\r?\n\r?\n## 3\.0\.0 /u.test(changelog), 'Changelog does not lead with 3.0.0');
+  invariant(changelog.replaceAll('\r\n', '\n').startsWith(`# Changelog\n\n## ${VERSION} - `),
+    'Changelog does not lead with the current release version');
 
   const forbidden = [
     'src/mcp',
