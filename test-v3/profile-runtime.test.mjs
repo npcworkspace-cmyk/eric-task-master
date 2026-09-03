@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { removeTestTree } from './test-fs.mjs';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
 import { createProfileRuntime } from '../src/runtime/profile-runtime.mjs';
 
@@ -35,7 +36,7 @@ class CloseFailingWorker extends EventEmitter {
 
 test('manual Profile retains its lease until failed close is contained', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-runtime-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const alive = new Set();
   const store = new ProfileStore({
     filePath: path.join(root, 'profiles.json'),

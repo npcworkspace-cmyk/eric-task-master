@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { removeTestTree } from './test-fs.mjs';
 import { createManager } from '../src/manager.mjs';
 
 async function json(url, { token, method = 'GET', body } = {}) {
@@ -50,7 +51,7 @@ test('Manager exposes the minimal v3 loopback API and passes through errors', as
   });
   t.after(async () => {
     await manager.stop();
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   });
   await manager.start();
   const base = manager.baseUrl;

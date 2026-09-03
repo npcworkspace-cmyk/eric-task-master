@@ -5,6 +5,7 @@ import { appendFile, mkdir, open, readFile, rm, writeFile } from 'node:fs/promis
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
+import { isProcessAlive } from './lib/process-tree.mjs';
 import { defaultDataDirectory, startManager } from './manager.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
@@ -340,13 +341,17 @@ export async function startBackgroundManager(config, {
   }
 }
 
-async function waitForManagerStop(config, timeoutMs = 20_000) {
+async function waitForManagerStop(config, timeoutMs = 20_000, managerPid = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       await health(config, 500);
     } catch (error) {
-      if (error.code === 'MANAGER_UNREACHABLE') return true;
+      if (error.code === 'MANAGER_UNREACHABLE') {
+        if (!managerPid || !isProcessAlive(managerPid)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        continue;
+      }
       throw error;
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -377,7 +382,7 @@ export async function ensureManager(config, { startManager = startBackgroundMana
       );
     }
     await requestJson(config, '/v1/manager/stop', { method: 'POST', body: {}, token });
-    if (!(await waitForManagerStop(config))) {
+    if (!(await waitForManagerStop(config, 20_000, current.pid))) {
       throw cliError(
         'MANAGER_VERSION_MISMATCH',
         `Manager ${current.version || 'unknown'} did not stop for the CLI ${VERSION} upgrade`,
@@ -663,14 +668,21 @@ async function managerCommand(action, options, json) {
     }
     const token = await readToken(config);
     await requestJson(config, '/v1/manager/stop', { method: 'POST', body: {}, token });
+    const managerPid = Number.isSafeInteger(current.pid) && current.pid > 0 ? current.pid : null;
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline) {
       try {
         await health(config, 500);
       } catch (error) {
         if (error.code === 'MANAGER_UNREACHABLE') {
-          emit({ ok: true, state: 'stopped' }, json);
-          return;
+          while (managerPid && Date.now() < deadline && isProcessAlive(managerPid)) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          if (!managerPid || !isProcessAlive(managerPid)) {
+            emit({ ok: true, state: 'stopped' }, json);
+            return;
+          }
+          break;
         }
       }
       await new Promise((resolve) => setTimeout(resolve, 200));

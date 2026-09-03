@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { writeSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { removeTestTree } from './test-fs.mjs';
+import { isProcessAlive } from '../src/lib/process-tree.mjs';
 import {
   ensureManager,
   parseIntegerOption,
@@ -99,13 +101,13 @@ test('CLI integer options reject non-finite, fractional, negative, blank, and fl
     assert.equal(lastJson(typo.stderr).error.code, 'UNKNOWN_OPTION');
     assert.match(lastJson(typo.stderr).error.message, /--profle/u);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   }
 });
 
 test('CLI preserves terminal task payloads, exit status, and Manager error details', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-server-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   await writeFile(path.join(root, 'config.json'), `${JSON.stringify({ managerToken: 'x'.repeat(48) })}\n`);
 
   const states = {
@@ -205,7 +207,7 @@ test('CLI preserves terminal task payloads, exit status, and Manager error detai
 
 test('non-JSON artifact reads stream every chunk to EOF', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-artifact-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   await writeFile(path.join(root, 'config.json'), `${JSON.stringify({ managerToken: 'a'.repeat(48) })}\n`);
   const content = Buffer.from('complete-artifact');
   const server = http.createServer((request, response) => {
@@ -244,9 +246,51 @@ test('non-JSON artifact reads stream every chunk to EOF', async (t) => {
   assert.equal(result.stdout, content.toString('utf8'));
 });
 
+test('manager stop waits for the exact Manager process to exit after its port closes', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-stop-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), `${JSON.stringify({ managerToken: 's'.repeat(48) })}\n`);
+  const managerProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+    windowsHide: true,
+    stdio: 'ignore'
+  });
+  t.after(() => {
+    if (managerProcess.exitCode === null) managerProcess.kill('SIGKILL');
+  });
+  const server = http.createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({
+        service: 'eric-task-master', version: '3.0.0', apiVersion: 3, pid: managerProcess.pid
+      }));
+      return;
+    }
+    if (request.url === '/v1/manager/stop' && request.method === 'POST') {
+      response.end(JSON.stringify({ ok: true, state: 'stopping' }));
+      setTimeout(() => managerProcess.kill('SIGTERM'), 700).unref();
+      setImmediate(() => {
+        server.close();
+        server.closeAllConnections?.();
+      });
+      return;
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'not found' } }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const result = await runCli([
+    'manager', 'stop', '--state-dir', root, '--port', String(server.address().port), '--json'
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(isProcessAlive(managerProcess.pid), false, 'CLI returned before the Manager process exited');
+});
+
 test('background Manager startup reports an early exit immediately with a persistent log', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-start-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const child = new EventEmitter();
   child.pid = 43210;
   child.unref = () => {};
@@ -276,7 +320,7 @@ test('background Manager startup reports an early exit immediately with a persis
 
 test('background Manager lock loser waits for the winning sibling instead of failing early', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-contended-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const child = new EventEmitter();
   child.pid = 43211;
   child.unref = () => {};
@@ -300,12 +344,15 @@ test('background Manager lock loser waits for the winning sibling instead of fai
   assert.deepEqual(result, expected);
 });
 
-test('CLI replaces an idle same-API old Manager but never interrupts its active tasks', async (t) => {
-  async function oldManager(activeTasks) {
+test('CLI replaces an idle same-API old Manager only after its process exits and never interrupts active tasks', async (t) => {
+  async function oldManager(activeTasks, { processId, onStop } = {}) {
     const server = http.createServer((request, response) => {
       response.setHeader('content-type', 'application/json');
       if (request.url === '/v1/health') {
-        response.end(JSON.stringify({ service: 'eric-task-master', version: '2.9.9', apiVersion: 3 }));
+        response.end(JSON.stringify({
+          service: 'eric-task-master', version: '2.9.9', apiVersion: 3,
+          ...(processId ? { pid: processId } : {})
+        }));
         return;
       }
       if (request.url === '/v1/status') {
@@ -314,6 +361,7 @@ test('CLI replaces an idle same-API old Manager but never interrupts its active 
       }
       if (request.url === '/v1/manager/stop' && request.method === 'POST') {
         response.end(JSON.stringify({ ok: true, state: 'stopping' }));
+        onStop?.();
         setImmediate(() => {
           server.close();
           server.closeAllConnections?.();
@@ -331,10 +379,20 @@ test('CLI replaces an idle same-API old Manager but never interrupts its active 
   }
 
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-version-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   await writeFile(path.join(root, 'config.json'), `${JSON.stringify({ managerToken: 'v'.repeat(48) })}\n`);
 
-  const idle = await oldManager(0);
+  const idleProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+    windowsHide: true,
+    stdio: 'ignore'
+  });
+  t.after(() => {
+    if (idleProcess.exitCode === null) idleProcess.kill('SIGKILL');
+  });
+  const idle = await oldManager(0, {
+    processId: idleProcess.pid,
+    onStop: () => setTimeout(() => idleProcess.kill('SIGTERM'), 700).unref()
+  });
   const idleConfig = {
     host: '127.0.0.1',
     port: idle.address().port,
@@ -344,7 +402,11 @@ test('CLI replaces an idle same-API old Manager but never interrupts its active 
   let starts = 0;
   const replacement = { service: 'eric-task-master', version: '3.0.0', apiVersion: 3 };
   assert.deepEqual(await ensureManager(idleConfig, {
-    startManager: async () => { starts += 1; return replacement; }
+    startManager: async () => {
+      assert.equal(isProcessAlive(idleProcess.pid), false, 'replacement started before old Manager exited');
+      starts += 1;
+      return replacement;
+    }
   }), replacement);
   assert.equal(starts, 1);
 
@@ -374,7 +436,7 @@ test('twelve concurrent CLI clients converge on one cold Manager across multiple
         'manager', 'stop', '--state-dir', item.stateDir, '--port', String(item.port), '--json'
       ]).catch(() => {});
     }
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   });
 
   for (let round = 0; round < 3; round += 1) {

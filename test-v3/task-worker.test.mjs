@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { removeTestTree } from './test-fs.mjs';
 import { runTaskWorker } from '../src/runtime/task-worker.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('one-file worker can bare-import Playwright and use raw runtime helpers', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-worker-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const outputDir = path.join(root, 'output');
   await mkdir(outputDir);
   await symlink(
@@ -62,7 +63,7 @@ test('one-file worker can bare-import Playwright and use raw runtime helpers', a
 
 test('one-file worker also accepts a default exported task function', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-default-worker-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const outputDir = path.join(root, 'output');
   await mkdir(outputDir);
   const modulePath = path.join(root, 'job.mjs');
@@ -104,7 +105,7 @@ test('one-file worker also accepts a default exported task function', async (t) 
 
 test('worker returns bounded structured errors and redacts their secrets', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-error-worker-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const outputDir = path.join(root, 'output');
   await mkdir(outputDir);
   const modulePath = path.join(root, 'job.mjs');
@@ -145,7 +146,7 @@ test('worker returns bounded structured errors and redacts their secrets', async
 
 test('failure capture falls back to raw CDP and tries another live page', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-error-capture-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const outputDir = path.join(root, 'output');
   await mkdir(outputDir);
   const modulePath = path.join(root, 'job.mjs');
@@ -196,7 +197,7 @@ test('failure capture falls back to raw CDP and tries another live page', async 
 
 test('Chrome launch failures preserve a bounded underlying cause', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-launch-error-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const outputDir = path.join(root, 'output');
   await mkdir(outputDir);
   const modulePath = path.join(root, 'job.mjs');

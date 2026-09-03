@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { removeTestTree } from './test-fs.mjs';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
 
 test('ProfileStore reaps dead leases after cleanup proof or inactive Profile expiry', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   let clock = Date.now();
   const alive = new Set();
   let profileUsage = 'inactive';
@@ -86,7 +87,7 @@ test('ProfileStore reaps dead leases after cleanup proof or inactive Profile exp
 
 test('legacy leases without a trustworthy identity stay quarantined until the exact Profile is inactive', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-legacy-profile-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTestTree(root));
   const profilesRoot = path.join(root, 'profiles');
   const profileId = `profile_${'a'.repeat(32)}`;
   const userDataDir = path.join(profilesRoot, profileId);
@@ -142,7 +143,7 @@ test('legacy leases without a trustworthy identity stay quarantined until the ex
 test('Profile deletion journal resumes every crash phase on restart', async (t) => {
   const roots = [];
   t.after(async () => {
-    await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
+    await Promise.all(roots.map((root) => removeTestTree(root)));
   });
   for (const phase of ['before-rename', 'after-rename', 'after-record-removal']) {
     const root = await mkdtemp(path.join(os.tmpdir(), `taskmaster-profile-delete-${phase}-`));

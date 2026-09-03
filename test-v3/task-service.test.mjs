@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
 import { createTaskService } from '../src/runtime/task-service.mjs';
+import { removeTestTree } from './test-fs.mjs';
 
 async function until(check, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
@@ -135,7 +136,7 @@ test('TaskService queues one writer, preserves partial output, and deletes atomi
   });
   t.after(async () => {
     await service.close();
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   });
   const source = path.join(root, 'job.mjs');
   await writeFile(source, 'export async function run() { return { ok: true }; }\n');
@@ -313,7 +314,7 @@ test('TaskService retains lease after browser close and tree termination both fa
     terminationWorks = true;
     worker.terminate();
     await service.close().catch(() => {});
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   });
   const source = path.join(root, 'job.mjs');
   await writeFile(source, 'export async function run() { return true; }\n');
@@ -393,7 +394,7 @@ test('Manager restart never kills a live process found only by persisted PID', a
   });
   t.after(async () => {
     await service.close();
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   });
 
   const recovered = await service.get(taskId);
@@ -449,7 +450,7 @@ test('Manager restart resumes private tombstone cleanup after a dead lease becom
   });
   t.after(async () => {
     await service.close();
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   });
   await until(async () => (await profileStore.get(profile.id)).state === 'idle');
   await until(() => !existsSync(taskRoot));
@@ -482,7 +483,7 @@ test('Profile deletion and task creation are linearized without stranded queued 
   });
   t.after(async () => {
     await service.close().catch(() => {});
-    await rm(root, { recursive: true, force: true });
+    await removeTestTree(root);
   });
   const source = path.join(root, 'job.mjs');
   await writeFile(source, 'export async function run() { return true; }\n');

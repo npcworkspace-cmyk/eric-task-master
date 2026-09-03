@@ -38,3 +38,22 @@ test('JSON store replacement never retries permanent failures', async () => {
   );
   assert.equal(calls, 1);
 });
+
+test('JSON store default retry budget survives a multi-second Windows sharing lock', async () => {
+  let calls = 0;
+  const delays = [];
+  await replaceFileWithRetry('source.tmp', 'state.json', {
+    replace: async () => {
+      calls += 1;
+      if (calls <= 12) {
+        const error = new Error('virus scanner still holds the destination');
+        error.code = 'EPERM';
+        throw error;
+      }
+    },
+    delay: async (milliseconds) => { delays.push(milliseconds); }
+  });
+
+  assert.equal(calls, 13);
+  assert.deepEqual(delays, [25, 50, 100, 200, 250, 250, 250, 250, 250, 250, 250, 250]);
+});

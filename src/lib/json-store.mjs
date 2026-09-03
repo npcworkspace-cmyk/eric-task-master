@@ -11,8 +11,10 @@ function wait(milliseconds) {
 export async function replaceFileWithRetry(source, destination, {
   replace = rename,
   delay = wait,
-  attempts = 8,
-  baseDelayMs = 8
+  // Antivirus and indexers can briefly retain a Windows sharing lock. Keep
+  // replacement atomic and wait at most about 4.1 seconds before surfacing it.
+  attempts = 20,
+  baseDelayMs = 25
 } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {

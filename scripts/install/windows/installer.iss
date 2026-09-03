@@ -108,7 +108,12 @@ begin
      (ResultCode <> 0) then
   begin
     Result := 'The previous Eric Task Master Manager could not be stopped safely. Close running tasks and retry the upgrade.';
+    Exit;
   end;
+  { Older launchers can report the closed port just before their Node process
+    releases node.exe. Give that bounded teardown a chance to finish; the
+    Restart Manager remains fail-closed if any process still owns the files. }
+  Sleep(1000);
 end;
 
 function PathContains(Value, Wanted: string): Boolean;

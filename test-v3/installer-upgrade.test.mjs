@@ -26,6 +26,7 @@ test('Windows upgrade stops the managed installation and replaces only managed a
   assert.match(installer, /manager stop --json/u);
   assert.match(installer, /StopStarted := Exec\(/u);
   assert.match(installer, /ExpandConstant\('\{cmd\}'\)/u);
+  assert.match(installer, /Sleep\(1000\)/u);
   assert.doesNotMatch(installer, /StopStarted := ShellExec\(/u);
   assert.match(installer, /waituntilterminated/u);
   assert.match(installer, /previous Eric Task Master Manager could not be stopped safely/u);
