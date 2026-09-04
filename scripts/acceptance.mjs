@@ -265,7 +265,8 @@ async function main() {
       opened.state === 'open' && closed.state === 'idle' && manualSandbox.matchedBrowsers === 1 && !manualSandbox.noSandbox,
       JSON.stringify(manualSandbox));
 
-    const browserRun = await cli(['run', browserJob, '--input', `@${inputPath}`, '--json'], 120_000);
+    const browserRun = await cli(['run', browserJob, '--input', `@${inputPath}`, '--json'], 120_000,
+      { allowExpectedTaskFailure: true });
     const browserTask = taskFrom(browserRun);
     taskIds.push(browserTask.id);
     const browserResult = browserTask.result;
@@ -274,7 +275,8 @@ async function main() {
       browserResult.barePlaywrightImport && browserResult.rendered === 'Eric|b|true' &&
       browserResult.evaluated === 'Task Master Acceptance' &&
       browserResult.cdp === 'Task Master Acceptance' &&
-      browserResult.upload === 'upload-ok' && browserResult.download === 'download-ok');
+      browserResult.upload === 'upload-ok' && browserResult.download === 'download-ok',
+      browserTask.error ? JSON.stringify({ error: browserTask.error, progress: browserTask.progress }).slice(0, 5_000) : '');
     const resultRead = (await cli(['files', browserTask.id, '--read', 'result.json', '--json'])).records.at(-1).artifact;
     add('incremental output is readable through CLI', JSON.parse(Buffer.from(resultRead.data, 'base64')).download === 'download-ok');
 
