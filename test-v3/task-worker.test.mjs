@@ -33,6 +33,7 @@ test('one-file worker can bare-import Playwright and use raw runtime helpers', a
   `);
 
   let closed = false;
+  let launchOptions;
   const page = { isClosed: () => false, screenshot: async () => {} };
   const context = {
     pages: () => [page],
@@ -41,7 +42,10 @@ test('one-file worker can bare-import Playwright and use raw runtime helpers', a
     close: async () => { closed = true; }
   };
   const fakePlaywright = {
-    chromium: { launchPersistentContext: async () => context }
+    chromium: { launchPersistentContext: async (_directory, options) => {
+      launchOptions = options;
+      return context;
+    } }
   };
   const result = await runTaskWorker({
     taskId: 'task_worker_test',
@@ -59,6 +63,7 @@ test('one-file worker can bare-import Playwright and use raw runtime helpers', a
   });
   assert.deepEqual(JSON.parse(await readFile(path.join(outputDir, 'result.json'), 'utf8')), { value: 42 });
   assert.equal(closed, true);
+  assert.equal(launchOptions.chromiumSandbox, true);
 });
 
 test('one-file worker also accepts a default exported task function', async (t) => {

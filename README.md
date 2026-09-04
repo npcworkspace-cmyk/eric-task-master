@@ -25,10 +25,12 @@ Use it for unattended research, recurring operations, long browser collections, 
 
 Download two files from the [latest GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest):
 
-1. the Manager package for Windows, macOS, or Linux;
-2. `eric-task-master-skill-v3.0.1.zip`.
+1. the Manager installer **or portable ZIP** matching your OS and CPU;
+2. `eric-task-master-skill-v3.0.2.zip`.
 
 The Manager package includes its Node.js runtime, Playwright runtime, CLI, Dashboard, and background service. It uses an installed stable Google Chrome and does not download a separate Chromium.
+
+Installer unavailable? Download `eric-task-master-v3.0.2-<target>-portable.zip`, verify it against `SHA256SUMS`, and extract it to a permanent folder. Run `eric-task-master/bin/taskmaster.cmd panel` on Windows or `eric-task-master/bin/taskmaster panel` on macOS/Linux. No installer, administrator access, or separate Node.js installation is needed. [Choose your target and view setup details](docs/INSTALLERS.md#portable-zip-fallback).
 
 After installation:
 

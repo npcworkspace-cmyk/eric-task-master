@@ -26,6 +26,7 @@ const required = [
   'scripts/build/package-windows.ps1',
   'scripts/build/package-macos.sh',
   'scripts/build/package-linux.sh',
+  'scripts/install/smoke-portable.mjs',
   'scripts/install/windows/installer.iss',
   'scripts/install/macos/preinstall',
   'scripts/install/linux/preinst'
@@ -59,10 +60,10 @@ const [stage, verifier, smokeTask, windowsSmoke, macSmoke, linuxSmoke, windowsPa
 ]);
 for (const [source, fragments] of [
   [windowsPackager, ['windows-x64-portable.zip', 'windows-x64-setup.exe']],
-  [macPackager, ['-${target}.pkg', '--scripts "${package_scripts}"', 'install/macos']],
-  [linuxPackager, ['-${target}.deb', '-${target}-portable.tar.gz', 'DEBIAN/preinst', 'install/linux']],
-  [collector, ['windows-x64-portable.zip', 'windows-x64-setup.exe', 'macos-arm64.pkg', 'macos-x64.pkg', 'linux-x64.deb', 'linux-arm64.deb']],
-  [ci, ['name: release-${{ matrix.target }}']],
+  [macPackager, ['-${target}.pkg', '-${target}-portable.zip', '--scripts "${package_scripts}"', 'install/macos']],
+  [linuxPackager, ['-${target}.deb', '-${target}-portable.tar.gz', '-${target}-portable.zip', 'DEBIAN/preinst', 'install/linux']],
+  [collector, ['windows-x64-portable.zip', 'windows-x64-setup.exe', 'macos-arm64.pkg', 'macos-x64.pkg', 'linux-x64.deb', 'linux-arm64.deb', 'macos-arm64-portable.zip', 'macos-x64-portable.zip', 'linux-x64-portable.zip', 'linux-arm64-portable.zip']],
+  [ci, ['name: release-${{ matrix.target }}', 'scripts/install/smoke-portable.mjs --archive']],
   [release, ["--pattern 'release-*'", '--sha "${RELEASE_SHA}"']],
   [stage, ['set "NODE_OPTIONS="', 'set "NODE_PATH="', 'unset NODE_OPTIONS NODE_PATH']],
   [verifier, ['__eric_task_master_host_injection_must_not_load__', 'hostNodeInjectionIsolated: true']],

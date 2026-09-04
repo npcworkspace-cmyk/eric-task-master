@@ -8,6 +8,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { VERSION } from '../src/contracts.mjs';
+import { commandLineUsesProfile } from '../src/lib/process-tree.mjs';
 
 const execFile = promisify(execFileCallback);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -36,6 +37,27 @@ async function reservePort() {
   const port = server.address().port;
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   return port;
+}
+
+async function inspectManualChromeSandbox(userDataDir) {
+  const command = process.platform === 'win32' ? 'powershell.exe' : 'ps';
+  const args = process.platform === 'win32'
+    ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+      "$ErrorActionPreference='Stop'; $OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | ForEach-Object { $_.CommandLine }"]
+    : ['-Aww', '-o', 'command='];
+  const { stdout } = await execFile(command, args, {
+    windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024
+  });
+  // Inspect only the Chrome launched for this temporary acceptance Profile;
+  // never include command lines or user Profile data in the report.
+  const browsers = stdout.split(/\r?\n/u).filter((line) => (
+    line.includes('--remote-debugging-pipe') && !/(?:^|[\s"])--type=/u.test(line) &&
+    commandLineUsesProfile(line, userDataDir)
+  ));
+  return {
+    matchedBrowsers: browsers.length,
+    noSandbox: browsers.some((line) => /(?:^|[\s"])--no-sandbox(?:$|[\s"=])/u.test(line))
+  };
 }
 
 async function createFixture() {
@@ -152,6 +174,12 @@ async function main() {
     "  await progress({ current: 3, total: 6, message: 'DOM evaluated' });",
     '  const cdp = await context.newCDPSession(page);',
     "  const cdpValue = await cdp.send('Runtime.evaluate', { expression: 'document.title', returnByValue: true });",
+    '  const versionPage = await context.newPage();',
+    '  let chromeCommandLine;',
+    '  try {',
+    "    await versionPage.goto('chrome://version');",
+    "    chromeCommandLine = await versionPage.locator('#command_line').textContent();",
+    '  } finally { await versionPage.close(); }',
     "  await progress({ current: 4, total: 6, message: 'CDP evaluated' });",
     "  const downloadEvent = page.waitForEvent('download');",
     "  await page.locator('#download').click();",
@@ -160,6 +188,7 @@ async function main() {
     "  await progress({ current: 5, total: 6, message: 'downloaded' });",
     '  const report = {',
     '    barePlaywrightImport: typeof chromium?.launchPersistentContext === \'function\',',
+    "    sandboxEnabled: chromeCommandLine.includes('--remote-debugging-pipe') && !/(?:^|[\\s\"])--no-sandbox(?:$|[\\s\"=])/u.test(chromeCommandLine),",
     "    rendered, evaluated, cdp: cdpValue.result.value,",
     "    upload: await readFile(input.uploadPath, 'utf8'),",
     "    download: await readFile(path.join(outputDir, 'download.txt'), 'utf8')",
@@ -229,19 +258,25 @@ async function main() {
 
     await cli(['profiles', 'open', profileA.id, '--json'], 120_000);
     const opened = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles.find((profile) => profile.id === profileA.id);
+    const manualSandbox = await inspectManualChromeSandbox(path.join(stateDir, 'profiles', profileA.id));
     await cli(['profiles', 'close', profileA.id, '--json'], 60_000);
     const closed = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles.find((profile) => profile.id === profileA.id);
-    add('visible Profile open and close', opened.state === 'open' && closed.state === 'idle');
+    add('visible Profile open and close with Chrome sandbox',
+      opened.state === 'open' && closed.state === 'idle' && manualSandbox.matchedBrowsers === 1 && !manualSandbox.noSandbox,
+      JSON.stringify(manualSandbox));
 
-    const browserRun = await cli(['run', browserJob, '--input', `@${inputPath}`, '--json'], 120_000);
+    const browserRun = await cli(['run', browserJob, '--input', `@${inputPath}`, '--json'], 120_000,
+      { allowExpectedTaskFailure: true });
     const browserTask = taskFrom(browserRun);
     taskIds.push(browserTask.id);
     const browserResult = browserTask.result;
-    add('raw Playwright, evaluate, CDP, upload, and download', browserTask.state === 'finished' &&
+    add('sandboxed Chrome, raw Playwright, evaluate, CDP, upload, and download', browserTask.state === 'finished' &&
+      browserResult.sandboxEnabled === true &&
       browserResult.barePlaywrightImport && browserResult.rendered === 'Eric|b|true' &&
       browserResult.evaluated === 'Task Master Acceptance' &&
       browserResult.cdp === 'Task Master Acceptance' &&
-      browserResult.upload === 'upload-ok' && browserResult.download === 'download-ok');
+      browserResult.upload === 'upload-ok' && browserResult.download === 'download-ok',
+      browserTask.error ? JSON.stringify({ error: browserTask.error, progress: browserTask.progress }).slice(0, 5_000) : '');
     const resultRead = (await cli(['files', browserTask.id, '--read', 'result.json', '--json'])).records.at(-1).artifact;
     add('incremental output is readable through CLI', JSON.parse(Buffer.from(resultRead.data, 'base64')).download === 'download-ok');
 

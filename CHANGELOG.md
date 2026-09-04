@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.2 - 2026-09-04
+
+- Enabled Chrome sandboxing for manual Profile windows and automated tasks while retaining extension support and raw Playwright/CDP access.
+- Added launch-configuration and real-browser regression checks to prevent silent unsandboxed startup.
+- Added installer-free portable ZIPs for every supported OS/CPU, with bundled-runtime startup and cleanup acceptance on each native CI target.
+
 ## 3.0.1 - 2026-09-04
 
 - Fixed early Manager and Profile Worker exits being reported as unhandled promise rejections.

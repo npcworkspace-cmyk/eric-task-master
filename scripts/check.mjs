@@ -110,6 +110,7 @@ async function staticChecks() {
     'raw task runtime is incomplete');
   invariant(browser.includes("channel: 'chrome'") && browser.includes("ignoreDefaultArgs: ['--disable-extensions']"),
     'stable Chrome or extension support changed');
+  invariant(browser.includes('chromiumSandbox: true'), 'Chrome sandbox must be enabled by default');
 
   for (const target of ['windows-x64', 'macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64']) {
     invariant(workflow.includes(`target: ${target}`), `CI lacks ${target}`);
