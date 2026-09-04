@@ -22,6 +22,7 @@ const stateDir = join(temporaryRoot, 'Isolated state');
 const bundleRoot = join(extracted, 'eric-task-master');
 const launcher = join(bundleRoot, 'bin', process.platform === 'win32' ? 'taskmaster.cmd' : 'taskmaster');
 const nodeBinary = join(bundleRoot, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
+const windowsTar = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
 let port;
 let manifest;
 let managerPid;
@@ -109,11 +110,11 @@ async function cli(parameters, timeout = 45_000) {
 try {
   await mkdir(extracted);
   const list = process.platform === 'win32'
-    ? await command('tar', ['-tf', archive])
+    ? await command(windowsTar, ['-tf', archive])
     : await command('unzip', ['-Z1', archive]);
   const entries = list.stdout.trim().split(/\r?\n/u).map((entry) => entry.replaceAll('\\', '/'));
   assert.ok(entries.length && entries.every((entry) => entry.startsWith('eric-task-master/') && !entry.split('/').includes('..')), 'ZIP entries must stay inside the application root');
-  if (process.platform === 'win32') await command('tar', ['-xf', archive, '-C', extracted], { timeout: 90_000 });
+  if (process.platform === 'win32') await command(windowsTar, ['-xf', archive, '-C', extracted], { timeout: 90_000 });
   else await command('unzip', ['-q', archive, '-d', extracted], { timeout: 90_000 });
   assert.deepEqual(await readdir(extracted), ['eric-task-master']);
   manifest = await readJson(join(bundleRoot, 'release-manifest.json'));
