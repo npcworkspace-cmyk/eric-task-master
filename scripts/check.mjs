@@ -132,12 +132,14 @@ for (const file of syntaxFiles) {
 const testFiles = await filesUnder('test-v3', (file) => file.endsWith('.test.mjs'));
 invariant(testFiles.length >= 5, 'v3 test suite is unexpectedly small');
 await run('v3 unit and integration tests', process.execPath, ['--test', '--test-concurrency=1', ...testFiles]);
+await run('native manual Profile handoff acceptance', process.execPath, [path.join(ROOT, 'scripts', 'acceptance-native-profile.mjs')]);
 await run('real Chrome acceptance', process.execPath, [path.join(ROOT, 'scripts', 'acceptance.mjs')]);
 await run('real Dashboard acceptance', process.execPath, [path.join(ROOT, 'scripts', 'dashboard-acceptance.mjs')]);
+await run('verification wait acceptance', process.execPath, [path.join(ROOT, 'scripts', 'acceptance-verification.mjs')]);
 await run('distribution policy', process.execPath, [path.join(ROOT, 'scripts', 'build', 'check-distribution.mjs')]);
 
 process.stdout.write(`\n${JSON.stringify({
   ok: true,
   version: VERSION,
-  stages: ['static', 'syntax', 'tests', 'real-chrome', 'dashboard', 'distribution']
+  stages: ['static', 'syntax', 'tests', 'native-profile', 'real-chrome', 'dashboard', 'verification-wait', 'distribution']
 })}\n`);

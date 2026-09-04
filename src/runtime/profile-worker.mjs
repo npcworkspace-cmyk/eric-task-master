@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { PROFILE_LAUNCH_TIMEOUT_MS } from '../contracts.mjs';
-import { launchChromeProfile } from './browser-engine.mjs';
+import { createNativeChrome } from './native-chrome.mjs';
+import { probeChromeProfileUsage } from '../lib/process-tree.mjs';
 import { redactSensitiveText } from '../lib/redaction.mjs';
 
 let processCleanupConfirmed = true;
@@ -40,17 +41,16 @@ function sendCleanupWithAck(message, timeoutMs = 2_000) {
   });
 }
 
-async function closeContext(context, timeoutMs = 10_000) {
-  if (!context) return false;
+async function closeBrowser(browser, profile, probeProfile, timeoutMs = 10_000) {
+  if (!browser) return await probeProfile(profile.userDataDir).catch(() => 'unknown') === 'inactive';
   let timer;
   try {
-    await Promise.race([
-      context.close(),
+    return await Promise.race([
+      browser.close(),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('close timeout')), timeoutMs);
       })
     ]);
-    return true;
   } catch {
     return false;
   } finally {
@@ -59,33 +59,26 @@ async function closeContext(context, timeoutMs = 10_000) {
 }
 
 export async function runProfileWorker(profile, {
-  loadPlaywright = () => import('playwright'),
+  openChrome = createNativeChrome,
+  probeProfile = probeChromeProfileUsage,
   sendMessage = send,
   sendCleanup = sendCleanupWithAck,
   signal
 } = {}) {
   processCleanupConfirmed = false;
-  let context;
+  let browser;
   let heartbeat;
-  let stage = 'load-playwright';
+  let stage = 'launch-native-chrome';
   const sendHeartbeat = () => sendMessage({ type: 'heartbeat', stage, at: new Date().toISOString() });
   try {
     sendHeartbeat();
     heartbeat = setInterval(sendHeartbeat, 10_000);
     heartbeat.unref?.();
-    const playwright = await loadPlaywright();
-    stage = 'launch-chrome';
-    context = await launchChromeProfile(playwright, profile, { timeout: PROFILE_LAUNCH_TIMEOUT_MS });
-    stage = 'open-page';
-    if (context.pages().length === 0) await context.newPage();
+    browser = await openChrome(profile, { signal });
+    await browser.ready({ timeoutMs: PROFILE_LAUNCH_TIMEOUT_MS, signal });
     stage = 'ready';
     sendMessage({ type: 'ready', at: new Date().toISOString() });
-    if (!signal?.aborted) {
-      await new Promise((resolve) => {
-        signal?.addEventListener('abort', resolve, { once: true });
-        context.once?.('close', resolve);
-      });
-    }
+    await browser.waitForClose(signal);
     return { ok: true };
   } catch (error) {
     sendMessage({
@@ -105,7 +98,7 @@ export async function runProfileWorker(profile, {
     return { ok: false, error };
   } finally {
     clearInterval(heartbeat);
-    const browserClosed = await closeContext(context);
+    const browserClosed = await closeBrowser(browser, profile, probeProfile);
     const cleanupAcknowledged = await sendCleanup({
       type: 'closed', browserClosed, at: new Date().toISOString()
     });

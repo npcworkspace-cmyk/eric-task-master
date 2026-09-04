@@ -1,6 +1,6 @@
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
-export const VERSION = '3.0.2';
+export const VERSION = '3.0.3';
 export const API_VERSION = 3;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -96,6 +96,7 @@ export function publicTask(task) {
     createdAt: task.createdAt ?? null,
     startedAt: task.startedAt ?? null,
     finishedAt: task.finishedAt ?? null,
+    outputClearedAt: task.outputClearedAt ?? null,
     heartbeatAt: task.heartbeatAt ?? null,
     canResume: task.state === 'waiting',
     elapsedMs: Number.isFinite(start) ? Math.max(0, end - start) : 0,

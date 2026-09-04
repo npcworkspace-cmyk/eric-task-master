@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.0.3 - 2026-09-04
+
+- Added a three-category Dashboard space cleaner: preview before deletion, preserve login/extension data, skip active Profiles/tasks, and require opt-in for historical task output.
+- Opened manual Profile windows with native stable Chrome, without a Playwright or CDP connection; automated tasks reuse the same Profile after the manual window closes.
+- Added verification waits with live browser/Worker heartbeats, four five-minute screenshot probes, and Agent-reviewed or manual resume.
+- Paused execution timeout accounting during verification waits and rejected stale screenshot resume references.
+- Returned screenshot attention and a continuation cursor from CLI follow without ending the task.
+
 ## 3.0.2 - 2026-09-04
 
 - Enabled Chrome sandboxing for manual Profile windows and automated tasks while retaining extension support and raw Playwright/CDP access.

@@ -2,7 +2,7 @@ import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { PROFILE_OPEN_TIMEOUT_MS } from '../contracts.mjs';
-import { isProcessAlive, terminateProcessTree } from '../lib/process-tree.mjs';
+import { isProcessAlive, probeChromeProfileUsage, terminateProcessTree } from '../lib/process-tree.mjs';
 import { TaskServiceError } from './task-service-error.mjs';
 
 const DEFAULT_WORKER = fileURLToPath(new URL('./profile-worker.mjs', import.meta.url));
@@ -41,6 +41,7 @@ export function createProfileRuntime({
   workerPath = DEFAULT_WORKER,
   terminateTree = terminateProcessTree,
   processAlive = isProcessAlive,
+  profileUsageProbe = probeChromeProfileUsage,
   leaseTtlMs = 45_000,
   heartbeatTimeoutMs = 35_000,
   openTimeoutMs = PROFILE_OPEN_TIMEOUT_MS,
@@ -74,12 +75,17 @@ export function createProfileRuntime({
 
   async function terminateOwnedTree(profileId, entry) {
     if (entry.terminationPromise) return entry.terminationPromise;
-    const attempt = (async () => {
+    // Publish the cleanup barrier before termination can synchronously emit exit.
+    const attempt = Promise.resolve().then(async () => {
       const terminated = await terminateTree(entry.child.pid, { graceMs: 3_000 }).catch(() => false);
-      entry.treeTerminated = terminated === true && !processAlive(entry.child.pid);
+      const profile = await profileStore.get(profileId);
+      const usage = terminated === true && !processAlive(entry.child.pid)
+        ? await profileUsageProbe(profile.userDataDir).catch(() => 'unknown')
+        : 'unknown';
+      entry.treeTerminated = terminated === true && !processAlive(entry.child.pid) && usage === 'inactive';
       if (entry.treeTerminated) await confirmCleanup(profileId, entry).catch(() => {});
       return entry.treeTerminated;
-    })();
+    });
     entry.terminationPromise = attempt;
     const result = await attempt;
     if (!result && entry.terminationPromise === attempt) entry.terminationPromise = null;

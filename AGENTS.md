@@ -10,7 +10,8 @@ Keep Eric Task Master on one path:
 - Use stable local Chrome with Task Master-owned persistent Profiles.
 - Manager owns process lifetime, Profile leases, progress, output metadata, stop, resume, and delete.
 - Task scripts own browser actions, selectors, waits, retries, checkpoints, HTTP, CDP, and data processing.
-- Do not add MCP, Task Type registration, Task Pack assets, mandatory probes, behavior modes, Journey facades, or special challenge policy.
+- Do not add MCP, Task Type registration, Task Pack assets, mandatory preflight probes, behavior modes, or Journey facades.
+- A task may enter `wait({ reason: 'verification' })`: runtime keeps Chrome alive and takes four screenshots, five minutes apart. The Agent judges the images; runtime never decides a page is cleared by itself.
 
 ## Engineering
 

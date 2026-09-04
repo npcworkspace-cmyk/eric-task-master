@@ -20,6 +20,9 @@ const profilesScreenshotPath = screenshotPath
       `${path.basename(screenshotPath, path.extname(screenshotPath))}-profiles${path.extname(screenshotPath) || '.png'}`
     )
   : null;
+const cleanupScreenshotPaths = screenshotPath ? Object.fromEntries(['desktop', 'mobile', 'result'].map((view) => [view,
+  path.join(path.dirname(screenshotPath), `${path.basename(screenshotPath, path.extname(screenshotPath))}-cleanup-${view}.png`)
+])) : null;
 const packageJson = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'));
 
 function now() {
@@ -120,8 +123,11 @@ const calls = {
   profileDeletes: [],
   profileCreates: [],
   profileRenames: [],
-  defaultChanges: []
+  defaultChanges: [],
+  cleanup: []
 };
+const cleanupBehavior = { failPreview: false, failExecution: false, partial: false, historicalOutputPresent: true };
+const cleanupSizes = { 'browser-cache': 1024 * 1024, 'temporary-files': 64 * 1024, 'task-output': 5 * 1024 * 1024 };
 
 function taskById(id) {
   const task = tasks.get(id);
@@ -172,6 +178,39 @@ async function handler(request, response) {
     json(response, 200, {
       profiles: clone(profiles),
       defaultProfileId: profiles.find((profile) => profile.isDefault)?.id || null
+    });
+    return;
+  }
+
+  if (request.method === 'POST' && pathname === '/v1/cleanup') {
+    const body = await bodyFrom(request);
+    calls.cleanup.push(clone(body));
+    assert.deepEqual(Object.keys(body).sort(), ['categories', 'preview']);
+    assert.ok(Array.isArray(body.categories) && body.categories.length > 0);
+    assert.ok(body.categories.every((category) => Object.hasOwn(cleanupSizes, category)));
+    if (body.preview && cleanupBehavior.failPreview) {
+      cleanupBehavior.failPreview = false;
+      json(response, 409, { error: { code: 'CLEANUP_BUSY', message: 'Cleanup is busy. Retry preview.' } });
+      return;
+    }
+    if (!body.preview && cleanupBehavior.failExecution) {
+      cleanupBehavior.failExecution = false;
+      json(response, 500, { error: { code: 'CLEANUP_FAILED', message: 'Fixture cleanup interrupted.' } });
+      return;
+    }
+    if (!body.preview && body.categories.includes('task-output')) cleanupBehavior.historicalOutputPresent = false;
+    const categories = body.categories.map((id) => ({
+      id, bytes: cleanupSizes[id] / (body.preview ? 1 : 2), files: body.preview ? 4 : 2
+    }));
+    json(response, 200, {
+      ok: true, preview: body.preview,
+      bytes: categories.reduce((total, category) => total + category.bytes, 0),
+      files: categories.reduce((total, category) => total + category.files, 0), categories,
+      skipped: [
+        { kind: 'task', id: 'task_waiting', name: 'Review open-ended feed', reason: 'TASK_ACTIVE_OR_CLEANUP_UNCONFIRMED' },
+        { kind: 'profile', id: 'profile_busy', name: 'Busy', reason: 'PROFILE_BUSY' }
+      ],
+      failed: cleanupBehavior.partial ? [{ kind: 'task', id: 'task_finished', name: 'Finished sample', reason: 'File is busy' }] : []
     });
     return;
   }
@@ -341,6 +380,126 @@ async function waitUntil(predicate, label, timeoutMs = 5_000) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
+async function checkCleanup(page, checks) {
+  const dialog = page.getByRole('dialog', { name: '清理空间', exact: true });
+  const confirm = page.locator('#confirm-cleanup');
+  const output = page.locator('[name="cleanup-category"][value="task-output"]');
+  const defaults = ['browser-cache', 'temporary-files'];
+  await page.getByRole('button', { name: '清理空间', exact: true }).click();
+  await dialog.waitFor();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  assert.deepEqual(calls.cleanup.at(-1), { categories: defaults, preview: true });
+  assert.equal(await output.isChecked(), false);
+  assert.equal(await page.locator('[name="cleanup-category"]:checked').count(), 2);
+  assert.match(await page.locator('#cleanup-safety').textContent(), /保留登录状态和扩展/u);
+  assert.match(await page.locator('#cleanup-summary').textContent(), /预计可释放.*1\.1 MB/u);
+  assert.match(await page.locator('#cleanup-details').textContent(), /已跳过 2 项/u);
+  assert.equal(calls.cleanup.some((entry) => !entry.preview), false);
+  if (cleanupScreenshotPaths) {
+    await mkdir(path.dirname(cleanupScreenshotPaths.desktop), { recursive: true });
+    await page.screenshot({ path: cleanupScreenshotPaths.desktop, fullPage: true });
+  }
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('#open-cleanup').evaluate((node) => node === document.activeElement), true);
+  checks.push('cleanup opens as a keyboard-closeable dialog; cache and temporary files default on, historical output defaults off');
+
+  // Hold an older preview so rapid changes cannot authorize a stale selection.
+  let releasePreview;
+  const heldPreview = new Promise((resolve) => { releasePreview = resolve; });
+  let previewHeld = false;
+  const holdPreview = async (route) => {
+    if (route.request().postDataJSON().preview && !previewHeld) {
+      previewHeld = true;
+      await heldPreview;
+    }
+    await route.continue();
+  };
+  await page.route('**/v1/cleanup', holdPreview);
+  await page.locator('#open-cleanup').click();
+  await waitUntil(() => previewHeld, 'held cleanup preview');
+  await output.check();
+  await page.locator('[name="cleanup-category"][value="browser-cache"]').uncheck();
+  assert.equal(await confirm.isDisabled(), true);
+  releasePreview();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  assert.deepEqual(calls.cleanup.at(-1), { categories: ['temporary-files', 'task-output'], preview: true });
+  assert.match(await page.locator('#cleanup-summary').textContent(), /5\.1 MB/u);
+  await page.unroute('**/v1/cleanup', holdPreview);
+  await page.keyboard.press('Escape');
+  checks.push('rapid selection changes serialize previews and only the latest matching preview enables cleanup');
+
+  await page.locator('#open-cleanup').click();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  const executionsBefore = calls.cleanup.filter((entry) => !entry.preview).length;
+  await confirm.evaluate((node) => { node.click(); node.click(); });
+  await page.locator('#cleanup-summary').getByText('已清理文件大小', { exact: true }).waitFor();
+  assert.equal(calls.cleanup.filter((entry) => !entry.preview).length, executionsBefore + 1);
+  assert.deepEqual(calls.cleanup.at(-1), { categories: defaults, preview: false });
+  assert.equal(cleanupBehavior.historicalOutputPresent, true);
+  assert.match(await page.locator('#cleanup-summary').textContent(), /544 KB.*4 个文件/u);
+  assert.equal(await confirm.isDisabled(), true);
+  await page.keyboard.press('Escape');
+  checks.push('one explicit confirmation sends one fresh non-preview request and reports actual bytes/files while preserving historical output');
+
+  cleanupBehavior.failPreview = true;
+  await page.locator('#open-cleanup').click();
+  await page.locator('#cleanup-error:not(.hidden)').waitFor();
+  assert.equal(await confirm.isDisabled(), true);
+  await page.locator('#retry-cleanup').click();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  cleanupBehavior.failExecution = true;
+  const failureRequestsBefore = calls.cleanup.filter((entry) => !entry.preview).length;
+  await confirm.click();
+  await page.locator('#cleanup-error').getByText(/清理结果未确认/u).waitFor();
+  assert.equal(calls.cleanup.filter((entry) => !entry.preview).length, failureRequestsBefore + 1);
+  assert.equal(await confirm.isDisabled(), true);
+  await page.locator('#retry-cleanup').click();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  cleanupBehavior.partial = true;
+  await output.check();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  await confirm.click();
+  await page.locator('#cleanup-summary').getByText('已清理文件大小', { exact: true }).waitFor();
+  assert.equal(cleanupBehavior.historicalOutputPresent, false);
+  assert.deepEqual(calls.cleanup.at(-1), { categories: [...defaults, 'task-output'], preview: false });
+  assert.match(await page.locator('#cleanup-summary').textContent(), /部分项目未清理/u);
+  assert.match(await page.locator('#cleanup-details').textContent(), /1 项未能清理.*Finished sample.*File is busy/u);
+  if (cleanupScreenshotPaths) await page.screenshot({ path: cleanupScreenshotPaths.result, fullPage: true });
+  await page.keyboard.press('Escape');
+  cleanupBehavior.partial = false;
+  checks.push('busy-preview and failed-cleanup retries require a new preview; opted-in output cleanup shows partial failures and skips truthfully');
+
+  await page.locator('#language-toggle').click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: 'Clean up space', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  assert.equal(await page.getByRole('dialog', { name: 'Clean up space', exact: true }).count(), 1);
+  assert.equal(await output.isChecked(), false);
+  assert.match(await page.locator('#cleanup-safety').textContent(), /Login state and extensions are preserved/u);
+  assert.match(await confirm.textContent(), /Clean selected/u);
+  const layout = await page.locator('#cleanup-dialog').evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    return { width: innerWidth, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+      height: innerHeight, overflow: node.scrollWidth > node.clientWidth };
+  });
+  assert.ok(layout.left >= 0 && layout.right <= layout.width && layout.top >= 0 && layout.bottom <= layout.height);
+  assert.equal(layout.overflow, false);
+  const actionBounds = await confirm.boundingBox();
+  assert.ok(actionBounds.y >= layout.top && actionBounds.y + actionBounds.height <= layout.bottom,
+    'mobile confirmation must be fully visible without scrolling');
+  assert.equal(await confirm.evaluate((node) => getComputedStyle(node).color), 'rgb(9, 9, 9)');
+  assert.equal(await page.locator('.cleanup-option').evaluateAll((nodes) => nodes.every((node) => node.getBoundingClientRect().height >= 44)), true);
+  await page.keyboard.press('Tab');
+  assert.equal(await page.locator('#cleanup-dialog').evaluate((node) => node.contains(document.activeElement)), true);
+  assert.notEqual(await page.evaluate(() => getComputedStyle(document.activeElement).outlineStyle), 'none');
+  if (cleanupScreenshotPaths) await page.screenshot({ path: cleanupScreenshotPaths.mobile, fullPage: true });
+  await page.keyboard.press('Escape');
+  await page.locator('#language-toggle').click();
+  await page.setViewportSize({ width: 1440, height: 960 });
+  checks.push('cleanup has translated English labels, contained keyboard focus, and a bounded scrollable mobile dialog');
+}
+
 const server = http.createServer((request, response) => {
   void handler(request, response).catch((error) => {
     json(response, 500, { error: { code: 'FIXTURE_FAILURE', message: error.message } });
@@ -374,6 +533,7 @@ try {
   assert.match(await page.locator('.task-card').filter({ hasText: 'Review open-ended feed' }).textContent(), /已处理 31/u);
   assert.equal(await page.locator('.task-card.is-targeted').count(), 1);
   checks.push('fixed Dashboard URL loads Tasks first, deep-links one task, and renders bounded and open-ended progress');
+  await checkCleanup(page, checks);
 
   const rejectApi = (route) => route.abort('connectionrefused');
   await page.route('**/v1/**', rejectApi);
@@ -521,11 +681,11 @@ try {
     await page.screenshot({ path: screenshotPath, fullPage: true });
   }
 
-  const allowedApi = /^\/v1\/(?:status|tasks(?:\/[^/]+(?:\/actions)?)?|profiles(?:\/[^/]+(?:\/actions)?)?)$/u;
+  const allowedApi = /^\/v1\/(?:status|cleanup|tasks(?:\/[^/]+(?:\/actions)?)?|profiles(?:\/[^/]+(?:\/actions)?)?)$/u;
   const unexpectedApi = calls.requests.filter((entry) => entry.pathname.startsWith('/v1/') && !allowedApi.test(entry.pathname));
   assert.deepEqual(unexpectedApi, []);
   assert.deepEqual(pageErrors, []);
-  checks.push('Dashboard uses only status, task, and Profile APIs and raises no page errors');
+  checks.push('Dashboard uses only status, task, Profile, and cleanup APIs and raises no page errors');
 
   const report = {
     ok: true,
@@ -537,7 +697,8 @@ try {
     profileActions: calls.profileActions,
     profileRenames: calls.profileRenames,
     profileDeletes: calls.profileDeletes,
-    screenshots: screenshotPath ? { tasks: screenshotPath, profiles: profilesScreenshotPath } : null,
+    cleanupRequests: calls.cleanup,
+    screenshots: screenshotPath ? { tasks: screenshotPath, profiles: profilesScreenshotPath, cleanup: cleanupScreenshotPaths } : null,
     pageErrors
   };
   if (reportPath) {

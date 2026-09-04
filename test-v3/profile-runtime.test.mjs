@@ -52,6 +52,7 @@ test('manual Profile retains its lease until failed close is contained', async (
     profileStore: store,
     workerFactory: () => worker,
     processAlive: (pid) => alive.has(pid),
+    profileUsageProbe: async () => 'inactive',
     closeTimeoutMs: 20,
     terminateTree: async () => {
       if (!terminationWorks) return false;
@@ -109,6 +110,7 @@ test('Profile observes worker rejection before delayed lease acquisition complet
         profileStore: store,
         workerFactory: () => worker,
         processAlive: (pid) => alive.has(pid),
+        profileUsageProbe: async () => 'inactive',
         terminateTree: async () => { if (alive.has(worker.pid)) worker.terminate(); return true; },
         closeTimeoutMs: 20
       });
@@ -136,6 +138,7 @@ test('Profile runtime preserves worker startup diagnostics through cleanup', asy
     profileStore: store,
     workerFactory: () => worker,
     processAlive: (pid) => alive.has(pid),
+    profileUsageProbe: async () => 'inactive',
     terminateTree: async () => { worker.terminate(); return true; },
     closeTimeoutMs: 20
   });
@@ -145,4 +148,21 @@ test('Profile runtime preserves worker startup diagnostics through cleanup', asy
     return true;
   });
   assert.equal((await store.get()).lease, null);
+});
+
+test('terminated manual Worker does not release a Profile with a surviving browser', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9303, alive);
+  const store = startupStore();
+  const runtime = createProfileRuntime({
+    profileStore: store,
+    workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid),
+    profileUsageProbe: async () => 'active',
+    terminateTree: async () => { worker.terminate(); return true; },
+    closeTimeoutMs: 20
+  });
+  await runtime.openProfile('startup-profile');
+  await assert.rejects(runtime.closeProfile('startup-profile'), { code: 'PROFILE_CLEANUP_UNCONFIRMED' });
+  assert.ok((await store.get()).lease, 'surviving Chrome must retain the one-writer fence');
 });
