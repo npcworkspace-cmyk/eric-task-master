@@ -30,6 +30,7 @@ let workerPid;
 let profileId;
 let taskId;
 let failure;
+let launcherInvoked = false;
 const cleanupErrors = [];
 const report = { ok: false, archive, extractedToPathWithSpaces: true, checks: [], cleanup: {} };
 
@@ -75,6 +76,21 @@ function samePath(left, right) {
 
 async function cli(parameters, timeout = 45_000) {
   const all = [...parameters, '--state-dir', stateDir, '--port', String(port)];
+  let windowsShell;
+  let windowsCommandLine;
+  if (process.platform === 'win32') {
+    windowsShell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
+    // cmd.exe expands shell syntax even inside quotes. Accept only this CI path/argument alphabet.
+    if (/[^\p{L}\p{N} :/\\._@-]/u.test(windowsShell)) {
+      throw new Error('PORTABLE_WINDOWS_ARGUMENT_REJECTED: Windows shell path contains unsupported characters');
+    }
+    windowsCommandLine = `"${[launcher, ...all].map((value) => {
+      if (typeof value !== 'string' || value.length === 0 || /[^\p{L}\p{N} :/\\._@-]/u.test(value)) {
+        throw new Error('PORTABLE_WINDOWS_ARGUMENT_REJECTED: Windows launcher arguments contain unsupported shell characters');
+      }
+      return `"${value}"`;
+    }).join(' ')}"`;
+  }
   const env = {
     ...process.env, ERIC_TASK_MASTER_HOME: stateDir, ERIC_TASK_MASTER_PORT: String(port),
     NODE_OPTIONS: '--require=__portable_host_injection_must_not_load__',
@@ -83,8 +99,10 @@ async function cli(parameters, timeout = 45_000) {
   let result;
   let commandError;
   try {
+    launcherInvoked = true;
     result = process.platform === 'win32'
-      ? await command(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${[launcher, ...all].map((value) => `"${value}"`).join(' ')}"`], {
+      ? await execute(windowsShell, ['/d', '/v:off', '/s', '/c', windowsCommandLine], {
+        cwd: temporaryRoot, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
         env, timeout, windowsVerbatimArguments: true
       })
       : await command(launcher, all, { env, timeout });
@@ -158,7 +176,7 @@ try {
 } catch (error) {
   failure = error;
 } finally {
-  if (port && manifest) {
+  if (launcherInvoked && port && manifest) {
     for (const operation of [
       ...(taskId ? [['stop', taskId, '--json'], ['delete', taskId, '--json']] : []),
       ...(profileId ? [['profiles', 'close', profileId, '--json'], ['profiles', 'delete', profileId, '--json']] : []),
@@ -177,6 +195,7 @@ try {
     while (Date.now() < deadline && (isProcessAlive(managerPid) || isProcessAlive(workerPid) || await portOpen())) await sleep(100);
   }
   const profileUsage = profileId ? await probeChromeProfileUsage(join(stateDir, 'profiles', profileId)) : 'inactive';
+  report.launcherInvoked = launcherInvoked;
   report.cleanup = { managerExited: !isProcessAlive(managerPid), workerExited: !isProcessAlive(workerPid), portClosed: !(await portOpen()), profileUsage, errors: cleanupErrors };
   if (!report.cleanup.managerExited || !report.cleanup.workerExited || !report.cleanup.portClosed || profileUsage !== 'inactive') cleanupErrors.push('Portable process or Profile cleanup is unconfirmed');
   try {
