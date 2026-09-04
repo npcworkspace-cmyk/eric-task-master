@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import fsPromises, { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import fsPromises, { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -72,8 +72,15 @@ class Worker extends EventEmitter {
   }
 }
 
-async function fixture(t, { profileUsageProbe = async () => 'inactive' } = {}) {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cleanup-test-'));
+async function fixture(t, { profileUsageProbe = async () => 'inactive', useRootAlias = false } = {}) {
+  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cleanup-test-'));
+  let root = fixtureRoot;
+  if (useRootAlias) {
+    const realRoot = path.join(fixtureRoot, 'real');
+    await mkdir(realRoot);
+    root = path.join(fixtureRoot, 'alias');
+    await symlink(realRoot, root, process.platform === 'win32' ? 'junction' : 'dir');
+  }
   const alive = new Set();
   const workers = [];
   const profileStore = new ProfileStore({
@@ -103,7 +110,7 @@ async function fixture(t, { profileUsageProbe = async () => 'inactive' } = {}) {
   });
   t.after(async () => {
     await service.close();
-    await removeTestTree(root);
+    await removeTestTree(fixtureRoot);
   });
   const createTask = async (selectedProfile = profile) => {
     const task = await service.create({ modulePath: source, profileId: selectedProfile.id });
@@ -325,14 +332,16 @@ test('Profile cleanup reserves only its Profile while other reads run and task l
 });
 
 test('task cleanup holds only its task reservation and rejects deletion until disk work finishes', async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, { useRootAlias: true });
   const item = await f.finishTask(await f.createTask());
   await put(path.join(item.outputDir, 'result.txt'));
+  const canonicalOutputDir = await realpath(item.outputDir);
+  assert.notEqual(path.resolve(item.outputDir), canonicalOutputDir, 'fixture must exercise a filesystem alias');
   const entered = deferred();
   const release = deferred();
   const original = fsPromises.readdir;
   const mock = t.mock.method(fsPromises, 'readdir', async (directory, ...args) => {
-    if (path.resolve(String(directory)) === path.resolve(item.outputDir)) {
+    if (await realpath(directory) === canonicalOutputDir) {
       entered.resolve();
       await release.promise;
     }
