@@ -15,10 +15,14 @@ const expected = [
   `eric-task-master-v${version}-windows-x64-portable.zip`,
   `eric-task-master-v${version}-windows-x64-setup.exe`,
   `eric-task-master-v${version}-macos-arm64.pkg`,
+  `eric-task-master-v${version}-macos-arm64-portable.zip`,
   `eric-task-master-v${version}-macos-x64.pkg`,
+  `eric-task-master-v${version}-macos-x64-portable.zip`,
   `eric-task-master-v${version}-linux-x64.deb`,
+  `eric-task-master-v${version}-linux-x64-portable.zip`,
   `eric-task-master-v${version}-linux-x64-portable.tar.gz`,
   `eric-task-master-v${version}-linux-arm64.deb`,
+  `eric-task-master-v${version}-linux-arm64-portable.zip`,
   `eric-task-master-v${version}-linux-arm64-portable.tar.gz`
 ];
 const expectedTargets = ['linux-arm64', 'linux-x64', 'macos-arm64', 'macos-x64', 'windows-x64'];
@@ -73,7 +77,7 @@ await writeFile(join(output, 'UNSIGNED-BUILD.txt'), [
   'Windows and macOS artifacts are not code-signed; Linux packages are not repository-signed.',
   'The repository did not have Authenticode or Apple Developer ID credentials when this release was built.',
   'Verify every download against SHA256SUMS. CI is not a platform signature.',
-  'CI validates installation, bundled Node, a bare Playwright task, stable Chrome launch, Manager lifecycle, and uninstall.',
+  'CI validates native installation and portable ZIP startup, bundled Node, a bare Playwright task, stable Chrome launch, Manager lifecycle, and cleanup.',
   ''
 ].join('\n'));
 process.stdout.write(`${JSON.stringify({

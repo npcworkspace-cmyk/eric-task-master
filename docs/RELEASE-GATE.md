@@ -23,7 +23,9 @@ Every CI job runs `npm run check`, stages a self-contained Manager with bundled 
 | Linux x64 | `ubuntu-24.04` | `release-linux-x64` |
 | Linux arm64 | `ubuntu-24.04-arm` | `release-linux-arm64` |
 
-Each artifact contains its native packages, bundle manifest, SPDX inventory, target checksum file, and acceptance evidence. The CI workflow runs for `main`, version branches matching `v*` (including `v3.0.0`), and `upgrade/**` pushes, all pull requests, and manual diagnostics. Only a successful `main` **push** run is eligible for release.
+Each job also extracts the target's portable ZIP after native uninstall, then runs its launcher and a real Chrome task using bundled Node in isolated state. Payload hashes, POSIX executable permissions, paths containing spaces, host Node environment isolation, and process/Profile cleanup must pass.
+
+Each artifact contains its native packages, portable ZIP, bundle manifest, SPDX inventory, target checksum file, and acceptance evidence. The CI workflow runs for `main`, version branches matching `v*` (including `v3.0.0`), and `upgrade/**` pushes, all pull requests, and manual diagnostics. Only a successful `main` **push** run is eligible for release.
 
 ## Publication
 

@@ -9,10 +9,10 @@ Google Chrome is intentionally not redistributed. The Manager uses a locally ins
 | Target | Package | Installation scope |
 | --- | --- | --- |
 | Windows 10/11 x64 | `windows-x64-setup.exe` and portable ZIP | per user, under Local AppData |
-| macOS Apple silicon | `macos-arm64.pkg` | system package; CLI at `/usr/local/bin/taskmaster` |
-| macOS Intel | `macos-x64.pkg` | system package; CLI at `/usr/local/bin/taskmaster` |
-| Debian/Ubuntu Linux x64 | `linux-x64.deb` and portable tarball | system package; CLI at `/usr/bin/taskmaster` |
-| Debian/Ubuntu Linux arm64 | `linux-arm64.deb` and portable tarball | system package; CLI at `/usr/bin/taskmaster` |
+| macOS Apple silicon | `macos-arm64.pkg` and portable ZIP | system installer or per-user extraction |
+| macOS Intel | `macos-x64.pkg` and portable ZIP | system installer or per-user extraction |
+| Debian/Ubuntu Linux x64 | `linux-x64.deb`, portable ZIP and tarball | system installer or per-user extraction |
+| Debian/Ubuntu Linux arm64 | `linux-arm64.deb`, portable ZIP and tarball | system installer or per-user extraction |
 
 The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.0.2` target. Windows arm64 is not a native `v3.0.2` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
 
@@ -25,6 +25,26 @@ Install stable Google Chrome first. Then use the package matching the operating 
 - Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.0.2-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
 
 `taskmaster --help` is the installation check. User data is created only when the Manager or another command starts.
+
+## Portable ZIP fallback
+
+Every target has `eric-task-master-v3.0.2-<target>-portable.zip`. Choose `windows-x64`, `macos-arm64` (Apple silicon), `macos-x64` (Intel), `linux-arm64`, or `linux-x64`. This is a complete Manager runtime, not the separate `eric-task-master-skill-v3.0.2.zip` instructions archive.
+
+1. Download the matching ZIP and `SHA256SUMS` from the same Release. Compare SHA-256 using `Get-FileHash` on Windows, `shasum -a 256` on macOS, or `sha256sum` on Linux.
+2. Extract into a permanent, user-writable folder. Preserve the entire `eric-task-master/` tree, including `runtime/` and `app/`. On macOS/Linux, `unzip PACKAGE.zip -d DESTINATION` preserves the launcher's executable permissions.
+3. Invoke the extracted launcher directly; it needs neither PATH setup nor a system Node.js installation:
+
+   ```powershell
+   & 'C:\Tools\eric-task-master\bin\taskmaster.cmd' panel
+   ```
+
+   ```bash
+   '/absolute/path/eric-task-master/bin/taskmaster' panel
+   ```
+
+Use that same absolute launcher for `run`, `follow`, and other commands. No administrator access is needed for extraction or startup. Stable Chrome and the platform requirements above still apply. Unsigned binaries may still require OS approval; a ZIP does not bypass Gatekeeper or SmartScreen.
+
+Before replacing or moving a portable runtime, stop its Manager with `manager stop --json`. Extract updates into a fresh application folder rather than merging files. User Profiles and task data remain in the separate Task Master user-state directory.
 
 ## Upgrading from 2.x
 
@@ -64,13 +84,15 @@ bash scripts/build/package-macos.sh dist/stage/macos-arm64 dist/release
 bash scripts/build/package-linux.sh dist/stage/linux-x64 dist/release
 ```
 
-Windows packaging uses Inno Setup 6. macOS packaging uses Apple's `pkgbuild`. Linux packaging uses `dpkg-deb` and GNU tar. These are build-time tools only and are not required by the user.
+Windows packaging uses Inno Setup 6. macOS packaging uses Apple's `pkgbuild` and `ditto`. Linux packaging uses `dpkg-deb`, GNU tar, and `zip`. These are build-time tools only and are not required by the user.
 
 ## Verification boundary
 
 CI must build on the target architecture, verify the pinned Node archive SHA-256, inspect the staged tree, install the native package, and run a disposable task that uses a bare `import { chromium } from 'playwright'` before uninstalling. This proves the installed Manager, bundled Node, Playwright module resolution, stable Chrome launch, task lifecycle, and native uninstaller together. Source acceptance separately exercises the complete Manager gate. The GitHub Linux arm64 runner does not preinstall Chrome, so that native job installs Google's official arm64 stable package solely for acceptance; Chrome is never copied into a Task Master artifact.
 
 Local Windows acceptance proves the Windows package on the maintainer's machine. Native GitHub runners provide separate macOS and Linux evidence; Windows success is not presented as macOS/Linux success.
+
+After native uninstall, each target also extracts its portable ZIP into a path containing spaces, verifies its payload hash and executable permissions, and invokes the extracted launcher with an isolated state directory. A real stable Chrome task must pass using bundled Node and Playwright, followed by verified Worker, Manager, Profile, and temporary-directory cleanup. This is separate evidence for the installer-free route.
 
 ## Unsigned `v3.0.2` boundary
 

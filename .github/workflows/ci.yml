@@ -103,7 +103,22 @@ jobs:
         shell: bash
         run: xvfb-run --auto-servernum bash scripts/install/smoke-linux.sh "$(find dist/release -maxdepth 1 -name '*.deb' -print -quit)"
       - name: Write target checksums
+        # Portable startup runs after native uninstall so it cannot depend on that installation.
         run: node scripts/build/checksums.mjs --dir dist/release --output dist/release/SHA256SUMS-${{ matrix.target }}
+      - name: Extract portable ZIP and run a real Chrome task
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          node scripts/install/smoke-portable.mjs --archive "dist/release/eric-task-master-v${version}-${{ matrix.target }}-portable.zip"
+      - name: Extract portable ZIP and run a real Chrome task with a display
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          xvfb-run --auto-servernum node scripts/install/smoke-portable.mjs --archive "dist/release/eric-task-master-v${version}-${{ matrix.target }}-portable.zip"
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

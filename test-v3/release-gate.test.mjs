@@ -37,6 +37,9 @@ test('CI exercises the complete gate on every advertised native target', async (
   assert.match(ci, /Install, start, stop, and uninstall Windows package/u);
   assert.match(ci, /Install, start, stop, and uninstall macOS package/u);
   assert.match(ci, /Install, start, stop, and uninstall Linux package/u);
+  assert.equal(count(ci, 'scripts/install/smoke-portable.mjs --archive'), 2, 'both Linux and non-Linux paths must exercise extracted ZIPs');
+  assert.match(ci, /xvfb-run --auto-servernum node scripts\/install\/smoke-portable.mjs/u);
+  assert.ok(ci.indexOf('Extract portable ZIP') > ci.indexOf('Install, start, stop, and uninstall Linux package'), 'portable tests must run independently after native uninstall');
 });
 
 test('CodeQL produces same-SHA main push evidence', async () => {

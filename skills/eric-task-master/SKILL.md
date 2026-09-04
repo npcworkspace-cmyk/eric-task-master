@@ -5,7 +5,7 @@ description: Run durable local Chrome automation with the installed Task Master 
 
 # Eric Task Master
 
-Use the installed `taskmaster` command. For a normal request, do not inspect the project source or create another controller.
+Use the installed or extracted portable `taskmaster` launcher. For a normal request, do not inspect the project source or create another controller.
 
 ## Run the task
 
@@ -20,7 +20,9 @@ Use the installed `taskmaster` command. For a normal request, do not inspect the
 4. Follow it with `taskmaster follow TASK_ID --json`. Report meaningful processed counts during a long run.
 5. Read the output files and deliver every usable result, including partial results from a stopped or failed run.
 
-Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. If `taskmaster` is not on PATH after installation, use the installed launcher directly: Windows `%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`; macOS `/usr/local/bin/taskmaster`; Linux `/usr/bin/taskmaster`. Only request installation if that launcher is also missing. If Manager reports `DEFAULT_PROFILE_REQUIRED`, ask the user to create or choose a Profile in `taskmaster panel`; do not install another controller.
+Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. If `taskmaster` is not on PATH, use its known portable location or the installed launcher directly: Windows `%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`; macOS `/usr/local/bin/taskmaster`; Linux `/usr/bin/taskmaster`. If Manager reports `DEFAULT_PROFILE_REQUIRED`, ask the user to create or choose a Profile in `taskmaster panel`; do not install another controller.
+
+For deployment when no launcher is available, use the [latest Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest). If the installer fails, download its `eric-task-master-v<VERSION>-<TARGET>-portable.zip`: TARGET is `windows-x64`, `macos-arm64`, `macos-x64`, `linux-arm64`, or `linux-x64`, matching this computer. Verify `SHA256SUMS`, extract to a permanent folder, and use the absolute `eric-task-master/bin/taskmaster.cmd` (Windows) or `eric-task-master/bin/taskmaster` (macOS/Linux) path for every command. It bundles Node.js and Playwright; only stable Chrome must already be installed. The separate Skill ZIP is instructions, not the Manager. OS security approval may still be required; ZIP does not bypass it.
 
 ## Minimal task module
 

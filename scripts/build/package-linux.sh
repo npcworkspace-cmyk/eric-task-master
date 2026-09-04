@@ -14,6 +14,7 @@ case "${target}" in
 esac
 
 mkdir -p "${output_dir}"
+output_dir="$(cd "${output_dir}" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 deb_root="${work}/deb"
@@ -40,8 +41,11 @@ EOF
 
 deb_asset="${output_dir}/eric-task-master-v${version}-${target}.deb"
 tar_asset="${output_dir}/eric-task-master-v${version}-${target}-portable.tar.gz"
-rm -f "${deb_asset}" "${tar_asset}"
+zip_asset="${output_dir}/eric-task-master-v${version}-${target}-portable.zip"
+rm -f "${deb_asset}" "${tar_asset}" "${zip_asset}"
 dpkg-deb --build --root-owner-group "${deb_root}" "${deb_asset}"
 tar --sort=name --owner=0 --group=0 --numeric-owner -czf "${tar_asset}" -C "${stage_root}" eric-task-master
-test -f "${deb_asset}" && test -f "${tar_asset}"
-printf '{"ok":true,"target":"%s","signed":false,"assets":["%s","%s"]}\n' "${target}" "${deb_asset}" "${tar_asset}"
+test -x "${runtime_root}/bin/taskmaster" && test -x "${runtime_root}/runtime/node"
+(cd "$(dirname "${runtime_root}")" && zip -q -r -y "${zip_asset}" eric-task-master)
+test -f "${deb_asset}" && test -f "${tar_asset}" && test -f "${zip_asset}"
+printf '{"ok":true,"target":"%s","signed":false,"assets":["%s","%s","%s"]}\n' "${target}" "${deb_asset}" "${tar_asset}" "${zip_asset}"
