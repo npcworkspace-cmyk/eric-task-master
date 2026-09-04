@@ -345,6 +345,28 @@ button { color: inherit; }
 
 .toast.is-error { border-color: var(--npc-danger-line); color: var(--npc-danger-text); background: var(--npc-danger-bg); }
 
+.cleanup-dialog { width: min(580px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 24px; overflow-y: auto; border: 1px solid var(--npc-line); border-radius: 26px; color: var(--npc-ink); background: var(--npc-paper-bright); box-shadow: 0 24px 80px rgba(9, 9, 9, .24); }
+.cleanup-dialog::backdrop { background: rgba(9, 9, 9, .45); }
+.cleanup-note { margin: 16px 0; color: #4f4e49; font-size: 12px; line-height: 1.65; }
+.cleanup-options { display: grid; gap: 8px; min-width: 0; margin: 20px 0; padding: 0; border: 0; }
+.cleanup-options legend { margin-bottom: 10px; color: #4f4e49; font-size: 12px; font-weight: 700; }
+.cleanup-option { display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: start; gap: 12px; min-height: 44px; padding: 14px; border: 1px solid var(--npc-line); border-radius: var(--npc-radius-control); cursor: pointer; }
+.cleanup-option:hover { background: var(--npc-paper); }
+.cleanup-option:has(input:checked) { border-color: var(--npc-placeholder); background: var(--npc-paper); }
+.cleanup-option input { width: 20px; height: 20px; margin: 0; accent-color: var(--npc-ink); }
+.cleanup-option strong { display: block; font-size: 13px; line-height: 1.5; }
+.cleanup-option small { display: block; margin-top: 4px; color: #4f4e49; font-size: 11px; line-height: 1.6; }
+.cleanup-options:disabled .cleanup-option { opacity: .55; cursor: wait; }
+.cleanup-summary { display: grid; gap: 6px; min-height: 91px; padding: 16px; border-radius: var(--npc-radius-control); background: var(--npc-paper); }
+.cleanup-summary small, .cleanup-summary p { margin: 0; color: #4f4e49; font-size: 12px; line-height: 1.5; }
+.cleanup-summary strong { font: 700 26px/1.2 var(--npc-font-mono); font-variant-numeric: tabular-nums; }
+.cleanup-details { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.cleanup-details h3 { margin: 16px 0 6px; font-size: 12px; }
+.cleanup-details ul { margin: 0; padding-left: 20px; }
+.cleanup-details .cleanup-failed { color: var(--npc-danger-text); }
+.cleanup-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.cleanup-actions .npc-btn { min-width: 120px; }
+
 @media (max-width: 980px) {
   .app-header { grid-template-columns: 1fr auto; }
   .primary-nav { grid-row: 2; grid-column: 1 / -1; justify-self: center; }
@@ -382,6 +404,12 @@ button { color: inherit; }
   .profile-actions .npc-btn-danger { margin-left: 0; }
   .system-banner { align-items: stretch; flex-direction: column; }
   .toast { right: 16px; bottom: 16px; }
+  .cleanup-dialog { padding: 20px; border-radius: 20px; }
+  .cleanup-dialog .cleanup-note { margin: 12px 0; }
+  .cleanup-options { margin: 16px 0; }
+  .cleanup-option { padding: 12px; }
+  .cleanup-actions { position: sticky; bottom: 0; padding-top: 12px; background: var(--npc-paper-bright); }
+  .cleanup-actions .npc-btn { flex: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {

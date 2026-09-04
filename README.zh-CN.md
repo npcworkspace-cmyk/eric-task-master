@@ -16,6 +16,7 @@ Agent 内置浏览器往往短暂且不适合长任务；直接控制浏览器�
 - **真实登录态：**命名 Profile 使用本机稳定版 Chrome，登录一次长期保留。
 - **多 Agent 并行：**不同 Profile 可以同时运行；同一 Profile 保持单写。
 - **边做边交付：**处理多少就保留多少，任务停止不否定已有结果。
+- **验证不丢任务：**暂停时保留浏览器，每 5 分钟截图一次、最多 4 次，由 Agent 判断或用户手动恢复。
 - **自动收尾：**回收僵尸租约；停止和删除会终止所属进程并释放 Profile。
 - **对接极简：**只有 CLI 和本机面板，没有 MCP、浏览器插件、配对码和 Task Pack 资产库。
 
@@ -26,11 +27,11 @@ Agent 内置浏览器往往短暂且不适合长任务；直接控制浏览器�
 从[最新 GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)下载两个文件：
 
 1. 对应系统和 CPU 的 Manager **安装包或便携 ZIP**；
-2. `eric-task-master-skill-v3.0.2.zip`。
+2. `eric-task-master-skill-v3.0.3.zip`。
 
 Manager 安装包自带 Node.js、Playwright、CLI、本机面板和后台服务，只使用电脑上已安装的稳定版 Google Chrome，不再下载独立 Chromium。
 
-安装失败时，下载 `eric-task-master-v3.0.2-<target>-portable.zip`，核对 `SHA256SUMS` 后解压到长期保留的文件夹。Windows 运行 `eric-task-master/bin/taskmaster.cmd panel`，macOS/Linux 运行 `eric-task-master/bin/taskmaster panel`。无需安装器、管理员权限或单独安装 Node.js。[选择对应包与部署说明](docs/INSTALLERS.md#portable-zip-fallback)。
+安装失败时，下载 `eric-task-master-v3.0.3-<target>-portable.zip`，核对 `SHA256SUMS` 后解压到长期保留的文件夹。Windows 运行 `eric-task-master/bin/taskmaster.cmd panel`，macOS/Linux 运行 `eric-task-master/bin/taskmaster panel`。无需安装器、管理员权限或单独安装 Node.js。[选择对应包与部署说明](docs/INSTALLERS.md#portable-zip-fallback)。
 
 安装后运行：
 
@@ -38,7 +39,9 @@ Manager 安装包自带 Node.js、Playwright、CLI、本机面板和后台服务
 taskmaster panel
 ```
 
-创建 Profile，在打开的 Chrome 窗口里登录一次并设为默认。然后把 Skill 给 Agent，直接告诉它任务。
+创建 Profile，在打开的原生 Chrome 窗口里登录，关闭该窗口并设为默认，任务会复用同一 Profile。然后把 Skill 给 Agent，直接告诉它任务。网站仍可能要求再次验证。
+
+面板的「清理空间」可清理闲置 Profile 的浏览器缓存与已结束任务的临时脚本；历史截图、下载和结果需单独勾选。登录态、扩展数据和正在使用的任务不会被清理。
 
 ## Agent 固定路径
 

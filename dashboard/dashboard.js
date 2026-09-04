@@ -17,6 +17,37 @@ const I18N = Object.freeze({
     'common.loading': '读取中',
     'common.close': '关闭',
     'common.delete': '删除',
+    'cleanup.open': '清理空间',
+    'cleanup.safety': '保留登录状态和扩展。运行中、等待中的任务，以及占用或手动打开的 Profiles 会跳过。',
+    'cleanup.select': '选择要清理的内容',
+    'cleanup.cache': '浏览器缓存',
+    'cleanup.cacheNote': '仅清理闲置浏览器的缓存，保留登录数据。',
+    'cleanup.temporary': '无用临时脚本和文件',
+    'cleanup.temporaryNote': '仅清理 Manager 确认可移除的临时文件。',
+    'cleanup.output': '历史截图、下载和结果',
+    'cleanup.outputNote': '默认保留；勾选后将永久删除可清理的历史产物。',
+    'cleanup.confirmNote': '预览不会删除文件。实际清理会重新检查；删除无法撤销。',
+    'cleanup.confirm': '清理所选',
+    'cleanup.retry': '重新预览',
+    'cleanup.estimating': '正在估算所选空间…',
+    'cleanup.estimate': '预计可释放',
+    'cleanup.freed': '已清理文件大小',
+    'cleanup.files': '{files} 个文件',
+    'cleanup.choose': '请至少选择一项，再查看预览。',
+    'cleanup.running': '正在清理所选内容…',
+    'cleanup.skipped': '已跳过 {count} 项',
+    'cleanup.failed': '{count} 项未能清理',
+    'cleanup.partial': '部分项目未清理，请查看下方原因。',
+    'cleanup.invalid': '清理响应与所选内容不匹配，请重新预览。',
+    'cleanup.unconfirmed': '清理结果未确认，请重新预览并核对当前空间后再试。',
+    'cleanup.reason.PROFILE_BUSY': 'Profile 正在使用，已保留',
+    'cleanup.reason.BROWSER_OPEN': '浏览器手动打开中，已保留',
+    'cleanup.reason.BROWSER_USAGE_UNKNOWN': '无法确认浏览器是否闲置，已保留',
+    'cleanup.reason.TASK_ACTIVE_OR_CLEANUP_UNCONFIRMED': '任务运行、等待中，或尚未确认进程已关闭',
+    'cleanup.reason.MANAGED_DIRECTORY_UNSAFE': '目录安全性未通过检查',
+    'cleanup.reason.STAGED_MODULE_NOT_FILE': '暂存脚本不是普通文件',
+    'cleanup.reason.INVALID_CLEANUP_PATH': '清理路径无效',
+    'cleanup.reason.SYMLINK_OR_JUNCTION': '链接目录或文件已保留',
     'connection.connecting': '正在连接本机 Manager',
     'connection.online': '本机 Manager 在线',
     'connection.offline': 'Manager 暂时离线',
@@ -107,6 +138,37 @@ const I18N = Object.freeze({
     'common.loading': 'Loading',
     'common.close': 'Close',
     'common.delete': 'Delete',
+    'cleanup.open': 'Clean up space',
+    'cleanup.safety': 'Login state and extensions are preserved. Running or waiting tasks, busy Profiles, and manually opened Profiles are skipped.',
+    'cleanup.select': 'Choose what to clean',
+    'cleanup.cache': 'Browser cache',
+    'cleanup.cacheNote': 'Only clears idle browser caches; login data is kept.',
+    'cleanup.temporary': 'Unused temporary scripts and files',
+    'cleanup.temporaryNote': 'Only temporary files Manager identifies as safe to remove.',
+    'cleanup.output': 'Historical screenshots, downloads, and results',
+    'cleanup.outputNote': 'Kept by default. Selecting this permanently deletes eligible historical output.',
+    'cleanup.confirmNote': 'Preview deletes nothing. Cleanup checks again before removing files. Deletion cannot be undone.',
+    'cleanup.confirm': 'Clean selected',
+    'cleanup.retry': 'Preview again',
+    'cleanup.estimating': 'Estimating selected space…',
+    'cleanup.estimate': 'Estimated space to free',
+    'cleanup.freed': 'Deleted file size',
+    'cleanup.files': '{files} files',
+    'cleanup.choose': 'Select at least one category to preview.',
+    'cleanup.running': 'Cleaning selected content…',
+    'cleanup.skipped': '{count} items skipped',
+    'cleanup.failed': '{count} items could not be cleaned',
+    'cleanup.partial': 'Some items were not cleaned. See the reasons below.',
+    'cleanup.invalid': 'The cleanup response does not match your selection. Preview again.',
+    'cleanup.unconfirmed': 'The cleanup result is unconfirmed. Preview again and check the current space before retrying.',
+    'cleanup.reason.PROFILE_BUSY': 'Profile is in use; preserved',
+    'cleanup.reason.BROWSER_OPEN': 'Browser is manually open; preserved',
+    'cleanup.reason.BROWSER_USAGE_UNKNOWN': 'Cannot confirm the browser is idle; preserved',
+    'cleanup.reason.TASK_ACTIVE_OR_CLEANUP_UNCONFIRMED': 'Task is running or waiting, or process shutdown is unconfirmed',
+    'cleanup.reason.MANAGED_DIRECTORY_UNSAFE': 'Directory did not pass safety checks',
+    'cleanup.reason.STAGED_MODULE_NOT_FILE': 'Staged script is not a regular file',
+    'cleanup.reason.INVALID_CLEANUP_PATH': 'Invalid cleanup path',
+    'cleanup.reason.SYMLINK_OR_JUNCTION': 'Linked file or directory preserved',
     'connection.connecting': 'Connecting to local Manager',
     'connection.online': 'Local Manager online',
     'connection.offline': 'Manager temporarily offline',
@@ -220,6 +282,11 @@ const state = {
   stopped: false
 };
 
+const cleanup = {
+  sequence: 0, previewRequest: null, preview: null, previewKey: '',
+  loading: false, executing: false, result: null, error: ''
+};
+
 const ui = {
   navLinks: [...document.querySelectorAll('[data-view]')],
   viewPanels: [...document.querySelectorAll('[data-view-panel]')],
@@ -241,7 +308,17 @@ const ui = {
   profileName: document.querySelector('#profile-name'),
   profiles: document.querySelector('#profiles'),
   profilesError: document.querySelector('#profiles-error'),
-  message: document.querySelector('#dashboard-message')
+  message: document.querySelector('#dashboard-message'),
+  openCleanup: document.querySelector('#open-cleanup'),
+  cleanupDialog: document.querySelector('#cleanup-dialog'),
+  closeCleanup: document.querySelector('#close-cleanup'),
+  cleanupOptions: document.querySelector('#cleanup-options'),
+  cleanupCategories: [...document.querySelectorAll('[name="cleanup-category"]')],
+  cleanupSummary: document.querySelector('#cleanup-summary'),
+  cleanupError: document.querySelector('#cleanup-error'),
+  cleanupDetails: document.querySelector('#cleanup-details'),
+  retryCleanup: document.querySelector('#retry-cleanup'),
+  confirmCleanup: document.querySelector('#confirm-cleanup')
 };
 
 function t(key, values = {}) {
@@ -276,6 +353,7 @@ function setLanguage(language) {
     markOffline();
   }
   renderAll();
+  renderCleanup();
 }
 
 class HttpError extends Error {
@@ -360,6 +438,124 @@ function setToast(message, kind = 'success') {
   ui.message.textContent = message;
   ui.message.className = `toast is-${kind}`;
   state.toastTimer = setTimeout(() => ui.message.classList.add('hidden'), 4_500);
+}
+
+function cleanupSelection() {
+  return ui.cleanupCategories.filter((node) => node.checked).map((node) => node.value);
+}
+
+function formatBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const index = bytes > 0 ? Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1) : 0;
+  return `${new Intl.NumberFormat(state.language, { maximumFractionDigits: index ? 1 : 0 }).format(bytes / (1024 ** index))} ${units[index]}`;
+}
+
+function cleanupResponse(payload, categories, preview) {
+  const value = dataFrom(payload);
+  const validCount = (number) => Number.isSafeInteger(number) && number >= 0;
+  if (value?.ok !== true || value.preview !== preview || !validCount(value.bytes) || !validCount(value.files) ||
+      !Array.isArray(value.skipped) || !Array.isArray(value.failed) || !Array.isArray(value.categories) ||
+      value.categories.map((category) => category.id).join(',') !== categories.join(',')) {
+    throw new Error(t('cleanup.invalid'));
+  }
+  return value;
+}
+
+function renderCleanup() {
+  const selectionKey = cleanupSelection().join(',');
+  const currentPreview = cleanup.preview && cleanup.previewKey === selectionKey;
+  ui.cleanupOptions.disabled = cleanup.executing;
+  ui.closeCleanup.disabled = cleanup.executing;
+  ui.confirmCleanup.disabled = cleanup.executing || cleanup.loading || !currentPreview || !selectionKey;
+  ui.confirmCleanup.textContent = t(cleanup.executing ? 'cleanup.running' : 'cleanup.confirm');
+  ui.retryCleanup.classList.toggle('hidden', !cleanup.error && !cleanup.result);
+  ui.retryCleanup.disabled = cleanup.loading || cleanup.executing;
+  ui.cleanupSummary.setAttribute('aria-busy', String(cleanup.loading || cleanup.executing));
+  setInlineError(ui.cleanupError, cleanup.error);
+  ui.cleanupSummary.replaceChildren();
+  ui.cleanupDetails.replaceChildren();
+  const report = cleanup.result || (currentPreview ? cleanup.preview : null);
+  if (cleanup.executing || cleanup.loading || !report) {
+    ui.cleanupSummary.append(element('p', '', t(cleanup.executing ? 'cleanup.running'
+      : cleanup.loading ? 'cleanup.estimating' : 'cleanup.choose')));
+  } else {
+    ui.cleanupSummary.append(
+      element('small', '', t(cleanup.result ? 'cleanup.freed' : 'cleanup.estimate')),
+      element('strong', 'npc-number', formatBytes(report.bytes)),
+      element('small', '', t('cleanup.files', { files: report.files }))
+    );
+    if (cleanup.result && report.failed.length) ui.cleanupSummary.append(element('p', '', t('cleanup.partial')));
+    for (const kind of ['skipped', 'failed']) {
+      if (!report[kind].length) continue;
+      const section = element('section', `cleanup-${kind}`);
+      const list = element('ul');
+      section.append(element('h3', '', t(`cleanup.${kind}`, { count: report[kind].length })), list);
+      for (const item of report[kind]) {
+        const reasonKey = `cleanup.reason.${item.reason}`;
+        const reason = I18N.en[reasonKey] ? t(reasonKey) : item.reason || '—';
+        list.append(element('li', '', `${item.name || item.id || item.kind || '—'}${item.path ? ` · ${item.path}` : ''} · ${reason}`));
+      }
+      ui.cleanupDetails.append(section);
+    }
+  }
+}
+
+async function previewCleanup() {
+  if (cleanup.executing) return;
+  const sequence = ++cleanup.sequence;
+  const categories = cleanupSelection();
+  cleanup.preview = null;
+  cleanup.previewKey = '';
+  cleanup.result = null;
+  cleanup.error = '';
+  cleanup.loading = categories.length > 0;
+  renderCleanup();
+  if (!categories.length) return;
+  // Serialize previews: a rapid selection change must not race Manager's cleanup lock.
+  await cleanup.previewRequest?.catch(() => {});
+  if (!ui.cleanupDialog.open || sequence !== cleanup.sequence) return;
+  const operation = request('/v1/cleanup', { method: 'POST', body: { categories, preview: true } });
+  cleanup.previewRequest = operation;
+  try {
+    const result = cleanupResponse(await operation, categories, true);
+    if (!ui.cleanupDialog.open || sequence !== cleanup.sequence) return;
+    cleanup.preview = result;
+    cleanup.previewKey = categories.join(',');
+  } catch (error) {
+    if (sequence === cleanup.sequence) cleanup.error = error.message || t('error.read');
+  } finally {
+    if (cleanup.previewRequest === operation) cleanup.previewRequest = null;
+    if (sequence === cleanup.sequence) {
+      cleanup.loading = false;
+      renderCleanup();
+    }
+  }
+}
+
+function openCleanup() {
+  if (ui.cleanupDialog.open) return;
+  for (const node of ui.cleanupCategories) node.checked = node.defaultChecked;
+  ui.cleanupDialog.showModal();
+  void previewCleanup();
+}
+
+async function executeCleanup() {
+  const categories = cleanupSelection();
+  if (cleanup.executing || cleanup.loading || !cleanup.preview || !categories.length ||
+      cleanup.previewKey !== categories.join(',')) return;
+  cleanup.executing = true;
+  cleanup.preview = null;
+  cleanup.error = '';
+  renderCleanup();
+  try {
+    const result = await request('/v1/cleanup', { method: 'POST', body: { categories, preview: false } });
+    cleanup.result = cleanupResponse(result, categories, false);
+  } catch (error) {
+    cleanup.error = `${t('cleanup.unconfirmed')} ${error.message || t('error.operation')}`;
+  } finally {
+    cleanup.executing = false;
+    renderCleanup();
+  }
 }
 
 function formatClock(value) {
@@ -883,6 +1079,20 @@ ui.retryOffline.addEventListener('click', () => void refreshAll());
 ui.toggleProfileCreate.addEventListener('click', () => profileCreateVisible(true));
 ui.closeProfileCreate.addEventListener('click', () => profileCreateVisible(false));
 ui.createProfileForm.addEventListener('submit', createProfile);
+ui.openCleanup.addEventListener('click', openCleanup);
+ui.closeCleanup.addEventListener('click', () => ui.cleanupDialog.close());
+ui.cleanupOptions.addEventListener('change', () => void previewCleanup());
+ui.retryCleanup.addEventListener('click', () => void previewCleanup());
+ui.confirmCleanup.addEventListener('click', () => void executeCleanup());
+ui.cleanupDialog.addEventListener('cancel', (event) => {
+  if (cleanup.executing) event.preventDefault();
+});
+ui.cleanupDialog.addEventListener('close', () => {
+  cleanup.sequence += 1;
+  cleanup.preview = null;
+  cleanup.loading = false;
+  ui.openCleanup.focus();
+});
 
 document.addEventListener('visibilitychange', () => {
   scheduleRefresh();

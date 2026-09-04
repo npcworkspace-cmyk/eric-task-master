@@ -122,40 +122,100 @@ async function closeContext(context, timeoutMs = 10_000) {
   }
 }
 
-async function captureFailure(context, outputDir) {
-  const pages = context?.pages?.().filter((page) => !page.isClosed?.()).reverse() ?? [];
+async function captureSnapshot(context, outputDir, relativePath = 'failure.png', { budget, signal, targetPage } = {}) {
+  const pages = (targetPage ? [targetPage] : context?.pages?.().slice().reverse() ?? [])
+    .filter((page) => !page.isClosed?.());
   if (pages.length === 0) return null;
-  const filePath = path.join(outputDir, 'failure.png');
-  for (const page of pages) {
+  const filePath = path.join(outputDir, relativePath);
+  let releaseReservation;
+  let written = false;
+  let maximumBytes = Infinity;
+  // Only observation is timed out. No page action is retried by this helper.
+  const bounded = async (operation) => {
+    if (signal?.aborted) throw new Error('Screenshot stopped');
+    let timer;
+    let abort;
     try {
-      await page.screenshot({ path: filePath, fullPage: false, timeout: 10_000 });
-      return 'failure.png';
-    } catch {
-      // Stable Chrome can occasionally reject the higher-level screenshot
-      // while its target is still readable. CDP is the bounded fallback.
-    }
-    let session;
-    try {
-      session = await context.newCDPSession(page);
-      const captured = await session.send('Page.captureScreenshot', {
-        format: 'png',
-        fromSurface: true,
-        captureBeyondViewport: false
-      });
-      if (!captured?.data) continue;
-      await writeFile(filePath, Buffer.from(captured.data, 'base64'), { mode: 0o600 });
-      return 'failure.png';
-    } catch {
-      // Try another live page before accepting that no image is available.
+      return await Promise.race([
+        Promise.resolve().then(() => {
+          if (signal?.aborted) throw new Error('Screenshot stopped');
+          return operation();
+        }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Screenshot timed out')), 10_000);
+          abort = () => reject(new Error('Screenshot stopped'));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener('abort', abort, { once: true });
+        })
+      ]);
     } finally {
-      await session?.detach?.().catch(() => {});
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
     }
+  };
+  try {
+    if (budget) {
+      const usage = await budget.assertWithinBudget();
+      // Do not make the scanner exceed its entry limit merely by creating
+      // the diagnostic directory and one image while the task is paused.
+      if (usage.entries + 2 > budget.limits.maxEntries) return null;
+      maximumBytes = budget.limits.diagnosticReserveBytes - usage.diagnosticBytes;
+      if (usage.diagnosticFiles >= budget.limits.diagnosticReserveFiles || maximumBytes <= 0) return null;
+      await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+      releaseReservation = await budget.reserveDiagnostic(filePath);
+    }
+    for (const page of pages) {
+      if (signal?.aborted) return null;
+      let bytes;
+      try {
+        bytes = await bounded(() => page.screenshot({ fullPage: false, timeout: 10_000 }));
+      } catch {
+        let session;
+        let expired = false;
+        try {
+          const captured = await bounded(async () => {
+            session = await context.newCDPSession(page);
+            if (expired || signal?.aborted) {
+              void session.detach?.().catch(() => {});
+              session = null;
+              throw new Error('Screenshot stopped');
+            }
+            return session.send('Page.captureScreenshot', {
+              format: 'png', fromSurface: true, captureBeyondViewport: false
+            });
+          });
+          if (captured?.data && Buffer.byteLength(captured.data, 'base64') <= maximumBytes) {
+            bytes = Buffer.from(captured.data, 'base64');
+          }
+        } catch {
+          // Another live page may still be readable.
+        } finally {
+          expired = true;
+          void session?.detach?.().catch(() => {});
+        }
+      }
+      if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > maximumBytes || signal?.aborted) continue;
+      await writeFile(filePath, bytes, { mode: 0o600, flag: budget ? 'wx' : 'w' });
+      written = true;
+      return relativePath;
+    }
+  } catch {
+    // A missing screenshot is an unknown observation, never a resume decision.
+  } finally {
+    if (!written) releaseReservation?.();
   }
   return null;
 }
 
+export function resumeTaskWorker(value = null, match = {}) {
+  return externalResume(value, match);
+}
+
 export async function runTaskWorker(config, {
   loadPlaywright = () => import('playwright'),
+  sendMessage = send,
+  verificationProbeIntervalMs = 5 * 60_000,
+  heartbeatIntervalMs = 10_000,
   signal
 } = {}) {
   processCleanupConfirmed = false;
@@ -169,12 +229,36 @@ export async function runTaskWorker(config, {
   let context;
   let heartbeat;
   let timeout;
+  let timeoutStartedAt = null;
+  let timeoutRemainingMs = Number.isSafeInteger(config.timeoutMs) && config.timeoutMs > 0
+    ? config.timeoutMs
+    : null;
   let stopBudget = () => {};
   let activeWait = null;
   const startedAt = new Date().toISOString();
 
-  const resumeWait = (value = null) => {
+  const armTimeout = () => {
+    if (timeoutRemainingMs === null || controller.signal.aborted) return;
+    timeoutStartedAt = Date.now();
+    timeout = setTimeout(() => {
+      const error = Object.assign(new Error(`Task exceeded ${config.timeoutMs}ms`), { code: 'TASK_TIMEOUT' });
+      if (!controller.signal.aborted) controller.abort(error);
+    }, timeoutRemainingMs);
+    timeout.unref?.();
+  };
+
+  const pauseTimeout = () => {
+    if (timeoutRemainingMs === null || timeoutStartedAt === null) return;
+    timeoutRemainingMs = Math.max(1, timeoutRemainingMs - (Date.now() - timeoutStartedAt));
+    timeoutStartedAt = null;
+    clearTimeout(timeout);
+    timeout = null;
+  };
+
+  const resumeWait = (value = null, { waitId, probeId } = {}) => {
     if (!activeWait) return false;
+    if (waitId !== undefined && activeWait.id !== waitId) return false;
+    if (probeId !== undefined && activeWait.probeId !== probeId) return false;
     const waiter = activeWait;
     activeWait = null;
     waiter.resolve(value);
@@ -198,18 +282,12 @@ export async function runTaskWorker(config, {
       if (!controller.signal.aborted) controller.abort(error);
     });
 
-    if (Number.isSafeInteger(config.timeoutMs) && config.timeoutMs > 0) {
-      timeout = setTimeout(() => {
-        const error = Object.assign(new Error(`Task exceeded ${config.timeoutMs}ms`), { code: 'TASK_TIMEOUT' });
-        if (!controller.signal.aborted) controller.abort(error);
-      }, config.timeoutMs);
-      timeout.unref?.();
-    }
+    armTimeout();
 
-    send({ type: 'state', state: 'running', at: startedAt });
-    heartbeat = setInterval(() => send({ type: 'heartbeat', at: new Date().toISOString() }), 10_000);
+    sendMessage({ type: 'state', state: 'running', at: startedAt });
+    heartbeat = setInterval(() => sendMessage({ type: 'heartbeat', at: new Date().toISOString() }), heartbeatIntervalMs);
     heartbeat.unref?.();
-    send({ type: 'heartbeat', at: new Date().toISOString() });
+    sendMessage({ type: 'heartbeat', at: new Date().toISOString() });
     const playwright = await loadPlaywright();
     context = await launchChromeProfile(playwright, config.profile);
     const page = context.pages()[0] || await context.newPage();
@@ -219,45 +297,95 @@ export async function runTaskWorker(config, {
       if (controller.signal.aborted) throw controller.signal.reason;
       const value = normalizeProgress(update);
       await outputBudget.assertWithinBudget();
-      send({ type: 'progress', progress: value, at: new Date().toISOString() });
+      sendMessage({ type: 'progress', progress: value, at: new Date().toISOString() });
       return value;
     };
 
     const emit = async (value) => {
       if (controller.signal.aborted) throw controller.signal.reason;
       const event = safeJson(value, { maximumBytes: 64 * 1024 });
-      send({ type: 'event', event, at: new Date().toISOString() });
+      sendMessage({ type: 'event', event, at: new Date().toISOString() });
       return event;
     };
 
-    const waitForResume = async ({ reason = 'waiting', resumeAfterMs = null, data = null } = {}) => {
+    const waitForResume = async ({ reason = 'waiting', resumeAfterMs = null, data = null, page: targetPage = page } = {}) => {
       if (controller.signal.aborted) throw controller.signal.reason;
       if (activeWait) throw Object.assign(new Error('Task already has an active wait'), { code: 'TASK_ALREADY_WAITING' });
       if (resumeAfterMs !== null && (!Number.isSafeInteger(resumeAfterMs) || resumeAfterMs < 0)) {
         throw new TypeError('resumeAfterMs must be null or a non-negative integer');
+      }
+      const verification = String(reason).trim().toLowerCase() === 'verification';
+      if (verification && resumeAfterMs !== null) {
+        throw new TypeError('verification waits use the Manager probe schedule and cannot set resumeAfterMs');
       }
       const waiting = {
         id: `wait_${randomUUID().replaceAll('-', '')}`,
         reason: String(reason).slice(0, 1_000),
         data: safeJson(data, { maximumBytes: 64 * 1024 }),
         startedAt: new Date().toISOString(),
+        ...(verification ? {
+          kind: 'verification',
+          probeIntervalMs: 5 * 60_000,
+          maximumProbes: 4,
+          nextProbeAt: new Date(Date.now() + 5 * 60_000).toISOString()
+        } : {}),
         ...(resumeAfterMs === null ? {} : {
           resumeAfterMs,
           resumeAt: new Date(Date.now() + resumeAfterMs).toISOString()
         })
       };
-      send({ type: 'waiting', waiting });
+      sendMessage({ type: 'waiting', waiting });
       let timer;
+      let probeTimer;
+      let probeCount = 0;
+      const probeStartedAt = Date.now();
+      const scheduleProbe = () => {
+        probeTimer = setTimeout(async () => {
+          if (!activeWait || activeWait.id !== waiting.id || controller.signal.aborted) return;
+          probeCount += 1;
+          const probeId = `probe_${randomUUID().replaceAll('-', '')}`;
+          activeWait.probeId = probeId;
+          const screenshot = await captureSnapshot(context, config.outputDir,
+            `screenshots/${probeStartedAt}-${waiting.id}-${probeCount}.png`,
+            { budget: outputBudget, signal: controller.signal, targetPage });
+          if (!activeWait || activeWait.id !== waiting.id || controller.signal.aborted) return;
+          sendMessage({
+            type: 'event',
+            event: {
+              type: 'verification.probe',
+              waitId: waiting.id,
+              probeId,
+              probe: probeCount,
+              maximumProbes: 4,
+              screenshot,
+              screenshotPath: screenshot ? path.join(config.outputDir, screenshot) : null,
+              needsAgentDecision: true,
+              automaticProbesComplete: probeCount === 4,
+              nextProbeAt: probeCount === 4 ? null :
+                new Date(probeStartedAt + (probeCount + 1) * verificationProbeIntervalMs).toISOString()
+            },
+            at: new Date().toISOString()
+          });
+          if (probeCount < 4) scheduleProbe();
+        }, Math.max(0, probeStartedAt + (probeCount + 1) * verificationProbeIntervalMs - Date.now()));
+        probeTimer.unref?.();
+      };
       try {
+        if (verification) {
+          pauseTimeout();
+          scheduleProbe();
+        }
         const value = await new Promise((resolve, reject) => {
           activeWait = { id: waiting.id, resolve, reject };
           if (resumeAfterMs !== null) timer = setTimeout(() => resumeWait(null), resumeAfterMs);
         });
         if (controller.signal.aborted) throw controller.signal.reason;
-        send({ type: 'resumed', waitId: waiting.id, at: new Date().toISOString() });
+        sendMessage({ type: 'resumed', waitId: waiting.id, at: new Date().toISOString() });
+        if (verification) armTimeout();
         return value;
       } finally {
         clearTimeout(timer);
+        clearTimeout(probeTimer);
         if (activeWait?.id === waiting.id) activeWait = null;
       }
     };
@@ -295,15 +423,15 @@ export async function runTaskWorker(config, {
     const result = await Promise.race([taskPromise, stoppedPromise]);
     await outputBudget.assertWithinBudget();
     const normalized = safeJson(result);
-    send({ type: 'result', result: normalized, at: new Date().toISOString() });
-    send({ type: 'state', state: 'finished', at: new Date().toISOString() });
+    sendMessage({ type: 'result', result: normalized, at: new Date().toISOString() });
+    sendMessage({ type: 'state', state: 'finished', at: new Date().toISOString() });
     return { state: 'finished', result: normalized };
   } catch (error) {
     const stopped = error instanceof TaskStoppedError || error?.code === 'TASK_STOPPED';
-    const screenshot = stopped ? null : await captureFailure(context, config.outputDir);
+    const screenshot = stopped ? null : await captureSnapshot(context, config.outputDir);
     const payload = normalizeTaskError(error, { stopped, screenshot });
-    send({ type: 'error', state: stopped ? 'stopped' : 'error', error: payload, at: new Date().toISOString() });
-    send({ type: 'state', state: stopped ? 'stopped' : 'error', at: new Date().toISOString() });
+    sendMessage({ type: 'error', state: stopped ? 'stopped' : 'error', error: payload, at: new Date().toISOString() });
+    sendMessage({ type: 'state', state: stopped ? 'stopped' : 'error', at: new Date().toISOString() });
     return { state: stopped ? 'stopped' : 'error', error: payload };
   } finally {
     stopBudget();
@@ -340,7 +468,9 @@ if (typeof process.send === 'function') {
       return;
     }
     if (message?.type === 'stop') controller.abort(new TaskStoppedError());
-    if (message?.type === 'resume') externalResume(message.value ?? null);
+    if (message?.type === 'resume') resumeTaskWorker(message.value ?? null, {
+      waitId: message.waitId, probeId: message.probeId
+    });
     if (message?.type === 'cleanup_ack' && activeCleanupAck?.id === message.cleanupId) {
       activeCleanupAck.finish(true);
     }

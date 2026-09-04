@@ -51,12 +51,13 @@ async function inspectManualChromeSandbox(userDataDir) {
   // Inspect only the Chrome launched for this temporary acceptance Profile;
   // never include command lines or user Profile data in the report.
   const browsers = stdout.split(/\r?\n/u).filter((line) => (
-    line.includes('--remote-debugging-pipe') && !/(?:^|[\s"])--type=/u.test(line) &&
+    !/(?:^|[\s"])--type=/u.test(line) &&
     commandLineUsesProfile(line, userDataDir)
   ));
   return {
     matchedBrowsers: browsers.length,
-    noSandbox: browsers.some((line) => /(?:^|[\s"])--no-sandbox(?:$|[\s"=])/u.test(line))
+    noSandbox: browsers.some((line) => /(?:^|[\s"])--no-sandbox(?:$|[\s"=])/u.test(line)),
+    automationConnection: browsers.some((line) => /--remote-debugging-(?:pipe|port)|--enable-automation/u.test(line))
   };
 }
 
@@ -261,8 +262,9 @@ async function main() {
     const manualSandbox = await inspectManualChromeSandbox(path.join(stateDir, 'profiles', profileA.id));
     await cli(['profiles', 'close', profileA.id, '--json'], 60_000);
     const closed = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles.find((profile) => profile.id === profileA.id);
-    add('visible Profile open and close with Chrome sandbox',
-      opened.state === 'open' && closed.state === 'idle' && manualSandbox.matchedBrowsers === 1 && !manualSandbox.noSandbox,
+    add('native Profile opens and closes without an automation connection',
+      opened.state === 'open' && closed.state === 'idle' && manualSandbox.matchedBrowsers === 1 &&
+      !manualSandbox.noSandbox && !manualSandbox.automationConnection,
       JSON.stringify(manualSandbox));
 
     const browserRun = await cli(['run', browserJob, '--input', `@${inputPath}`, '--json'], 120_000,

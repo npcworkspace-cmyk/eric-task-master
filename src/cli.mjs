@@ -16,10 +16,10 @@ Fast path:
   taskmaster run JOB.mjs [--profile NAME_OR_ID] [--input JSON_OR_@FILE] [--label TEXT] [--detach]
 
 Tasks:
-  taskmaster follow TASK_ID
+  taskmaster follow TASK_ID [--after SEQUENCE]
   taskmaster status [TASK_ID]
   taskmaster stop TASK_ID
-  taskmaster resume TASK_ID [--value JSON_OR_@FILE]
+  taskmaster resume TASK_ID [--probe PROBE_ID] [--value JSON_OR_@FILE]
   taskmaster delete TASK_ID
   taskmaster files TASK_ID [--read RELATIVE_PATH]
 
@@ -447,12 +447,22 @@ async function followTask(taskId, options, json) {
           }, json);
       historyWarningEmitted = true;
     }
+    let attention = null;
     for (const event of result.events) {
       after = Math.max(after, event.sequence);
+      if (event.type === 'task.event' && event.data?.type === 'verification.probe') {
+        if (result.task.state !== 'waiting' || result.task.waiting?.id !== event.data.waitId ||
+            result.task.waiting?.probeId !== event.data.probeId) continue;
+        attention = event.data;
+      }
       emit(json ? { ok: true, taskId, event } : event, json);
     }
     lastState = result.task;
     if (TERMINAL_TASK_STATES.has(result.task.state)) break;
+    if (attention) {
+      emit(json ? { ok: true, task: lastState, attention, after } : { task: lastState, attention, after }, json);
+      return lastState;
+    }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   emit(json ? { ok: true, task: lastState } : lastState, json);
@@ -492,6 +502,10 @@ async function runCommand(args, options, json) {
 
 async function taskAction(action, taskId, options, json) {
   if (!taskId) throw cliError('TASK_ID_REQUIRED', `${action} requires TASK_ID`);
+  if (options.probe !== undefined &&
+      (typeof options.probe !== 'string' || !options.probe.trim() || options.probe.length > 160)) {
+    throw cliError('INVALID_PROBE_ID', '--probe requires a non-empty probe ID');
+  }
   const context = await apiContext(options);
   let result;
   if (action === 'delete') {
@@ -503,6 +517,7 @@ async function taskAction(action, taskId, options, json) {
       method: 'POST',
       body: {
         action,
+        ...(action === 'resume' && options.probe !== undefined ? { probeId: options.probe } : {}),
         ...(action === 'resume' && options.value !== undefined
           ? { value: await parseJsonInput(options.value, 'resume value') }
           : {})
@@ -722,7 +737,7 @@ async function main() {
     return statusCommand(args[0], options, json);
   }
   if (command === 'stop' || command === 'resume' || command === 'delete') {
-    assertAllowedOptions(options, command === 'resume' ? ['value'] : []);
+    assertAllowedOptions(options, command === 'resume' ? ['value', 'probe'] : []);
     return taskAction(command, args[0], options, json);
   }
   if (command === 'files') {

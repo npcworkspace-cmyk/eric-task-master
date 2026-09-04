@@ -30,10 +30,12 @@ class FakeWorker extends EventEmitter {
     this.alive = alive;
     this.config = null;
     this.rejectResume = false;
+    this.messages = [];
     alive.add(pid);
   }
 
   send(message, _handle, _options, callback) {
+    this.messages.push(message);
     if (message.type === 'resume' && this.rejectResume) {
       callback?.(new Error('IPC unavailable'));
       return;
@@ -47,7 +49,7 @@ class FakeWorker extends EventEmitter {
       });
     }
     if (message.type === 'resume') {
-      setImmediate(() => this.emit('message', { type: 'resumed', waitId: 'wait_fake' }));
+      setImmediate(() => this.emit('message', { type: 'resumed', waitId: message.waitId }));
     }
     if (message.type === 'stop') setImmediate(() => this.finish('stopped'));
   }
@@ -230,6 +232,47 @@ test('TaskService queues one writer, preserves partial output, and deletes atomi
   await service.resume(third.id, { continue: true });
   await until(async () => (await service.get(third.id)).state === 'running');
   await assert.rejects(service.resume(third.id, { continue: true }), { code: 'TASK_NOT_WAITING' });
+  workers[2].emit('message', {
+    type: 'waiting', waiting: { id: 'wait_verification', reason: 'verification' }
+  });
+  const probe = {
+    type: 'verification.probe', waitId: 'wait_verification', probeId: 'probe_current',
+    probe: 4, maximumProbes: 4, screenshot: 'screenshots/probe.png',
+    screenshotPath: path.join(workers[2].config.outputDir, 'screenshots', 'probe.png'),
+    needsAgentDecision: true, automaticProbesComplete: true, nextProbeAt: null
+  };
+  workers[2].emit('message', { type: 'event', event: probe });
+  workers[2].emit('message', { type: 'resumed', waitId: 'wait_fake' });
+  const waiting = await service.get(third.id);
+  assert.equal(waiting.state, 'waiting', 'an old resume ack must not release the current wait');
+  assert.equal(waiting.waiting.probeId, probe.probeId);
+  assert.equal(waiting.waiting.screenshotPath, probe.screenshotPath);
+  assert.equal(waiting.waiting.automaticProbesComplete, true);
+  assert.equal(waiting.waiting.nextProbeAt, null);
+  assert.equal(alive.has(workers[2].pid), true, 'four completed probes do not stop the Worker');
+  const persistedWaiting = JSON.parse(await readFile(path.join(root, 'tasks', 'tasks.json'), 'utf8'))
+    .tasks.find((task) => task.id === third.id).waiting;
+  assert.equal(persistedWaiting.probeId, probe.probeId);
+  assert.equal(persistedWaiting.screenshotPath, probe.screenshotPath);
+  workers[2].emit('message', {
+    type: 'event', event: { ...probe, waitId: 'wait_old', probeId: 'probe_old' }
+  });
+  assert.equal((await service.get(third.id)).waiting.probeId, probe.probeId);
+  await assert.rejects(service.resume(third.id, null, { waitId: 'wait_old' }), { code: 'TASK_WAIT_MISMATCH' });
+  await assert.rejects(service.resume(third.id, null, { probeId: 'probe_old' }), { code: 'TASK_PROBE_MISMATCH' });
+  await assert.rejects(service.resume(third.id, null, { probeId: true }), { code: 'INVALID_TASK_RESUME' });
+  await service.resume(third.id, { continue: true }, { waitId: probe.waitId, probeId: probe.probeId });
+  assert.deepEqual(workers[2].messages.findLast((message) => message.type === 'resume'), {
+    type: 'resume', waitId: probe.waitId, probeId: probe.probeId, value: { continue: true }
+  });
+  await until(async () => (await service.get(third.id)).state === 'running');
+  workers[2].emit('message', {
+    type: 'waiting', waiting: { id: 'wait_manual', reason: 'verification' }
+  });
+  await until(async () => (await service.get(third.id)).state === 'waiting');
+  await service.resume(third.id);
+  assert.equal(workers[2].messages.findLast((message) => message.type === 'resume').waitId, 'wait_manual');
+  await until(async () => (await service.get(third.id)).state === 'running');
   await workers[2].finish();
   await until(async () => (await service.get(third.id)).state === 'finished');
 

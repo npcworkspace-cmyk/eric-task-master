@@ -26,6 +26,7 @@
           <span id="connection-dot" class="npc-signal-dot is-pending" aria-hidden="true"></span>
           <span><strong id="connection-label" data-i18n="connection.connecting">正在连接本机 Manager</strong><small id="last-refresh" data-i18n="connection.never">尚未刷新</small></span>
         </div>
+        <button id="open-cleanup" class="npc-btn npc-btn-secondary" type="button" aria-haspopup="dialog" aria-controls="cleanup-dialog" data-i18n="cleanup.open">清理空间</button>
         <button id="language-toggle" class="npc-btn npc-btn-ghost language-button" type="button" aria-label="Switch to English" title="Switch to English">EN</button>
         <button id="refresh-all" class="npc-btn npc-btn-secondary icon-button" type="button" aria-label="刷新任务和 Profiles" title="刷新任务和 Profiles" data-i18n-aria-label="refresh.aria" data-i18n-title="refresh.title"><span aria-hidden="true">↻</span></button>
       </div>
@@ -70,6 +71,27 @@
 
       <p id="dashboard-message" class="toast hidden" role="status" aria-live="polite"></p>
     </main>
+    <dialog id="cleanup-dialog" class="cleanup-dialog" aria-labelledby="cleanup-title" aria-describedby="cleanup-safety">
+      <div class="compact-heading">
+        <div><p class="npc-eyebrow">LOCAL STORAGE</p><h2 id="cleanup-title" data-i18n="cleanup.open">清理空间</h2></div>
+        <button id="close-cleanup" class="npc-btn npc-btn-ghost compact-button" type="button" data-i18n="common.close" autofocus>关闭</button>
+      </div>
+      <p id="cleanup-safety" class="cleanup-note" data-i18n="cleanup.safety">保留登录状态和扩展。运行中、等待中的任务，以及占用或手动打开的 Profiles 会跳过。</p>
+      <fieldset id="cleanup-options" class="cleanup-options">
+        <legend data-i18n="cleanup.select">选择要清理的内容</legend>
+        <label class="cleanup-option"><input type="checkbox" name="cleanup-category" value="browser-cache" checked><span><strong data-i18n="cleanup.cache">浏览器缓存</strong><small data-i18n="cleanup.cacheNote">仅清理闲置浏览器的缓存，保留登录数据。</small></span></label>
+        <label class="cleanup-option"><input type="checkbox" name="cleanup-category" value="temporary-files" checked><span><strong data-i18n="cleanup.temporary">无用临时脚本和文件</strong><small data-i18n="cleanup.temporaryNote">仅清理 Manager 确认可移除的临时文件。</small></span></label>
+        <label class="cleanup-option"><input type="checkbox" name="cleanup-category" value="task-output"><span><strong data-i18n="cleanup.output">历史截图、下载和结果</strong><small data-i18n="cleanup.outputNote">默认保留；勾选后将永久删除可清理的历史产物。</small></span></label>
+      </fieldset>
+      <div id="cleanup-summary" class="cleanup-summary" role="status" aria-live="polite" aria-atomic="true"></div>
+      <p id="cleanup-error" class="inline-error hidden" role="alert"></p>
+      <div id="cleanup-details" class="cleanup-details"></div>
+      <p class="cleanup-note" data-i18n="cleanup.confirmNote">预览不会删除文件。实际清理会重新检查；删除无法撤销。</p>
+      <div class="cleanup-actions">
+        <button id="retry-cleanup" class="npc-btn npc-btn-secondary hidden" type="button" data-i18n="cleanup.retry">重新预览</button>
+        <button id="confirm-cleanup" class="npc-btn npc-btn-primary" type="button" disabled data-i18n="cleanup.confirm">清理所选</button>
+      </div>
+    </dialog>
     <script type="module" src="/dashboard/dashboard.js"></script>
   </body>
 </html>

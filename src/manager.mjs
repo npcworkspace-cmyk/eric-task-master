@@ -188,6 +188,15 @@ export async function createManager({
           sendJson(response, 200, { ok: true, ...(await taskService.status()) });
           return;
         }
+        if (request.method === 'POST' && pathname === '/v1/cleanup') {
+          const result = await taskService.cleanup(await readJson(request));
+          if (!result.preview) await journal.append({
+            level: 'info', event: 'space.cleaned',
+            message: `files=${result.files} bytes=${result.bytes} skipped=${result.skipped.length} failed=${result.failed.length}`
+          }).catch(() => {});
+          sendJson(response, 200, { ok: true, ...result });
+          return;
+        }
         if (request.method === 'GET' && pathname === '/v1/tasks') {
           sendJson(response, 200, { ok: true, tasks: await taskService.list() });
           return;
@@ -241,7 +250,13 @@ export async function createManager({
             return;
           }
           if (body.action === 'resume') {
-            sendJson(response, 200, { ok: true, task: await taskService.resume(taskId, body.value ?? null) });
+            sendJson(response, 200, {
+              ok: true,
+              task: await taskService.resume(taskId, body.value ?? null, {
+                ...(body.probeId === undefined ? {} : { probeId: body.probeId }),
+                ...(body.waitId === undefined ? {} : { waitId: body.waitId })
+              })
+            });
             return;
           }
           throw new HttpError(400, 'INVALID_TASK_ACTION', 'Task action must be stop or resume');

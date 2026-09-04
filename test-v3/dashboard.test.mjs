@@ -86,3 +86,37 @@ test('portable Skill contains only one CLI guide and its license', async () => {
   assert.doesNotMatch(skill, /task type|surface-probe|full-human|journey|ephemeral/iu);
   assert.ok(skill.split(/\r?\n/u).length <= 70, 'Skill should stay one-page and cheap to read');
 });
+
+test('cleanup is one accessible dialog with opt-in historical output and matching-preview confirmation', async () => {
+  const [html, source, css, acceptance] = await Promise.all([
+    text('dashboard/index.html'), text('dashboard/dashboard.js'), text('dashboard/styles.css'),
+    text('scripts/dashboard-acceptance.mjs')
+  ]);
+  assert.equal([...html.matchAll(/<dialog\b/gu)].length, 1);
+  assert.match(html, /<dialog[^>]+id="cleanup-dialog"[^>]+aria-labelledby="cleanup-title"[^>]+aria-describedby="cleanup-safety"/u);
+  assert.match(html, /id="open-cleanup"[^>]+aria-haspopup="dialog"/u);
+  const checkboxes = [...html.matchAll(/<input type="checkbox" name="cleanup-category" value="([^"]+)"([^>]*)>/gu)];
+  assert.deepEqual(checkboxes.map((match) => [match[1], /\bchecked\b/u.test(match[2])]), [
+    ['browser-cache', true], ['temporary-files', true], ['task-output', false]
+  ]);
+  assert.match(html, /id="confirm-cleanup"[^>]+disabled/u);
+  assert.match(source, /previewKey !== categories\.join\(','\)/u);
+  assert.match(source, /sequence !== cleanup\.sequence/u);
+  assert.match(source, /await cleanup\.previewRequest\?\.catch/u);
+  assert.match(source, /body: \{ categories, preview: true \}/u);
+  assert.match(source, /body: \{ categories, preview: false \}/u);
+  assert.match(source, /cleanup\.executing \|\| cleanup\.loading/u);
+  assert.match(source, /cleanup\.preview = null/u);
+  assert.match(source, /cleanupDialog\.addEventListener\('cancel'/u);
+  assert.match(source, /'cleanup\.open': '清理空间'/u);
+  assert.match(source, /'cleanup\.open': 'Clean up space'/u);
+  assert.match(source, /'cleanup\.freed': '已清理文件大小'/u);
+  assert.match(source, /'cleanup\.freed': 'Deleted file size'/u);
+  assert.match(source, /cleanup\.reason\.BROWSER_OPEN/u);
+  assert.match(css, /\.cleanup-dialog::backdrop/u);
+  assert.match(css, /max-height: calc\(100dvh - 32px\)/u);
+  assert.match(css, /\.cleanup-option[^}]+min-height: 44px/u);
+  for (const evidence of ['historicalOutputPresent', 'previewHeld', 'failPreview', 'failExecution', 'cleanupScreenshotPaths']) {
+    assert.ok(acceptance.includes(evidence), `Browser acceptance must cover ${evidence}`);
+  }
+});

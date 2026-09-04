@@ -207,6 +207,90 @@ test('CLI preserves terminal task payloads, exit status, and Manager error detai
   });
 });
 
+test('follow returns the current verification probe and cursor without ending the task', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-verification-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), `${JSON.stringify({ managerToken: 'p'.repeat(48) })}\n`);
+  const probe = {
+    type: 'verification.probe', waitId: 'wait_current', probeId: 'probe_current', probe: 4,
+    maximumProbes: 4, screenshot: 'screenshots/current.png',
+    screenshotPath: path.join(root, 'screenshots', 'current.png'),
+    needsAgentDecision: true, automaticProbesComplete: true, nextProbeAt: null
+  };
+  const waiting = { id: probe.waitId, reason: 'verification', ...probe };
+  const task = { id: 'task_probe', state: 'waiting', waiting };
+  const resumes = [];
+  let eventRequests = 0;
+  const server = http.createServer(async (request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
+      return;
+    }
+    if (request.url === '/v1/tasks/task_probe') {
+      response.end(JSON.stringify({ ok: true, task }));
+      return;
+    }
+    if (request.url === '/v1/tasks/task_probe/actions') {
+      let body = '';
+      for await (const chunk of request) body += chunk;
+      resumes.push(JSON.parse(body));
+      response.end(JSON.stringify({ ok: true, task }));
+      return;
+    }
+    const url = new URL(request.url, 'http://127.0.0.1');
+    if (url.pathname === '/v1/tasks/task_probe/events') {
+      eventRequests += 1;
+      const after = Number(url.searchParams.get('after'));
+      const events = [
+        { sequence: 1, type: 'task.event', data: { ...probe, waitId: 'wait_old', probeId: 'probe_old_wait' } },
+        { sequence: 2, type: 'task.event', data: { ...probe, probeId: 'probe_old' } },
+        { sequence: 3, type: 'task.event', data: probe },
+        { sequence: 4, type: 'progress', data: { current: 1, message: 'still waiting' } }
+      ].filter((event) => event.sequence > after);
+      response.end(JSON.stringify({
+        events,
+        task: eventRequests === 1 ? task : { ...task, state: 'finished', waiting: null },
+        nextAfter: events.at(-1)?.sequence ?? after,
+        truncated: false
+      }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'not found' } }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const common = ['--state-dir', root, '--port', String(server.address().port), '--json'];
+
+  const followed = await runCli(['follow', task.id, ...common]);
+  assert.equal(followed.code, 0, followed.stderr);
+  assert.equal(eventRequests, 1, 'follow should hand the new screenshot back to the Agent immediately');
+  assert.deepEqual(lastJson(followed.stdout), { ok: true, task, attention: probe, after: 4 });
+  assert.equal(followed.stdout.includes('probe_old'), false, 'old wait and probe images must not be reissued');
+  const continued = await runCli(['follow', task.id, '--after', '4', ...common]);
+  assert.equal(continued.code, 0, continued.stderr);
+  assert.equal(lastJson(continued.stdout).task.state, 'finished');
+  assert.equal(continued.stdout.includes('attention'), false);
+
+  const status = await runCli(['status', task.id, ...common]);
+  assert.equal(status.code, 0, status.stderr);
+  assert.equal(lastJson(status.stdout).task.waiting.screenshotPath, probe.screenshotPath);
+  assert.equal(lastJson(status.stdout).task.waiting.probeId, probe.probeId);
+  const automatic = await runCli(['resume', task.id, '--probe', probe.probeId, ...common]);
+  assert.equal(automatic.code, 0, automatic.stderr);
+  assert.deepEqual(resumes.at(-1), { action: 'resume', probeId: probe.probeId });
+  const manual = await runCli(['resume', task.id, ...common]);
+  assert.equal(manual.code, 0, manual.stderr);
+  assert.deepEqual(resumes.at(-1), { action: 'resume' });
+  const invalid = await runCli(['resume', task.id, '--probe', ...common]);
+  assert.equal(invalid.code, 1);
+  assert.equal(lastJson(invalid.stderr).error.code, 'INVALID_PROBE_ID');
+});
+
 test('non-JSON artifact reads stream every chunk to EOF', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-artifact-'));
   t.after(() => removeTestTree(root));

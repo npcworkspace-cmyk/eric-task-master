@@ -41,6 +41,14 @@ Only the entry `.mjs` is copied and frozen. Keep it self-contained: use Node bui
 
 If an action with an external effect has an unknown outcome, inspect the page or service before repeating it. Never put cookies, tokens, passwords, or authorization headers in progress messages or output files.
 
+## Verification waits
+
+When the task detects a verification page, stop dispatching work and call `await wait({ reason: 'verification' })`. If it is in another tab, pass `page: thatPage`. Detection belongs to the task; Manager does not intercept arbitrary raw scripts. Do not add a screenshot timer to the task.
+
+Manager retains Chrome, the Worker and heartbeat, freezes the execution timeout, and captures the page at 5, 10, 15 and 20 minutes. `follow` returns an `attention` record and `after` cursor for a new screenshot. Open `attention.screenshotPath` and judge it yourself. Only if clearly recovered, run `taskmaster resume TASK_ID --probe PROBE_ID --json` using its `attention.probeId`; otherwise send no resume. Continue `taskmaster follow TASK_ID --after SEQUENCE --json` using the returned `after`. Screenshot failure or uncertainty means remain paused, not retry browser actions.
+
+After the fourth unresolved probe, report that the browser remains open awaiting manual resume; no more screenshots run. The Dashboard Resume button or the user's request to resume maps to `taskmaster resume TASK_ID --json`. `stop` and `delete` still end the task and close its browser. Keep following during the four-probe window: CLI delivers events but cannot wake an Agent that has ended its turn or lost its terminal session.
+
 ## Control
 
 ```text
@@ -53,3 +61,5 @@ taskmaster panel
 ```
 
 Manager owns browser startup, one-writer Profile leases, process cleanup, and task persistence. The task module owns the work.
+
+For manual sign-in, open the Profile in the Dashboard or with `taskmaster profiles open NAME_OR_ID`: this is native Chrome without a debugging connection. Close all its windows before starting a task. Automation reuses that same Profile; individual sites can still require verification again.

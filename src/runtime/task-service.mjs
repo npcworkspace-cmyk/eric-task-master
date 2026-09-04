@@ -16,7 +16,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isTerminalTask, publicProfile, publicTask } from '../contracts.mjs';
 import { JsonStore } from '../lib/json-store.mjs';
-import { isProcessAlive, terminateProcessTree } from '../lib/process-tree.mjs';
+import { isProcessAlive, probeChromeProfileUsage, terminateProcessTree } from '../lib/process-tree.mjs';
+import { cleanManagedPath } from '../lib/space-cleanup.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
 import { ProfileStoreError } from '../lib/profile-store.mjs';
 import { createProfileRuntime } from './profile-runtime.mjs';
@@ -141,6 +142,7 @@ export function createTaskService({
   profileWorkerFactory = defaultWorkerFactory,
   terminateTree = terminateProcessTree,
   processAlive = isProcessAlive,
+  profileUsageProbe = probeChromeProfileUsage,
   now = Date.now,
   maxConcurrentTasks = 8,
   heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
@@ -168,6 +170,8 @@ export function createTaskService({
   const tombstoneCleanup = new Map();
   const deletingProfiles = new Set();
   const profileOperations = new Set();
+  const cleaningTasks = new Set();
+  let cleanupPromise = null;
   let mutationTail = Promise.resolve();
   let closing = false;
   let closePromise = null;
@@ -647,10 +651,25 @@ export function createTaskService({
         task.waiting = redactSensitiveValue(jsonClone(message.waiting, 'waiting'));
         appendEvent(task, 'task.waiting', task.waiting);
       } else if (message?.type === 'resumed') {
+        if (task.state !== 'waiting' || task.waiting?.id !== message.waitId) return;
         task.state = 'running';
         task.waiting = null;
         appendEvent(task, 'task.resumed', { waitId: message.waitId ?? null });
       } else if (message?.type === 'event') {
+        const probe = message.event;
+        if (probe?.type === 'verification.probe' && task.state === 'waiting' &&
+            task.waiting?.id === probe.waitId) {
+          Object.assign(task.waiting, redactSensitiveValue({
+            probeId: probe.probeId,
+            probe: probe.probe,
+            maximumProbes: probe.maximumProbes,
+            screenshot: probe.screenshot ?? null,
+            screenshotPath: probe.screenshotPath ?? null,
+            needsAgentDecision: true,
+            automaticProbesComplete: probe.automaticProbesComplete === true,
+            nextProbeAt: probe.nextProbeAt ?? null
+          }));
+        }
         appendEvent(task, 'task.event', message.event);
       } else if (message?.type === 'result') {
         task.result = redactSensitiveValue(message.result);
@@ -933,9 +952,14 @@ export function createTaskService({
     };
   }
 
-  async function resume(id, value = null) {
+  async function resume(id, value = null, { probeId, waitId } = {}) {
     await ready;
-    const entry = await serialize(async () => {
+    for (const reference of [probeId, waitId]) {
+      if (reference !== undefined && (typeof reference !== 'string' || !reference.trim() || reference.length > 160)) {
+        throw new TaskServiceError('INVALID_TASK_RESUME', 'Resume waitId and probeId must be non-empty strings');
+      }
+    }
+    const target = await serialize(async () => {
       const task = findTask(id);
       if (task.state !== 'waiting') {
         throw new TaskServiceError(
@@ -944,13 +968,27 @@ export function createTaskService({
           409
         );
       }
+      if (waitId !== undefined && waitId !== task.waiting?.id) {
+        throw new TaskServiceError('TASK_WAIT_MISMATCH', 'The task is no longer in that wait', 409);
+      }
+      if (probeId !== undefined && probeId !== task.waiting?.probeId) {
+        throw new TaskServiceError('TASK_PROBE_MISMATCH', 'The verification probe is no longer current', 409);
+      }
       const current = children.get(id);
       if (!current) throw new TaskServiceError('TASK_NOT_RUNNING', 'Waiting task has no live worker', 409);
-      appendEvent(task, 'task.resume_requested');
+      appendEvent(task, 'task.resume_requested', {
+        waitId: task.waiting?.id,
+        ...(probeId === undefined ? {} : { probeId })
+      });
       await persist();
-      return current;
+      return { entry: current, waitId: task.waiting?.id };
     });
-    const accepted = await send(entry.child, { type: 'resume', value: jsonClone(value, 'resume value') });
+    const accepted = await send(target.entry.child, {
+      type: 'resume',
+      waitId: target.waitId,
+      ...(probeId === undefined ? {} : { probeId }),
+      value: jsonClone(value, 'resume value')
+    });
     if (!accepted) {
       throw new TaskServiceError(
         'TASK_RESUME_FAILED',
@@ -1025,6 +1063,9 @@ export function createTaskService({
   async function deleteTask(id) {
     await ready;
     const retired = await serialize(async () => {
+      if (cleaningTasks.has(id)) {
+        throw new TaskServiceError('TASK_CLEANUP_ACTIVE', 'Task files are being cleaned; retry after cleanup', 409);
+      }
       const task = tasks.get(id);
       if (!task) return { entry: children.get(id) ?? null };
       const entry = children.get(id) ?? null;
@@ -1262,6 +1303,135 @@ export function createTaskService({
     }
   }
 
+  async function cleanup(options = {}) {
+    await ready;
+    const allowed = ['browser-cache', 'temporary-files', 'task-output'];
+    if (!options || typeof options !== 'object' || Array.isArray(options) ||
+        Object.keys(options).some((key) => !['categories', 'preview'].includes(key))) {
+      throw new TaskServiceError('INVALID_CLEANUP_OPTIONS', 'Cleanup accepts only categories and preview');
+    }
+    const { categories = allowed.slice(0, 2), preview = true } = options;
+    if (!Array.isArray(categories) || categories.length > 3 ||
+        categories.some((id) => !allowed.includes(id)) || new Set(categories).size !== categories.length ||
+        typeof preview !== 'boolean') {
+      throw new TaskServiceError('INVALID_CLEANUP_OPTIONS', 'Select known cleanup categories and a boolean preview');
+    }
+    if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
+    if (cleanupPromise) throw new TaskServiceError('CLEANUP_BUSY', 'Another space cleanup is active; retry shortly', 409);
+
+    const attempt = (async () => {
+      const result = {
+        preview, bytes: 0, files: 0, skipped: [], failed: [],
+        categories: categories.map((id) => ({ id, bytes: 0, files: 0 }))
+      };
+      const clean = async (categoryId, subject, rootPath, relativePath, linkOnly = false) => {
+        const parent = await lstat(path.dirname(rootPath)).catch(() => null);
+        if (!parent?.isDirectory() || parent.isSymbolicLink()) {
+          const issue = { path: relativePath, reason: 'MANAGED_DIRECTORY_UNSAFE' };
+          result.failed.push({ ...subject, ...issue });
+          return { bytes: 0, files: 0, skipped: [], failed: [issue] };
+        }
+        if (categoryId === 'temporary-files' && !linkOnly) {
+          const staged = await lstat(path.join(rootPath, relativePath)).catch(() => null);
+          if (staged && !staged.isFile() && !staged.isSymbolicLink()) {
+            const issue = { path: relativePath, reason: 'STAGED_MODULE_NOT_FILE' };
+            result.failed.push({ ...subject, ...issue });
+            return { bytes: 0, files: 0, skipped: [], failed: [issue] };
+          }
+        }
+        const value = await cleanManagedPath({ root: rootPath, relativePath, preview, linkOnly }).catch((error) => ({
+          bytes: 0, files: 0, skipped: [],
+          failed: [{ path: relativePath, reason: error.code || 'CLEANUP_IO_ERROR' }]
+        }));
+        const category = result.categories.find((item) => item.id === categoryId);
+        category.bytes += value.bytes;
+        category.files += value.files;
+        result.bytes += value.bytes;
+        result.files += value.files;
+        for (const key of ['skipped', 'failed']) {
+          result[key].push(...value[key].map((item) => ({ ...subject, ...item })));
+        }
+        return value;
+      };
+      if (categories.includes('browser-cache')) {
+        for (const candidate of await profileStore.list()) {
+          const subject = { kind: 'profile', id: candidate.id, name: candidate.name };
+          const profile = await serialize(async () => {
+            const current = await profileStore.get(candidate.id).catch(() => null);
+            if (!current || current.state !== 'idle' || current.lease ||
+                activeProfileIds().has(candidate.id) || deletingProfiles.has(candidate.id) ||
+                profileOperations.has(candidate.id)) return null;
+            profileOperations.add(candidate.id);
+            return current;
+          });
+          if (!profile) {
+            result.skipped.push({ ...subject, reason: 'PROFILE_BUSY' });
+            continue;
+          }
+          try {
+            const usage = await profileUsageProbe(profile.userDataDir).catch(() => 'unknown');
+            if (usage !== 'inactive') {
+              result.skipped.push({ ...subject, reason: usage === 'active' ? 'BROWSER_OPEN' : 'BROWSER_USAGE_UNKNOWN' });
+              continue;
+            }
+            // Only disposable Chrome caches. Never sweep *Cache*, site storage,
+            // extension data, cookies, preferences, or the userDataDir itself.
+            for (const cache of ['Cache', 'Code Cache', 'GPUCache']) {
+              await clean('browser-cache', subject, profile.userDataDir, `Default/${cache}`);
+            }
+          } finally {
+            await serialize(() => { profileOperations.delete(profile.id); });
+            void schedule();
+          }
+        }
+      }
+      if (categories.includes('temporary-files') || categories.includes('task-output')) {
+        for (const candidate of [...tasks.values()]) {
+          const subject = { kind: 'task', id: candidate.id, name: candidate.label };
+          const task = await serialize(async () => {
+            const current = tasks.get(candidate.id);
+            const profile = current ? await profileStore.get(current.profileId).catch(() => null) : null;
+            if (!current || !isTerminalTask(current) || children.has(current.id) ||
+                profile?.lease?.taskId === current.id) return null;
+            cleaningTasks.add(current.id);
+            return current;
+          });
+          if (!task) {
+            result.skipped.push({ ...subject, reason: 'TASK_ACTIVE_OR_CLEANUP_UNCONFIRMED' });
+            continue;
+          }
+          try {
+            const taskRoot = taskRootPath(root, task.id);
+            if (categories.includes('temporary-files')) {
+              await clean('temporary-files', subject, taskRoot, 'task.mjs');
+              await clean('temporary-files', subject, taskRoot, 'node_modules', true);
+            }
+            if (categories.includes('task-output')) {
+              const value = await clean('task-output', subject, taskRoot, 'output');
+              if (!preview) await serialize(async () => {
+                if (!value.failed.length && !value.skipped.length) task.outputClearedAt = nowIso(now);
+                appendEvent(task, 'task.output_cleaned', {
+                  bytes: value.bytes, files: value.files,
+                  skipped: value.skipped.length, failed: value.failed.length
+                });
+                await persist();
+              });
+            }
+          } finally {
+            await serialize(() => { cleaningTasks.delete(task.id); });
+          }
+        }
+      }
+      return result;
+    })();
+    cleanupPromise = attempt;
+    try {
+      return await attempt;
+    } finally {
+      cleanupPromise = null;
+    }
+  }
+
   async function status() {
     await ready;
     const taskList = await list();
@@ -1283,6 +1453,7 @@ export function createTaskService({
       closePromise = (async () => {
         clearInterval(reaper);
         await ready.catch(() => {});
+        await cleanupPromise?.catch(() => {});
         const activeIds = [...children.keys()];
         const taskResults = await Promise.allSettled(activeIds.map(async (id) => {
           if (!tombstones.has(id)) return stop(id);
@@ -1338,6 +1509,7 @@ export function createTaskService({
     openProfile,
     closeProfile,
     deleteProfile,
+    cleanup,
     close
   });
 }
