@@ -35,6 +35,7 @@ test('manual Profile renews startup heartbeat during slow import and Chrome laun
   t.mock.timers.tick(10_000);
   assert.equal(messages.at(-1).stage, 'launch-chrome');
   assert.equal(launchOptions.timeout, PROFILE_LAUNCH_TIMEOUT_MS);
+  assert.equal(launchOptions.chromiumSandbox, true);
   assert.equal(launchOptions.timeout, 60_000);
   assert.equal(PROFILE_OPEN_TIMEOUT_MS, 75_000);
   assert.equal(PROFILE_ACTION_TIMEOUT_MS, 100_000);

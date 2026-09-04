@@ -26,7 +26,7 @@ Agent 内置浏览器往往短暂且不适合长任务；直接控制浏览器�
 从[最新 GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)下载两个文件：
 
 1. 对应 Windows、macOS 或 Linux 的 Manager 安装包；
-2. `eric-task-master-skill-v3.0.1.zip`。
+2. `eric-task-master-skill-v3.0.2.zip`。
 
 Manager 安装包自带 Node.js、Playwright、CLI、本机面板和后台服务，只使用电脑上已安装的稳定版 Google Chrome，不再下载独立 Chromium。
 

@@ -1,6 +1,6 @@
 # Self-contained installers
 
-Eric Task Master `v3.0.1` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, and local Dashboard. Users do not install Node.js, npm, Playwright, or a Playwright browser.
+Eric Task Master `v3.0.2` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, and local Dashboard. Users do not install Node.js, npm, Playwright, or a Playwright browser.
 
 Google Chrome is intentionally not redistributed. The Manager uses a locally installed stable Chrome channel and reports a direct installation instruction if Chrome cannot be found.
 
@@ -14,15 +14,15 @@ Google Chrome is intentionally not redistributed. The Manager uses a locally ins
 | Debian/Ubuntu Linux x64 | `linux-x64.deb` and portable tarball | system package; CLI at `/usr/bin/taskmaster` |
 | Debian/Ubuntu Linux arm64 | `linux-arm64.deb` and portable tarball | system package; CLI at `/usr/bin/taskmaster` |
 
-The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.0.1` target. Windows arm64 is not a native `v3.0.1` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
+The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.0.2` target. Windows arm64 is not a native `v3.0.2` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
 
 ## Install
 
 Install stable Google Chrome first. Then use the package matching the operating system and CPU:
 
 - Windows x64: open the `setup.exe`. Start a new terminal after installation and run `taskmaster panel`. The portable ZIP needs no installer; extract it and run `bin\\taskmaster.cmd`.
-- macOS: run `sudo installer -pkg eric-task-master-v3.0.1-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
-- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.0.1-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
+- macOS: run `sudo installer -pkg eric-task-master-v3.0.2-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
+- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.0.2-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
 
 `taskmaster --help` is the installation check. User data is created only when the Manager or another command starts.
 
@@ -72,9 +72,9 @@ CI must build on the target architecture, verify the pinned Node archive SHA-256
 
 Local Windows acceptance proves the Windows package on the maintainer's machine. Native GitHub runners provide separate macOS and Linux evidence; Windows success is not presented as macOS/Linux success.
 
-## Unsigned `v3.0.1` boundary
+## Unsigned `v3.0.2` boundary
 
-The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v3.0.1` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
+The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v3.0.2` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
 
 - Windows may display Microsoft Defender SmartScreen guidance.
 - macOS may require the Owner to approve an unidentified developer package.

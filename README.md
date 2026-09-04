@@ -26,7 +26,7 @@ Use it for unattended research, recurring operations, long browser collections, 
 Download two files from the [latest GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest):
 
 1. the Manager package for Windows, macOS, or Linux;
-2. `eric-task-master-skill-v3.0.1.zip`.
+2. `eric-task-master-skill-v3.0.2.zip`.
 
 The Manager package includes its Node.js runtime, Playwright runtime, CLI, Dashboard, and background service. It uses an installed stable Google Chrome and does not download a separate Chromium.
 

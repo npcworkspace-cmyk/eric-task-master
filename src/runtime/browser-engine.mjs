@@ -6,6 +6,7 @@ export function chromeLaunchOptions(overrides = {}) {
   return {
     channel: 'chrome',
     headless: false,
+    chromiumSandbox: true,
     ignoreDefaultArgs: ['--disable-extensions'],
     ...overrides
   };
