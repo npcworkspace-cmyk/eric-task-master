@@ -81,12 +81,14 @@ async function cli(parameters, timeout = 45_000) {
   if (process.platform === 'win32') {
     windowsShell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
     // cmd.exe expands shell syntax even inside quotes. Accept only this CI path/argument alphabet.
-    if (/[^\p{L}\p{N} :/\\._@-]/u.test(windowsShell)) {
+    if (/[^\p{L}\p{N} :/\\._@~-]/u.test(windowsShell)) {
       throw new Error('PORTABLE_WINDOWS_ARGUMENT_REJECTED: Windows shell path contains unsupported characters');
     }
-    windowsCommandLine = `"${[launcher, ...all].map((value) => {
-      if (typeof value !== 'string' || value.length === 0 || /[^\p{L}\p{N} :/\\._@-]/u.test(value)) {
-        throw new Error('PORTABLE_WINDOWS_ARGUMENT_REJECTED: Windows launcher arguments contain unsupported shell characters');
+    windowsCommandLine = `"${[launcher, ...all].map((value, index) => {
+      if (typeof value !== 'string' || value.length === 0 || /[^\p{L}\p{N} :/\\._@~-]/u.test(value)) {
+        const invalid = typeof value === 'string' ? value.match(/[^\p{L}\p{N} :/\\._@~-]/u)?.[0] : null;
+        const codepoint = invalid ? `U+${invalid.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}` : 'invalid-type-or-empty';
+        throw new Error(`PORTABLE_WINDOWS_ARGUMENT_REJECTED: parameter ${index}, character ${codepoint}`);
       }
       return `"${value}"`;
     }).join(' ')}"`;
