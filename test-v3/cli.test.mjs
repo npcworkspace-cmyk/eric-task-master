@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { removeTestTree } from './test-fs.mjs';
 import { isProcessAlive } from '../src/lib/process-tree.mjs';
 import { VERSION } from '../src/contracts.mjs';
@@ -22,9 +22,9 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'src', 'cli.mjs');
 
-function runCli(args, { cwd = ROOT } = {}) {
+function runCli(args, { cwd = ROOT, nodeArgs = [] } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI, ...args], {
+    const child = spawn(process.execPath, [...nodeArgs, CLI, ...args], {
       cwd,
       env: { ...process.env, NODE_OPTIONS: '' },
       windowsHide: true,
@@ -729,6 +729,43 @@ test('bounded follow returns a usable cursor on timeout and current manual atten
   assert.deepEqual(lastJson(paused.stdout).attention, {
     type: 'verification.paused', ...task.waiting, needsAgentDecision: false, manualResumeRequired: true
   });
+});
+
+test('bounded follow returns after its final wait even when the timer wakes before the wall-clock deadline', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-early-timer-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'j'.repeat(48) }));
+  const preload = path.join(root, 'early-timer.mjs');
+  await writeFile(preload, `
+    const schedule = globalThis.setTimeout;
+    Date.now = () => 1000;
+    globalThis.setTimeout = (callback, milliseconds, ...args) =>
+      schedule(callback, milliseconds <= 50 ? 0 : milliseconds, ...args);
+  `);
+  let eventRequests = 0;
+  const task = { id: 'task_early_timer', state: 'running', eventSequence: 0 };
+  const server = http.createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
+      return;
+    }
+    eventRequests += 1;
+    response.end(JSON.stringify({
+      // A redundant second request ends the old loop deterministically, so
+      // this regression fails without hanging when the clock remains early.
+      task: eventRequests === 1 ? task : { ...task, state: 'finished' },
+      events: [], nextAfter: 0
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const followed = await runCli([
+    'follow', task.id, '--wait-ms', '50', '--state-dir', root, '--port', String(server.address().port), '--json'
+  ], { nodeArgs: ['--import', pathToFileURL(preload).href] });
+  assert.equal(followed.code, 0, followed.stderr);
+  assert.equal(eventRequests, 1, 'a final wait never starts another poll because the timer fired early');
+  assert.deepEqual(lastJson(followed.stdout), { ok: true, task, state: 'running', attention: null, after: 0 });
 });
 
 test('bounded follow keeps its last snapshot when a later event request stalls past the deadline', async (t) => {

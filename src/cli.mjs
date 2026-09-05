@@ -522,8 +522,10 @@ async function followTask(taskId, options, json, existingContext = null) {
     }
     if (Date.now() >= deadline) return returnSnapshot();
     if (hasMore) continue;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(500, deadline - Date.now())));
-    if (Date.now() >= deadline) return returnSnapshot();
+    const remainingWaitMs = deadline - Date.now();
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, remainingWaitMs)));
+    // The final wait completes this call even if the OS timer wakes a little early.
+    if (remainingWaitMs <= 500 || Date.now() >= deadline) return returnSnapshot();
   }
   emit(json ? { ok: true, task: lastState, state: lastState.state, after } : { task: lastState, state: lastState.state, after }, json);
   if (lastState.state === 'error' || lastState.state === 'stopped') process.exitCode = 1;
