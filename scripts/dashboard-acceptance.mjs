@@ -14,6 +14,9 @@ const reportPath = process.env.TASKMASTER_DASHBOARD_REPORT
 const screenshotPath = process.env.TASKMASTER_DASHBOARD_SCREENSHOT
   ? path.resolve(process.env.TASKMASTER_DASHBOARD_SCREENSHOT)
   : null;
+const activeTasksScreenshotPath = screenshotPath
+  ? path.join(path.dirname(screenshotPath), `${path.basename(screenshotPath, path.extname(screenshotPath))}-active.png`)
+  : null;
 const profilesScreenshotPath = screenshotPath
   ? path.join(
       path.dirname(screenshotPath),
@@ -380,6 +383,49 @@ async function waitUntil(predicate, label, timeoutMs = 5_000) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
+async function checkCurrentTasks(page, checks) {
+  const originals = new Map([...tasks].map(([id, task]) => [id, clone(task)]));
+  const deletesBefore = calls.taskDeletes.length;
+  const baseUrl = new URL(page.url()).origin;
+  try {
+    for (const state of ['queued', 'stopping', 'stopped', 'error']) {
+      const id = `task_${state}_visibility`;
+      tasks.set(id, taskFixture(id, { state }));
+    }
+    await page.locator('#refresh-all').click();
+    await page.locator('[data-task-id="task_queued_visibility"] .npc-chip').getByText('排队中', { exact: true }).waitFor();
+    assert.equal(await page.locator('.task-card').count(), 4);
+    assert.equal(await page.locator('#task-count-chip').textContent(), '4 个任务');
+    for (const id of ['task_finished', 'task_stopped_visibility', 'task_error_visibility']) {
+      assert.equal(await page.locator(`[data-task-id="${id}"]`).count(), 0);
+    }
+    tasks.get('task_running').state = 'finished';
+    await page.locator('[data-task-id="task_running"]').waitFor({ state: 'detached' });
+    assert.equal(tasks.has('task_running'), true, 'automatic removal must not delete the record or its output');
+    tasks.get('task_waiting').state = 'stopped';
+    tasks.get('task_queued_visibility').state = 'finished';
+    tasks.get('task_stopping_visibility').state = 'error';
+    await page.locator('#tasks .empty-state').getByText('当前没有进行中的任务。', { exact: true }).waitFor();
+    assert.equal(await page.locator('.task-card').count(), 0);
+    assert.equal(await page.locator('#task-count-chip').textContent(), '0 个任务');
+    await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
+    await page.getByRole('heading', { name: 'Current tasks', exact: true }).waitFor();
+    assert.equal(await page.locator('#tasks .empty-state').textContent(), 'No active tasks.');
+    await page.goto(`${baseUrl}/dashboard?task=task_finished`);
+    await page.getByText('No active tasks.', { exact: true }).waitFor();
+    assert.equal(await page.locator('.task-card').count(), 0, 'a completed deep link must not restore a history card');
+    assert.equal(calls.taskDeletes.length, deletesBefore);
+    checks.push('only current tasks appear; finished, stopped and failed tasks leave automatically, counts reach zero, and completed deep links never restore history or delete stored output');
+  } finally {
+    tasks.clear();
+    for (const [id, task] of originals) tasks.set(id, task);
+    const chineseToggle = page.getByRole('button', { name: '切换到中文', exact: true });
+    if (await chineseToggle.count()) await chineseToggle.click();
+    await page.goto(`${baseUrl}/dashboard?task=task_running`);
+    await page.locator('[data-task-id="task_running"]').waitFor();
+  }
+}
+
 async function checkVerificationPause(page, checks) {
   const original = clone(tasks.get('task_waiting'));
   const actionsBefore = calls.taskActions.length;
@@ -405,7 +451,7 @@ async function checkVerificationPause(page, checks) {
     assert.equal(await card.getByRole('button', { name: '恢复', exact: true }).isEnabled(), true);
     assert.equal(await card.getByRole('button', { name: '停止', exact: true }).isEnabled(), true);
     assert.match(await card.textContent(), /已处理 31/u);
-    assert.equal(await page.locator('.task-card').count(), 3);
+    assert.equal(await page.locator('.task-card').count(), 2);
     assert.equal(calls.taskActions.length, actionsBefore);
     assert.equal(calls.taskDeletes.length, deletesBefore);
     tasks.get('task_waiting').state = 'stopping';
@@ -566,14 +612,19 @@ try {
   page.on('pageerror', (error) => pageErrors.push(error.message));
 
   await page.goto(`${baseUrl}/dashboard?task=task_running`, { waitUntil: 'domcontentloaded' });
-  await page.getByRole('heading', { name: '任务进度', exact: true }).waitFor();
+  await page.getByRole('heading', { name: '当前任务', exact: true }).waitFor();
   await page.locator('.task-card').first().waitFor();
-  assert.equal(await page.locator('.task-card').count(), 3);
-  assert.match(await page.locator('#task-count-chip').textContent(), /2 个运行中/u);
+  assert.equal(await page.locator('.task-card').count(), 2);
+  assert.equal(await page.locator('#task-count-chip').textContent(), '2 个任务');
   assert.match(await page.locator('.task-card').filter({ hasText: 'Collect 20 pages' }).textContent(), /7\s*\/\s*20/u);
   assert.match(await page.locator('.task-card').filter({ hasText: 'Review open-ended feed' }).textContent(), /已处理 31/u);
   assert.equal(await page.locator('.task-card.is-targeted').count(), 1);
   checks.push('fixed Dashboard URL loads Tasks first, deep-links one task, and renders bounded and open-ended progress');
+  await checkCurrentTasks(page, checks);
+  if (activeTasksScreenshotPath) {
+    await mkdir(path.dirname(activeTasksScreenshotPath), { recursive: true });
+    await page.screenshot({ path: activeTasksScreenshotPath, fullPage: true });
+  }
   await checkVerificationPause(page, checks);
   await checkCleanup(page, checks);
 
@@ -581,7 +632,7 @@ try {
   await page.route('**/v1/**', rejectApi);
   await page.locator('#refresh-all').click();
   await page.locator('#offline-banner:not(.hidden)').waitFor();
-  assert.equal(await page.locator('.task-card').count(), 3);
+  assert.equal(await page.locator('.task-card').count(), 2);
   // Hold successful responses until the visible Retry action is clicked.
   // Otherwise background polling can recover between unroute() and click(),
   // hide the banner, and make this test wait for a button that correctly left.
@@ -597,7 +648,7 @@ try {
     await page.unrouteAll({ behavior: 'wait' });
   }
   await page.locator('#offline-banner').waitFor({ state: 'hidden' });
-  assert.equal(await page.locator('.task-card').count(), 3);
+  assert.equal(await page.locator('.task-card').count(), 2);
   checks.push('a temporary Manager outage keeps the last task state and recovers in place');
 
   const runningCard = page.locator('.task-card').filter({ hasText: 'Collect 20 pages' });
@@ -606,15 +657,19 @@ try {
     node.click();
   });
   await waitUntil(() => tasks.get('task_running')?.state === 'stopped', 'task stop');
-  await runningCard.getByRole('button', { name: '恢复', exact: true }).waitFor();
+  await runningCard.waitFor({ state: 'detached' });
   assert.equal(calls.taskActions.filter((entry) => entry.id === 'task_running' && entry.action === 'stop').length, 1);
-  await runningCard.getByRole('button', { name: '恢复', exact: true }).click();
-  await waitUntil(() => tasks.get('task_running')?.state === 'running', 'task resume');
-  await runningCard.getByRole('button', { name: '停止', exact: true }).waitFor();
-  assert.deepEqual(calls.taskActions.filter((entry) => entry.id === 'task_running').map((entry) => entry.action), ['stop', 'resume']);
-  checks.push('task stop and resume are idempotent at the UI boundary and retain current progress');
-
   const waitingCard = page.locator('.task-card').filter({ hasText: 'Review open-ended feed' });
+  await waitingCard.getByRole('button', { name: '恢复', exact: true }).evaluate((node) => {
+    node.click();
+    node.click();
+  });
+  await waitUntil(() => tasks.get('task_waiting')?.state === 'running', 'task resume');
+  await waitingCard.locator('.npc-chip').getByText('运行中', { exact: true }).waitFor();
+  assert.equal(calls.taskActions.filter((entry) => entry.id === 'task_waiting' && entry.action === 'resume').length, 1);
+  assert.match(await waitingCard.textContent(), /已处理 31/u);
+  checks.push('stop removes its ended card and waiting-task resume retains progress; both commands remain idempotent at the UI boundary');
+
   page.once('dialog', (dialog) => dialog.accept());
   await waitingCard.getByRole('button', { name: '删除', exact: true }).click();
   await waitUntil(() => !tasks.has('task_waiting'), 'live task deletion');
@@ -752,7 +807,7 @@ try {
     profileRenames: calls.profileRenames,
     profileDeletes: calls.profileDeletes,
     cleanupRequests: calls.cleanup,
-    screenshots: screenshotPath ? { tasks: screenshotPath, profiles: profilesScreenshotPath, cleanup: cleanupScreenshotPaths } : null,
+    screenshots: screenshotPath ? { tasks: screenshotPath, activeTasks: activeTasksScreenshotPath, profiles: profilesScreenshotPath, cleanup: cleanupScreenshotPaths } : null,
     pageErrors
   };
   if (reportPath) {
