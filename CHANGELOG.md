@@ -5,6 +5,7 @@
 - Keep the Dashboard task list limited to current work: queued, running, waiting, automatically paused, and stopping tasks. Finished, stopped, and failed tasks leave the list on refresh, including when opened through an old task link.
 - Count only visible tasks, label queued work accurately, and show a concise empty state. Preserve task records and output for CLI follow and explicit cleanup; hiding a card never deletes files.
 - Exercise automatic task removal, terminal states, empty lists, old links, and stop/resume behavior in the real Dashboard acceptance.
+- Drive resume-timeout regressions with a controlled clock so CI filesystem latency cannot create false acknowledgement failures; production timeouts remain unchanged.
 
 ## 3.1.1 - 2026-09-06
 
