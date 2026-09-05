@@ -119,7 +119,9 @@ export async function createOutputBudget({ root, limits: suppliedLimits } = {}) 
   }
   const canonicalRoot = await realpath(resolvedRoot);
   const diagnosticPaths = new Set();
-  let scanTail = Promise.resolve();
+  let pendingScan = null;
+  let lastSnapshot = null;
+  let lastScanAt = 0;
   let terminalError = null;
 
   async function verifyRoot() {
@@ -232,17 +234,27 @@ export async function createOutputBudget({ root, limits: suppliedLimits } = {}) 
     return Object.freeze(snapshot);
   }
 
-  async function assertWithinBudget() {
+  async function assertWithinBudget({ allowCached = false } = {}) {
     if (terminalError) throw terminalError;
-    const operation = scanTail.then(scan, scan);
-    scanTail = operation.catch(() => {});
-    try {
-      return await operation;
-    } catch (error) {
+    // Progress is observational: share an ongoing scan or a recent result.
+    // Explicit safety boundaries still request a scan started after the call.
+    if (allowCached && pendingScan) return pendingScan;
+    if (allowCached && lastSnapshot && Date.now() - lastScanAt < limits.checkIntervalMs) return lastSnapshot;
+    const operation = (pendingScan ?? Promise.resolve()).then(scan).then((snapshot) => {
+      lastSnapshot = snapshot;
+      lastScanAt = Date.now();
+      return snapshot;
+    }).catch((error) => {
       terminalError = error instanceof OutputBudgetError
         ? error
         : new OutputBudgetError('TASK_OUTPUT_SCAN_FAILED', 'Task output resource accounting failed safely');
       throw terminalError;
+    });
+    pendingScan = operation;
+    try {
+      return await operation;
+    } finally {
+      if (pendingScan === operation) pendingScan = null;
     }
   }
 

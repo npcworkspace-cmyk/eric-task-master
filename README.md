@@ -16,7 +16,7 @@ Built-in Agent browsers are short-lived. Direct browser control is flexible but 
 - **Real signed-in sessions:** named persistent Profiles use the computer's stable Chrome.
 - **Multi-Agent ready:** different Profiles run concurrently; one Profile has one writer at a time.
 - **Results while running:** progress and output files remain useful even when a task stops early.
-- **Verification without losing the task:** pause with Chrome open, receive four five-minute screenshot checks, and let the Agent or user resume.
+- **Verification without losing the task:** keep Chrome open, request a system notification immediately and every 30 seconds until actual resume, and take screenshots at 5/10/15/20 minutes. After 20 minutes, reminders stop and the task stays automatically paused until manual resume.
 - **Simple recovery:** stale leases are reclaimed; stop and delete terminate owned processes and release the Profile.
 - **Quiet local operation:** CLI only, loopback only. No MCP registration, browser extension, pairing code, or task-asset catalog.
 
@@ -27,11 +27,11 @@ Use it for unattended research, recurring operations, long browser collections, 
 Download two files from the [latest GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest):
 
 1. the Manager installer **or portable ZIP** matching your OS and CPU;
-2. `eric-task-master-skill-v3.0.3.zip`.
+2. `eric-task-master-skill-v3.1.0.zip`.
 
 The Manager package includes its Node.js runtime, Playwright runtime, CLI, Dashboard, and background service. It uses an installed stable Google Chrome and does not download a separate Chromium.
 
-Installer unavailable? Download `eric-task-master-v3.0.3-<target>-portable.zip`, verify it against `SHA256SUMS`, and extract it to a permanent folder. Run `eric-task-master/bin/taskmaster.cmd panel` on Windows or `eric-task-master/bin/taskmaster panel` on macOS/Linux. No installer, administrator access, or separate Node.js installation is needed. [Choose your target and view setup details](docs/INSTALLERS.md#portable-zip-fallback).
+Installer unavailable? Download `eric-task-master-v3.1.0-<target>-portable.zip`, verify it against `SHA256SUMS`, and extract it to a permanent folder. Run `eric-task-master/bin/taskmaster.cmd panel` on Windows or `eric-task-master/bin/taskmaster panel` on macOS/Linux. No installer, administrator access, or separate Node.js installation is needed. [Choose your target and view setup details](docs/INSTALLERS.md#portable-zip-fallback).
 
 After installation:
 

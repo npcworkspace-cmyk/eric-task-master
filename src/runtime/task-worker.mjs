@@ -6,7 +6,8 @@ import { createOutputBudget } from '../lib/output-budget.mjs';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
 import { launchChromeProfile } from './browser-engine.mjs';
 
-let externalResume = () => false;
+const notWaiting = () => ({ accepted: false, waitId: null, reason: 'TASK_NOT_WAITING' });
+let externalResume = notWaiting;
 let activeCleanupAck = null;
 let processCleanupConfirmed = true;
 
@@ -208,13 +209,25 @@ async function captureSnapshot(context, outputDir, relativePath = 'failure.png',
 }
 
 export function resumeTaskWorker(value = null, match = {}) {
-  return externalResume(value, match);
+  return externalResume(value, match).accepted;
+}
+
+export function acknowledgeTaskWorkerResume(message, sendMessage = send) {
+  const result = externalResume(message.value ?? null, {
+    waitId: message.waitId, probeId: message.probeId
+  });
+  sendMessage({
+    type: 'resume_ack', requestId: message.requestId, ...result,
+    ...(message.probeId === undefined ? {} : { probeId: message.probeId })
+  });
+  return result.accepted;
 }
 
 export async function runTaskWorker(config, {
   loadPlaywright = () => import('playwright'),
   sendMessage = send,
   verificationProbeIntervalMs = 5 * 60_000,
+  verificationPauseAfterMs = 20 * 60_000,
   heartbeatIntervalMs = 10_000,
   signal
 } = {}) {
@@ -237,6 +250,40 @@ export async function runTaskWorker(config, {
   let activeWait = null;
   const startedAt = new Date().toISOString();
 
+  const assertActive = () => {
+    if (controller.signal.aborted) throw controller.signal.reason;
+  };
+  // Every asynchronous startup phase observes cancellation immediately. A
+  // browser handle arriving after cancellation is still ours to close.
+  const abortable = (operation, onLateValue) => new Promise((resolve, reject) => {
+    let settled = false;
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      reject(controller.signal.reason);
+    };
+    if (controller.signal.aborted) return abort();
+    controller.signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve().then(() => {
+      assertActive();
+      return operation();
+    }).then((value) => {
+      controller.signal.removeEventListener('abort', abort);
+      if (settled || controller.signal.aborted) {
+        if (onLateValue) void Promise.resolve().then(() => onLateValue(value)).catch(() => {});
+        abort();
+        return;
+      }
+      settled = true;
+      resolve(value);
+    }, (error) => {
+      controller.signal.removeEventListener('abort', abort);
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+  });
+
   const armTimeout = () => {
     if (timeoutRemainingMs === null || controller.signal.aborted) return;
     timeoutStartedAt = Date.now();
@@ -256,13 +303,15 @@ export async function runTaskWorker(config, {
   };
 
   const resumeWait = (value = null, { waitId, probeId } = {}) => {
-    if (!activeWait) return false;
-    if (waitId !== undefined && activeWait.id !== waitId) return false;
-    if (probeId !== undefined && activeWait.probeId !== probeId) return false;
+    if (!activeWait) return notWaiting();
+    const rejected = (reason) => ({ accepted: false, waitId: activeWait.id, reason });
+    if (waitId !== undefined && activeWait.id !== waitId) return rejected('TASK_WAIT_MISMATCH');
+    if (probeId !== undefined && activeWait.automaticPaused) return rejected('TASK_VERIFICATION_PAUSED');
+    if (probeId !== undefined && activeWait.probeId !== probeId) return rejected('TASK_PROBE_MISMATCH');
     const waiter = activeWait;
     activeWait = null;
     waiter.resolve(value);
-    return true;
+    return { accepted: true, waitId: waiter.id };
   };
   externalResume = resumeWait;
 
@@ -275,28 +324,29 @@ export async function runTaskWorker(config, {
   controller.signal.addEventListener('abort', abortWait, { once: true });
 
   try {
-    await mkdir(config.outputDir, { recursive: true, mode: 0o700 });
-    const outputBudget = await createOutputBudget({ root: config.outputDir, limits: config.outputBudget });
-    await outputBudget.assertWithinBudget();
+    armTimeout();
+    await abortable(() => mkdir(config.outputDir, { recursive: true, mode: 0o700 }));
+    const outputBudget = await abortable(() => createOutputBudget({ root: config.outputDir, limits: config.outputBudget }));
+    await abortable(() => outputBudget.assertWithinBudget());
     stopBudget = outputBudget.startPeriodic((error) => {
       if (!controller.signal.aborted) controller.abort(error);
     });
-
-    armTimeout();
 
     sendMessage({ type: 'state', state: 'running', at: startedAt });
     heartbeat = setInterval(() => sendMessage({ type: 'heartbeat', at: new Date().toISOString() }), heartbeatIntervalMs);
     heartbeat.unref?.();
     sendMessage({ type: 'heartbeat', at: new Date().toISOString() });
-    const playwright = await loadPlaywright();
-    context = await launchChromeProfile(playwright, config.profile);
-    const page = context.pages()[0] || await context.newPage();
+    const playwright = await abortable(loadPlaywright);
+    context = await abortable(() => launchChromeProfile(playwright, config.profile), closeContext);
+    assertActive();
+    const page = context.pages()[0] || await abortable(() => context.newPage());
     const browser = context.browser?.() || null;
 
     const progress = async (update) => {
       if (controller.signal.aborted) throw controller.signal.reason;
       const value = normalizeProgress(update);
-      await outputBudget.assertWithinBudget();
+      await outputBudget.assertWithinBudget({ allowCached: true });
+      assertActive();
       sendMessage({ type: 'progress', progress: value, at: new Date().toISOString() });
       return value;
     };
@@ -325,73 +375,106 @@ export async function runTaskWorker(config, {
         startedAt: new Date().toISOString(),
         ...(verification ? {
           kind: 'verification',
-          probeIntervalMs: 5 * 60_000,
+          probeIntervalMs: verificationProbeIntervalMs,
           maximumProbes: 4,
-          nextProbeAt: new Date(Date.now() + 5 * 60_000).toISOString()
+          nextProbeAt: new Date(Date.now() + verificationProbeIntervalMs).toISOString(),
+          automaticPaused: false,
+          pauseAfterMs: verificationPauseAfterMs,
+          pauseAt: new Date(Date.now() + verificationPauseAfterMs).toISOString()
         } : {}),
         ...(resumeAfterMs === null ? {} : {
           resumeAfterMs,
           resumeAt: new Date(Date.now() + resumeAfterMs).toISOString()
         })
       };
-      sendMessage({ type: 'waiting', waiting });
       let timer;
-      let probeTimer;
-      let probeCount = 0;
+      let pauseTimer;
+      const probeTimers = [];
       const probeStartedAt = Date.now();
-      const scheduleProbe = () => {
-        probeTimer = setTimeout(async () => {
+      const waitController = new AbortController();
+      const abortCapture = () => waitController.abort();
+      controller.signal.addEventListener('abort', abortCapture, { once: true });
+      const scheduleProbes = () => {
+        for (let probeCount = 1; probeCount <= 4; probeCount += 1) {
+          const probeTimer = setTimeout(async () => {
+            if (!activeWait || activeWait.id !== waiting.id || activeWait.automaticPaused || controller.signal.aborted) return;
+            const probeId = `probe_${randomUUID().replaceAll('-', '')}`;
+            const screenshot = await captureSnapshot(context, config.outputDir,
+              `screenshots/${probeStartedAt}-${waiting.id}-${probeCount}.png`,
+              { budget: outputBudget, signal: waitController.signal, targetPage });
+            if (!activeWait || activeWait.id !== waiting.id || controller.signal.aborted) return;
+            // The Agent can only match an observation it has actually received.
+            // Keep the previous published ID valid while a new capture is pending.
+            activeWait.probeId = probeId;
+            const automaticPaused = activeWait.automaticPaused;
+            sendMessage({
+              type: 'event',
+              event: {
+                type: 'verification.probe',
+                waitId: waiting.id,
+                probeId,
+                probe: probeCount,
+                maximumProbes: 4,
+                screenshot,
+                screenshotPath: screenshot ? path.join(config.outputDir, screenshot) : null,
+                needsAgentDecision: !automaticPaused,
+                automaticPaused,
+                automaticProbesComplete: automaticPaused || probeCount === 4,
+                nextProbeAt: automaticPaused || probeCount === 4 ? null :
+                  new Date(probeStartedAt + (probeCount + 1) * verificationProbeIntervalMs).toISOString()
+              },
+              at: new Date().toISOString()
+            });
+          }, Math.max(0, probeStartedAt + probeCount * verificationProbeIntervalMs - Date.now()));
+          probeTimer.unref?.();
+          probeTimers.push(probeTimer);
+        }
+        // The deadline does not wait for screenshots or Agent decisions. Chrome
+        // stays available for a later explicit manual resume or stop.
+        pauseTimer = setTimeout(() => {
           if (!activeWait || activeWait.id !== waiting.id || controller.signal.aborted) return;
-          probeCount += 1;
-          const probeId = `probe_${randomUUID().replaceAll('-', '')}`;
-          activeWait.probeId = probeId;
-          const screenshot = await captureSnapshot(context, config.outputDir,
-            `screenshots/${probeStartedAt}-${waiting.id}-${probeCount}.png`,
-            { budget: outputBudget, signal: controller.signal, targetPage });
-          if (!activeWait || activeWait.id !== waiting.id || controller.signal.aborted) return;
+          activeWait.automaticPaused = true;
           sendMessage({
             type: 'event',
             event: {
-              type: 'verification.probe',
-              waitId: waiting.id,
-              probeId,
-              probe: probeCount,
-              maximumProbes: 4,
-              screenshot,
-              screenshotPath: screenshot ? path.join(config.outputDir, screenshot) : null,
-              needsAgentDecision: true,
-              automaticProbesComplete: probeCount === 4,
-              nextProbeAt: probeCount === 4 ? null :
-                new Date(probeStartedAt + (probeCount + 1) * verificationProbeIntervalMs).toISOString()
+              type: 'verification.paused', waitId: waiting.id,
+              automaticPaused: true, pausedAt: new Date().toISOString(),
+              reason: 'verification_wait_timeout', nextProbeAt: null,
+              automaticProbesComplete: true, needsAgentDecision: false
             },
             at: new Date().toISOString()
           });
-          if (probeCount < 4) scheduleProbe();
-        }, Math.max(0, probeStartedAt + (probeCount + 1) * verificationProbeIntervalMs - Date.now()));
-        probeTimer.unref?.();
+        }, verificationPauseAfterMs);
+        pauseTimer.unref?.();
       };
       try {
+        const resumed = new Promise((resolve, reject) => {
+          activeWait = { id: waiting.id, resolve, reject, automaticPaused: false };
+        });
         if (verification) {
           pauseTimeout();
-          scheduleProbe();
+          scheduleProbes();
         }
-        const value = await new Promise((resolve, reject) => {
-          activeWait = { id: waiting.id, resolve, reject };
-          if (resumeAfterMs !== null) timer = setTimeout(() => resumeWait(null), resumeAfterMs);
-        });
+        if (resumeAfterMs !== null) timer = setTimeout(() => resumeWait(null), resumeAfterMs);
+        sendMessage({ type: 'waiting', waiting });
+        const value = await resumed;
         if (controller.signal.aborted) throw controller.signal.reason;
         sendMessage({ type: 'resumed', waitId: waiting.id, at: new Date().toISOString() });
         if (verification) armTimeout();
         return value;
       } finally {
         clearTimeout(timer);
-        clearTimeout(probeTimer);
+        clearTimeout(pauseTimer);
+        for (const probeTimer of probeTimers) clearTimeout(probeTimer);
+        waitController.abort();
+        controller.signal.removeEventListener('abort', abortCapture);
         if (activeWait?.id === waiting.id) activeWait = null;
       }
     };
 
     const sourceUrl = `${pathToFileURL(config.modulePath).href}?task=${encodeURIComponent(config.taskId)}`;
-    const taskModule = await import(sourceUrl);
+    const taskModule = await abortable(() => import(sourceUrl));
+    assertActive();
     const run = typeof taskModule.run === 'function'
       ? taskModule.run
       : typeof taskModule.default === 'function'
@@ -403,7 +486,7 @@ export async function runTaskWorker(config, {
       });
     }
 
-    const taskPromise = Promise.resolve().then(() => run({
+    const result = await abortable(() => run({
       playwright,
       browser,
       context,
@@ -415,20 +498,15 @@ export async function runTaskWorker(config, {
       wait: waitForResume,
       signal: controller.signal
     }));
-    taskPromise.catch(() => {});
-    const stoppedPromise = new Promise((_, reject) => {
-      controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true });
-    });
-    stoppedPromise.catch(() => {});
-    const result = await Promise.race([taskPromise, stoppedPromise]);
-    await outputBudget.assertWithinBudget();
+    await abortable(() => outputBudget.assertWithinBudget());
+    assertActive();
     const normalized = safeJson(result);
     sendMessage({ type: 'result', result: normalized, at: new Date().toISOString() });
     sendMessage({ type: 'state', state: 'finished', at: new Date().toISOString() });
     return { state: 'finished', result: normalized };
   } catch (error) {
     const stopped = error instanceof TaskStoppedError || error?.code === 'TASK_STOPPED';
-    const screenshot = stopped ? null : await captureSnapshot(context, config.outputDir);
+    const screenshot = controller.signal.aborted ? null : await captureSnapshot(context, config.outputDir);
     const payload = normalizeTaskError(error, { stopped, screenshot });
     sendMessage({ type: 'error', state: stopped ? 'stopped' : 'error', error: payload, at: new Date().toISOString() });
     sendMessage({ type: 'state', state: stopped ? 'stopped' : 'error', at: new Date().toISOString() });
@@ -439,7 +517,7 @@ export async function runTaskWorker(config, {
     clearTimeout(timeout);
     controller.signal.removeEventListener('abort', abortWait);
     signal?.removeEventListener('abort', stop);
-    externalResume = () => false;
+    externalResume = notWaiting;
     if (!controller.signal.aborted) controller.abort(new TaskStoppedError());
     const browserClosed = await closeContext(context);
     const cleanupAcknowledged = await sendCleanupWithAck({
@@ -468,9 +546,7 @@ if (typeof process.send === 'function') {
       return;
     }
     if (message?.type === 'stop') controller.abort(new TaskStoppedError());
-    if (message?.type === 'resume') resumeTaskWorker(message.value ?? null, {
-      waitId: message.waitId, probeId: message.probeId
-    });
+    if (message?.type === 'resume') acknowledgeTaskWorkerResume(message);
     if (message?.type === 'cleanup_ack' && activeCleanupAck?.id === message.cleanupId) {
       activeCleanupAck.finish(true);
     }

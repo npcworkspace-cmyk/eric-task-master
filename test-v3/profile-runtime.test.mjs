@@ -5,9 +5,18 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { setImmediate as nextTurn } from 'node:timers/promises';
+import { performance } from 'node:perf_hooks';
 import { removeTestTree } from './test-fs.mjs';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
 import { createProfileRuntime } from '../src/runtime/profile-runtime.mjs';
+
+async function eventually(predicate, label) {
+  const deadline = performance.now() + 5_000;
+  while (!predicate()) {
+    assert.ok(performance.now() < deadline, `Timed out waiting for ${label}`);
+    await nextTurn();
+  }
+}
 
 class CloseFailingWorker extends EventEmitter {
   constructor(pid, alive) {
@@ -90,10 +99,39 @@ function startupStore(beforeAcquire = async () => {}) {
     },
     confirmLeaseCleanup: async () => true,
     renewLease: async () => true,
-    markLeaseError: async () => true,
-    releaseLease: async () => { profile.lease = null; return true; }
+    markLeaseError: async () => { profile.state = 'error'; return true; },
+    releaseLease: async () => { profile.lease = null; profile.state = 'idle'; return true; }
   };
 }
+
+test('a stalled Profile close IPC callback cannot hold cleanup forever', { timeout: 5_000 }, async () => {
+  // Fake workers have no real IPC handle to keep Node alive while sending.
+  const keepAlive = setInterval(() => {}, 5_000);
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9399, alive);
+  const originalSend = worker.send.bind(worker);
+  worker.send = (message, ...args) => { if (message.type !== 'close') originalSend(message, ...args); };
+  const store = startupStore();
+  let terminated = 0;
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
+    closeTimeoutMs: 10,
+    terminateTree: async () => { terminated += 1; worker.terminate(); return true; }
+  });
+  try {
+    await runtime.openProfile('startup-profile');
+    const start = performance.now();
+    assert.deepEqual(await runtime.closeProfile('startup-profile'), { status: 'closed', profileId: 'startup-profile' });
+    assert.ok(performance.now() - start < 3_000);
+    assert.equal(terminated, 1);
+    assert.equal((await store.get()).lease, null);
+  } finally {
+    if (alive.has(worker.pid)) worker.terminate();
+    await runtime.closeAll().catch(() => {});
+    clearInterval(keepAlive);
+  }
+});
 
 test('Profile observes worker rejection before delayed lease acquisition completes', async (t) => {
   for (const failure of ['error', 'exit']) {
@@ -165,4 +203,135 @@ test('terminated manual Worker does not release a Profile with a surviving brows
   await runtime.openProfile('startup-profile');
   await assert.rejects(runtime.closeProfile('startup-profile'), { code: 'PROFILE_CLEANUP_UNCONFIRMED' });
   assert.ok((await store.get()).lease, 'surviving Chrome must retain the one-writer fence');
+});
+
+for (const trigger of ['watchdog', 'lease-renewal']) {
+  test(`${trigger} cleanup failures are contained, retried three times, and can be closed manually`, async (t) => {
+    const alive = new Set();
+    const worker = new CloseFailingWorker(9401, alive);
+    const store = startupStore();
+    const profile = await store.get();
+    let terminations = 0;
+    let terminationWorks = false;
+    let cleanupConfirmations = 0;
+    let leaseErrors = 0;
+    store.renewLease = async () => { throw new Error('lease write failed'); };
+    store.confirmLeaseCleanup = async () => { cleanupConfirmations += 1; return true; };
+    store.markLeaseError = async () => { leaseErrors += 1; profile.state = 'error'; return true; };
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 1_750_000_000_000 });
+    const runtime = createProfileRuntime({
+      profileStore: store, workerFactory: () => worker,
+      processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
+      heartbeatTimeoutMs: 1_000, closeTimeoutMs: 20, cleanupRetryDelayMs: 5_000,
+      maximumCleanupAttempts: 3,
+      terminateTree: async () => {
+        terminations += 1;
+        if (!terminationWorks) return false;
+        worker.terminate();
+        return true;
+      }
+    });
+    t.after(async () => {
+      terminationWorks = true;
+      await runtime.closeAll();
+      t.mock.timers.reset();
+    });
+    await runtime.openProfile(profile.id);
+    if (trigger === 'watchdog') t.mock.timers.tick(1_001);
+    else worker.emit('message', { type: 'heartbeat' });
+    await eventually(() => leaseErrors === 1, 'first failed cleanup');
+    await nextTurn();
+    assert.equal(terminations, 1);
+    assert.equal(profile.state, 'error');
+    assert.equal(runtime.owns(profile.id), true);
+    for (let attempt = 2; attempt <= 3; attempt += 1) {
+      t.mock.timers.tick(5_000);
+      await eventually(() => terminations === attempt, `cleanup attempt ${attempt}`);
+      await nextTurn();
+      await nextTurn();
+    }
+    t.mock.timers.tick(60_000);
+    worker.emit('message', { type: 'heartbeat' });
+    await nextTurn();
+    assert.equal(terminations, 3, 'automatic cleanup stops at its bounded attempt count');
+    assert.equal(leaseErrors, 1, 'one persistent error mark is reused across cleanup attempts');
+    assert.ok(profile.lease);
+    await assert.rejects(runtime.openProfile(profile.id), { code: 'PROFILE_PROCESS_STILL_ALIVE' });
+    terminationWorks = true;
+    assert.deepEqual(await runtime.closeProfile(profile.id), { status: 'closed', profileId: profile.id });
+    assert.equal(terminations, 4);
+    assert.equal(cleanupConfirmations, 1);
+    assert.equal(profile.lease, null);
+    assert.equal(profile.state, 'idle');
+    assert.equal(runtime.owns(profile.id), false);
+  });
+}
+
+test('a failed cleanup confirmation can be retried after process exit without losing the owned entry', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9402, alive);
+  const store = startupStore();
+  let confirmationWorks = false;
+  let confirmations = 0;
+  let usageProbes = 0;
+  let terminations = 0;
+  store.confirmLeaseCleanup = async () => {
+    confirmations += 1;
+    if (!confirmationWorks) throw new Error('temporary state write failure');
+    return true;
+  };
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), closeTimeoutMs: 20,
+    profileUsageProbe: async () => { usageProbes += 1; return 'inactive'; },
+    terminateTree: async () => { terminations += 1; worker.terminate(); return true; }
+  });
+  await runtime.openProfile('startup-profile');
+  await assert.rejects(runtime.closeProfile('startup-profile'), /temporary state write failure/u);
+  assert.equal(runtime.owns('startup-profile'), true);
+  assert.equal((await store.get()).state, 'error');
+  confirmationWorks = true;
+  await runtime.closeProfile('startup-profile');
+  assert.equal(runtime.owns('startup-profile'), false);
+  assert.equal((await store.get()).lease, null);
+  assert.equal(terminations, 1, 'successful process containment is reused');
+  assert.equal(usageProbes, 1);
+  assert.equal(confirmations, 2, 'one confirmation per close attempt, retrying only after failure');
+});
+
+test('normal Profile close confirms cleanup once and performs no extra usage probe or termination', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9403, alive);
+  const store = startupStore();
+  let confirmations = 0;
+  let releases = 0;
+  let probes = 0;
+  const baseSend = worker.send.bind(worker);
+  worker.send = (message, handle, options, callback) => {
+    if (message.type === 'close') {
+      callback?.(null);
+      setImmediate(() => worker.emit('message', { type: 'closed', browserClosed: true, cleanupId: 'closed_once' }));
+      return;
+    }
+    if (message.type === 'closed_ack') {
+      callback?.(null);
+      setImmediate(() => worker.terminate());
+      return;
+    }
+    baseSend(message, handle, options, callback);
+  };
+  store.confirmLeaseCleanup = async () => { confirmations += 1; return true; };
+  const release = store.releaseLease;
+  store.releaseLease = async (...args) => { releases += 1; return release(...args); };
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker, processAlive: (pid) => alive.has(pid),
+    profileUsageProbe: async () => { probes += 1; return 'inactive'; },
+    terminateTree: async () => { throw new Error('normal close must not terminate the process tree'); }
+  });
+  await runtime.openProfile('startup-profile');
+  await runtime.closeProfile('startup-profile');
+  assert.equal(confirmations, 1);
+  assert.equal(releases, 1);
+  assert.equal(probes, 0);
+  assert.equal(runtime.owns('startup-profile'), false);
 });

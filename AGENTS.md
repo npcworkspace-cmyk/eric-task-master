@@ -11,7 +11,7 @@ Keep Eric Task Master on one path:
 - Manager owns process lifetime, Profile leases, progress, output metadata, stop, resume, and delete.
 - Task scripts own browser actions, selectors, waits, retries, checkpoints, HTTP, CDP, and data processing.
 - Do not add MCP, Task Type registration, Task Pack assets, mandatory preflight probes, behavior modes, or Journey facades.
-- A task may enter `wait({ reason: 'verification' })`: runtime keeps Chrome alive and takes four screenshots, five minutes apart. The Agent judges the images; runtime never decides a page is cleared by itself.
+- A task may enter `wait({ reason: 'verification' })`: runtime keeps Chrome alive, requests a desktop notification immediately and every 30 seconds, and takes screenshots at 5/10/15/20 minutes. At 20 minutes it automatically pauses, stops reminders, and requires manual resume; the final screenshot is diagnostic only. The Agent judges earlier images; runtime never decides a page is cleared by itself.
 
 ## Engineering
 

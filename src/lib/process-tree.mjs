@@ -192,12 +192,111 @@ function signalProcessGroup(pid, signal) {
   }
 }
 
-function isProcessGroupAlive(pid) {
+async function readPosixProcesses() {
+  const source = await capture('ps', ['-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat=', '-o', 'lstart='], 1_000);
+  if (source === null) return null;
+  const rows = [];
+  for (const line of source.split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/u.exec(line);
+    if (!match || rows.length >= 20_000) return null;
+    rows.push({ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]),
+      state: match[4], startedAt: match[5] });
+  }
+  return rows;
+}
+
+// Used only by forced cleanup. A Playwright Chrome may have its own detached
+// process group, so the Worker's group alone is not the complete owned tree.
+export async function terminatePosixProcessTree(pid, {
+  graceMs = 5_000,
+  readProcesses = readPosixProcesses,
+  signalGroup = signalProcessGroup,
+  delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+} = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return false;
+  const identities = new Map();
+  const groups = new Set();
+  const stopped = new Set();
+  const alive = (row) => !row.state.startsWith('Z');
+  const sameIdentity = (row) => identities.get(row.pid) === row.startedAt;
+  const descendants = (rows, seeds) => {
+    const owned = new Set(seeds);
+    // The process table is bounded above. Walking adjacency lists is linear.
+    const children = new Map();
+    for (const row of rows) {
+      if (!children.has(row.ppid)) children.set(row.ppid, []);
+      children.get(row.ppid).push(row.pid);
+    }
+    const pending = [...owned];
+    for (let index = 0; index < pending.length; index += 1) {
+      for (const child of children.get(pending[index]) ?? []) {
+        if (!owned.has(child)) { owned.add(child); pending.push(child); }
+      }
+    }
+    return owned;
+  };
+  const remaining = async () => {
+    const rows = await readProcesses();
+    if (!rows) return null;
+    const owned = descendants(rows, rows.filter(sameIdentity).map((row) => row.pid));
+    // A newly spawned or identity-changed member cannot be killed based on a
+    // stale group number. Leave cleanup unconfirmed instead of widening scope.
+    if (rows.some((row) => alive(row) && (groups.has(row.pgid) || owned.has(row.pid)) && !sameIdentity(row))) return null;
+    return rows.filter((row) => alive(row) && sameIdentity(row));
+  };
   try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
+    let stable = false;
+    for (let pass = 0; pass < 4; pass += 1) {
+      const rows = await readProcesses();
+      const root = rows?.find((row) => row.pid === pid);
+      if ((!identities.has(pid) && (!root || root.pgid !== pid)) ||
+          (root && identities.has(pid) && !sameIdentity(root))) return false;
+      const owned = descendants(rows, [pid, ...rows.filter(sameIdentity).map((row) => row.pid)]);
+      const tree = rows.filter((row) => owned.has(row.pid));
+      if (tree.some((row) => identities.has(row.pid) && !sameIdentity(row))) return false;
+      const foundGroups = new Set(tree.filter(alive).map((row) => row.pgid));
+      if (foundGroups.size > 128 || [...foundGroups].some((group) => group <= 1) ||
+          rows.some((row) => alive(row) && foundGroups.has(row.pgid) && !owned.has(row.pid))) return false;
+      for (const row of tree) identities.set(row.pid, row.startedAt);
+      const newGroups = [...foundGroups].filter((group) => !groups.has(group));
+      if (newGroups.length === 0) { stable = true; break; }
+      for (const group of newGroups) {
+        if (!signalGroup(group, 'SIGSTOP')) return false;
+        stopped.add(group);
+        groups.add(group);
+      }
+    }
+    if (!stable) return false;
+    for (const group of [...groups].reverse()) if (!signalGroup(group, 'SIGTERM')) return false;
+    for (const group of stopped) if (!signalGroup(group, 'SIGCONT')) return false;
+    stopped.clear();
+    const firstWait = Math.min(100, Math.max(0, graceMs));
+    await delay(firstWait);
+    let live = await remaining();
+    if (live === null) return false;
+    if (!live.length) return true;
+    await delay(Math.max(0, graceMs - firstWait));
+    live = await remaining();
+    if (live === null) return false;
+    if (!live.length) return true;
+    for (const group of new Set(live.map((row) => row.pgid))) {
+      if (!groups.has(group) || !signalGroup(group, 'SIGKILL')) return false;
+    }
+    await delay(100);
+    live = await remaining();
+    if (live === null) return false;
+    if (!live.length) return true;
+    await delay(Math.max(900, Math.min(2_900, graceMs)));
+    live = await remaining();
+    return live !== null && live.length === 0;
+  } catch {
+    return false;
+  } finally {
+    // A failed enumeration or signal must never leave an owned browser frozen.
+    for (const group of stopped) {
+      try { signalGroup(group, 'SIGCONT'); } catch { /* The caller retains the lease on failure. */ }
+    }
   }
 }
 
@@ -214,18 +313,5 @@ export async function terminateProcessTree(pid, { graceMs = 5_000 } = {}) {
     // PID disappeared while the command was running.
     return terminated && !isProcessAlive(pid);
   }
-
-  signalProcessGroup(pid, 'SIGTERM');
-  const deadline = Date.now() + graceMs;
-  while (Date.now() < deadline && isProcessGroupAlive(pid)) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-  }
-  if (isProcessGroupAlive(pid)) {
-    signalProcessGroup(pid, 'SIGKILL');
-    const killDeadline = Date.now() + Math.max(1_000, Math.min(3_000, graceMs));
-    while (Date.now() < killDeadline && isProcessGroupAlive(pid)) {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-    }
-  }
-  return !isProcessGroupAlive(pid);
+  return terminatePosixProcessTree(pid, { graceMs });
 }

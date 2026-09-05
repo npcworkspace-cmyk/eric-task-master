@@ -49,7 +49,10 @@ class FakeWorker extends EventEmitter {
       });
     }
     if (message.type === 'resume') {
-      setImmediate(() => this.emit('message', { type: 'resumed', waitId: message.waitId }));
+      setImmediate(() => {
+        this.emit('message', { type: 'resume_ack', requestId: message.requestId, accepted: true, waitId: message.waitId });
+        this.emit('message', { type: 'resumed', waitId: message.waitId });
+      });
     }
     if (message.type === 'stop') setImmediate(() => this.finish('stopped'));
   }
@@ -262,8 +265,10 @@ test('TaskService queues one writer, preserves partial output, and deletes atomi
   await assert.rejects(service.resume(third.id, null, { probeId: 'probe_old' }), { code: 'TASK_PROBE_MISMATCH' });
   await assert.rejects(service.resume(third.id, null, { probeId: true }), { code: 'INVALID_TASK_RESUME' });
   await service.resume(third.id, { continue: true }, { waitId: probe.waitId, probeId: probe.probeId });
-  assert.deepEqual(workers[2].messages.findLast((message) => message.type === 'resume'), {
-    type: 'resume', waitId: probe.waitId, probeId: probe.probeId, value: { continue: true }
+  const resumeMessage = workers[2].messages.findLast((message) => message.type === 'resume');
+  assert.equal(typeof resumeMessage.requestId, 'string');
+  assert.deepEqual(resumeMessage, {
+    type: 'resume', requestId: resumeMessage.requestId, waitId: probe.waitId, probeId: probe.probeId, value: { continue: true }
   });
   await until(async () => (await service.get(third.id)).state === 'running');
   workers[2].emit('message', {
@@ -387,6 +392,46 @@ test('TaskService retains lease after browser close and tree termination both fa
   await until(async () => (
     JSON.parse(await readFile(path.join(root, 'tasks', 'tasks.json'), 'utf8')).tombstones.length === 0
   ));
+});
+
+test('forced Worker exit does not release a Profile still occupied by Chrome', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-forced-occupancy-'));
+  const alive = new Set();
+  let usage = 'active';
+  let clock = Date.now();
+  const profileStore = new ProfileStore({
+    filePath: path.join(root, 'profiles.json'), profilesRoot: path.join(root, 'profiles'),
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => usage, now: () => clock
+  });
+  await profileStore.init();
+  const profile = await profileStore.create({ name: 'Forced cleanup' });
+  const worker = new CleanupFailingWorker(8188, alive);
+  const service = createTaskService({
+    stateDir: path.join(root, 'tasks'), profileStore, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => usage,
+    terminateTree: async () => { worker.terminate(); return true; },
+    stopWaitMs: 10, terminationWaitMs: 10, reaperIntervalMs: 60_000
+  });
+  t.after(async () => {
+    usage = 'inactive'; clock += 120_000;
+    worker.terminate();
+    await service.close().catch(() => {});
+    await removeTestTree(root);
+  });
+  const source = path.join(root, 'job.mjs');
+  await writeFile(source, 'export default async function() { return true; }\n');
+  const task = await service.create({ modulePath: source, profileId: profile.id });
+  await until(() => worker.config);
+  worker.failCleanup();
+  await until(async () => (await service.get(task.id)).error?.code === 'TASK_CLEANUP_UNCONFIRMED');
+  assert.equal(alive.has(worker.pid), false);
+  assert.ok((await profileStore.get(profile.id)).lease);
+  usage = 'unknown'; clock += 120_000;
+  await profileStore.recoverExpiredLeases();
+  assert.ok((await profileStore.get(profile.id)).lease, 'unknown occupancy must remain fenced');
+  usage = 'inactive';
+  await profileStore.recoverExpiredLeases();
+  assert.equal((await profileStore.get(profile.id)).lease, null, 'confirmed inactivity releases the expired lease');
 });
 
 test('Manager restart never kills a live process found only by persisted PID', async (t) => {

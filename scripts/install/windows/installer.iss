@@ -37,10 +37,16 @@ Type: files; Name: "{app}\THIRD_PARTY_NOTICES.txt"; Check: IsManagedUpgradeRoot
 Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\Eric Task Master Panel"; Filename: "{app}\bin\taskmaster.cmd"; Parameters: "panel"; WorkingDir: "{app}"; IconFilename: "{cmd}"
+Name: "{group}\Eric Task Master Panel"; Filename: "{app}\bin\taskmaster.cmd"; Parameters: "panel"; WorkingDir: "{app}"; IconFilename: "{cmd}"; AppUserModelID: "NPCWorkspace.EricTaskMaster"
+
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\NPCWorkspace.EricTaskMaster"; ValueType: string; ValueName: "DisplayName"; ValueData: "Eric Task Master"; Flags: uninsdeletekey
 
 [UninstallRun]
 Filename: "{app}\bin\taskmaster.cmd"; Parameters: "manager stop --json"; Flags: runhidden shellexec waituntilterminated skipifdoesntexist; RunOnceId: "StopManager"
+
+[UninstallDelete]
+Type: files; Name: "{userprograms}\Eric Task Master\Eric Task Master Notifications.lnk"
 
 [Code]
 const

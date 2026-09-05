@@ -76,11 +76,16 @@ const I18N = Object.freeze({
     'tasks.delete': '删除',
     'tasks.targetMissing': '指定的任务不存在或已经删除',
     'state.running': '运行中',
+    'state.stopping': '正在停止',
     'state.waiting': '等待中',
+    'state.automaticPaused': '已自动暂停',
+    'activity.automaticPaused': '等待验证已满20分钟，系统提醒已停止；浏览器现场保留，可手动恢复或停止任务。',
+    'activity.verification': '等待人工验证，系统每30秒提醒；20分钟后自动暂停并停止提醒。',
     'state.finished': '已结束',
     'state.stopped': '已停止',
     'state.error': '发生错误',
     'activity.running': '正在执行任务',
+    'activity.stopping': '正在停止任务并释放浏览器',
     'activity.waiting': '任务正在等待',
     'activity.finished': '任务已结束',
     'activity.stopped': '任务已停止',
@@ -197,11 +202,16 @@ const I18N = Object.freeze({
     'tasks.delete': 'Delete',
     'tasks.targetMissing': 'The requested task does not exist or has been deleted',
     'state.running': 'Running',
+    'state.stopping': 'Stopping',
     'state.waiting': 'Waiting',
+    'state.automaticPaused': 'Automatically paused',
+    'activity.automaticPaused': 'Verification waited 20 minutes. Reminders stopped; the browser is retained for manual resume or stop.',
+    'activity.verification': 'Waiting for verification. System reminders repeat every 30 seconds and stop at the 20-minute automatic pause.',
     'state.finished': 'Finished',
     'state.stopped': 'Stopped',
     'state.error': 'Error',
     'activity.running': 'Running the task',
+    'activity.stopping': 'Stopping the task and releasing its browser',
     'activity.waiting': 'The task is waiting',
     'activity.finished': 'The task has finished',
     'activity.stopped': 'The task has stopped',
@@ -579,6 +589,7 @@ function formatDuration(milliseconds) {
 
 function normalizeTaskState(task) {
   const value = String(task?.state || task?.status || 'running').toLowerCase();
+  if (value === 'stopping') return 'stopping';
   if (['completed', 'complete', 'finished', 'done', 'success', 'succeeded'].includes(value)) return 'finished';
   if (['failed', 'error'].includes(value)) return 'error';
   if (['cancelled', 'canceled', 'terminated', 'stopped'].includes(value)) return 'stopped';
@@ -614,6 +625,8 @@ function taskProgress(task) {
 }
 
 function taskActivity(task) {
+  if (task.state === 'waiting' && task.waiting?.automaticPaused) return t('activity.automaticPaused');
+  if (task.state === 'waiting' && task.waiting?.kind === 'verification') return t('activity.verification');
   const status = normalizeTaskState(task);
   return taskProgress(task).message || t(`activity.${status}`);
 }
@@ -735,7 +748,8 @@ function renderTasks() {
     const heading = element('div', 'card-heading');
     const headingCopy = element('div', 'card-title');
     headingCopy.append(element('h2', '', taskTitle(task)), element('p', 'task-activity', taskActivity(task)));
-    heading.append(headingCopy, element('span', `npc-chip task-state-${status}`, t(`state.${status}`)));
+    heading.append(headingCopy, element('span', `npc-chip task-state-${status}`,
+      t(task.state === 'waiting' && task.waiting?.automaticPaused ? 'state.automaticPaused' : `state.${status}`)));
 
     const progressBlock = element('div', 'task-progress-block');
     const progressCopy = element('div', 'progress-copy');

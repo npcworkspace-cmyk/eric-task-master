@@ -87,6 +87,8 @@ test('CLI integer options reject non-finite, fractional, negative, blank, and fl
       ['run', 'missing.mjs', '--max-files', '-1', '--port', '9'],
       ['run', 'missing.mjs', '--max-entries', '2.5', '--port', '9'],
       ['follow', 'task_missing', '--after', 'Infinity', '--port', '9'],
+      ['follow', 'task_missing', '--wait-ms', '-1', '--port', '9'],
+      ['follow', 'task_missing', '--wait-ms', '60001', '--port', '9'],
       ['files', 'task_missing', '--offset', ' ', '--port', '9'],
       ['files', 'task_missing', '--max-bytes', 'NaN', '--port', '9'],
       ['status', '--port', '1.5']
@@ -269,7 +271,7 @@ test('follow returns the current verification probe and cursor without ending th
   const followed = await runCli(['follow', task.id, ...common]);
   assert.equal(followed.code, 0, followed.stderr);
   assert.equal(eventRequests, 1, 'follow should hand the new screenshot back to the Agent immediately');
-  assert.deepEqual(lastJson(followed.stdout), { ok: true, task, attention: probe, after: 4 });
+  assert.deepEqual(lastJson(followed.stdout), { ok: true, task, state: 'waiting', attention: probe, after: 4 });
   assert.equal(followed.stdout.includes('probe_old'), false, 'old wait and probe images must not be reissued');
   const continued = await runCli(['follow', task.id, '--after', '4', ...common]);
   assert.equal(continued.code, 0, continued.stderr);
@@ -460,13 +462,33 @@ test('background Manager lock loser waits for the winning sibling instead of fai
   assert.deepEqual(result, expected);
 });
 
-test('CLI replaces an idle same-API old Manager only after its process exits and never interrupts active tasks', async (t) => {
-  async function oldManager(activeTasks, { processId, onStop } = {}) {
-    const server = http.createServer((request, response) => {
+test('background startup accepts a compatible different-version sibling that wins the startup race', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-start-compatible-'));
+  t.after(() => removeTestTree(root));
+  const expected = { service: 'eric-task-master', apiVersion: 3, version: '3.0.1', state: 'ready' };
+  const server = http.createServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(expected));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const child = new EventEmitter();
+  child.pid = 43212;
+  child.unref = () => {};
+  const result = await startBackgroundManager({
+    host: '127.0.0.1', port: server.address().port, stateDir: root,
+    baseUrl: `http://127.0.0.1:${server.address().port}`
+  }, { spawnProcess: () => child });
+  assert.deepEqual(result, expected);
+});
+
+test('explicit Manager maintenance waits for process exit and never interrupts active tasks or manual Profiles', async (t) => {
+  async function oldManager(activeTasks, { processId, onStop, profiles = [], capabilities = ['manager.idle-stop'] } = {}) {
+    const server = http.createServer(async (request, response) => {
       response.setHeader('content-type', 'application/json');
       if (request.url === '/v1/health') {
         response.end(JSON.stringify({
-          service: 'eric-task-master', version: '2.9.9', apiVersion: 3,
+          service: 'eric-task-master', version: '2.9.9', apiVersion: 3, capabilities,
           ...(processId ? { pid: processId } : {})
         }));
         return;
@@ -475,7 +497,14 @@ test('CLI replaces an idle same-API old Manager only after its process exits and
         response.end(JSON.stringify({ ok: true, tasks: { running: activeTasks, queued: 0 } }));
         return;
       }
+      if (request.url === '/v1/profiles') {
+        response.end(JSON.stringify({ ok: true, profiles }));
+        return;
+      }
       if (request.url === '/v1/manager/stop' && request.method === 'POST') {
+        let source = '';
+        for await (const chunk of request) source += chunk;
+        assert.deepEqual(JSON.parse(source), { onlyIfIdle: true });
         response.end(JSON.stringify({ ok: true, state: 'stopping' }));
         onStop?.();
         setImmediate(() => {
@@ -518,6 +547,7 @@ test('CLI replaces an idle same-API old Manager only after its process exits and
   let starts = 0;
   const replacement = { service: 'eric-task-master', version: VERSION, apiVersion: 3 };
   assert.deepEqual(await ensureManager(idleConfig, {
+    maintainVersion: true,
     startManager: async () => {
       assert.equal(isProcessAlive(idleProcess.pid), false, 'replacement started before old Manager exited');
       starts += 1;
@@ -535,12 +565,200 @@ test('CLI replaces an idle same-API old Manager only after its process exits and
     baseUrl: `http://127.0.0.1:${active.address().port}`
   };
   await assert.rejects(ensureManager(activeConfig, {
+    maintainVersion: true,
     startManager: async () => { throw new Error('must not start'); }
   }), (error) => {
     assert.equal(error.code, 'MANAGER_VERSION_MISMATCH');
     assert.match(error.nextAction, /finish or stop/u);
     return true;
   });
+
+  const manual = await oldManager(0, {
+    profiles: [{ id: 'profile_manual', state: 'open', lease: { kind: 'manual' } }],
+    onStop: () => assert.fail('maintenance must not close the manual login window')
+  });
+  t.after(() => new Promise((resolve) => manual.close(resolve)));
+  await assert.rejects(ensureManager({
+    ...activeConfig, baseUrl: `http://127.0.0.1:${manual.address().port}`
+  }, { maintainVersion: true }), (error) => {
+    assert.equal(error.code, 'MANAGER_VERSION_MISMATCH');
+    assert.match(error.message, /occupied Profile/u);
+    assert.match(error.nextAction, /controls remain available/u);
+    return true;
+  });
+
+  const legacy = await oldManager(0, { capabilities: [], onStop: () => assert.fail('legacy Manager cannot guard idle maintenance') });
+  t.after(() => new Promise((resolve) => legacy.close(resolve)));
+  await assert.rejects(ensureManager({
+    ...activeConfig, baseUrl: `http://127.0.0.1:${legacy.address().port}`
+  }, { maintainVersion: true }), (error) => {
+    assert.equal(error.code, 'MANAGER_CAPABILITY_UNAVAILABLE');
+    assert.match(error.nextAction, /explicitly run taskmaster manager stop/u);
+    return true;
+  });
+});
+
+test('compatible different-version Managers remain usable for task controls and ordinary runs without maintenance', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-compatible-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'c'.repeat(48) }));
+  const requests = [];
+  const submissions = [];
+  const task = { id: 'task_existing', state: 'finished', eventSequence: 0 };
+  let capabilities = [];
+  const server = http.createServer(async (request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({ service: 'eric-task-master', version: '3.0.1', apiVersion: 3, capabilities }));
+      return;
+    }
+    if (request.url === '/v1/status') {
+      response.end(JSON.stringify({ ok: true, tasks: { running: 3, queued: 2 } }));
+      return;
+    }
+    if (request.url === '/v1/tasks' && request.method === 'POST') {
+      let source = '';
+      for await (const chunk of request) source += chunk;
+      submissions.push(JSON.parse(source));
+    }
+    if (request.url.startsWith('/v1/tasks')) {
+      response.end(JSON.stringify({ ok: true, task, events: [], nextAfter: 0, files: [] }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: { code: 'UNEXPECTED_REQUEST', message: request.url } }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const common = ['--state-dir', root, '--port', String(server.address().port), '--json'];
+  for (const args of [
+    ['status', task.id], ['follow', task.id], ['files', task.id], ['stop', task.id],
+    ['resume', task.id], ['delete', task.id], ['run', 'job.mjs', '--detach']
+  ]) {
+    const result = await runCli([...args, ...common]);
+    assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
+  }
+  assert.equal(requests.some((request) => request.includes('/v1/status')), false, 'ordinary commands do not preflight idle state');
+  assert.equal(requests.some((request) => request.includes('/v1/manager/stop')), false);
+  const unsupported = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', '--detach', ...common]);
+  assert.equal(unsupported.code, 1);
+  assert.equal(lastJson(unsupported.stderr).error.code, 'MANAGER_CAPABILITY_UNAVAILABLE');
+  assert.match(lastJson(unsupported.stderr).nextAction, /controls remain available/u);
+  assert.equal(submissions.length, 1, 'an unsupported request key is never silently ignored');
+
+  capabilities = ['task.request-key'];
+  requests.length = 0;
+  const accepted = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', ...common]);
+  assert.equal(accepted.code, 0, accepted.stderr);
+  assert.equal(submissions.at(-1).requestKey, 'logical-submit');
+  assert.equal(requests.filter((request) => request.includes('/v1/health')).length, 1, 'run reuses its connection for follow');
+  const invalid = await runCli(['run', 'job.mjs', '--request-key', ...common]);
+  assert.equal(invalid.code, 1);
+  assert.equal(lastJson(invalid.stderr).error.code, 'INVALID_REQUEST_KEY');
+});
+
+test('follow drains every retained terminal event and returns the final cursor', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-pages-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'e'.repeat(48) }));
+  const events = Array.from({ length: 601 }, (_, index) => ({ sequence: index + 100, type: 'progress', data: { current: index } }));
+  const cursors = [];
+  const task = { id: 'task_pages', state: 'finished', eventSequence: 700 };
+  const server = http.createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
+      return;
+    }
+    const url = new URL(request.url, 'http://127.0.0.1');
+    const after = Number(url.searchParams.get('after'));
+    cursors.push(after);
+    const selected = events.filter((event) => event.sequence > after).slice(0, 500);
+    response.end(JSON.stringify({ task, events: selected, truncated: after < 99, nextAfter: selected.at(-1)?.sequence ?? after }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const followed = await runCli(['follow', task.id, '--state-dir', root, '--port', String(server.address().port), '--json']);
+  assert.equal(followed.code, 0, followed.stderr);
+  const records = followed.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+  assert.equal(records.filter((record) => record.event).length, 601);
+  assert.equal(records.filter((record) => record.warning).length, 1);
+  assert.deepEqual(cursors, [0, 599]);
+  assert.deepEqual(records.at(-1), { ok: true, task, state: 'finished', after: 700 });
+});
+
+test('bounded follow returns a usable cursor on timeout and current manual attention immediately', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-bounded-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'b'.repeat(48) }));
+  let eventRequests = 0;
+  let task = { id: 'task_bound', state: 'running', eventSequence: 7 };
+  const server = http.createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
+      return;
+    }
+    eventRequests += 1;
+    response.end(JSON.stringify({ task, events: [], nextAfter: 7, truncated: false }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const common = ['--after', '7', '--state-dir', root, '--port', String(server.address().port), '--json'];
+  const followed = await runCli(['follow', task.id, '--wait-ms', '50', ...common]);
+  assert.equal(followed.code, 0, followed.stderr);
+  assert.deepEqual(lastJson(followed.stdout), { ok: true, task, state: 'running', attention: null, after: 7 });
+  assert.equal(eventRequests, 1, 'the deadline does not trigger a redundant final request');
+  const immediate = await runCli(['follow', task.id, '--wait-ms', '0', ...common]);
+  assert.equal(immediate.code, 0, immediate.stderr);
+  assert.equal(lastJson(immediate.stdout).after, 7);
+  task = { ...task, state: 'waiting', waiting: { id: 'wait_user', reason: 'user', message: 'Provide input' } };
+  const started = Date.now();
+  const waiting = await runCli(['follow', task.id, '--wait-ms', '60000', ...common]);
+  assert.equal(waiting.code, 0, waiting.stderr);
+  assert.ok(Date.now() - started < 5_000, 'current manual waiting does not consume the long wait budget');
+  assert.deepEqual(lastJson(waiting.stdout), {
+    ok: true, task, state: 'waiting', attention: { type: 'task.waiting', ...task.waiting }, after: 7
+  });
+  task.waiting = {
+    id: 'wait_verification', reason: 'verification', automaticPaused: true, needsAgentDecision: false, probeId: 'probe_4'
+  };
+  const paused = await runCli(['follow', task.id, ...common]);
+  assert.equal(paused.code, 0, paused.stderr);
+  assert.deepEqual(lastJson(paused.stdout).attention, {
+    type: 'verification.paused', ...task.waiting, needsAgentDecision: false, manualResumeRequired: true
+  });
+});
+
+test('bounded follow keeps its last snapshot when a later event request stalls past the deadline', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-bounded-socket-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'd'.repeat(48) }));
+  let eventRequests = 0;
+  const task = { id: 'task_socket', state: 'running', eventSequence: 0 };
+  const server = http.createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
+      return;
+    }
+    eventRequests += 1;
+    if (eventRequests === 1) response.end(JSON.stringify({ task, events: [], nextAfter: 0 }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => {
+    server.close(resolve);
+    server.closeAllConnections();
+  }));
+  const started = Date.now();
+  const result = await runCli([
+    'follow', task.id, '--wait-ms', '600', '--state-dir', root, '--port', String(server.address().port), '--json'
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(lastJson(result.stdout), { ok: true, task, state: 'running', attention: null, after: 0 });
+  assert.equal(eventRequests, 2);
+  assert.ok(Date.now() - started < 5_000, 'the request must share the follow deadline instead of waiting 30 seconds');
 });
 
 test('twelve concurrent CLI clients converge on one cold Manager across multiple rounds', async (t) => {

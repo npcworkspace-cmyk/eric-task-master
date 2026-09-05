@@ -13,10 +13,10 @@ const CLI_PATH = fileURLToPath(import.meta.url);
 const HELP = `Eric Task Master ${VERSION}
 
 Fast path:
-  taskmaster run JOB.mjs [--profile NAME_OR_ID] [--input JSON_OR_@FILE] [--label TEXT] [--detach]
+  taskmaster run JOB.mjs [--profile NAME_OR_ID] [--input JSON_OR_@FILE] [--label TEXT] [--request-key KEY] [--detach]
 
 Tasks:
-  taskmaster follow TASK_ID [--after SEQUENCE]
+  taskmaster follow TASK_ID [--after SEQUENCE] [--wait-ms 0..60000]
   taskmaster status [TASK_ID]
   taskmaster stop TASK_ID
   taskmaster resume TASK_ID [--probe PROBE_ID] [--value JSON_OR_@FILE]
@@ -34,7 +34,9 @@ Manager:
   taskmaster panel
   taskmaster manager start|foreground|status|stop
 
-All commands accept --json. Manager starts automatically when needed.`;
+All commands accept --json. Manager starts automatically when needed.
+Compatible running Managers are reused. Only manager start maintains the installed version.
+follow --wait-ms returns current state and an after cursor when the wait expires.`;
 
 function parseArgs(argv) {
   const positionals = [];
@@ -153,6 +155,7 @@ function emit(value, json = false) {
 
 async function requestJson(config, pathname, { method = 'GET', body, token, timeoutMs = 30_000 } = {}) {
   let response;
+  let source;
   try {
     response = await fetch(new URL(pathname, config.baseUrl), {
       method,
@@ -163,10 +166,10 @@ async function requestJson(config, pathname, { method = 'GET', body, token, time
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(timeoutMs)
     });
+    source = await response.text();
   } catch (error) {
-    throw cliError('MANAGER_UNREACHABLE', `Manager request failed: ${error.message}`);
+    throw Object.assign(cliError('MANAGER_UNREACHABLE', `Manager request failed: ${error.message}`), { cause: error });
   }
-  const source = await response.text();
   let payload = {};
   try {
     payload = source ? JSON.parse(source) : {};
@@ -211,9 +214,6 @@ async function waitForManager(config, timeoutMs = 20_000) {
       const current = await health(config);
       if (current.apiVersion !== API_VERSION) {
         throw cliError('MANAGER_API_INCOMPATIBLE', `Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`);
-      }
-      if (current.version !== VERSION) {
-        throw cliError('MANAGER_VERSION_MISMATCH', `Manager ${current.version || 'unknown'} does not match CLI ${VERSION}`);
       }
       return current;
     } catch (error) {
@@ -361,47 +361,67 @@ async function waitForManagerStop(config, timeoutMs = 20_000, managerPid = null)
   return false;
 }
 
-export async function ensureManager(config, { startManager = startBackgroundManager } = {}) {
+export async function ensureManager(config, { startManager = startBackgroundManager, maintainVersion = false } = {}) {
+  let current;
   try {
-    const current = await health(config);
-    if (current.apiVersion !== API_VERSION) {
-      throw cliError(
-        'MANAGER_API_INCOMPATIBLE',
-        `Running Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`,
-        'Stop the older Manager once, then retry.'
-      );
-    }
-    if (current.version === VERSION) return current;
-
-    const token = await readToken(config);
-    const status = await requestJson(config, '/v1/status', { token });
-    const activeTasks = Number(status.tasks?.running || 0) + Number(status.tasks?.queued || 0);
-    if (activeTasks > 0) {
-      throw cliError(
-        'MANAGER_VERSION_MISMATCH',
-        `Manager ${current.version || 'unknown'} has ${activeTasks} active task(s) and cannot be replaced by CLI ${VERSION}`,
-        'Let the active tasks finish or stop them, then run the command again.'
-      );
-    }
-    await requestJson(config, '/v1/manager/stop', { method: 'POST', body: {}, token });
-    if (!(await waitForManagerStop(config, 20_000, current.pid))) {
-      throw cliError(
-        'MANAGER_VERSION_MISMATCH',
-        `Manager ${current.version || 'unknown'} did not stop for the CLI ${VERSION} upgrade`,
-        'Stop the old Manager manually, then run the command again.'
-      );
-    }
-    return startManager(config);
+    current = await health(config);
   } catch (error) {
     if (error.code !== 'MANAGER_UNREACHABLE') throw error;
     return startManager(config);
   }
+  if (current.apiVersion !== API_VERSION) {
+    throw cliError(
+      'MANAGER_API_INCOMPATIBLE',
+      `Running Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`,
+      'Finish or stop the existing work with its compatible CLI, then run manager start.'
+    );
+  }
+  if (!maintainVersion || current.version === VERSION) return current;
+  if (!current.capabilities?.includes('manager.idle-stop')) {
+    throw cliError(
+      'MANAGER_CAPABILITY_UNAVAILABLE',
+      `Manager ${current.version || 'unknown'} cannot guard an idle version replacement`,
+      'Keep using the compatible running Manager. To update, finish the existing work, close its Profiles, explicitly run taskmaster manager stop, then taskmaster manager start.'
+    );
+  }
+
+  const token = await readToken(config);
+  const status = await requestJson(config, '/v1/status', { token });
+  const activeTasks = Number(status.tasks?.running || 0) + Number(status.tasks?.queued || 0);
+  if (activeTasks > 0) {
+    throw cliError(
+      'MANAGER_VERSION_MISMATCH',
+      `Manager ${current.version || 'unknown'} has ${activeTasks} active task(s) and cannot be replaced by CLI ${VERSION}`,
+      'Let the active tasks finish or stop them, then run taskmaster manager start again.'
+    );
+  }
+  const { profiles } = await requestJson(config, '/v1/profiles', { token });
+  if (!Array.isArray(profiles)) {
+    throw cliError('INVALID_MANAGER_RESPONSE', 'Manager did not return its Profiles for version maintenance');
+  }
+  const occupiedProfiles = profiles.filter((profile) => profile.lease || ['opening', 'open', 'closing'].includes(profile.state));
+  if (occupiedProfiles.length) {
+    throw cliError(
+      'MANAGER_VERSION_MISMATCH',
+      `Manager ${current.version || 'unknown'} has ${occupiedProfiles.length} occupied Profile(s) and cannot be replaced by CLI ${VERSION}`,
+      'Close the occupied Profiles, then run taskmaster manager start again. Existing task and Profile controls remain available.'
+    );
+  }
+  await requestJson(config, '/v1/manager/stop', { method: 'POST', body: { onlyIfIdle: true }, token });
+  if (!(await waitForManagerStop(config, 20_000, current.pid))) {
+    throw cliError(
+      'MANAGER_VERSION_MISMATCH',
+      `Manager ${current.version || 'unknown'} did not stop for the CLI ${VERSION} upgrade`,
+      'Stop the old Manager manually, then run the command again.'
+    );
+  }
+  return startManager(config);
 }
 
 async function apiContext(options) {
   const config = settings(options);
-  await ensureManager(config);
-  return { config, token: await readToken(config) };
+  const manager = await ensureManager(config);
+  return { config, token: await readToken(config), manager };
 }
 
 async function parseJsonInput(value, field = 'input') {
@@ -417,19 +437,38 @@ async function parseJsonInput(value, field = 'input') {
   }
 }
 
-async function followTask(taskId, options, json) {
+async function followTask(taskId, options, json, existingContext = null) {
+  if (!taskId) throw cliError('TASK_ID_REQUIRED', 'follow requires TASK_ID');
   let after = parseIntegerOption(options.after ?? 0, {
     name: '--after', minimum: 0, maximum: Number.MAX_SAFE_INTEGER
   });
-  const context = await apiContext(options);
+  const waitMs = options['wait-ms'] === undefined ? null : parseIntegerOption(options['wait-ms'], {
+    name: '--wait-ms', minimum: 0, maximum: 60_000
+  });
+  const context = existingContext || await apiContext(options);
+  const deadline = waitMs === null ? Infinity : Date.now() + waitMs;
   let lastState = null;
   let historyWarningEmitted = false;
+  const returnSnapshot = () => {
+    emit({ ok: true, task: lastState, state: lastState.state, attention: null, after }, json);
+    return lastState;
+  };
   while (true) {
-    const result = await requestJson(
-      context.config,
-      `/v1/tasks/${encodeURIComponent(taskId)}/events?after=${after}&limit=500`,
-      { token: context.token }
-    );
+    const previousAfter = after;
+    let result;
+    try {
+      result = await requestJson(
+        context.config,
+        `/v1/tasks/${encodeURIComponent(taskId)}/events?after=${after}&limit=500`,
+        {
+          token: context.token,
+          timeoutMs: lastState && waitMs !== null ? Math.max(1, Math.min(30_000, deadline - Date.now())) : 30_000
+        }
+      );
+    } catch (error) {
+      if (lastState && waitMs !== null && Date.now() >= deadline && error.cause?.name === 'TimeoutError') return returnSnapshot();
+      throw error;
+    }
     if (result.truncated && !historyWarningEmitted) {
       emit(json
         ? {
@@ -452,20 +491,41 @@ async function followTask(taskId, options, json) {
       after = Math.max(after, event.sequence);
       if (event.type === 'task.event' && event.data?.type === 'verification.probe') {
         if (result.task.state !== 'waiting' || result.task.waiting?.id !== event.data.waitId ||
-            result.task.waiting?.probeId !== event.data.probeId) continue;
+            result.task.waiting?.probeId !== event.data.probeId || result.task.waiting?.automaticPaused) continue;
         attention = event.data;
+      }
+      if (event.type === 'task.event' && event.data?.type === 'verification.paused') {
+        if (result.task.state !== 'waiting' || result.task.waiting?.id !== event.data.waitId ||
+            !result.task.waiting?.automaticPaused) continue;
+        attention = { ...event.data, needsAgentDecision: false, manualResumeRequired: true };
       }
       emit(json ? { ok: true, taskId, event } : event, json);
     }
+    if (Number.isSafeInteger(result.nextAfter)) after = Math.max(after, result.nextAfter);
     lastState = result.task;
-    if (TERMINAL_TASK_STATES.has(result.task.state)) break;
+    const hasMore = Number.isSafeInteger(lastState.eventSequence)
+      ? after < lastState.eventSequence
+      : result.events.length === 500;
+    if (hasMore && after <= previousAfter) {
+      throw cliError('INVALID_EVENT_RESPONSE', 'Manager did not advance the task event cursor');
+    }
+    if (TERMINAL_TASK_STATES.has(lastState.state) && !hasMore) break;
+    if (lastState.state === 'waiting' && lastState.waiting?.automaticPaused && !hasMore) {
+      attention ||= { type: 'verification.paused', ...lastState.waiting, needsAgentDecision: false, manualResumeRequired: true };
+    }
+    if (waitMs !== null && lastState.state === 'waiting' && !hasMore) {
+      attention ||= { type: 'task.waiting', ...lastState.waiting };
+    }
     if (attention) {
-      emit(json ? { ok: true, task: lastState, attention, after } : { task: lastState, attention, after }, json);
+      emit(json ? { ok: true, task: lastState, state: lastState.state, attention, after } : { task: lastState, state: lastState.state, attention, after }, json);
       return lastState;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (Date.now() >= deadline) return returnSnapshot();
+    if (hasMore) continue;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, deadline - Date.now())));
+    if (Date.now() >= deadline) return returnSnapshot();
   }
-  emit(json ? { ok: true, task: lastState } : lastState, json);
+  emit(json ? { ok: true, task: lastState, state: lastState.state, after } : { task: lastState, state: lastState.state, after }, json);
   if (lastState.state === 'error' || lastState.state === 'stopped') process.exitCode = 1;
   return lastState;
 }
@@ -480,15 +540,27 @@ async function runCommand(args, options, json) {
         name: '--timeout', minimum: 1_000, maximum: 30 * 24 * 60 * 60_000
       });
   const outputBudget = parseOutputBudgetOptions(options);
+  const requestKey = options['request-key'];
+  if (requestKey !== undefined && (typeof requestKey !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/u.test(requestKey))) {
+    throw cliError('INVALID_REQUEST_KEY', '--request-key requires 1-160 letters, digits, dots, underscores, colons or hyphens, starting with a letter or digit');
+  }
   const body = {
     modulePath,
     ...(options.profile ? { profileId: options.profile } : {}),
     ...(options.label ? { label: options.label } : {}),
     input: await parseJsonInput(options.input),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    ...(outputBudget === undefined ? {} : { outputBudget })
+    ...(outputBudget === undefined ? {} : { outputBudget }),
+    ...(requestKey === undefined ? {} : { requestKey })
   };
   const context = await apiContext(options);
+  if (requestKey !== undefined && !context.manager.capabilities?.includes('task.request-key')) {
+    throw cliError(
+      'MANAGER_CAPABILITY_UNAVAILABLE',
+      `Manager ${context.manager.version || 'unknown'} does not support --request-key`,
+      'Finish the existing work and close its Profiles, then run taskmaster manager start to update the Manager. Task controls remain available.'
+    );
+  }
   const created = await requestJson(context.config, '/v1/tasks', {
     method: 'POST',
     body,
@@ -497,7 +569,7 @@ async function runCommand(args, options, json) {
   });
   emit(json ? created : created.task, json);
   if (options.detach === true || options.detach === 'true') return created.task;
-  return followTask(created.task.id, options, json);
+  return followTask(created.task.id, options, json, context);
 }
 
 async function taskAction(action, taskId, options, json) {
@@ -666,7 +738,7 @@ async function managerCommand(action, options, json) {
   const config = settings(options);
   if (action === 'foreground') return serveCommand(config, json);
   if (action === 'start') {
-    const current = await ensureManager(config);
+    const current = await ensureManager(config, { maintainVersion: true });
     emit({ ok: true, manager: current }, json);
     return;
   }
@@ -725,11 +797,11 @@ async function main() {
     return serveCommand(settings(options), json);
   }
   if (command === 'run') {
-    assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'timeout']);
+    assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'request-key', 'timeout']);
     return runCommand(args, options, json);
   }
   if (command === 'follow') {
-    assertAllowedOptions(options, ['after']);
+    assertAllowedOptions(options, ['after', 'wait-ms']);
     return followTask(args[0], options, json);
   }
   if (command === 'status') {
