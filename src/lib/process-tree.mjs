@@ -158,14 +158,22 @@ async function probeLinuxProfile(userDataDir) {
  * Only an explicit --user-data-dir argument equal to the resolved Profile path
  * counts as active; ambiguous enumeration failures remain fenced as unknown.
  */
-export async function probeChromeProfileUsage(userDataDir) {
+export async function probeChromeProfileUsage(userDataDir, {
+  platform = process.platform, captureProcessList = capture
+} = {}) {
   if (typeof userDataDir !== 'string' || !userDataDir) return 'unknown';
-  if (process.platform === 'linux') return probeLinuxProfile(userDataDir);
+  if (platform === 'linux') return probeLinuxProfile(userDataDir);
 
-  if (process.platform === 'win32') {
-    const source = await capture('powershell.exe', [
+  if (platform === 'win32') {
+    // Query WMI directly to avoid importing CimCmdlets inside the first probe's
+    // five-second budget. Keep one bounded query and request only CommandLine.
+    const source = await captureProcessList('powershell.exe', [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-      "$ErrorActionPreference='Stop'; $OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | ForEach-Object { if ($null -ne $_.CommandLine) { $_.CommandLine } }"
+      "$ErrorActionPreference='Stop'; $OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
+      + "$profileQuery=[wmisearcher]\"SELECT CommandLine FROM Win32_Process WHERE Name = 'chrome.exe'\"; "
+      + 'try { foreach ($chromeProcess in $profileQuery.Get()) { '
+      + 'if ($null -ne $chromeProcess.CommandLine) { $chromeProcess.CommandLine } } } '
+      + 'finally { $profileQuery.Dispose() }'
     ]);
     if (source === null) return 'unknown';
     return source.split(/\r?\n/u).some((line) => commandLineUsesProfile(line, userDataDir))
@@ -173,8 +181,8 @@ export async function probeChromeProfileUsage(userDataDir) {
       : 'inactive';
   }
 
-  if (process.platform === 'darwin') {
-    const source = await capture('ps', ['-Aww', '-o', 'comm=', '-o', 'command=']);
+  if (platform === 'darwin') {
+    const source = await captureProcessList('ps', ['-Aww', '-o', 'comm=', '-o', 'command=']);
     if (source === null) return 'unknown';
     return source.split(/\r?\n/u).some((line) => (
       /(?:Google Chrome|Chromium)/u.test(line) && commandLineUsesProfile(line, userDataDir)

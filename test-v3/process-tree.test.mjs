@@ -3,12 +3,49 @@ import test from 'node:test';
 import { spawn, execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
-import { commandLineUsesProfile, terminatePosixProcessTree, terminateProcessTree } from '../src/lib/process-tree.mjs';
+import { commandLineUsesProfile, probeChromeProfileUsage, terminatePosixProcessTree, terminateProcessTree } from '../src/lib/process-tree.mjs';
 
 const ROOT_PID = 41001;
 const processRow = (pid, ppid, pgid = pid) => ({ pid, ppid, pgid, state: 'S', startedAt: `started-${pid}` });
 const ownedTree = () => [processRow(ROOT_PID, 900), processRow(41002, ROOT_PID),
   processRow(41003, 41002), processRow(99000, 900)];
+
+test('Windows Profile query returns unknown on enumeration failure and never retries', async () => {
+  const profile = 'C:\\Task Master\\profile_123';
+  for (const [source, expected] of [
+    [null, 'unknown'], ['', 'inactive'],
+    [`chrome.exe --user-data-dir="${profile}" --no-first-run`, 'active'],
+    [`chrome.exe --user-data-dir="${profile} Copy" --no-first-run`, 'inactive']
+  ]) {
+    let calls = 0;
+    assert.equal(await probeChromeProfileUsage(profile, {
+      platform: 'win32', captureProcessList: async () => { calls += 1; return source; }
+    }), expected);
+    assert.equal(calls, 1);
+  }
+});
+
+test('Windows Profile probe works without loading CIM cmdlets', {
+  skip: process.platform !== 'win32', timeout: 10_000
+}, async () => {
+  const execute = promisify(execFile);
+  let calls = 0;
+  const profile = `C:\\Task Master probe fixture ${process.pid} ${Date.now()}\\unused`;
+  const result = await probeChromeProfileUsage(profile, {
+    captureProcessList: async (command, args) => {
+      calls += 1;
+      try {
+        const { stdout } = await execute(command, [...args.slice(0, -1),
+          `$PSModuleAutoLoadingPreference='None'; ${args.at(-1)}`], {
+          windowsHide: true, timeout: 5_000
+        });
+        return stdout;
+      } catch { return null; }
+    }
+  });
+  assert.equal(result, 'inactive');
+  assert.equal(calls, 1);
+});
 
 test('macOS ps command lines match an exact Profile path containing spaces', () => {
   const profile = '/Users/eric/Library/Application Support/Eric Task Master/profiles/profile_123';
