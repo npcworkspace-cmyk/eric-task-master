@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.2 - 2026-09-06
+
+- Keep the Dashboard task list limited to current work: queued, running, waiting, automatically paused, and stopping tasks. Finished, stopped, and failed tasks leave the list on refresh, including when opened through an old task link.
+- Count only visible tasks, label queued work accurately, and show a concise empty state. Preserve task records and output for CLI follow and explicit cleanup; hiding a card never deletes files.
+- Exercise automatic task removal, terminal states, empty lists, old links, and stop/resume behavior in the real Dashboard acceptance.
+
 ## 3.1.1 - 2026-09-06
 
 - Keep observing the single Chrome close operation after its ten-second deadline, so a later confirmed close can acknowledge cleanup and release the Profile without unnecessary force termination.

@@ -27,11 +27,11 @@ Use it for unattended research, recurring operations, long browser collections, 
 Download two files from the [latest GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest):
 
 1. the Manager installer **or portable ZIP** matching your OS and CPU;
-2. `eric-task-master-skill-v3.1.1.zip`.
+2. `eric-task-master-skill-v3.1.2.zip`.
 
 The Manager package includes its Node.js runtime, Playwright runtime, CLI, Dashboard, and background service. It uses an installed stable Google Chrome and does not download a separate Chromium.
 
-Installer unavailable? Download `eric-task-master-v3.1.1-<target>-portable.zip`, verify it against `SHA256SUMS`, and extract it to a permanent folder. Run `eric-task-master/bin/taskmaster.cmd panel` on Windows or `eric-task-master/bin/taskmaster panel` on macOS/Linux. No installer, administrator access, or separate Node.js installation is needed. [Choose your target and view setup details](docs/INSTALLERS.md#portable-zip-fallback).
+Installer unavailable? Download `eric-task-master-v3.1.2-<target>-portable.zip`, verify it against `SHA256SUMS`, and extract it to a permanent folder. Run `eric-task-master/bin/taskmaster.cmd panel` on Windows or `eric-task-master/bin/taskmaster panel` on macOS/Linux. No installer, administrator access, or separate Node.js installation is needed. [Choose your target and view setup details](docs/INSTALLERS.md#portable-zip-fallback).
 
 After installation:
 
@@ -40,6 +40,8 @@ taskmaster panel
 ```
 
 Create a Profile, sign in in its native Chrome window, close that window, and set it as default. Tasks reuse the same Profile. Then give the Skill to the Agent and state the task. Sites may still ask for verification again.
+
+The Dashboard shows only current tasks, including queued, running, waiting, and stopping work. Ended tasks leave the list automatically; results and files remain available through the CLI.
 
 The Dashboard's **Clean space** dialog clears idle Profile browser caches and finished-task temporary scripts. Historical screenshots, downloads, and results require a separate opt-in. Login state, extension data, and active tasks are preserved.
 

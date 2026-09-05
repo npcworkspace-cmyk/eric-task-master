@@ -16,7 +16,7 @@ The CLI is the only Agent integration. There is no MCP adapter, browser extensio
 - **CLI:** auto-starts Manager, submits one local `.mjs`, follows progress, and controls tasks and Profiles.
 - **Manager:** owns durable state, HTTP Dashboard/API, queues, leases, Worker processes, cleanup, and task output metadata.
 - **Worker:** opens the selected persistent Profile with stable local Chrome, imports the copied task script, and exposes direct Playwright objects.
-- **Dashboard:** two views only: Tasks and Profiles.
+- **Dashboard:** two views only: current Tasks and Profiles. Terminal tasks disappear from the panel; Manager retains their records and output for CLI follow and explicit cleanup.
 - **Skill:** one short, platform-neutral CLI guide.
 
 ## Task contract

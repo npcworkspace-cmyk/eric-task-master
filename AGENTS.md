@@ -17,6 +17,7 @@ Keep Eric Task Master on one path:
 
 - Prefer the smallest implementation that proves the requested outcome.
 - Keep Dashboard limited to Tasks and Profiles.
+- Show only current tasks in Dashboard; terminal task cards disappear without deleting records or output needed by CLI follow.
 - Any new required pre-run step needs explicit product justification.
 - Add a regression test for every bug fix.
 - Run `npm run check` before commit.

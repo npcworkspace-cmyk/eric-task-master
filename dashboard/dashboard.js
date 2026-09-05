@@ -58,11 +58,11 @@ const I18N = Object.freeze({
     'offline.title': '暂时无法连接 Manager',
     'offline.body': '面板会保留上次状态并自动重试，后台任务不受影响。',
     'offline.retry': '立即重试',
-    'tasks.title': '任务进度',
-    'tasks.description': '实时查看处理数量与当前动作；需要时可停止、恢复或删除任务。',
+    'tasks.title': '当前任务',
+    'tasks.description': '只显示进行中和等待处理的任务，结束后自动从列表移除。',
     'tasks.loading': '正在读取任务…',
-    'tasks.empty': '当前还没有任务。Agent 启动任务后会立即显示在这里。',
-    'tasks.count': '{active} 个运行中 · 共 {total} 个',
+    'tasks.empty': '当前没有进行中的任务。',
+    'tasks.count': '{count} 个任务',
     'tasks.untitled': '未命名任务',
     'tasks.processed': '已处理 {current}',
     'tasks.inProgress': '正在执行',
@@ -76,6 +76,7 @@ const I18N = Object.freeze({
     'tasks.delete': '删除',
     'tasks.targetMissing': '指定的任务不存在或已经删除',
     'state.running': '运行中',
+    'state.queued': '排队中',
     'state.stopping': '正在停止',
     'state.waiting': '等待中',
     'state.automaticPaused': '已自动暂停',
@@ -85,6 +86,7 @@ const I18N = Object.freeze({
     'state.stopped': '已停止',
     'state.error': '发生错误',
     'activity.running': '正在执行任务',
+    'activity.queued': '等待空闲资源',
     'activity.stopping': '正在停止任务并释放浏览器',
     'activity.waiting': '任务正在等待',
     'activity.finished': '任务已结束',
@@ -184,11 +186,11 @@ const I18N = Object.freeze({
     'offline.title': 'Manager is temporarily unavailable',
     'offline.body': 'The panel keeps the last known state and retries automatically. Background tasks are not interrupted.',
     'offline.retry': 'Retry now',
-    'tasks.title': 'Task progress',
-    'tasks.description': 'See processed counts and the current action in real time. Stop, resume, or delete a task when needed.',
+    'tasks.title': 'Current tasks',
+    'tasks.description': 'Only active and waiting tasks appear here. Ended tasks leave the list automatically.',
     'tasks.loading': 'Loading tasks…',
-    'tasks.empty': 'No tasks yet. A task appears here as soon as an Agent starts it.',
-    'tasks.count': '{active} running · {total} total',
+    'tasks.empty': 'No active tasks.',
+    'tasks.count': '{count} tasks',
     'tasks.untitled': 'Untitled task',
     'tasks.processed': '{current} processed',
     'tasks.inProgress': 'In progress',
@@ -202,6 +204,7 @@ const I18N = Object.freeze({
     'tasks.delete': 'Delete',
     'tasks.targetMissing': 'The requested task does not exist or has been deleted',
     'state.running': 'Running',
+    'state.queued': 'Queued',
     'state.stopping': 'Stopping',
     'state.waiting': 'Waiting',
     'state.automaticPaused': 'Automatically paused',
@@ -211,6 +214,7 @@ const I18N = Object.freeze({
     'state.stopped': 'Stopped',
     'state.error': 'Error',
     'activity.running': 'Running the task',
+    'activity.queued': 'Waiting for available resources',
     'activity.stopping': 'Stopping the task and releasing its browser',
     'activity.waiting': 'The task is waiting',
     'activity.finished': 'The task has finished',
@@ -589,6 +593,7 @@ function formatDuration(milliseconds) {
 
 function normalizeTaskState(task) {
   const value = String(task?.state || task?.status || 'running').toLowerCase();
+  if (value === 'queued') return 'queued';
   if (value === 'stopping') return 'stopping';
   if (['completed', 'complete', 'finished', 'done', 'success', 'succeeded'].includes(value)) return 'finished';
   if (['failed', 'error'].includes(value)) return 'error';
@@ -727,12 +732,9 @@ function taskActionButtons(task) {
 }
 
 function renderTasks() {
-  const ordered = [...state.tasks].sort((left, right) => {
-    const leftTerminal = TERMINAL_STATES.has(normalizeTaskState(left));
-    const rightTerminal = TERMINAL_STATES.has(normalizeTaskState(right));
-    if (leftTerminal !== rightTerminal) return leftTerminal ? 1 : -1;
-    return Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0);
-  });
+  const ordered = state.tasks
+    .filter((task) => !TERMINAL_STATES.has(normalizeTaskState(task)))
+    .sort((left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0));
   ui.tasks.replaceChildren();
   if (!ordered.length) {
     ui.tasks.append(element('p', 'empty-state', t('tasks.empty')));
@@ -778,8 +780,7 @@ function renderTasks() {
     card.append(heading, progressBlock, facts, footer);
     ui.tasks.append(card);
   }
-  const active = state.tasks.filter((task) => !TERMINAL_STATES.has(normalizeTaskState(task))).length;
-  ui.taskCountChip.textContent = t('tasks.count', { active, total: state.tasks.length });
+  ui.taskCountChip.textContent = t('tasks.count', { count: ordered.length });
   setInlineError(ui.tasksError, state.errors.tasks);
   focusInitialTask();
 }
