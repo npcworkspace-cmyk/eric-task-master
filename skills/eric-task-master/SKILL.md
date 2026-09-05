@@ -17,7 +17,7 @@ Use the installed or extracted portable `taskmaster` launcher. For a normal requ
    ```
 
 3. Retain the returned task ID, run `taskmaster panel --json`, and immediately give the user its Dashboard URL.
-4. Follow it with `taskmaster follow TASK_ID --json`. Report meaningful processed counts during a long run.
+4. Follow it with `taskmaster follow TASK_ID --json`; optionally add `--wait-ms 30000` to bound a call. Retain `after` and continue with `--after SEQUENCE`. Report meaningful processed counts during a long run.
 5. Read the output files and deliver every usable result, including partial results from a stopped or failed run.
 
 Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. If `taskmaster` is not on PATH, use its known portable location or the installed launcher directly: Windows `%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`; macOS `/usr/local/bin/taskmaster`; Linux `/usr/bin/taskmaster`. If Manager reports `DEFAULT_PROFILE_REQUIRED`, ask the user to create or choose a Profile in `taskmaster panel`; do not install another controller.
@@ -37,7 +37,7 @@ export async function run({ page, context, input, outputDir, progress, wait, sig
 
 The `page` and `context` values are normal Playwright objects. The task decides navigation, selectors, concurrency, retry, pacing, waiting, recovery, and result format. Write valuable output incrementally under `outputDir`; do not wait until the end to persist a large batch. Use `progress()` after meaningful units. Use generic `wait()` only when this task chooses to pause.
 
-Only the entry `.mjs` is copied and frozen. Keep it self-contained: use Node built-ins, bare `playwright`, task `input`, absolute paths, or `outputDir`. Do not rely on relative sibling imports or files beside the source module because they are not copied.
+Only the entry `.mjs` is copied and frozen. Keep it self-contained: use Node built-ins, bare `playwright`, task `input`, absolute paths, or `outputDir`. Relative sibling imports/files are not copied. For uncertain submission retries, optionally use `run --request-key KEY` (1-160 ASCII letters/digits/`._:-`, starting with a letter/digit): identical submissions return the same task; changed content requires a new key.
 
 If an action with an external effect has an unknown outcome, inspect the page or service before repeating it. Never put cookies, tokens, passwords, or authorization headers in progress messages or output files.
 
@@ -45,9 +45,9 @@ If an action with an external effect has an unknown outcome, inspect the page or
 
 When the task detects a verification page, stop dispatching work and call `await wait({ reason: 'verification' })`. If it is in another tab, pass `page: thatPage`. Detection belongs to the task; Manager does not intercept arbitrary raw scripts. Do not add a screenshot timer to the task.
 
-Manager retains Chrome, the Worker and heartbeat, freezes the execution timeout, and captures the page at 5, 10, 15 and 20 minutes. `follow` returns an `attention` record and `after` cursor for a new screenshot. Open `attention.screenshotPath` and judge it yourself. Only if clearly recovered, run `taskmaster resume TASK_ID --probe PROBE_ID --json` using its `attention.probeId`; otherwise send no resume. Continue `taskmaster follow TASK_ID --after SEQUENCE --json` using the returned `after`. Screenshot failure or uncertainty means remain paused, not retry browser actions.
+Manager retains Chrome, Worker and heartbeat, freezes execution timeout, and requests a system notification immediately and every 30 seconds until actual resume or the 20-minute deadline. Page screenshots occur at 5/10/15/20 minutes. Before the deadline, `follow` returns screenshot `attention` and an `after` cursor. Open `attention.screenshotPath`; only if clearly recovered, run `taskmaster resume TASK_ID --probe PROBE_ID --json` with `attention.probeId`. Otherwise continue following with `--after SEQUENCE`; uncertainty means stay waiting.
 
-After the fourth unresolved probe, report that the browser remains open awaiting manual resume; no more screenshots run. The Dashboard Resume button or the user's request to resume maps to `taskmaster resume TASK_ID --json`. `stop` and `delete` still end the task and close its browser. Keep following during the four-probe window: CLI delivers events but cannot wake an Agent that has ended its turn or lost its terminal session.
+At 20 minutes Manager automatically pauses and stops reminders, preserving the browser and checkpoint. `follow` returns `manualResumeRequired`; the final screenshot is diagnostic only and must not trigger probe-based resume. The Dashboard Resume button or user's resume request maps to `taskmaster resume TASK_ID --json`. `stop`/`delete` cancel reminders and end the task. Keep following before automatic pause: CLI cannot wake an Agent whose turn or terminal session ended. Notification presentation follows OS settings; failures never block task control.
 
 ## Control
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.1.0 - 2026-09-05
+
+- Send a desktop notification immediately when verification stops work, then every 30 seconds until actual resume, explicit stop/delete, completion, or automatic pause at 20 minutes. Notification failures never gate task control.
+- Preserve Chrome, Worker, Profile and checkpoint on automatic pause; require manual resume after the deadline and retain the final screenshot for diagnosis only.
+- Bound startup cancellation and resume acknowledgement, reject obsolete probes, and handle tasks that complete immediately after resuming without false failures.
+- Contain background Profile cleanup failures with bounded retries, recover after transient state-write failures, bound stalled IPC sends, and reuse confirmed cleanup within one lease.
+- Terminate detached descendant process groups during POSIX forced cleanup using bounded ownership snapshots; retain the lease when browser inactivity cannot be confirmed.
+- Coalesce frequent progress writes, avoid global task-history rewrites for heartbeats, and share recent output-budget scans on progress.
+- Add optional submission request keys and bounded follow calls; drain retained terminal events before returning the final cursor.
+- Reuse API-compatible Managers without automatic replacement on normal commands; guard explicit idle maintenance against concurrent task/Profile creation.
+- Add clock-driven notification, real Windows notification submission, real Chrome verification, lifecycle, and control-race regressions.
+- Run one CI/CodeQL gate per pull-request update and a separate exact-main push gate for publication, avoiding duplicate feature-push checks without removing any required platform or release verification.
+
 ## 3.0.3 - 2026-09-04
 
 - Added a three-category Dashboard space cleaner: preview before deletion, preserve login/extension data, skip active Profiles/tasks, and require opt-in for historical task output.

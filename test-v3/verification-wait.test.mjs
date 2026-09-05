@@ -5,7 +5,7 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import test from 'node:test';
-import { runTaskWorker, resumeTaskWorker } from '../src/runtime/task-worker.mjs';
+import { runTaskWorker, resumeTaskWorker, acknowledgeTaskWorkerResume } from '../src/runtime/task-worker.mjs';
 import { removeTestTree } from './test-fs.mjs';
 
 const PROBE_INTERVAL_MS = 5 * 60_000;
@@ -122,6 +122,7 @@ async function fixture(t, {
     get cdpAttempts() { return cdpAttempts; },
     get waits() { return messages.filter((message) => message.type === 'waiting').map((message) => message.waiting); },
     get probes() { return messages.filter((message) => message.event?.type === 'verification.probe').map((message) => message.event); },
+    get pauses() { return messages.filter((message) => message.event?.type === 'verification.paused').map((message) => message.event); },
     get heartbeats() { return messages.filter((message) => message.type === 'heartbeat'); },
     get continued() { return messages.filter((message) => message.event?.phase === 'continued'); }
   };
@@ -138,19 +139,22 @@ async function probe(t, state, number) {
   return state.probes.at(-1);
 }
 
-test('verification probes at 5/10/15/20 minutes, then stays waiting with Chrome and heartbeat alive', async (t) => {
+test('verification probes at 5/10/15/20 minutes, then pauses automatically with Chrome and heartbeat alive', async (t) => {
   const state = await fixture(t);
   const waiting = state.waits[0];
   assert.equal(waiting.kind, 'verification');
   assert.equal(waiting.probeIntervalMs, PROBE_INTERVAL_MS);
   assert.equal(waiting.maximumProbes, 4);
+  assert.equal(waiting.automaticPaused, false);
+  assert.equal(waiting.pauseAfterMs, 4 * PROBE_INTERVAL_MS);
+  assert.equal(Date.parse(waiting.pauseAt), CLOCK_START + 4 * PROBE_INTERVAL_MS);
   assert.equal(Date.parse(waiting.nextProbeAt), CLOCK_START + PROBE_INTERVAL_MS);
   for (let number = 1; number <= 4; number += 1) {
     const event = await probe(t, state, number);
     assert.equal(event.waitId, waiting.id);
     assert.equal(event.probe, number);
     assert.equal(event.maximumProbes, 4);
-    assert.equal(event.needsAgentDecision, true);
+    assert.equal(event.needsAgentDecision, number < 4);
     assert.equal(event.automaticProbesComplete, number === 4);
     assert.equal(state.captures[number - 1].at, CLOCK_START + number * PROBE_INTERVAL_MS);
     assert.equal(event.nextProbeAt, number === 4 ? null
@@ -159,6 +163,10 @@ test('verification probes at 5/10/15/20 minutes, then stays waiting with Chrome 
     assert.deepEqual(await readFile(event.screenshotPath), SCREENSHOT);
   }
   assert.equal(new Set(state.probes.map((event) => event.probeId)).size, 4);
+  assert.equal(state.pauses.length, 1);
+  assert.equal(state.pauses[0].waitId, waiting.id);
+  assert.equal(state.pauses[0].automaticPaused, true);
+  assert.equal(Date.parse(state.pauses[0].pausedAt), CLOCK_START + 4 * PROBE_INTERVAL_MS);
   const heartbeats = state.heartbeats.length;
   t.mock.timers.tick(2 * PROBE_INTERVAL_MS);
   await nextTurn();
@@ -177,14 +185,15 @@ test('failed verification screenshots remain unknown and never finish or resume 
     const event = await probe(t, state, number);
     assert.equal(event.screenshot, null);
     assert.equal(event.screenshotPath, null);
-    assert.equal(event.needsAgentDecision, true);
+    assert.equal(event.needsAgentDecision, number < 4);
   }
   assert.equal(state.cdpAttempts, 4);
   assert.equal(state.done, false);
   assert.equal(state.closeCount, 0);
   assert.equal(state.continued.length, 0);
   const last = state.probes.at(-1);
-  assert.equal(resumeTaskWorker({ verified: true }, { waitId: last.waitId, probeId: last.probeId }), true);
+  assert.equal(resumeTaskWorker({ verified: true }, { waitId: last.waitId, probeId: last.probeId }), false);
+  assert.equal(resumeTaskWorker({ verified: true }, { waitId: last.waitId }), true);
   assert.deepEqual(await state.running, { state: 'finished', result: [{ verified: true }] });
 });
 
@@ -220,7 +229,7 @@ test('an exhausted diagnostic reserve yields four unknown probes without exiting
     const event = await probe(t, state, number);
     assert.equal(event.screenshot, null);
     assert.equal(event.screenshotPath, null);
-    assert.equal(event.needsAgentDecision, true);
+    assert.equal(event.needsAgentDecision, number < 4);
   }
   assert.equal(state.captures.length, 0);
   assert.equal(state.done, false);
@@ -289,7 +298,9 @@ for (const resumeAtProbe of [1, 4]) {
     const state = await fixture(t);
     for (let number = 1; number <= resumeAtProbe; number += 1) await probe(t, state, number);
     const last = state.probes.at(-1);
-    assert.equal(resumeTaskWorker('verified', { waitId: last.waitId, probeId: last.probeId }), true);
+    assert.equal(resumeTaskWorker('verified', {
+      waitId: last.waitId, ...(resumeAtProbe < 4 ? { probeId: last.probeId } : {})
+    }), true);
     assert.deepEqual(await state.running, { state: 'finished', result: ['verified'] });
     assert.equal(state.continued.length, 1);
     assert.equal(state.closeCount, 1);
@@ -318,6 +329,80 @@ test('stale wait and probe IDs cannot resume the current verification wait', asy
   assert.equal(state.continued.length, 1);
   assert.equal(resumeTaskWorker('second', { waitId: state.waits[1].id }), true);
   assert.deepEqual(await state.running, { state: 'finished', result: ['first', 'second'] });
+});
+
+test('the last published probe remains resumable while the next screenshot is pending', async (t) => {
+  let captureNumber = 0;
+  let finishScreenshot;
+  const state = await fixture(t, { screenshot: () => {
+    captureNumber += 1;
+    if (captureNumber === 2) return new Promise((resolve) => { finishScreenshot = resolve; });
+    return SCREENSHOT;
+  } });
+  const first = await probe(t, state, 1);
+  t.mock.timers.tick(PROBE_INTERVAL_MS);
+  await eventually(() => finishScreenshot, 'second screenshot startup');
+  assert.equal(state.probes.length, 1);
+  assert.equal(resumeTaskWorker('cleared', { waitId: first.waitId, probeId: first.probeId }), true);
+  finishScreenshot(SCREENSHOT);
+  assert.deepEqual(await state.running, { state: 'finished', result: ['cleared'] });
+  assert.equal(state.probes.length, 1, 'resuming invalidates the unfinished observation');
+  assert.equal(state.continued.length, 1);
+});
+
+test('the 20-minute pause is emitted while the final screenshot is still pending', async (t) => {
+  let captureNumber = 0;
+  let finishScreenshot;
+  const state = await fixture(t, { screenshot: () => {
+    captureNumber += 1;
+    if (captureNumber === 4) return new Promise((resolve) => { finishScreenshot = resolve; });
+    return SCREENSHOT;
+  } });
+  for (let number = 1; number <= 3; number += 1) await probe(t, state, number);
+  const lastPublished = state.probes.at(-1);
+  t.mock.timers.tick(PROBE_INTERVAL_MS);
+  await eventually(() => finishScreenshot, 'fourth screenshot startup');
+  assert.equal(state.probes.length, 3);
+  assert.equal(state.pauses.length, 1);
+  assert.equal(state.closeCount, 0);
+  const acknowledgements = [];
+  assert.equal(acknowledgeTaskWorkerResume({
+    requestId: 'request_after_pause', waitId: lastPublished.waitId, probeId: lastPublished.probeId
+  }, (message) => acknowledgements.push(message)), false);
+  assert.equal(acknowledgements[0].reason, 'TASK_VERIFICATION_PAUSED');
+  finishScreenshot(SCREENSHOT);
+  await eventually(() => state.probes.length === 4, 'fourth diagnostic publication');
+  assert.equal(state.probes[3].needsAgentDecision, false);
+  assert.equal(state.probes[3].automaticPaused, true);
+  assert.equal(acknowledgeTaskWorkerResume({
+    requestId: 'manual_resume', waitId: lastPublished.waitId, value: 'manual'
+  }, (message) => acknowledgements.push(message)), true);
+  assert.deepEqual(acknowledgements[1], {
+    type: 'resume_ack', requestId: 'manual_resume', accepted: true, waitId: lastPublished.waitId
+  });
+  assert.deepEqual(await state.running, { state: 'finished', result: ['manual'] });
+  assert.equal(state.messages.filter((message) => message.type === 'resumed').length, 1);
+});
+
+test('resume acknowledgements distinguish stale commands from accepted execution', async (t) => {
+  const state = await fixture(t);
+  const first = await probe(t, state, 1);
+  const acknowledgements = [];
+  const ack = (message) => acknowledgements.push(message);
+  assert.equal(acknowledgeTaskWorkerResume({ requestId: 'bad_wait', waitId: 'obsolete' }, ack), false);
+  assert.equal(acknowledgements.at(-1).reason, 'TASK_WAIT_MISMATCH');
+  assert.equal(acknowledgeTaskWorkerResume({
+    requestId: 'bad_probe', waitId: first.waitId, probeId: 'obsolete'
+  }, ack), false);
+  assert.equal(acknowledgements.at(-1).reason, 'TASK_PROBE_MISMATCH');
+  assert.equal(acknowledgeTaskWorkerResume({
+    requestId: 'accepted', waitId: first.waitId, probeId: first.probeId, value: 'go'
+  }, ack), true);
+  assert.equal(acknowledgements.at(-1).accepted, true);
+  assert.equal(acknowledgeTaskWorkerResume({ requestId: 'duplicate', waitId: first.waitId }, ack), false);
+  assert.equal(acknowledgements.at(-1).reason, 'TASK_NOT_WAITING');
+  assert.deepEqual(await state.running, { state: 'finished', result: ['go'] });
+  assert.equal(state.continued.length, 1);
 });
 
 test('stop cancels verification, closes Chrome, and prevents all later probes and heartbeats', async (t) => {
@@ -363,7 +448,7 @@ test('verification freezes timeout and restores only the unspent execution budge
   for (let number = 1; number <= 4; number += 1) await probe(t, state, number);
   assert.equal(state.done, false, 'verification time must not consume the timeout');
   const last = state.probes.at(-1);
-  assert.equal(resumeTaskWorker(true, { waitId: last.waitId, probeId: last.probeId }), true);
+  assert.equal(resumeTaskWorker(true, { waitId: last.waitId }), true);
   await eventually(() => state.continued.length === 1, 'execution after verification');
   await nextTurn();
   t.mock.timers.tick(699);

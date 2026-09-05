@@ -10,7 +10,8 @@ import {
   readdir,
   rm,
   symlink,
-  unlink
+  unlink,
+  writeFile
 } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,10 +62,13 @@ function waitFor(promise, timeoutMs) {
 function send(child, message) {
   return new Promise((resolve) => {
     if (!child?.connected) return resolve(false);
+    const timer = setTimeout(() => resolve(false), 1_000);
+    timer.unref?.();
+    const finish = (accepted) => { clearTimeout(timer); resolve(accepted); };
     try {
-      child.send(message, undefined, undefined, (error) => resolve(!error));
+      child.send(message, undefined, undefined, (error) => finish(!error));
     } catch {
-      resolve(false);
+      finish(false);
     }
   });
 }
@@ -116,6 +120,14 @@ function jsonClone(value, field = 'value') {
   }
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function taskRootPath(root, taskId) {
   if (!TASK_ID.test(taskId)) throw new TaskServiceError('TASK_NOT_FOUND', 'Task was not found', 404);
   const candidate = path.resolve(root, taskId);
@@ -149,7 +161,10 @@ export function createTaskService({
   leaseTtlMs = LEASE_TTL_MS,
   reaperIntervalMs = 5_000,
   stopWaitMs = 12_000,
-  terminationWaitMs = 3_000
+  terminationWaitMs = 3_000,
+  resumeWaitMs = 5_000,
+  progressFlushMs = 1_000,
+  verificationNotifier = null
 } = {}) {
   if (!stateDir || !profileStore) throw new TypeError('stateDir and profileStore are required');
   if (!Number.isInteger(maxConcurrentTasks) || maxConcurrentTasks < 1 || maxConcurrentTasks > 64) {
@@ -171,6 +186,8 @@ export function createTaskService({
   const deletingProfiles = new Set();
   const profileOperations = new Set();
   const cleaningTasks = new Set();
+  const pendingProgress = new Set();
+  let progressTimer = null;
   let cleanupPromise = null;
   let mutationTail = Promise.resolve();
   let closing = false;
@@ -195,7 +212,33 @@ export function createTaskService({
     tombstones: [...tombstones.values()]
   });
 
+  function flushProgress(task) {
+    if (pendingProgress.delete(task.id)) appendEvent(task, 'progress', task.progress);
+  }
+
+  function scheduleProgressFlush() {
+    if (progressTimer || closing) return;
+    progressTimer = setTimeout(() => {
+      progressTimer = null;
+      void serialize(async () => {
+        if (!pendingProgress.size) return;
+        for (const id of pendingProgress) {
+          const task = tasks.get(id);
+          if (task) flushProgress(task);
+          else pendingProgress.delete(id);
+        }
+        await persist();
+      }).catch(() => {});
+    }, progressFlushMs);
+    progressTimer.unref?.();
+  }
+
+  function observeNotification(task) {
+    try { verificationNotifier?.observeTask(task); } catch { /* Notifications never gate task state. */ }
+  }
+
   const appendEvent = (task, type, data) => {
+    if (type !== 'progress') flushProgress(task);
     task.eventSequence = (task.eventSequence || 0) + 1;
     const event = {
       sequence: task.eventSequence,
@@ -274,14 +317,14 @@ export function createTaskService({
       await persist();
       for (const id of tombstones.keys()) void cleanupTombstone(id);
       reaper = setInterval(() => {
-        for (const [taskId, entry] of children) {
+      for (const [taskId, entry] of children) {
           if (!entry.finalized && !processAlive(entry.child.pid)) {
-            void finalizeTask(taskId, entry, entry.child.exitCode, entry.child.signalCode);
+            void finalizeTask(taskId, entry, entry.child.exitCode, entry.child.signalCode).catch(() => {});
           } else if (!entry.finalized && entry.stopRequested) {
             void containTaskWorker(taskId, entry, {
               code: 'TASK_TERMINATION_RETRY',
               message: 'Retrying termination of the owned task process tree.'
-            });
+            }).catch(() => {});
           }
         }
         void profileStore.recoverExpiredLeases().then((recovered) => {
@@ -298,10 +341,10 @@ export function createTaskService({
   }
   void initialize();
 
-  async function stageModule(sourcePath, taskRoot) {
+  async function stageModule(sourcePath, taskRoot, sourceBytes = null) {
     const resolved = path.resolve(sourcePath);
-    const stats = await lstat(resolved).catch(() => null);
-    if (!stats?.isFile() || stats.isSymbolicLink() || stats.size < 1 || stats.size > MAX_MODULE_BYTES) {
+    const stats = sourceBytes === null ? await lstat(resolved).catch(() => null) : null;
+    if (sourceBytes === null && (!stats?.isFile() || stats.isSymbolicLink() || stats.size < 1 || stats.size > MAX_MODULE_BYTES)) {
       throw new TaskServiceError(
         'TASK_MODULE_INVALID',
         `Task module must be one regular .mjs file no larger than ${MAX_MODULE_BYTES} bytes`
@@ -311,8 +354,9 @@ export function createTaskService({
       throw new TaskServiceError('TASK_MODULE_INVALID', 'Task module must use the .mjs extension');
     }
     const destination = path.join(taskRoot, 'task.mjs');
-    await copyFile(resolved, destination);
-    const bytes = await readFile(destination);
+    if (sourceBytes === null) await copyFile(resolved, destination);
+    else await writeFile(destination, sourceBytes, { mode: 0o600, flag: 'wx' });
+    const bytes = sourceBytes ?? await readFile(destination);
     const moduleSha256 = createHash('sha256').update(bytes).digest('hex');
 
     // Make the bundled Playwright package resolvable for a copied one-file
@@ -419,14 +463,17 @@ export function createTaskService({
   const leaseIdentity = (entry) => ({
     ownerId: entry.ownerId,
     nonce: entry.nonce,
-    generation: entry.generation
+      generation: entry.generation
   });
 
   function confirmEntryCleanup(entry) {
     if (!entry.generation) return Promise.resolve(false);
-    entry.cleanupTail = entry.cleanupTail.then(() => (
-      profileStore.confirmLeaseCleanup(entry.profileId, leaseIdentity(entry))
-    ));
+    if (entry.cleanupConfirmed) return Promise.resolve(true);
+    entry.cleanupTail = entry.cleanupTail.catch(() => {}).then(async () => {
+      if (entry.cleanupConfirmed) return true;
+      entry.cleanupConfirmed = await profileStore.confirmLeaseCleanup(entry.profileId, leaseIdentity(entry));
+      return entry.cleanupConfirmed;
+    });
     return entry.cleanupTail;
   }
 
@@ -438,12 +485,15 @@ export function createTaskService({
 
   async function terminateOwnedTask(entry) {
     if (entry.terminationPromise) return entry.terminationPromise;
-    const attempt = (async () => {
+    const attempt = Promise.resolve().then(async () => {
       const terminated = await terminateTree(entry.child.pid, { graceMs: 3_000 }).catch(() => false);
-      entry.treeTerminated = terminated === true && !processAlive(entry.child.pid);
+      const usage = terminated === true && !processAlive(entry.child.pid)
+        ? await profileUsageProbe(entry.userDataDir).catch(() => 'unknown')
+        : 'unknown';
+      entry.treeTerminated = terminated === true && !processAlive(entry.child.pid) && usage === 'inactive';
       if (entry.treeTerminated) await confirmEntryCleanup(entry).catch(() => {});
       return entry.treeTerminated;
-    })();
+    });
     entry.terminationPromise = attempt;
     const result = await attempt;
     if (!result && entry.terminationPromise === attempt) entry.terminationPromise = null;
@@ -517,6 +567,8 @@ export function createTaskService({
     let resolveCleanup;
     const entry = {
       child,
+      userDataDir: profile.userDataDir,
+      pendingResumes: new Map(),
       profileId: profile.id,
       ownerId,
       nonce,
@@ -543,13 +595,21 @@ export function createTaskService({
     // body. Diagnostics must use structured progress/emit/error or artifacts.
     child.stdout?.resume();
     child.stderr?.resume();
-    child.on('message', (message) => void handleWorkerMessage(task.id, entry, message));
+    child.on('message', (message) => void handleWorkerMessage(task.id, entry, message).catch(() => {
+      void containTaskWorker(task.id, entry, {
+        code: 'TASK_STATE_UPDATE_FAILED', message: 'Task state could not be recorded; stopping this worker.'
+      }).catch(() => {});
+    }));
     child.once('error', (error) => {
-      void recordWorkerEvent(task.id, 'worker.error', normalizeError(error, 'TASK_WORKER_ERROR'));
+      void recordWorkerEvent(task.id, 'worker.error', normalizeError(error, 'TASK_WORKER_ERROR')).catch(() => {});
     });
     child.once('exit', (code, signal) => {
       resolveExit(true);
-      void finalizeTask(task.id, entry, code, signal);
+      for (const pending of entry.pendingResumes.values()) {
+        pending.resolveAck({ accepted: false, reason: 'TASK_WORKER_EXITED' });
+        if (entry.observedResumeWaitId !== pending.waitId) pending.resolveResumed(false);
+      }
+      void finalizeTask(task.id, entry, code, signal).catch(() => {});
     });
 
     try {
@@ -585,7 +645,7 @@ export function createTaskService({
       task.input = null;
       entry.watchdog = setInterval(() => {
         if (!entry.finalized && Date.now() - entry.lastHeartbeatAt > heartbeatTimeoutMs) {
-          void failUnresponsiveTask(task.id, entry);
+          void failUnresponsiveTask(task.id, entry).catch(() => {});
         }
       }, Math.min(5_000, Math.max(1_000, Math.floor(heartbeatTimeoutMs / 3))));
       entry.watchdog.unref?.();
@@ -609,6 +669,12 @@ export function createTaskService({
   }
 
   async function handleWorkerMessage(taskId, entry, message) {
+    if (message?.type === 'resume_ack') {
+      if (children.get(taskId) === entry) entry.pendingResumes.get(message.requestId)?.resolveAck(message);
+      return;
+    }
+    if (message?.type === 'resumed' && children.get(taskId) === entry && !entry.stopRequested &&
+        tasks.get(taskId)?.waiting?.id === message.waitId) entry.observedResumeWaitId = message.waitId;
     let cleanupFailed = message?.type === 'cleanup' && message.browserClosed !== true;
     if (message?.type === 'cleanup' && children.get(taskId) === entry && !entry.finalized) {
       entry.browserClosed = message.browserClosed === true;
@@ -635,7 +701,9 @@ export function createTaskService({
             ttlMs: leaseTtlMs
           });
           if (!renewed) throw new Error('Profile lease was lost');
-        }).catch(() => void failUnresponsiveTask(taskId, entry));
+        }).catch(() => { void failUnresponsiveTask(taskId, entry).catch(() => {}); });
+        // Liveness is cheap in-memory state; lease renewal persists separately.
+        return;
       } else if (message?.type === 'progress') {
         task.progress = {
           current: Number.isFinite(message.progress?.current) ? Math.max(0, message.progress.current) : 0,
@@ -645,30 +713,40 @@ export function createTaskService({
             ? { phase: redactSensitiveText(message.progress.phase).slice(0, 64) }
             : {})
         };
-        appendEvent(task, 'progress', task.progress);
+        pendingProgress.add(task.id);
+        scheduleProgressFlush();
+        return;
       } else if (message?.type === 'waiting') {
+        if (entry.stopRequested) return;
         task.state = 'waiting';
         task.waiting = redactSensitiveValue(jsonClone(message.waiting, 'waiting'));
         appendEvent(task, 'task.waiting', task.waiting);
       } else if (message?.type === 'resumed') {
-        if (task.state !== 'waiting' || task.waiting?.id !== message.waitId) return;
+        if (entry.stopRequested || task.state !== 'waiting' || task.waiting?.id !== message.waitId) return;
         task.state = 'running';
         task.waiting = null;
         appendEvent(task, 'task.resumed', { waitId: message.waitId ?? null });
       } else if (message?.type === 'event') {
         const probe = message.event;
         if (probe?.type === 'verification.probe' && task.state === 'waiting' &&
-            task.waiting?.id === probe.waitId) {
+            task.waiting?.id === probe.waitId && !task.waiting.automaticPaused) {
           Object.assign(task.waiting, redactSensitiveValue({
             probeId: probe.probeId,
             probe: probe.probe,
             maximumProbes: probe.maximumProbes,
             screenshot: probe.screenshot ?? null,
             screenshotPath: probe.screenshotPath ?? null,
-            needsAgentDecision: true,
+            needsAgentDecision: probe.needsAgentDecision !== false,
             automaticProbesComplete: probe.automaticProbesComplete === true,
             nextProbeAt: probe.nextProbeAt ?? null
           }));
+        }
+        if (probe?.type === 'verification.paused' && task.state === 'waiting' &&
+            task.waiting?.id === probe.waitId) {
+          Object.assign(task.waiting, {
+            automaticPaused: true, pausedAt: probe.pausedAt ?? timestamp,
+            needsAgentDecision: false, automaticProbesComplete: true, nextProbeAt: null
+          });
         }
         appendEvent(task, 'task.event', message.event);
       } else if (message?.type === 'result') {
@@ -685,7 +763,13 @@ export function createTaskService({
         cleanupFailed = entry.cleanupFailed;
       }
       task.updatedAt = timestamp;
+      observeNotification(task);
       await persist();
+      if (message?.type === 'resumed') {
+        for (const pending of entry.pendingResumes.values()) {
+          if (pending.waitId === message.waitId) pending.resolveResumed(true);
+        }
+      }
     });
     if (cleanupFailed) {
       await containTaskWorker(taskId, entry, {
@@ -709,6 +793,7 @@ export function createTaskService({
         if (!task) return;
         task.state = 'stopping';
         task.error = { code, message };
+        observeNotification(task);
         appendEvent(task, 'task.stopping', task.error);
         await persist();
       });
@@ -741,9 +826,11 @@ export function createTaskService({
       return entry.finalized === true && (entry.browserClosed === true || entry.treeTerminated === true);
     })();
     entry.containmentPromise = attempt;
-    const result = await attempt;
-    if (!result && entry.containmentPromise === attempt) entry.containmentPromise = null;
-    return result;
+    try {
+      return await attempt;
+    } finally {
+      if (!entry.finalized && entry.containmentPromise === attempt) entry.containmentPromise = null;
+    }
   }
 
   async function failUnresponsiveTask(taskId, entry) {
@@ -787,6 +874,7 @@ export function createTaskService({
       children.delete(taskId);
       delete task.workerPid;
       task.waiting = null;
+      verificationNotifier?.remove(taskId);
       task.finishedAt ||= nowIso(now);
       if (!cleanupConfirmed || !released) {
         task.state = 'error';
@@ -839,11 +927,15 @@ export function createTaskService({
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       throw new TaskServiceError('INVALID_TASK', 'Task request must be an object');
     }
-    const allowed = new Set(['modulePath', 'profileId', 'label', 'input', 'timeoutMs', 'outputBudget']);
+    const allowed = new Set(['modulePath', 'profileId', 'label', 'input', 'timeoutMs', 'outputBudget', 'requestKey']);
     const unknown = Object.keys(body).filter((key) => !allowed.has(key));
     if (unknown.length) throw new TaskServiceError('INVALID_TASK', `Unsupported fields: ${unknown.join(', ')}`);
     if (typeof body.modulePath !== 'string' || !body.modulePath) {
       throw new TaskServiceError('TASK_MODULE_REQUIRED', 'modulePath is required');
+    }
+    if (body.requestKey !== undefined && (typeof body.requestKey !== 'string' ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/u.test(body.requestKey))) {
+      throw new TaskServiceError('INVALID_REQUEST_KEY', 'requestKey must contain 1-160 letters, digits, dots, underscores, colons or hyphens');
     }
     if (body.timeoutMs !== undefined && body.timeoutMs !== null && (
       !Number.isSafeInteger(body.timeoutMs) || body.timeoutMs < 1_000 || body.timeoutMs > 30 * 24 * 60 * 60_000
@@ -852,6 +944,35 @@ export function createTaskService({
     }
 
     return serialize(async () => {
+      if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
+      let requestKeyHash;
+      let requestFingerprint;
+      let sourceBytes = null;
+      if (body.requestKey !== undefined) {
+        const sourcePath = path.resolve(body.modulePath);
+        const sourceStats = await lstat(sourcePath).catch(() => null);
+        if (!sourceStats?.isFile() || sourceStats.isSymbolicLink() || sourceStats.size < 1 || sourceStats.size > MAX_MODULE_BYTES) {
+          throw new TaskServiceError('TASK_MODULE_INVALID', 'Request source must be a regular task module within the size limit');
+        }
+        sourceBytes = await readFile(sourcePath);
+        if (sourceBytes.length < 1 || sourceBytes.length > MAX_MODULE_BYTES) {
+          throw new TaskServiceError('INVALID_MODULE', 'Task module must be a non-empty file within the module size limit', 400);
+        }
+        const moduleSha256 = createHash('sha256').update(sourceBytes).digest('hex');
+        requestKeyHash = createHash('sha256').update(body.requestKey).digest('hex');
+        requestFingerprint = createHash('sha256').update(canonicalJson(jsonClone({
+          moduleSha256, profileId: body.profileId ?? null, input: body.input ?? {},
+          label: normalizeLabel(body.label, body.modulePath), timeoutMs: body.timeoutMs ?? null,
+          outputBudget: body.outputBudget ?? {}
+        }))).digest('hex');
+        const previous = [...tasks.values()].find((task) => task.requestKeyHash === requestKeyHash);
+        if (previous) {
+          if (previous.requestFingerprint !== requestFingerprint) {
+            throw new TaskServiceError('TASK_REQUEST_CONFLICT', 'requestKey already belongs to a different task request', 409);
+          }
+          return publicTask(previous);
+        }
+      }
       await profileStore.recoverExpiredLeases();
       const profile = body.profileId
         ? await profileStore.get(body.profileId)
@@ -882,7 +1003,7 @@ export function createTaskService({
       await mkdir(outputDir, { recursive: true, mode: 0o700 });
       let staged;
       try {
-        staged = await stageModule(body.modulePath, taskRoot);
+        staged = await stageModule(body.modulePath, taskRoot, sourceBytes);
       } catch (error) {
         await rm(taskRoot, { recursive: true, force: true }).catch(() => {});
         throw error;
@@ -896,6 +1017,7 @@ export function createTaskService({
         moduleName: staged.moduleName,
         modulePath: staged.modulePath,
         moduleSha256: staged.moduleSha256,
+        ...(requestKeyHash ? { requestKeyHash, requestFingerprint } : {}),
         input: jsonClone(body.input ?? {}, 'input'),
         timeoutMs: body.timeoutMs ?? null,
         outputBudget: body.outputBudget === undefined ? {} : jsonClone(body.outputBudget, 'outputBudget'),
@@ -974,29 +1096,44 @@ export function createTaskService({
       if (probeId !== undefined && probeId !== task.waiting?.probeId) {
         throw new TaskServiceError('TASK_PROBE_MISMATCH', 'The verification probe is no longer current', 409);
       }
+      if (probeId !== undefined && task.waiting?.automaticPaused) {
+        throw new TaskServiceError('TASK_VERIFICATION_PAUSED', 'Verification waiting reached 20 minutes; resume manually without --probe', 409);
+      }
       const current = children.get(id);
       if (!current) throw new TaskServiceError('TASK_NOT_RUNNING', 'Waiting task has no live worker', 409);
+      if (current.pendingResumes.size) throw new TaskServiceError('TASK_RESUME_PENDING', 'A resume request is already awaiting the Worker response', 409);
       appendEvent(task, 'task.resume_requested', {
         waitId: task.waiting?.id,
         ...(probeId === undefined ? {} : { probeId })
       });
       await persist();
-      return { entry: current, waitId: task.waiting?.id };
+      const requestId = randomUUID();
+      let resolveAck;
+      let resolveResumed;
+      const ack = new Promise((resolve) => { resolveAck = resolve; });
+      const resumed = new Promise((resolve) => { resolveResumed = resolve; });
+      current.pendingResumes.set(requestId, { waitId: task.waiting?.id, resolveAck, resolveResumed });
+      return { entry: current, waitId: task.waiting?.id, requestId, ack, resumed };
     });
-    const accepted = await send(target.entry.child, {
-      type: 'resume',
-      waitId: target.waitId,
-      ...(probeId === undefined ? {} : { probeId }),
-      value: jsonClone(value, 'resume value')
-    });
-    if (!accepted) {
-      throw new TaskServiceError(
-        'TASK_RESUME_FAILED',
-        'Task worker did not accept the resume request; the task remains waiting',
-        409
-      );
+    const deadline = Date.now() + resumeWaitMs;
+    try {
+      const delivered = await waitFor(send(target.entry.child, {
+        type: 'resume', requestId: target.requestId, waitId: target.waitId,
+        ...(probeId === undefined ? {} : { probeId }), value: jsonClone(value, 'resume value')
+      }), Math.max(1, deadline - Date.now()));
+      if (!delivered) throw new TaskServiceError('TASK_RESUME_FAILED', 'Worker did not receive the resume request', 409);
+      const ack = await waitFor(target.ack, Math.max(1, deadline - Date.now()));
+      if (!ack) throw new TaskServiceError('TASK_RESUME_UNCONFIRMED', 'Worker did not confirm the resume request; inspect current task state before retrying', 409);
+      if (ack.accepted !== true) {
+        throw new TaskServiceError(ack.reason || 'TASK_RESUME_REJECTED', 'Worker rejected the resume request; task state was preserved', 409);
+      }
+      if (!(await waitFor(target.resumed, Math.max(1, deadline - Date.now())))) {
+        throw new TaskServiceError('TASK_RESUME_UNCONFIRMED', 'Worker accepted resume but has not confirmed running; inspect current task state', 409);
+      }
+      return get(id);
+    } finally {
+      target.entry.pendingResumes.delete(target.requestId);
     }
-    return get(id);
   }
 
   async function stop(id) {
@@ -1028,6 +1165,7 @@ export function createTaskService({
       }
       entry.stopRequested = true;
       task.state = 'stopping';
+      verificationNotifier?.remove(task.id);
       appendEvent(task, 'task.stopping');
       await persist();
       return { task, entry };
@@ -1071,6 +1209,8 @@ export function createTaskService({
       const entry = children.get(id) ?? null;
       if (entry) entry.stopRequested = true;
       tasks.delete(id);
+      pendingProgress.delete(id);
+      verificationNotifier?.remove(id);
       tombstones.set(id, {
         id,
         profileId: task.profileId,
@@ -1199,7 +1339,9 @@ export function createTaskService({
 
   async function createProfile(body) {
     await ready;
+    if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
     return serialize(async () => {
+      if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
       const profile = await profileStore.create(body);
       const snapshot = await profileStore.snapshot();
       return publicProfile(profile, snapshot.defaultProfileId);
@@ -1221,7 +1363,9 @@ export function createTaskService({
 
   async function openProfile(identifier) {
     await ready;
+    if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
     const profile = await serialize(async () => {
+      if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
       const current = await profileStore.get(identifier);
       if (deletingProfiles.has(current.id)) {
         throw new TaskServiceError('PROFILE_DELETING', 'Profile is being deleted', 409);
@@ -1446,12 +1590,27 @@ export function createTaskService({
     };
   }
 
+  async function prepareIdleStop() {
+    await ready;
+    await serialize(async () => {
+      const profiles = await profileStore.list();
+      if (children.size || profileOperations.size || cleanupPromise || deletingProfiles.size ||
+          [...tasks.values()].some((task) => !isTerminalTask(task)) ||
+          profiles.some((profile) => profile.lease || !['idle'].includes(profile.state))) {
+        throw new TaskServiceError('MANAGER_BUSY', 'Manager has active tasks, Profiles or cleanup; maintenance was not started', 409);
+      }
+      closing = true;
+    });
+  }
+
   async function close() {
     if (closePromise) return closePromise;
     closing = true;
     try {
       closePromise = (async () => {
         clearInterval(reaper);
+        clearTimeout(progressTimer);
+        verificationNotifier?.close();
         await ready.catch(() => {});
         await cleanupPromise?.catch(() => {});
         const activeIds = [...children.keys()];
@@ -1475,6 +1634,13 @@ export function createTaskService({
           profileFailure = error;
         }
         await mutationTail;
+        await serialize(async () => {
+          for (const id of pendingProgress) {
+            const task = tasks.get(id);
+            if (task) flushProgress(task);
+          }
+          await persist();
+        });
         await Promise.allSettled([...tombstones.keys()].map((id) => cleanupTombstone(id)));
         const taskFailure = taskResults.find((result) => result.status === 'rejected');
         if (taskFailure || profileFailure) {
@@ -1510,6 +1676,7 @@ export function createTaskService({
     closeProfile,
     deleteProfile,
     cleanup,
+    prepareIdleStop,
     close
   });
 }

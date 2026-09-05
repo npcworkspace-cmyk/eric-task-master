@@ -16,7 +16,7 @@ function count(sourceText, fragment) {
 
 test('CI exercises the complete gate on every advertised native target', async () => {
   const ci = await source('.github/workflows/ci.yml');
-  assert.match(ci, /push:\s*\r?\n\s+branches: \[main, "v\*", "upgrade\/\*\*"\]/u);
+  assert.match(ci, /push:\s*\r?\n\s+branches: \[main\]/u, 'feature pushes must not duplicate their PR gate');
   assert.match(ci, /\r?\n  pull_request:\s*\r?\n/u);
   assert.match(ci, /\r?\n  workflow_dispatch:\s*\r?\n/u);
 
@@ -44,7 +44,8 @@ test('CI exercises the complete gate on every advertised native target', async (
 
 test('CodeQL produces same-SHA main push evidence', async () => {
   const codeql = await source('.github/workflows/codeql.yml');
-  assert.match(codeql, /push:\s*\r?\n\s+branches: \[main, "v\*", "stability\/\*\*", "upgrade\/\*\*"\]/u);
+  assert.match(codeql, /push:\s*\r?\n\s+branches: \[main\]/u, 'feature pushes must not duplicate their PR scan');
+  assert.match(codeql, /workflow_dispatch:/u);
   assert.match(codeql, /github\/codeql-action\/init@/u);
   assert.match(codeql, /github\/codeql-action\/analyze@/u);
 });

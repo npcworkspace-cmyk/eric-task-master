@@ -318,7 +318,8 @@ async function main() {
     taskIds.splice(taskIds.indexOf(endless.id), 1);
     const releasedProfile = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles
       .find((profile) => profile.id === profileB.id);
-    add('deleting a running task kills it and releases the Profile', releasedProfile.state === 'idle');
+    add('deleting a running task kills it and releases the Profile', releasedProfile.state === 'idle',
+      releasedProfile.state === 'idle' ? '' : JSON.stringify({ state: releasedProfile.state, lease: releasedProfile.lease ?? null }));
 
     for (const id of [...taskIds]) await cli(['delete', id, '--json'], 60_000);
     taskIds.length = 0;

@@ -27,10 +27,19 @@ function wait(promise, timeoutMs) {
 function send(child, message) {
   return new Promise((resolve) => {
     if (!child?.connected) return resolve(false);
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish(false), 1_000);
+    timer.unref?.();
     try {
-      child.send(message, undefined, undefined, (error) => resolve(!error));
+      child.send(message, undefined, undefined, (error) => finish(!error));
     } catch {
-      resolve(false);
+      finish(false);
     }
   });
 }
@@ -46,10 +55,16 @@ export function createProfileRuntime({
   heartbeatTimeoutMs = 35_000,
   openTimeoutMs = PROFILE_OPEN_TIMEOUT_MS,
   closeTimeoutMs = 12_000,
+  cleanupRetryDelayMs = 5_000,
+  maximumCleanupAttempts = 3,
   onProfileAvailable = () => {}
 } = {}) {
   if (!profileStore || typeof workerFactory !== 'function') {
     throw new TypeError('profileStore and workerFactory are required');
+  }
+  if (!Number.isSafeInteger(maximumCleanupAttempts) || maximumCleanupAttempts < 1 ||
+      !Number.isSafeInteger(cleanupRetryDelayMs) || cleanupRetryDelayMs < 1) {
+    throw new TypeError('cleanup retry count and delay must be positive integers');
   }
   const entries = new Map();
 
@@ -61,16 +76,21 @@ export function createProfileRuntime({
 
   function confirmCleanup(profileId, entry) {
     if (!entry.generation) return Promise.resolve(false);
-    entry.cleanupTail = entry.cleanupTail.then(() => (
-      profileStore.confirmLeaseCleanup(profileId, leaseIdentity(entry))
-    ));
+    if (entry.cleanupConfirmed) return Promise.resolve(true);
+    entry.cleanupTail = entry.cleanupTail.catch(() => {}).then(async () => {
+      if (entry.cleanupConfirmed) return true;
+      entry.cleanupConfirmed = await profileStore.confirmLeaseCleanup(profileId, leaseIdentity(entry));
+      return entry.cleanupConfirmed;
+    });
     return entry.cleanupTail;
   }
 
   async function markCleanupError(profileId, entry) {
     if (!entry.generation) return false;
+    if (entry.cleanupErrorMarked) return true;
     await entry.cleanupTail.catch(() => {});
-    return profileStore.markLeaseError(profileId, leaseIdentity(entry)).catch(() => false);
+    entry.cleanupErrorMarked = await profileStore.markLeaseError(profileId, leaseIdentity(entry)).catch(() => false);
+    return entry.cleanupErrorMarked;
   }
 
   async function terminateOwnedTree(profileId, entry) {
@@ -83,18 +103,19 @@ export function createProfileRuntime({
         ? await profileUsageProbe(profile.userDataDir).catch(() => 'unknown')
         : 'unknown';
       entry.treeTerminated = terminated === true && !processAlive(entry.child.pid) && usage === 'inactive';
-      if (entry.treeTerminated) await confirmCleanup(profileId, entry).catch(() => {});
       return entry.treeTerminated;
     });
     entry.terminationPromise = attempt;
-    const result = await attempt;
-    if (!result && entry.terminationPromise === attempt) entry.terminationPromise = null;
-    return result;
+    try {
+      return await attempt;
+    } finally {
+      if (!entry.treeTerminated && entry.terminationPromise === attempt) entry.terminationPromise = null;
+    }
   }
 
   async function finalize(profileId, entry) {
     if (entry.finalizePromise) return entry.finalizePromise;
-    entry.finalizePromise = (async () => {
+    const attempt = (async () => {
       clearInterval(entry.watchdog);
       await entry.terminationPromise?.catch(() => {});
       await wait(entry.closedPromise, 500);
@@ -105,25 +126,34 @@ export function createProfileRuntime({
       const cleanupConfirmed = entry.browserClosed === true || entry.treeTerminated === true;
       let released = !entry.generation;
       if (entry.generation && cleanupConfirmed) {
-        await confirmCleanup(profileId, entry);
-        released = await profileStore.releaseLease(profileId, leaseIdentity(entry)).catch(() => false);
-      } else if (entry.generation) {
+        if (await confirmCleanup(profileId, entry)) {
+          released = await profileStore.releaseLease(profileId, leaseIdentity(entry)).catch(() => false);
+        }
+      }
+      if (!released && entry.generation) {
         await markCleanupError(profileId, entry);
       }
 
-      if (entries.get(profileId) === entry) entries.delete(profileId);
+      if (released && entries.get(profileId) === entry) {
+        clearTimeout(entry.cleanupRetryTimer);
+        entries.delete(profileId);
+      }
       if (released) await Promise.resolve(onProfileAvailable(profileId)).catch(() => {});
       return cleanupConfirmed && released;
     })();
-    const result = await entry.finalizePromise;
-    if (result === false && processAlive(entry.child.pid)) entry.finalizePromise = null;
-    return result;
+    entry.finalizePromise = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (entries.get(profileId) === entry && entry.finalizePromise === attempt) entry.finalizePromise = null;
+    }
   }
 
   async function stopEntry(profileId, entry) {
     if (entry.stopPromise) return entry.stopPromise;
     entry.stopPromise = (async () => {
       entry.stopping = true;
+      clearInterval(entry.watchdog);
       await send(entry.child, { type: 'close' });
       const closedOrExited = await wait(
         Promise.race([entry.closedPromise, entry.exitPromise]),
@@ -160,9 +190,36 @@ export function createProfileRuntime({
     })();
     try {
       return await entry.stopPromise;
+    } catch (error) {
+      entry.cleanupError = error;
+      await markCleanupError(profileId, entry);
+      throw error;
     } finally {
       if (entries.get(profileId) === entry) entry.stopPromise = null;
     }
+  }
+
+  function stopInBackground(profileId, entry) {
+    if (entries.get(profileId) !== entry || entry.backgroundDisabled || entry.backgroundStop ||
+        entry.cleanupRetryTimer || entry.cleanupAttempts >= maximumCleanupAttempts) return;
+    entry.cleanupAttempts += 1;
+    const attempt = Promise.resolve().then(() => stopEntry(profileId, entry)).catch(async (error) => {
+      entry.cleanupError = error;
+      await markCleanupError(profileId, entry);
+      if (entries.get(profileId) !== entry || entry.backgroundDisabled ||
+          entry.cleanupAttempts >= maximumCleanupAttempts) return;
+      entry.cleanupRetryTimer = setTimeout(() => {
+        entry.cleanupRetryTimer = null;
+        stopInBackground(profileId, entry);
+      }, cleanupRetryDelayMs);
+      entry.cleanupRetryTimer.unref?.();
+    });
+    entry.backgroundStop = attempt;
+    // EventEmitter and timer callbacks cannot own a rejected cleanup promise.
+    // Keep the failure on the entry and in Profile state for manual close retry.
+    void attempt.catch((error) => { entry.cleanupError = error; }).finally(() => {
+      if (entry.backgroundStop === attempt) entry.backgroundStop = null;
+    });
   }
 
   async function openProfile(identifier) {
@@ -209,6 +266,13 @@ export function createProfileRuntime({
       lastHeartbeatAt: Date.now(),
       renewTail: Promise.resolve(),
       cleanupTail: Promise.resolve(),
+      cleanupConfirmed: false,
+      cleanupAttempts: 0,
+      cleanupRetryTimer: null,
+      cleanupError: null,
+      cleanupErrorMarked: false,
+      backgroundStop: null,
+      backgroundDisabled: false,
       terminationPromise: null,
       treeTerminated: false,
       browserClosed: null,
@@ -226,7 +290,7 @@ export function createProfileRuntime({
     child.once('exit', () => {
       resolveExit(true);
       if (!entry.stopping) rejectReady(new TaskServiceError('PROFILE_WORKER_EXITED', 'Profile worker exited', 500));
-      void finalize(profile.id, entry);
+      if (!entry.stopping) stopInBackground(profile.id, entry);
     });
     child.once('error', () => {
       rejectReady(new TaskServiceError('PROFILE_WORKER_START_FAILED', 'Profile worker could not start', 500));
@@ -261,7 +325,7 @@ export function createProfileRuntime({
           });
           if (!renewed) throw new Error('Profile lease was lost');
         }).catch(() => {
-          if (!entry.stopping) void stopEntry(profile.id, entry);
+          stopInBackground(profile.id, entry);
         });
       }
     });
@@ -280,7 +344,7 @@ export function createProfileRuntime({
       }
       entry.watchdog = setInterval(() => {
         if (!entry.stopping && Date.now() - entry.lastHeartbeatAt > heartbeatTimeoutMs) {
-          void stopEntry(profile.id, entry);
+          stopInBackground(profile.id, entry);
         }
       }, Math.min(5_000, Math.max(1_000, Math.floor(heartbeatTimeoutMs / 3))));
       entry.watchdog.unref?.();
@@ -301,7 +365,12 @@ export function createProfileRuntime({
     await profileStore.recoverExpiredLeases();
     const profile = await profileStore.get(identifier);
     const entry = entries.get(profile.id);
-    if (entry) return stopEntry(profile.id, entry);
+    if (entry) {
+      clearTimeout(entry.cleanupRetryTimer);
+      entry.cleanupRetryTimer = null;
+      entry.cleanupAttempts = 0;
+      return stopEntry(profile.id, entry);
+    }
     if (profile.lease?.kind === 'manual') {
       await profileStore.markLeaseError(profile.id, profile.lease).catch(() => {});
       throw new TaskServiceError(
@@ -318,7 +387,12 @@ export function createProfileRuntime({
 
   async function closeAll() {
     const results = await Promise.allSettled(
-      [...entries.entries()].map(([profileId, entry]) => stopEntry(profileId, entry))
+      [...entries.entries()].map(([profileId, entry]) => {
+        entry.backgroundDisabled = true;
+        clearTimeout(entry.cleanupRetryTimer);
+        entry.cleanupRetryTimer = null;
+        return stopEntry(profileId, entry);
+      })
     );
     const failure = results.find((result) => result.status === 'rejected');
     if (failure) throw failure.reason;

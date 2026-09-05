@@ -12,6 +12,7 @@ import { OperationalJournal } from './lib/operational-journal.mjs';
 import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 import { createTaskService, TaskServiceError } from './runtime/task-service.mjs';
+import { createVerificationNotifier } from './lib/desktop-notifications.mjs';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -116,6 +117,12 @@ export async function createManager({
   let stopPromise;
   let address;
   const journal = new OperationalJournal({ stateDir: resolvedDataDir });
+  const verificationNotifier = createVerificationNotifier({
+    onError: (error) => {
+      void journal.append({ level: 'warn', event: 'notification.failed',
+        code: 'DESKTOP_NOTIFICATION_FAILED', message: error.message }).catch(() => {});
+    }
+  });
   try {
     const configStore = new JsonStore(path.join(resolvedDataDir, 'config.json'), () => ({
       version: 3,
@@ -141,6 +148,7 @@ export async function createManager({
     taskService = await taskServiceFactory({
       stateDir: path.join(resolvedDataDir, 'tasks'),
       profileStore,
+      verificationNotifier,
       ...taskServiceOptions
     });
 
@@ -160,6 +168,7 @@ export async function createManager({
             service: 'eric-task-master',
             version: VERSION,
             apiVersion: API_VERSION,
+            capabilities: ['task.request-key', 'manager.idle-stop', 'verification.notifications'],
             state: stopping ? 'stopping' : 'ready',
             pid: process.pid
           });
@@ -214,6 +223,8 @@ export async function createManager({
           return;
         }
         if (request.method === 'POST' && pathname === '/v1/manager/stop') {
+          const options = await readJson(request);
+          if (options.onlyIfIdle === true) await taskService.prepareIdleStop();
           sendJson(response, 202, { ok: true, state: 'stopping' });
           setImmediate(() => {
             void stop().catch((error) => journal.append({
@@ -375,6 +386,7 @@ export async function createManager({
       const attempt = (async () => {
         stopping = true;
         await taskService.close();
+        verificationNotifier.close();
         if (address) {
           await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
         }
@@ -401,6 +413,7 @@ export async function createManager({
       profileStore
     });
   } catch (error) {
+    verificationNotifier.close();
     await taskService?.close?.().catch(() => {});
     await managerLock.release().catch(() => {});
     throw error;

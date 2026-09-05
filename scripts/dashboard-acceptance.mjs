@@ -380,6 +380,47 @@ async function waitUntil(predicate, label, timeoutMs = 5_000) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
+async function checkVerificationPause(page, checks) {
+  const original = clone(tasks.get('task_waiting'));
+  const actionsBefore = calls.taskActions.length;
+  const deletesBefore = calls.taskDeletes.length;
+  const card = page.locator('.task-card').filter({ hasText: 'Review open-ended feed' });
+  try {
+    tasks.get('task_waiting').waiting = {
+      id: 'wait_dashboard_verification', kind: 'verification', reason: 'verification',
+      startedAt: ago(60_000), automaticPaused: false
+    };
+    await page.locator('#refresh-all').click();
+    await card.locator('.task-activity').getByText('等待人工验证，系统每30秒提醒；20分钟后自动暂停并停止提醒。', { exact: true }).waitFor();
+    assert.equal(await card.getByRole('button', { name: '恢复', exact: true }).isEnabled(), true);
+
+    Object.assign(tasks.get('task_waiting').waiting, {
+      startedAt: ago(20 * 60_000), automaticPaused: true,
+      pausedAt: now(), needsAgentDecision: false, nextProbeAt: null
+    });
+    await page.locator('#refresh-all').click();
+    await card.locator('.npc-chip').getByText('已自动暂停', { exact: true }).waitFor();
+    assert.equal(await card.locator('.task-activity').textContent(),
+      '等待验证已满20分钟，系统提醒已停止；浏览器现场保留，可手动恢复或停止任务。');
+    assert.equal(await card.getByRole('button', { name: '恢复', exact: true }).isEnabled(), true);
+    assert.equal(await card.getByRole('button', { name: '停止', exact: true }).isEnabled(), true);
+    assert.match(await card.textContent(), /已处理 31/u);
+    assert.equal(await page.locator('.task-card').count(), 3);
+    assert.equal(calls.taskActions.length, actionsBefore);
+    assert.equal(calls.taskDeletes.length, deletesBefore);
+    tasks.get('task_waiting').state = 'stopping';
+    await page.locator('#refresh-all').click();
+    await card.locator('.npc-chip').getByText('正在停止', { exact: true }).waitFor();
+    await card.locator('.npc-chip').getByText('已自动暂停', { exact: true }).waitFor({ state: 'hidden' });
+    assert.doesNotMatch(await card.locator('.task-activity').textContent(), /等待验证已满20分钟|系统提醒已停止/u);
+    checks.push('verification shows 30-second reminders, then an automatic-pause label and stopped-reminder copy with resume/stop enabled; stopping clears stale automatic-pause text');
+  } finally {
+    tasks.set('task_waiting', original);
+    await page.locator('#refresh-all').click();
+    await card.locator('.task-activity').getByText(original.progress.message, { exact: true }).waitFor();
+  }
+}
+
 async function checkCleanup(page, checks) {
   const dialog = page.getByRole('dialog', { name: '清理空间', exact: true });
   const confirm = page.locator('#confirm-cleanup');
@@ -533,6 +574,7 @@ try {
   assert.match(await page.locator('.task-card').filter({ hasText: 'Review open-ended feed' }).textContent(), /已处理 31/u);
   assert.equal(await page.locator('.task-card.is-targeted').count(), 1);
   checks.push('fixed Dashboard URL loads Tasks first, deep-links one task, and renders bounded and open-ended progress');
+  await checkVerificationPause(page, checks);
   await checkCleanup(page, checks);
 
   const rejectApi = (route) => route.abort('connectionrefused');
@@ -540,8 +582,20 @@ try {
   await page.locator('#refresh-all').click();
   await page.locator('#offline-banner:not(.hidden)').waitFor();
   assert.equal(await page.locator('.task-card').count(), 3);
+  // Hold successful responses until the visible Retry action is clicked.
+  // Otherwise background polling can recover between unroute() and click(),
+  // hide the banner, and make this test wait for a button that correctly left.
+  let restoreNetwork;
+  const networkRestored = new Promise((resolve) => { restoreNetwork = resolve; });
+  const holdRecovery = async (route) => { await networkRestored; await route.continue(); };
+  await page.route('**/v1/**', holdRecovery);
   await page.unroute('**/v1/**', rejectApi);
-  await page.locator('#retry-offline').click();
+  try {
+    await page.locator('#retry-offline').click();
+  } finally {
+    restoreNetwork();
+    await page.unrouteAll({ behavior: 'wait' });
+  }
   await page.locator('#offline-banner').waitFor({ state: 'hidden' });
   assert.equal(await page.locator('.task-card').count(), 3);
   checks.push('a temporary Manager outage keeps the last task state and recovers in place');

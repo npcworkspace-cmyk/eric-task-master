@@ -3,11 +3,21 @@ import { mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { setImmediate as nextTurn } from 'node:timers/promises';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { removeTestTree } from './test-fs.mjs';
 import { runTaskWorker } from '../src/runtime/task-worker.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+async function eventually(predicate, label) {
+  const deadline = performance.now() + 5_000;
+  while (!predicate()) {
+    assert.ok(performance.now() < deadline, `Timed out waiting for ${label}`);
+    await nextTurn();
+  }
+}
 
 test('one-file worker can bare-import Playwright and use raw runtime helpers', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-worker-'));
@@ -227,4 +237,107 @@ test('Chrome launch failures preserve a bounded underlying cause', async (t) => 
   assert.equal(result.state, 'error');
   assert.equal(result.error.code, 'CHROME_LAUNCH_FAILED');
   assert.deepEqual(result.error.cause, { code: 'EACCES', message: 'spawn failed' });
+});
+
+for (const phase of ['load', 'launch', 'page', 'import']) {
+  test(`stop during asynchronous ${phase} never enters task code or a later startup phase`, async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-startup-abort-'));
+    const key = `taskmaster_${path.basename(root).replaceAll('-', '_')}`;
+    let release;
+    const pending = new Promise((resolve) => { release = resolve; });
+    const track = { entered: false, runCount: 0, pending };
+    globalThis[key] = track;
+    t.after(async () => {
+      delete globalThis[key];
+      await removeTestTree(root);
+    });
+    const modulePath = path.join(root, 'job.mjs');
+    await writeFile(modulePath, `
+      const track = globalThis[${JSON.stringify(key)}];
+      ${phase === 'import' ? 'track.entered = true; await track.pending;' : ''}
+      export default async function () { track.runCount += 1; return true; }
+    `);
+    let launches = 0;
+    let pageCount = 0;
+    let closed = 0;
+    const page = {};
+    const context = {
+      pages: () => [], browser: () => null,
+      newPage: async () => {
+        pageCount += 1;
+        if (phase === 'page') { track.entered = true; await pending; }
+        return page;
+      },
+      close: async () => { closed += 1; }
+    };
+    const playwright = { chromium: { launchPersistentContext: async () => {
+      launches += 1;
+      if (phase === 'launch') { track.entered = true; await pending; }
+      return context;
+    } } };
+    const controller = new AbortController();
+    const messages = [];
+    const running = runTaskWorker({
+      taskId: `startup_${phase}`, modulePath, outputDir: path.join(root, 'output'),
+      profile: { userDataDir: path.join(root, 'profile') }
+    }, {
+      signal: controller.signal,
+      sendMessage: (message) => messages.push(message),
+      loadPlaywright: async () => {
+        if (phase === 'load') { track.entered = true; await pending; }
+        return playwright;
+      }
+    });
+    await eventually(() => track.entered, `${phase} phase`);
+    controller.abort();
+    const result = await running;
+    assert.equal(result.state, 'stopped', 'stop must not await the blocked startup operation');
+    release();
+    if (phase === 'launch') await eventually(() => closed === 1, 'late browser closure');
+    await nextTurn();
+    await nextTurn();
+    assert.equal(track.runCount, 0);
+    assert.equal(launches, phase === 'load' ? 0 : 1);
+    assert.equal(pageCount, ['load', 'launch'].includes(phase) ? 0 : 1);
+    assert.equal(closed, phase === 'load' ? 0 : 1);
+    assert.equal(messages.some((message) => message.state === 'finished'), false);
+  });
+}
+
+test('startup timeout returns before a slow launch, closes its late context, and never calls run', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-startup-timeout-'));
+  t.after(async () => { t.mock.timers.reset(); await removeTestTree(root); });
+  const modulePath = path.join(root, 'job.mjs');
+  await writeFile(modulePath, 'export default async function () { throw new Error("run must never execute"); }');
+  let finishLaunch;
+  let closed = 0;
+  let pagesRead = 0;
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const running = runTaskWorker({
+    taskId: 'startup_timeout', modulePath, outputDir: path.join(root, 'output'),
+    timeoutMs: 1_000, profile: { userDataDir: path.join(root, 'profile') }
+  }, { loadPlaywright: async () => ({ chromium: {
+    launchPersistentContext: () => new Promise((resolve) => { finishLaunch = resolve; })
+  } }) });
+  await eventually(() => finishLaunch, 'slow launch startup');
+  t.mock.timers.tick(1_000);
+  const result = await running;
+  assert.equal(result.state, 'error');
+  assert.equal(result.error.code, 'TASK_TIMEOUT');
+  finishLaunch({ pages: () => { pagesRead += 1; return []; }, close: async () => { closed += 1; } });
+  await eventually(() => closed === 1, 'late timeout context cleanup');
+  assert.equal(pagesRead, 0);
+});
+
+test('an already stopped worker performs no browser startup', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-prestopped-'));
+  t.after(() => removeTestTree(root));
+  let loads = 0;
+  const controller = new AbortController();
+  controller.abort();
+  const result = await runTaskWorker({
+    taskId: 'prestopped', modulePath: path.join(root, 'unused.mjs'), outputDir: path.join(root, 'output')
+  }, { signal: controller.signal, loadPlaywright: async () => { loads += 1; } });
+  assert.equal(result.state, 'stopped');
+  assert.equal(loads, 0);
 });

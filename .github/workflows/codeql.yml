@@ -2,8 +2,9 @@ name: code-scanning
 
 on:
   push:
-    branches: [main, "v*", "stability/**", "upgrade/**"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
   schedule:
     - cron: "17 19 * * 1"
 
