@@ -149,6 +149,72 @@ test('cancellation before launching Chrome reports true cleanup without starting
   assert.equal(env.track.confirmations, 1);
 });
 
+test('a normal close finishing after its deadline still acknowledges real cleanup without closing twice', async (t) => {
+  const env = await fixture(t);
+  const closed = deferred();
+  env.context.pages = () => [{}];
+  env.context.close = async () => { env.track.closes++; await closed.promise; };
+  env.launch.resolve(env.context);
+  const running = runTaskWorker(env.config, env.options);
+  await eventually(() => env.track.closes === 1, 'normal browser close');
+  assert.equal(env.track.runCount, 1);
+  t.mock.timers.tick(9_999);
+  await nextTurn();
+  assert.equal(env.cleanups.length, 0);
+  t.mock.timers.tick(1);
+  assert.equal((await running).state, 'finished');
+  assert.deepEqual(env.cleanups.map((message) => message.browserClosed), [false]);
+  assert.deepEqual(env.cleanups[0].details, { phase: 'close', reason: 'timeout', elapsedMs: 10_000 });
+  assert.equal(env.track.confirmations, 0);
+  closed.resolve();
+  // Give the already-started close and its acknowledgement time to settle.
+  for (let turn = 0; turn < 10; turn++) await nextTurn();
+  assert.deepEqual(env.cleanups.map((message) => message.browserClosed), [false, true]);
+  assert.equal(env.track.confirmations, 1);
+  assert.equal(env.track.closes, 1);
+  t.mock.timers.tick(20_000);
+  await nextTurn();
+  assert.equal(env.cleanups.length, 2);
+});
+
+test('a rejected close reports a redacted error immediately and never confirms cleanup', async (t) => {
+  const env = await fixture(t);
+  env.context.pages = () => [{}];
+  env.context.close = () => {
+    env.track.closes++;
+    throw Object.assign(new Error('close failed: token=fixture-secret'), { code: 'CONNECTION_CLOSED' });
+  };
+  env.launch.resolve(env.context);
+  await runTaskWorker(env.config, env.options);
+  assert.deepEqual(env.cleanups.map((message) => message.browserClosed), [false]);
+  assert.equal(env.cleanups[0].details.reason, 'error');
+  assert.equal(env.cleanups[0].details.error.code, 'CONNECTION_CLOSED');
+  assert.equal(JSON.stringify(env.cleanups).includes('fixture-secret'), false);
+  assert.equal(env.track.confirmations, 0);
+  t.mock.timers.tick(20_000);
+  await nextTurn();
+  assert.equal(env.cleanups.length, 1);
+  assert.equal(env.track.closes, 1);
+});
+
+test('a late real close without Manager acknowledgement cannot request Worker exit', async (t) => {
+  const env = await fixture(t);
+  const closed = deferred();
+  env.context.pages = () => [{}];
+  env.context.close = () => { env.track.closes++; return closed.promise; };
+  env.options.sendCleanup = async (message) => { env.cleanups.push(message); return false; };
+  env.launch.resolve(env.context);
+  const running = runTaskWorker(env.config, env.options);
+  await eventually(() => env.track.closes === 1, 'normal close');
+  t.mock.timers.tick(10_000);
+  await running;
+  closed.resolve();
+  await eventually(() => env.cleanups.length === 2, 'late close report');
+  assert.deepEqual(env.cleanups.map((message) => message.browserClosed), [false, true]);
+  assert.equal(env.track.confirmations, 0);
+  assert.equal(env.track.closes, 1);
+});
+
 test('cancellation during Playwright loading cannot turn a late load into browser startup', async (t) => {
   const env = await fixture(t);
   const loaded = deferred();
@@ -168,7 +234,9 @@ test('cancellation during Playwright loading cannot turn a late load into browse
   assert.equal(env.track.confirmations, 1);
 });
 
-test('TaskService deletion during launch releases the Profile through the real cleanup acknowledgement without force termination', async (t) => {
+for (const lateClose of [false, true]) test(lateClose
+  ? 'TaskService releases a late normal close without force termination and retains its timeout diagnostic'
+  : 'TaskService deletion during launch releases the Profile through the real cleanup acknowledgement without force termination', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-delete-launch-'));
   const alive = new Set();
   const launch = deferred();
@@ -178,9 +246,10 @@ test('TaskService deletion during launch releases the Profile through the real c
   let closeCount = 0;
   let terminateCount = 0;
   let cleanupConfirmed = 0;
+  const closed = deferred();
   const context = {
-    pages: () => assert.fail('a cancelled launch cannot inspect its pages'),
-    close: async () => { closeCount++; }
+    pages: () => lateClose ? [{}] : assert.fail('a cancelled launch cannot inspect its pages'),
+    close: async () => { closeCount++; if (lateClose) await closed.promise; }
   };
   class WorkerBridge extends EventEmitter {
     constructor() {
@@ -229,27 +298,46 @@ test('TaskService deletion during launch releases the Profile through the real c
     t.mock.timers.reset();
     worker?.controller.abort();
     launch.resolve(context);
+    closed.resolve();
     await worker?.running;
     await service.close();
     await removeTestTree(root);
   });
   const modulePath = path.join(root, 'job.mjs');
-  await writeFile(modulePath, 'export async function run() { throw new Error("task code must never run"); }\n');
+  await writeFile(modulePath, lateClose
+    ? 'export async function run() { return { done: true }; }\n'
+    : 'export async function run() { throw new Error("task code must never run"); }\n');
   await service.list();
   t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'] });
   const task = await service.create({ modulePath, profileId: profile.id });
   await eventually(() => launchCount === 1, 'bridged browser launch');
-  const deleted = service.deleteTask(task.id);
-  await eventually(() => messages.some((message) => message.type === 'stop'), 'delete stop dispatch');
-  assert.equal((await worker.running).state, 'stopped');
-  assert.equal(messages.some((message) => message.type === 'cleanup_ack'), false);
-  t.mock.timers.tick(1_000);
-  launch.resolve(context);
-  assert.deepEqual(await deleted, { deleted: true, id: task.id });
+  if (lateClose) {
+    launch.resolve(context);
+    await eventually(() => closeCount === 1, 'normal close started');
+    t.mock.timers.tick(10_000);
+    assert.equal((await worker.running).state, 'finished');
+    await eventually(() => messages.some((message) => message.type === 'stop'), 'containment dispatch');
+    closed.resolve();
+    await eventually(async () => (await service.get(task.id)).state === 'error', 'late cleanup finalization');
+    const final = await service.get(task.id);
+    assert.deepEqual(final.result, { done: true });
+    assert.equal(final.error.code, 'TASK_BROWSER_CLOSE_FAILED', 'late cleanup must not hide the original deadline failure');
+    assert.deepEqual(final.error.details, { phase: 'close', reason: 'timeout', elapsedMs: 10_000 });
+    assert.equal(messages.filter((message) => message.type === 'cleanup_ack').length, 2);
+    await service.deleteTask(task.id);
+  } else {
+    const deleted = service.deleteTask(task.id);
+    await eventually(() => messages.some((message) => message.type === 'stop'), 'delete stop dispatch');
+    assert.equal((await worker.running).state, 'stopped');
+    assert.equal(messages.some((message) => message.type === 'cleanup_ack'), false);
+    t.mock.timers.tick(1_000);
+    launch.resolve(context);
+    assert.deepEqual(await deleted, { deleted: true, id: task.id });
+    assert.equal(messages.filter((message) => message.type === 'cleanup_ack').length, 1);
+  }
   assert.equal(closeCount, 1);
   assert.equal(terminateCount, 0);
   assert.equal(cleanupConfirmed, 1);
-  assert.equal(messages.filter((message) => message.type === 'cleanup_ack').length, 1);
   assert.equal((await profileStore.get(profile.id)).lease, null);
   assert.equal((await profileStore.get(profile.id)).state, 'idle');
   assert.equal(alive.size, 0);

@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.1 - 2026-09-06
+
+- Keep observing the single Chrome close operation after its ten-second deadline, so a later confirmed close can acknowledge cleanup and release the Profile without unnecessary force termination.
+- Retain the original timeout failure and task output; report whether closure timed out or threw, with elapsed time and bounded, redacted error details. Do not retry closure or extend its deadline.
+- Add regressions for late-close acknowledgement, missing Manager acknowledgement, close errors, and Profile release through the Worker/Manager cleanup protocol.
+
 ## 3.1.0 - 2026-09-05
 
 - Send a desktop notification immediately when verification stops work, then every 30 seconds until actual resume, explicit stop/delete, completion, or automatic pause at 20 minutes. Notification failures never gate task control.
