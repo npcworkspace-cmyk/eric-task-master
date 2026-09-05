@@ -5,6 +5,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { JsonStore } from '../src/lib/json-store.mjs';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
 import { createTaskService } from '../src/runtime/task-service.mjs';
@@ -24,6 +25,7 @@ class ContractWorker extends EventEmitter {
 
   send(message, _handle, _options, callback) {
     this.messages.push(message);
+    if (message.type === 'resume') this.emit('resume-requested');
     if (message.type === 'resume' && this.resumeMode === 'stalled-send') return;
     callback?.(null);
     if (message.type === 'start') this.config = message.config;
@@ -78,7 +80,7 @@ async function fixture(t, serviceOptions = {}) {
     workerFactory: factory, profileWorkerFactory: factory,
     processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
     terminateTree: async (pid) => { workers.find((worker) => worker.pid === pid)?.finish('stopped'); return true; },
-    resumeWaitMs: 80, stopWaitMs: 100, terminationWaitMs: 100, ...serviceOptions
+    stopWaitMs: 100, terminationWaitMs: 100, ...serviceOptions
   });
   t.after(async () => {
     await service.close();
@@ -157,16 +159,31 @@ test('request fingerprint and staged execution use the same source snapshot when
 });
 
 test('rejected and missing resume acknowledgements preserve waiting and release the command for a later retry', async (t) => {
-  const env = await fixture(t);
+  const env = await fixture(t, { resumeWaitMs: 80 });
   const { task, worker } = await waitingTask(env);
+  // Keep real filesystem work outside the synthetic deadline. Hosted runners
+  // can take longer than 80ms to persist an otherwise immediate resume.
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  t.after(() => t.mock.timers.reset());
   for (const [mode, code] of [
     ['rejected', 'TASK_PROBE_MISMATCH'], ['missing-ack', 'TASK_RESUME_UNCONFIRMED'],
     ['ack-only', 'TASK_RESUME_UNCONFIRMED'], ['stalled-send', 'TASK_RESUME_FAILED']
   ]) {
     worker.resumeMode = mode;
-    const started = Date.now();
-    await assert.rejects(env.service.resume(task.id, null, { probeId: 'probe_contract' }), { code });
-    assert.ok(Date.now() - started < 3_000, `${mode} must be bounded`);
+    const dispatched = new Promise((resolve) => worker.once('resume-requested', resolve));
+    const attempt = env.service.resume(task.id, null, { probeId: 'probe_contract' });
+    let settled = false;
+    void attempt.then(() => { settled = true; }, () => { settled = true; });
+    const rejected = assert.rejects(attempt, { code });
+    await dispatched;
+    await nextTurn(); // Let the delivery/acknowledgement timers arm.
+    if (mode !== 'rejected') {
+      t.mock.timers.tick(79);
+      await nextTurn();
+      assert.equal(settled, false, `${mode} must not time out before its deadline`);
+      t.mock.timers.tick(1);
+    }
+    await rejected;
     assert.equal((await env.service.get(task.id)).state, 'waiting');
   }
   worker.resumeMode = 'accepted';
