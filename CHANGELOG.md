@@ -6,6 +6,7 @@
 - Count only visible tasks, label queued work accurately, and show a concise empty state. Preserve task records and output for CLI follow and explicit cleanup; hiding a card never deletes files.
 - Exercise automatic task removal, terminal states, empty lists, old links, and stop/resume behavior in the real Dashboard acceptance.
 - Drive resume-timeout regressions with a controlled clock so CI filesystem latency cannot create false acknowledgement failures; production timeouts remain unchanged.
+- Query Windows Chrome command lines directly through WMI without loading CIM cmdlets on the first Profile probe. Keep one query, the five-second limit, exact Profile matching, and unknown results on enumeration failure.
 
 ## 3.1.1 - 2026-09-06
 

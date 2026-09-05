@@ -43,7 +43,11 @@ async function inspectManualChromeSandbox(userDataDir) {
   const command = process.platform === 'win32' ? 'powershell.exe' : 'ps';
   const args = process.platform === 'win32'
     ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-      "$ErrorActionPreference='Stop'; $OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | ForEach-Object { $_.CommandLine }"]
+      "$ErrorActionPreference='Stop'; $OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
+      + "$profileQuery=[wmisearcher]\"SELECT CommandLine FROM Win32_Process WHERE Name = 'chrome.exe'\"; "
+      + 'try { foreach ($chromeProcess in $profileQuery.Get()) { '
+      + 'if ($null -ne $chromeProcess.CommandLine) { $chromeProcess.CommandLine } } } '
+      + 'finally { $profileQuery.Dispose() }']
     : ['-Aww', '-o', 'command='];
   const { stdout } = await execFile(command, args, {
     windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024
