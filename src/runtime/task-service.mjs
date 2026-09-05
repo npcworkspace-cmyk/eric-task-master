@@ -774,14 +774,16 @@ export function createTaskService({
     if (cleanupFailed) {
       await containTaskWorker(taskId, entry, {
         code: 'TASK_BROWSER_CLOSE_FAILED',
-        message: 'Browser cleanup failed; Manager is terminating the owned process tree.'
+        message: 'Browser cleanup failed; Manager is terminating the owned process tree.',
+        details: message.details
       });
     }
   }
 
   async function containTaskWorker(taskId, entry, {
     code = 'TASK_TERMINATION_REQUIRED',
-    message = 'Manager is terminating the owned task process tree.'
+    message = 'Manager is terminating the owned task process tree.',
+    details
   } = {}) {
     if (entry.finalized) return true;
     if (entry.containmentPromise) return entry.containmentPromise;
@@ -792,7 +794,7 @@ export function createTaskService({
         const task = tasks.get(taskId);
         if (!task) return;
         task.state = 'stopping';
-        task.error = { code, message };
+        task.error = normalizeError({ code, message, ...(details ? { details } : {}) });
         observeNotification(task);
         appendEvent(task, 'task.stopping', task.error);
         await persist();

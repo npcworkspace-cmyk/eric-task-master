@@ -1,6 +1,6 @@
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
-export const VERSION = '3.1.0';
+export const VERSION = '3.1.1';
 export const API_VERSION = 3;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;

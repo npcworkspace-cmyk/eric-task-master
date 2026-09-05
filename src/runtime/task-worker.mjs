@@ -104,22 +104,30 @@ function normalizeProgress(update = {}) {
   };
 }
 
-async function closeContext(context, timeoutMs = 10_000) {
+function closeContext(context, reportCleanup, timeoutMs = 10_000) {
   // No context handle is not cleanup proof: a failed launch can still have
   // started a Chrome child. Let the Manager contain the owned process tree.
-  if (!context) return false;
+  if (!context) return reportCleanup(false, { phase: 'close', reason: 'missing_context' });
+  const startedAt = Date.now();
   let timer;
-  try {
-    await Promise.race([
-      context.close(),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('close timeout')), timeoutMs); })
-    ]);
-    return true;
-  } catch {
-    return false;
-  } finally {
+  const closing = Promise.resolve().then(() => context.close()).then(() => {
     clearTimeout(timer);
-  }
+    return reportCleanup(true);
+  }, (error) => {
+    clearTimeout(timer);
+    return reportCleanup(false, {
+      phase: 'close', reason: 'error', elapsedMs: Date.now() - startedAt,
+      error: normalizeTaskError(error)
+    });
+  });
+  // The deadline starts containment; it must not discard a later real close.
+  // Keep observing the one close operation, without retrying or delaying stop.
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(reportCleanup(false, {
+      phase: 'close', reason: 'timeout', elapsedMs: Date.now() - startedAt
+    })), timeoutMs);
+  });
+  return Promise.race([closing, deadline]);
 }
 
 async function captureSnapshot(context, outputDir, relativePath = 'failure.png', { budget, signal, targetPage } = {}) {
@@ -289,17 +297,20 @@ export async function runTaskWorker(config, {
     });
   });
 
-  const reportCleanup = async (browserClosed) => {
+  const reportCleanup = async (browserClosed, details) => {
     if (browserClosed ? cleanupSucceededReported : cleanupFailedReported || cleanupSucceededReported) return;
     if (browserClosed) cleanupSucceededReported = true;
     else cleanupFailedReported = true;
-    const acknowledged = await sendCleanup({ type: 'cleanup', browserClosed, at: new Date().toISOString() });
+    const acknowledged = await sendCleanup({
+      type: 'cleanup', browserClosed, at: new Date().toISOString(),
+      ...(details ? { details } : {})
+    });
     if (browserClosed && acknowledged) onCleanupConfirmed();
   };
   const closeAndReport = (ownedContext) => {
-    cleanupPromise ||= closeContext(ownedContext).then(async (browserClosed) => {
+    cleanupPromise ||= closeContext(ownedContext, async (browserClosed, details) => {
       clearTimeout(cleanupTimer);
-      await reportCleanup(browserClosed);
+      await reportCleanup(browserClosed, details);
     });
     return cleanupPromise;
   };
