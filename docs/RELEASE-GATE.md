@@ -25,7 +25,7 @@ Every CI job runs `npm run check`, stages a self-contained Manager with bundled 
 
 Each job also extracts the target's portable ZIP after native uninstall, then runs its launcher and a real Chrome task using bundled Node in isolated state. Payload hashes, POSIX executable permissions, paths containing spaces, host Node environment isolation, and process/Profile cleanup must pass.
 
-Each artifact contains its native packages, portable ZIP, bundle manifest, SPDX inventory, target checksum file, and acceptance evidence. The CI workflow runs for `main`, version branches matching `v*` (including `v3.0.0`), and `upgrade/**` pushes, all pull requests, and manual diagnostics. Only a successful `main` **push** run is eligible for release.
+Each artifact contains its native packages, portable ZIP, bundle manifest, SPDX inventory, target checksum file, and acceptance evidence. CI and CodeQL run once per pull-request update and again for `main` pushes; both also support manual diagnostics. Feature-branch pushes do not trigger a duplicate copy alongside their pull request. Every platform and required check remains mandatory. Only a successful `main` **push** run is eligible for release.
 
 ## Publication
 

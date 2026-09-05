@@ -11,6 +11,7 @@
 - Add optional submission request keys and bounded follow calls; drain retained terminal events before returning the final cursor.
 - Reuse API-compatible Managers without automatic replacement on normal commands; guard explicit idle maintenance against concurrent task/Profile creation.
 - Add clock-driven notification, real Windows notification submission, real Chrome verification, lifecycle, and control-race regressions.
+- Run one CI/CodeQL gate per pull-request update and a separate exact-main push gate for publication, avoiding duplicate feature-push checks without removing any required platform or release verification.
 
 ## 3.0.3 - 2026-09-04
 
