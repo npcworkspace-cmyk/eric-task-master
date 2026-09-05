@@ -9,7 +9,6 @@ import { launchChromeProfile } from './browser-engine.mjs';
 const notWaiting = () => ({ accepted: false, waitId: null, reason: 'TASK_NOT_WAITING' });
 let externalResume = notWaiting;
 let activeCleanupAck = null;
-let processCleanupConfirmed = true;
 
 class TaskStoppedError extends Error {
   constructor() {
@@ -226,12 +225,14 @@ export function acknowledgeTaskWorkerResume(message, sendMessage = send) {
 export async function runTaskWorker(config, {
   loadPlaywright = () => import('playwright'),
   sendMessage = send,
+  sendCleanup = sendCleanupWithAck,
+  onCleanupConfirmed = () => {},
+  pendingLaunchCleanupMs = 10_000,
   verificationProbeIntervalMs = 5 * 60_000,
   verificationPauseAfterMs = 20 * 60_000,
   heartbeatIntervalMs = 10_000,
   signal
 } = {}) {
-  processCleanupConfirmed = false;
   const controller = new AbortController();
   const stop = () => {
     if (!controller.signal.aborted) controller.abort(new TaskStoppedError());
@@ -240,6 +241,11 @@ export async function runTaskWorker(config, {
   else signal?.addEventListener('abort', stop, { once: true });
 
   let context;
+  let launchPromise;
+  let cleanupPromise;
+  let cleanupTimer;
+  let cleanupFailedReported = false;
+  let cleanupSucceededReported = false;
   let heartbeat;
   let timeout;
   let timeoutStartedAt = null;
@@ -255,7 +261,7 @@ export async function runTaskWorker(config, {
   };
   // Every asynchronous startup phase observes cancellation immediately. A
   // browser handle arriving after cancellation is still ours to close.
-  const abortable = (operation, onLateValue) => new Promise((resolve, reject) => {
+  const abortable = (operation) => new Promise((resolve, reject) => {
     let settled = false;
     const abort = () => {
       if (settled) return;
@@ -270,7 +276,6 @@ export async function runTaskWorker(config, {
     }).then((value) => {
       controller.signal.removeEventListener('abort', abort);
       if (settled || controller.signal.aborted) {
-        if (onLateValue) void Promise.resolve().then(() => onLateValue(value)).catch(() => {});
         abort();
         return;
       }
@@ -283,6 +288,21 @@ export async function runTaskWorker(config, {
       reject(error);
     });
   });
+
+  const reportCleanup = async (browserClosed) => {
+    if (browserClosed ? cleanupSucceededReported : cleanupFailedReported || cleanupSucceededReported) return;
+    if (browserClosed) cleanupSucceededReported = true;
+    else cleanupFailedReported = true;
+    const acknowledged = await sendCleanup({ type: 'cleanup', browserClosed, at: new Date().toISOString() });
+    if (browserClosed && acknowledged) onCleanupConfirmed();
+  };
+  const closeAndReport = (ownedContext) => {
+    cleanupPromise ||= closeContext(ownedContext).then(async (browserClosed) => {
+      clearTimeout(cleanupTimer);
+      await reportCleanup(browserClosed);
+    });
+    return cleanupPromise;
+  };
 
   const armTimeout = () => {
     if (timeoutRemainingMs === null || controller.signal.aborted) return;
@@ -337,7 +357,10 @@ export async function runTaskWorker(config, {
     heartbeat.unref?.();
     sendMessage({ type: 'heartbeat', at: new Date().toISOString() });
     const playwright = await abortable(loadPlaywright);
-    context = await abortable(() => launchChromeProfile(playwright, config.profile), closeContext);
+    context = await abortable(() => {
+      launchPromise = launchChromeProfile(playwright, config.profile);
+      return launchPromise;
+    });
     assertActive();
     const page = context.pages()[0] || await abortable(() => context.newPage());
     const browser = context.browser?.() || null;
@@ -519,29 +542,44 @@ export async function runTaskWorker(config, {
     signal?.removeEventListener('abort', stop);
     externalResume = notWaiting;
     if (!controller.signal.aborted) controller.abort(new TaskStoppedError());
-    const browserClosed = await closeContext(context);
-    const cleanupAcknowledged = await sendCleanupWithAck({
-      type: 'cleanup', browserClosed, at: new Date().toISOString()
-    });
-    processCleanupConfirmed = browserClosed && cleanupAcknowledged;
+    if (context) {
+      await closeAndReport(context);
+    } else if (!launchPromise) {
+      // Cancellation happened before this runtime could start Chrome.
+      await reportCleanup(true);
+    } else {
+      // Do not turn an unresolved launch into a failed close. Stop task code
+      // immediately, keep the Worker attached, and close the eventual handle.
+      // The bounded deadline still hands an unresponsive launch to the Manager.
+      cleanupTimer = setTimeout(() => {
+        void reportCleanup(false).catch(() => {});
+      }, pendingLaunchCleanupMs);
+      cleanupTimer.unref?.();
+      void launchPromise.then(closeAndReport, async () => {
+        clearTimeout(cleanupTimer);
+        await reportCleanup(false);
+      }).catch(() => {});
+    }
   }
 }
 
 if (typeof process.send === 'function') {
   const controller = new AbortController();
   let started = false;
+  let exitRequested = false;
+  const finishAfterCleanup = () => {
+    if (exitRequested) return;
+    exitRequested = true;
+    if (process.connected) process.disconnect();
+    setTimeout(() => process.exit(0), 25);
+  };
   process.on('message', (message) => {
     if (message?.type === 'start' && !started) {
       started = true;
-      void runTaskWorker(message.config, { signal: controller.signal }).finally(() => {
-        // If Playwright could not prove that its persistent context closed,
-        // stay attached so the owning Manager can terminate this complete
-        // detached process tree. Exiting here could orphan Chrome while making
-        // the Profile appear reusable.
-        if (processCleanupConfirmed) {
-          if (process.connected) process.disconnect();
-          setTimeout(() => process.exit(0), 25);
-        }
+      // This callback also handles cleanup completed by a late launch handle
+      // after task execution has already returned its stopped/timeout result.
+      void runTaskWorker(message.config, {
+        signal: controller.signal, onCleanupConfirmed: finishAfterCleanup
       });
       return;
     }

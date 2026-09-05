@@ -348,6 +348,7 @@ test('TaskService retains lease after browser close and tree termination both fa
     profileStore,
     workerFactory: () => worker,
     processAlive: (pid) => alive.has(pid),
+    profileUsageProbe: async () => 'inactive',
     heartbeatTimeoutMs: 60_000,
     reaperIntervalMs: 20,
     stopWaitMs: 20,
