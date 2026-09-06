@@ -4,7 +4,9 @@
 
 Eric Task Master is an always-on local Chrome task system for AI agents. It gives Codex, Claude Code, WorkBuddy, Hermes, Pi, and any other local Agent with terminal access a shared way to start long-running browser work, stream partial results, and leave the task running after the Agent disconnects.
 
-[中文说明](README.zh-CN.md)
+English | [简体中文](README.zh-CN.md)
+
+Looking for a workflow your agent can use now? Visit the [Task Master Skills library](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) for creator discovery and community research. You can also [contribute your own Skill](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md).
 
 ## Why
 
@@ -101,3 +103,18 @@ If a feature adds a required step before the first browser action without improv
 MIT
 
 Keywords: AI agent browser automation, Playwright automation, Chrome automation, long-running agent tasks, unattended automation, local AI agent, browser profile manager, CLI automation, multi-agent automation, RPA, web research, data collection.
+
+---
+
+## Build and share what you automate
+
+Task Master keeps browser jobs running. The companion [Task Master Skills library](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) gives agents reusable instructions, task scripts, and result checks for specific work. Skills are optional; you can always run your own script directly.
+
+Have a workflow that saves you time? Package the useful part as a Skill and share it. Start with a [workflow idea](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/issues/new?template=skill-proposal.md), improve an existing Skill, or follow the [contribution guide](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md) to prepare a pull request. Reviewed contributions can become downloadable releases that others can install and use.
+
+Our goal is to make large batches of useful work manageable by one person and their agents. Every shared workflow, tested fix, and clearer instruction helps the next person automate more of their work.
+
+**The two projects work together:**
+
+- [Eric Task Master — install the local browser task runner](https://github.com/npcworkspace-cmyk/eric-task-master)
+- [Task Master Skills — find, build, and share reusable workflows](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill)

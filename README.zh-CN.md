@@ -4,7 +4,9 @@
 
 Eric Task Master 是给本机 AI Agent 使用的全时 Chrome 任务系统。Codex、Claude Code、WorkBuddy、Hermes、Pi，以及任何能调用本机终端的 Agent，都可以通过同一条 CLI 启动长任务、持续输出结果，并在 Agent 退出后继续运行。
 
-[English](README.md)
+[English](README.md) | 简体中文
+
+想先用现成的工作流？到 [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md)找红人开发、社群调研等能力，也欢迎[把自己的 Skill 分享出来](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md)。
 
 ## 它解决什么
 
@@ -97,3 +99,18 @@ Manager 自身只监听 `127.0.0.1`，不会在自己的诊断中记录凭据，
 MIT
 
 关键词：AI Agent 浏览器自动化、Playwright、Chrome 自动化、长期任务、无人值守、多 Agent、浏览器 Profile、CLI 自动化、RPA、网页调研、数据采集。
+
+---
+
+## 把你做好的自动化，分享给更多人
+
+任务大师负责让浏览器任务持续运行，配套的 [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md)提供具体工作的操作说明、执行脚本和结果检查方法。Skill 按需使用，你也可以继续直接运行自己的脚本。
+
+有一套已经帮你节省时间的工作流？欢迎把有用的部分整理成 Skill。可以先[提交想法](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/issues/new?template=skill-proposal.md)，改进已有 Skill，或者按[贡献指南](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md)提交 PR。审核通过后，可以发布成其他人能下载、安装和使用的版本。
+
+我们希望一个人和自己的 Agent 也能组织大批量、有结果的工作。每一个共享的工作流、经过验证的修复和更清楚的说明，都在帮助下一个人多自动化一部分工作，让个人的规模化自动化逐步成为可能。
+
+**两个项目配合使用：**
+
+- [Eric Task Master 任务大师——安装本地浏览器任务执行器](https://github.com/npcworkspace-cmyk/eric-task-master)
+- [Task Master Skills——寻找、开发和分享可复用的工作流](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill)
