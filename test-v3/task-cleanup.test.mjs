@@ -222,7 +222,8 @@ test('task output cleanup is opt-in and preserves the terminal task record and u
   assert.equal(existsSync(resultFile), true);
   const cleaned = await f.service.cleanup({ categories: ['task-output'], preview: false });
   assert.deepEqual(cleaned.failed, []);
-  assert.equal(cleaned.files, 2);
+  assert.deepEqual(cleaned.skipped, []);
+  assert.equal(cleaned.files, 2, JSON.stringify(cleaned));
   assert.equal(existsSync(resultFile), false);
   assert.equal(existsSync(screenshot), false);
   assert.equal(existsSync(leftover), true, 'output selection must not expand to temporary-files');
@@ -230,6 +231,34 @@ test('task output cleanup is opt-in and preserves the terminal task record and u
   const retained = await f.service.get(item.task.id);
   assert.equal(retained.state, 'finished');
   assert.ok(Date.parse(retained.outputClearedAt));
+});
+
+test('a late lease-renewal failure cannot move a finalized task back to stopping or block output cleanup', async (t) => {
+  const f = await fixture(t);
+  const renewalEntered = deferred();
+  const releaseRenewal = deferred();
+  t.mock.method(f.profileStore, 'renewLease', async () => {
+    renewalEntered.resolve();
+    await releaseRenewal.promise;
+    return false;
+  });
+  const item = await f.createTask();
+  try {
+    await bounded(renewalEntered.promise);
+    item.worker.finish();
+  } finally {
+    releaseRenewal.resolve();
+  }
+  await until(async () => ['finished', 'error', 'stopping'].includes((await f.service.get(item.task.id)).state));
+  await put(path.join(item.outputDir, 'result.txt'), 'keep-until-cleaned');
+  const report = await f.service.cleanup({ categories: ['task-output'], preview: false });
+  assert.equal((await f.service.get(item.task.id)).state, 'finished');
+  assert.deepEqual(report.skipped, []);
+  assert.deepEqual(report.failed, []);
+  assert.equal(report.files, 1);
+  assert.equal((await f.profileStore.get(f.profile.id)).lease, null);
+  const events = await f.service.events(item.task.id);
+  assert.equal(events.events.some((event) => event.type === 'task.stopping'), false);
 });
 
 test('busy manual Profiles and physically active or unknown Chrome Profiles keep every cache', async (t) => {
@@ -351,7 +380,9 @@ test('task cleanup holds only its task reservation and rejects deletion until di
   const cleaning = f.service.cleanup({ categories: ['task-output'], preview: false });
   cleaning.catch(() => {});
   try {
-    await bounded(entered.promise);
+    await bounded(Promise.race([entered.promise, cleaning.then((report) => {
+      assert.fail(`Cleanup completed before reading the output directory: ${JSON.stringify(report)}`);
+    })]));
     await assert.rejects(bounded(f.service.deleteTask(item.task.id)), { code: 'TASK_CLEANUP_ACTIVE', statusCode: 409 });
     assert.equal((await bounded(f.service.get(item.task.id))).state, 'finished', 'disk work must not hold the global serializer');
     release.resolve();

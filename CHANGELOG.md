@@ -5,6 +5,7 @@
 - Return the fixed Dashboard link without opening a browser for `panel --json`; explicit `taskmaster panel` still opens it. Align the Agent Skill and bilingual quick start so repeated tasks do not accumulate Dashboard windows.
 - Replace the Dashboard header and favicon with the current NPC Signal Flow brand assets; preserve task, Profile, and manually opened browser lifecycles.
 - Add an explicit NPC website link to Dashboard navigation, the Logo, and both README introductions; external links open only on user interaction.
+- Ignore stale containment callbacks after task finalization, so late lease-renewal failures cannot revive completed tasks or block output cleanup.
 
 ## 3.1.3 - 2026-09-08
 

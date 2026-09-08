@@ -900,17 +900,22 @@ export function createTaskService({
     if (entry.finalized) return true;
     if (entry.containmentPromise) return entry.containmentPromise;
     const attempt = (async () => {
-      entry.stopRequested = true;
-      entry.terminalState = 'error';
-      await serialize(async () => {
+      const admitted = await serialize(async () => {
+        // A renewal failure can arrive while finalization owns mutationTail.
+        // Recheck here so a queued callback cannot revive a completed task.
+        if (entry.finalized || children.get(taskId) !== entry) return false;
+        entry.stopRequested = true;
+        entry.terminalState = 'error';
         const task = tasks.get(taskId);
-        if (!task) return;
+        if (!task) return true; // Deleted task: still contain its live Worker.
         task.state = 'stopping';
         task.error = normalizeError({ code, message, ...(details ? { details } : {}) });
         observeNotification(task);
         appendEvent(task, 'task.stopping', task.error);
         await persist();
+        return true;
       });
+      if (!admitted) return entry.finalized === true;
 
       await send(entry.child, { type: 'stop' });
       if (!(await waitFor(entry.exitPromise, 1_000)) && processAlive(entry.child.pid)) {
@@ -921,6 +926,7 @@ export function createTaskService({
       if (processAlive(entry.child.pid)) {
         await markEntryCleanupError(entry);
         await serialize(async () => {
+          if (entry.finalized || children.get(taskId) !== entry) return;
           const task = tasks.get(taskId);
           if (!task) return;
           task.state = 'stopping';
