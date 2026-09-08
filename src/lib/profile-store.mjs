@@ -268,6 +268,14 @@ export class ProfileStore {
     return this.#store.read();
   }
 
+  async assertUnchanged() {
+    return this.#store.assertUnchanged();
+  }
+
+  fence() {
+    this.#store.fence();
+  }
+
   async list() {
     return (await this.#store.read()).profiles;
   }

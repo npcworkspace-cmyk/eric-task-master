@@ -6,8 +6,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, VERSION } from './contracts.mjs';
 import { HttpError, readJson, sendJson, serveStatic } from './lib/http-utils.mjs';
-import { JsonStore } from './lib/json-store.mjs';
+import { JsonStore, JsonStoreConflictError } from './lib/json-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
+import { managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
 import { OperationalJournal } from './lib/operational-journal.mjs';
 import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
@@ -64,7 +65,8 @@ function dashboardSameOrigin(request, origin) {
 }
 
 function errorPayload(error, requestId) {
-  const known = error instanceof HttpError || error instanceof TaskServiceError || error instanceof ProfileStoreError;
+  const known = error instanceof HttpError || error instanceof TaskServiceError ||
+    error instanceof ProfileStoreError || error instanceof JsonStoreConflictError;
   const statusCode = known ? error.statusCode ?? 400 : 500;
   const code = known ? error.code : 'INTERNAL_ERROR';
   const message = known ? error.message : 'Internal Manager error';
@@ -92,6 +94,16 @@ function integerParam(value, fallback, { minimum = 0, maximum = Number.MAX_SAFE_
     throw new HttpError(400, 'INVALID_PARAMETER', 'Numeric query parameter is invalid');
   }
   return parsed;
+}
+
+function stateChangedError() {
+  const error = new HttpError(
+    409,
+    'MANAGER_STATE_CHANGED',
+    'Manager state changed on disk after this process started; the request was not executed'
+  );
+  error.nextAction = 'Retry the command. An idle stale Manager is replaced automatically; if it owns active work, run taskmaster manager recover to contain it explicitly.';
+  return error;
 }
 
 export async function createManager({
@@ -124,20 +136,31 @@ export async function createManager({
     }
   });
   try {
-    const configStore = new JsonStore(path.join(resolvedDataDir, 'config.json'), () => ({
+    const configPath = path.join(resolvedDataDir, 'config.json');
+    const configStore = new JsonStore(configPath, () => ({
       version: 3,
       managerToken: randomBytes(32).toString('base64url'),
+      stateInstanceId: randomBytes(24).toString('base64url'),
       createdAt: new Date().toISOString()
     }));
     await configStore.init();
     let config = await configStore.read();
-    if (typeof config.managerToken !== 'string' || config.managerToken.length < 32) {
+    if (typeof config.managerToken !== 'string' || config.managerToken.length < 32 ||
+        typeof config.stateInstanceId !== 'string' || config.stateInstanceId.length < 16) {
       config = await configStore.update((draft) => {
         draft.version = 3;
-        draft.managerToken = randomBytes(32).toString('base64url');
+        if (typeof draft.managerToken !== 'string' || draft.managerToken.length < 32) {
+          draft.managerToken = randomBytes(32).toString('base64url');
+        }
+        if (typeof draft.stateInstanceId !== 'string' || draft.stateInstanceId.length < 16) {
+          draft.stateInstanceId = randomBytes(24).toString('base64url');
+        }
       });
     }
-    const token = config.managerToken;
+    const stateInstanceId = config.stateInstanceId;
+    const stateId = managerStateId(stateInstanceId, resolvedDataDir);
+    const recoveryNonce = randomBytes(24).toString('base64url');
+    let stateConflict = false;
 
     const profileStore = new ProfileStore({
       filePath: path.join(resolvedDataDir, 'profiles.json'),
@@ -152,6 +175,39 @@ export async function createManager({
       ...taskServiceOptions
     });
 
+    function markStateConflict() {
+      stateConflict = true;
+      taskService.beginStateRecovery?.();
+    }
+
+    async function readCurrentConfig({ requireSameInstance = true } = {}) {
+      let current;
+      try {
+        current = await readManagerConfig(configPath);
+      } catch {
+        if (requireSameInstance) markStateConflict();
+        throw stateChangedError();
+      }
+      if (requireSameInstance && current.stateInstanceId !== stateInstanceId) {
+        markStateConflict();
+        throw stateChangedError();
+      }
+      return current;
+    }
+
+    async function assertCurrentState() {
+      if (stateConflict) throw stateChangedError();
+      const current = await readCurrentConfig();
+      try {
+        await taskService.assertStateUnchanged?.();
+      } catch (error) {
+        if (!(error instanceof JsonStoreConflictError)) throw error;
+        markStateConflict();
+        throw stateChangedError();
+      }
+      return current;
+    }
+
     const handle = async (request, response) => {
       const started = Date.now();
       const requestId = `req_${randomBytes(12).toString('hex')}`;
@@ -163,14 +219,24 @@ export async function createManager({
         pathname = url.pathname;
 
         if (request.method === 'GET' && pathname === '/v1/health') {
+          let stateChanged = false;
+          try {
+            await assertCurrentState();
+          } catch (error) {
+            if (error?.code !== 'MANAGER_STATE_CHANGED') throw error;
+            stateChanged = true;
+          }
           sendJson(response, 200, {
             ok: true,
             service: 'eric-task-master',
             version: VERSION,
             apiVersion: API_VERSION,
-            capabilities: ['task.request-key', 'manager.idle-stop', 'verification.notifications'],
+            capabilities: ['task.request-key', 'manager.idle-stop', 'manager.state-recovery', 'verification.notifications'],
             state: stopping ? 'stopping' : 'ready',
-            pid: process.pid
+            pid: process.pid,
+            stateId,
+            stateChanged,
+            ...(stateChanged ? { recoveryNonce } : {})
           });
           return;
         }
@@ -183,7 +249,52 @@ export async function createManager({
           return;
         }
 
-        const authenticated = secureEqual(parseBearer(request), token) || dashboardSameOrigin(request, base);
+        if (request.method === 'POST' && pathname === '/v1/manager/recover') {
+          let changed = false;
+          try {
+            await assertCurrentState();
+          } catch (error) {
+            if (error?.code !== 'MANAGER_STATE_CHANGED') throw error;
+            changed = true;
+          }
+          if (!changed) {
+            // This is a no-op and reveals only what public health already does.
+            // A transient config rewrite may have finished since CLI read health.
+            throw new HttpError(409, 'MANAGER_STATE_CURRENT', 'Manager already owns the current on-disk state');
+          }
+          const body = await readJson(request);
+          if (body.force !== undefined && typeof body.force !== 'boolean') {
+            throw new HttpError(400, 'INVALID_RECOVERY_REQUEST', 'force must be a boolean');
+          }
+          const force = body.force === true;
+          const currentConfig = await readCurrentConfig({ requireSameInstance: false });
+          const expectedProof = managerRecoveryProof(
+            currentConfig.managerToken,
+            stateId,
+            recoveryNonce,
+            { force }
+          );
+          if (!secureEqual(body.proof, expectedProof)) {
+            throw new HttpError(401, 'RECOVERY_PROOF_REQUIRED', 'A valid local state recovery proof is required');
+          }
+          const contained = force
+            ? await taskService.containForStateRecovery()
+            : (await taskService.prepareIdleStop({ stateRecovery: true }), { tasks: 0, profiles: 0 });
+          sendJson(response, 202, { ok: true, state: 'stopping', contained });
+          setImmediate(() => {
+            void stop({ abandonState: true }).catch((error) => journal.append({
+              level: 'error',
+              event: 'manager.recovery_stop_failed',
+              code: error?.code || 'MANAGER_RECOVERY_FAILED',
+              message: redactSensitiveText(error?.message || 'Manager recovery failed'),
+              state: 'stopping'
+            }).catch(() => {}));
+          });
+          return;
+        }
+
+        const currentConfig = await assertCurrentState();
+        const authenticated = secureEqual(parseBearer(request), currentConfig.managerToken) || dashboardSameOrigin(request, base);
         if (!authenticated) throw new HttpError(401, 'AUTH_REQUIRED', 'Local Manager authorization is required');
         const managerStopRequest = request.method === 'POST' && pathname === '/v1/manager/stop';
         if (
@@ -381,11 +492,11 @@ export async function createManager({
       return address;
     }
 
-    async function stop() {
+    async function stop({ abandonState = false } = {}) {
       if (stopPromise) return stopPromise;
       const attempt = (async () => {
         stopping = true;
-        await taskService.close();
+        await taskService.close({ abandonState });
         verificationNotifier.close();
         if (address) {
           await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

@@ -89,6 +89,7 @@ button { color: inherit; }
 
 .brand {
   display: inline-flex;
+  min-height: 44px;
   align-items: center;
   gap: 12px;
   width: fit-content;
@@ -97,26 +98,11 @@ button { color: inherit; }
 }
 
 .npc-brand-mark {
-  position: relative;
-  display: grid;
-  width: 48px;
-  height: 48px;
-  place-items: center;
-  border-radius: 13px;
-  color: var(--npc-paper-bright);
-  background: var(--npc-ink);
-  font: 700 12px/1 var(--npc-font-mono);
-  letter-spacing: .08em;
-}
-
-.npc-brand-mark::after {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 5px;
-  height: 5px;
-  background: var(--npc-signal);
-  content: "";
+  display: block;
+  width: 132px;
+  height: 44px;
+  flex-shrink: 0;
+  object-fit: contain;
 }
 
 .brand-copy { display: grid; gap: 3px; }
@@ -145,6 +131,17 @@ button { color: inherit; }
 
 .nav-link:hover { background: rgba(255, 254, 249, .64); }
 .nav-link.is-active { background: var(--npc-paper-bright); box-shadow: 0 4px 12px rgba(9, 9, 9, .08); }
+
+.website-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--npc-ink);
+  background: var(--npc-signal);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.website-link:hover { background: #FF6845; }
 
 .header-actions {
   display: flex;
@@ -386,7 +383,7 @@ button { color: inherit; }
 @media (max-width: 560px) {
   .app-header { gap: 10px; padding: 10px; border-radius: 20px; }
   .brand-copy { display: none; }
-  .npc-brand-mark { width: 44px; height: 44px; }
+  .npc-brand-mark { width: 96px; height: 32px; }
   .header-actions { gap: 3px; }
   .primary-nav { justify-self: stretch; }
   .nav-link { min-width: 0; padding-inline: 12px; }

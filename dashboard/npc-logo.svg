@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="220" viewBox="0 0 660 220" role="img" aria-labelledby="title desc">
+  <title id="title">NPC Signal Flow v2.1 display logo</title>
+  <desc id="desc">Refined custom NPC wordmark containing one variable-width signal-orange wake, one deep-orange counterflow, one paper highlight, and one restrained pink accent.</desc>
+  <defs>
+    <mask id="npc-v2-1-primary-signal-flow-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="660" height="220">
+      <rect width="660" height="220" fill="#000000"/>
+      <path d="M28 192V28h39l82 108V28h41v164h-39L69 85v107H28Z" fill="#FFFFFF"/>
+      <path fill="#FFFFFF" fill-rule="evenodd" d="M226 192V28h94c55 0 90 27 90 72s-35 72-90 72h-52v20h-42Zm42-126v68h50c31 0 50-13 50-34s-19-34-50-34h-50Z"/>
+      <path d="M586 54A79 79 0 1 0 586 166" fill="none" stroke="#FFFFFF" stroke-width="40" stroke-linecap="butt"/>
+    </mask>
+  </defs>
+  <g mask="url(#npc-v2-1-primary-signal-flow-mask)">
+    <rect width="660" height="220" fill="#090909"/>
+    <path fill="#FF4B23" d="M608 106C580 84 550 76 520 84C492 91 467 102 444 111C422 122 405 132 382 137C337 145 304 116 263 99C207 76 132 82 28 105L28 119C132 101 202 98 258 118C302 135 337 159 386 155C434 151 461 135 482 123C500 113 518 107 536 108C561 109 585 113 608 114Z"/>
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M608 102C584 70 558 60 532 66C507 72 468 64 444 76C418 98 397 111 353 117C306 123 272 86 230 64C175 35 108 34 28 52" stroke="#FFFEF9" stroke-width="2"/>
+      <path d="M608 104C584 82 558 74 532 80C509 84 476 88 448 102C428 116 411 125 389 129C339 139 295 105 250 84C190 46 118 58 28 88" stroke="#FF8AC5" stroke-width="3"/>
+      <path d="M608 116C582 124 556 128 530 121C505 114 472 116 444 124C418 132 404 112 382 106C340 97 318 111 282 129C216 166 136 154 28 132" stroke="#B52B0E" stroke-width="5"/>
+    </g>
+  </g>
+  <rect x="608" y="98" width="24" height="24" fill="#FF4B23"/>
+</svg>

@@ -67,6 +67,26 @@ export function createProfileRuntime({
     throw new TypeError('cleanup retry count and delay must be positive integers');
   }
   const entries = new Map();
+  const pendingOpens = new Set();
+  const pendingStateWrites = new Set();
+  let abandoningState = false;
+  let containmentPromise = null;
+
+  function assertCurrentState() {
+    if (abandoningState) {
+      throw new TaskServiceError('MANAGER_STATE_CHANGED', 'Manager state recovery is in progress', 409);
+    }
+  }
+
+  function writeState(method, ...args) {
+    assertCurrentState();
+    const operation = Promise.resolve().then(() => {
+      assertCurrentState();
+      return profileStore[method](...args);
+    });
+    pendingStateWrites.add(operation);
+    return operation.finally(() => pendingStateWrites.delete(operation));
+  }
 
   const leaseIdentity = (entry) => ({
     ownerId: entry.ownerId,
@@ -75,21 +95,25 @@ export function createProfileRuntime({
   });
 
   function confirmCleanup(profileId, entry) {
+    if (abandoningState) return Promise.resolve(false);
     if (!entry.generation) return Promise.resolve(false);
     if (entry.cleanupConfirmed) return Promise.resolve(true);
     entry.cleanupTail = entry.cleanupTail.catch(() => {}).then(async () => {
+      if (abandoningState) return false;
       if (entry.cleanupConfirmed) return true;
-      entry.cleanupConfirmed = await profileStore.confirmLeaseCleanup(profileId, leaseIdentity(entry));
+      entry.cleanupConfirmed = await writeState('confirmLeaseCleanup', profileId, leaseIdentity(entry));
       return entry.cleanupConfirmed;
     });
     return entry.cleanupTail;
   }
 
   async function markCleanupError(profileId, entry) {
+    if (abandoningState) return false;
     if (!entry.generation) return false;
     if (entry.cleanupErrorMarked) return true;
     await entry.cleanupTail.catch(() => {});
-    entry.cleanupErrorMarked = await profileStore.markLeaseError(profileId, leaseIdentity(entry)).catch(() => false);
+    if (abandoningState) return false;
+    entry.cleanupErrorMarked = await writeState('markLeaseError', profileId, leaseIdentity(entry)).catch(() => false);
     return entry.cleanupErrorMarked;
   }
 
@@ -98,9 +122,8 @@ export function createProfileRuntime({
     // Publish the cleanup barrier before termination can synchronously emit exit.
     const attempt = Promise.resolve().then(async () => {
       const terminated = await terminateTree(entry.child.pid, { graceMs: 3_000 }).catch(() => false);
-      const profile = await profileStore.get(profileId);
       const usage = terminated === true && !processAlive(entry.child.pid)
-        ? await profileUsageProbe(profile.userDataDir).catch(() => 'unknown')
+        ? await profileUsageProbe(entry.userDataDir).catch(() => 'unknown')
         : 'unknown';
       entry.treeTerminated = terminated === true && !processAlive(entry.child.pid) && usage === 'inactive';
       return entry.treeTerminated;
@@ -114,6 +137,7 @@ export function createProfileRuntime({
   }
 
   async function finalize(profileId, entry) {
+    if (abandoningState) return false;
     if (entry.finalizePromise) return entry.finalizePromise;
     const attempt = (async () => {
       clearInterval(entry.watchdog);
@@ -121,15 +145,18 @@ export function createProfileRuntime({
       await wait(entry.closedPromise, 500);
       await entry.renewTail.catch(() => {});
       await entry.cleanupTail.catch(() => {});
+      if (abandoningState) return false;
       if (processAlive(entry.child.pid)) return false;
 
       const cleanupConfirmed = entry.browserClosed === true || entry.treeTerminated === true;
       let released = !entry.generation;
       if (entry.generation && cleanupConfirmed) {
         if (await confirmCleanup(profileId, entry)) {
-          released = await profileStore.releaseLease(profileId, leaseIdentity(entry)).catch(() => false);
+          if (abandoningState) return false;
+          released = await writeState('releaseLease', profileId, leaseIdentity(entry)).catch(() => false);
         }
       }
+      if (abandoningState) return false;
       if (!released && entry.generation) {
         await markCleanupError(profileId, entry);
       }
@@ -138,7 +165,7 @@ export function createProfileRuntime({
         clearTimeout(entry.cleanupRetryTimer);
         entries.delete(profileId);
       }
-      if (released) await Promise.resolve(onProfileAvailable(profileId)).catch(() => {});
+      if (released && !abandoningState) await Promise.resolve(onProfileAvailable(profileId)).catch(() => {});
       return cleanupConfirmed && released;
     })();
     entry.finalizePromise = attempt;
@@ -150,6 +177,10 @@ export function createProfileRuntime({
   }
 
   async function stopEntry(profileId, entry) {
+    if (abandoningState) {
+      if (await containEntry(profileId, entry)) return { status: 'closed', profileId };
+      throw containmentError();
+    }
     if (entry.stopPromise) return entry.stopPromise;
     entry.stopPromise = (async () => {
       entry.stopping = true;
@@ -200,13 +231,15 @@ export function createProfileRuntime({
   }
 
   function stopInBackground(profileId, entry) {
-    if (entries.get(profileId) !== entry || entry.backgroundDisabled || entry.backgroundStop ||
+    if (abandoningState || entries.get(profileId) !== entry || entry.backgroundDisabled || entry.backgroundStop ||
         entry.cleanupRetryTimer || entry.cleanupAttempts >= maximumCleanupAttempts) return;
     entry.cleanupAttempts += 1;
-    const attempt = Promise.resolve().then(() => stopEntry(profileId, entry)).catch(async (error) => {
+    const attempt = Promise.resolve().then(() => {
+      if (!abandoningState) return stopEntry(profileId, entry);
+    }).catch(async (error) => {
       entry.cleanupError = error;
       await markCleanupError(profileId, entry);
-      if (entries.get(profileId) !== entry || entry.backgroundDisabled ||
+      if (abandoningState || entries.get(profileId) !== entry || entry.backgroundDisabled ||
           entry.cleanupAttempts >= maximumCleanupAttempts) return;
       entry.cleanupRetryTimer = setTimeout(() => {
         entry.cleanupRetryTimer = null;
@@ -223,8 +256,21 @@ export function createProfileRuntime({
   }
 
   async function openProfile(identifier) {
-    await profileStore.recoverExpiredLeases();
+    assertCurrentState();
+    const operation = openProfileInState(identifier);
+    pendingOpens.add(operation);
+    try {
+      return await operation;
+    } finally {
+      pendingOpens.delete(operation);
+    }
+  }
+
+  async function openProfileInState(identifier) {
+    await writeState('recoverExpiredLeases');
+    assertCurrentState();
     let profile = await profileStore.get(identifier);
+    assertCurrentState();
     const existing = entries.get(profile.id);
     if (existing && processAlive(existing.child.pid)) {
       if (existing.stopping || profile.state === 'error') {
@@ -237,7 +283,9 @@ export function createProfileRuntime({
       return { status: 'open', profileId: profile.id, pid: existing.child.pid };
     }
     if (existing) await finalize(profile.id, existing);
+    assertCurrentState();
     profile = await profileStore.get(profile.id);
+    assertCurrentState();
     if (profile.lease) {
       throw new TaskServiceError(
         profile.state === 'error' ? 'PROFILE_CLEANUP_UNCONFIRMED' : 'PROFILE_LEASED',
@@ -248,6 +296,7 @@ export function createProfileRuntime({
       );
     }
 
+    assertCurrentState();
     const child = workerFactory(workerPath, 'profile');
     if (!child || !Number.isSafeInteger(child.pid) || child.pid <= 0) {
       throw new TaskServiceError('PROFILE_WORKER_START_FAILED', 'Profile worker could not start', 500);
@@ -260,6 +309,7 @@ export function createProfileRuntime({
     let resolveClosed;
     const entry = {
       child,
+      userDataDir: profile.userDataDir,
       ownerId,
       nonce,
       generation: null,
@@ -283,6 +333,7 @@ export function createProfileRuntime({
       closedPromise: new Promise((resolve) => { resolveClosed = resolve; }),
       readyPromise: new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; })
     };
+    entry.rejectReady = rejectReady;
     // A worker can fail while acquireLease is still pending; observe now, await below.
     entry.readyPromise.catch(() => {});
     entries.set(profile.id, entry);
@@ -307,17 +358,18 @@ export function createProfileRuntime({
       }
       if (message?.type === 'closed') {
         entry.browserClosed = message.browserClosed === true;
-        if (entry.browserClosed) await confirmCleanup(profile.id, entry).catch(() => false);
+        if (entry.browserClosed && !abandoningState) await confirmCleanup(profile.id, entry).catch(() => false);
         if (typeof message.cleanupId === 'string') {
           await send(entry.child, { type: 'closed_ack', cleanupId: message.cleanupId });
         }
         resolveClosed(true);
       }
       if (message?.type === 'heartbeat') {
+        if (abandoningState) return;
         entry.lastHeartbeatAt = Date.now();
         entry.renewTail = entry.renewTail.then(async () => {
-          if (entry.stopping || !entry.generation) return;
-          const renewed = await profileStore.renewLease(profile.id, {
+          if (abandoningState || entry.stopping || !entry.generation) return;
+          const renewed = await writeState('renewLease', profile.id, {
             ownerId,
             nonce,
             generation: entry.generation,
@@ -331,7 +383,8 @@ export function createProfileRuntime({
     });
 
     try {
-      const leased = await profileStore.acquireLease(profile.id, {
+      assertCurrentState();
+      const leased = await writeState('acquireLease', profile.id, {
         ownerId,
         kind: 'manual',
         pid: child.pid,
@@ -339,9 +392,11 @@ export function createProfileRuntime({
         ttlMs: leaseTtlMs
       });
       entry.generation = leased.lease.generation;
+      assertCurrentState();
       if (!(await send(child, { type: 'open', profile: leased }))) {
         throw new TaskServiceError('PROFILE_WORKER_START_FAILED', 'Profile worker did not accept startup', 500);
       }
+      assertCurrentState();
       entry.watchdog = setInterval(() => {
         if (!entry.stopping && Date.now() - entry.lastHeartbeatAt > heartbeatTimeoutMs) {
           stopInBackground(profile.id, entry);
@@ -349,9 +404,12 @@ export function createProfileRuntime({
       }, Math.min(5_000, Math.max(1_000, Math.floor(heartbeatTimeoutMs / 3))));
       entry.watchdog.unref?.();
       const opened = await wait(entry.readyPromise, openTimeoutMs);
+      assertCurrentState();
       if (opened !== true) throw new TaskServiceError('PROFILE_OPEN_TIMEOUT', 'Profile did not open in time', 504);
       return { status: 'open', profileId: profile.id, pid: child.pid };
     } catch (error) {
+      // Detection only fences state. Explicit recovery owns process containment.
+      if (abandoningState) throw error;
       try {
         await stopEntry(profile.id, entry);
       } catch (cleanupError) {
@@ -362,8 +420,11 @@ export function createProfileRuntime({
   }
 
   async function closeProfile(identifier) {
-    await profileStore.recoverExpiredLeases();
+    assertCurrentState();
+    await writeState('recoverExpiredLeases');
+    assertCurrentState();
     const profile = await profileStore.get(identifier);
+    assertCurrentState();
     const entry = entries.get(profile.id);
     if (entry) {
       clearTimeout(entry.cleanupRetryTimer);
@@ -372,7 +433,7 @@ export function createProfileRuntime({
       return stopEntry(profile.id, entry);
     }
     if (profile.lease?.kind === 'manual') {
-      await profileStore.markLeaseError(profile.id, profile.lease).catch(() => {});
+      await writeState('markLeaseError', profile.id, profile.lease).catch(() => {});
       throw new TaskServiceError(
         'PROFILE_CLEANUP_UNCONFIRMED',
         'This Profile belongs to an earlier Manager session; no process identity can be safely confirmed',
@@ -398,9 +459,83 @@ export function createProfileRuntime({
     if (failure) throw failure.reason;
   }
 
+  function beginStateRecovery() {
+    abandoningState = true;
+    for (const entry of entries.values()) {
+      entry.rejectReady(new TaskServiceError('MANAGER_STATE_CHANGED', 'Manager state recovery is in progress', 409));
+      entry.backgroundDisabled = true;
+      entry.stopping = true;
+      clearInterval(entry.watchdog);
+      clearTimeout(entry.cleanupRetryTimer);
+      entry.cleanupRetryTimer = null;
+    }
+  }
+
+  function containmentError() {
+    return new TaskServiceError(
+      'MANAGER_RECOVERY_CONTAINMENT_FAILED',
+      'One or more manual Profile operations or processes could not be contained; retry Manager recovery',
+      409
+    );
+  }
+
+  async function containEntry(profileId, entry) {
+    if (entry.containmentPromise) return entry.containmentPromise;
+    const attempt = (async () => {
+      await send(entry.child, { type: 'close' });
+      await wait(Promise.race([entry.closedPromise, entry.exitPromise]), closeTimeoutMs);
+      if (entry.browserClosed === true && processAlive(entry.child.pid)) {
+        await wait(entry.exitPromise, 1_000);
+      }
+      if (processAlive(entry.child.pid) || entry.browserClosed !== true) {
+        const terminated = await terminateOwnedTree(profileId, entry);
+        if (terminated) await wait(entry.exitPromise, 3_000);
+      }
+      if (processAlive(entry.child.pid)) return false;
+      // A cleanup acknowledgement belongs to the old runtime. Confirm physical
+      // inactivity again before a replacement Manager may use the Profile.
+      const inactive = await profileUsageProbe(entry.userDataDir).catch(() => 'unknown') === 'inactive';
+      if (inactive && entries.get(profileId) === entry) entries.delete(profileId);
+      return inactive;
+    })();
+    entry.containmentPromise = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (entry.containmentPromise === attempt) entry.containmentPromise = null;
+    }
+  }
+
+  async function containAllWithoutState() {
+    beginStateRecovery();
+    if (containmentPromise) return containmentPromise;
+    const targets = [...entries.entries()];
+    const attempt = (async () => {
+      const results = await Promise.allSettled(targets.map(([profileId, entry]) => containEntry(profileId, entry)));
+      // Calls already inside a store await cannot be cancelled. Keep recovery
+      // pending until they settle; their continuations may no longer spawn or write.
+      const settled = await wait(Promise.allSettled([...pendingOpens, ...pendingStateWrites]).then(() => true), closeTimeoutMs);
+      if (settled !== true || entries.size || pendingOpens.size || pendingStateWrites.size ||
+          results.some((result) => result.status !== 'fulfilled' || result.value !== true)) {
+        throw containmentError();
+      }
+      return { profiles: targets.length };
+    })();
+    containmentPromise = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (containmentPromise === attempt) containmentPromise = null;
+    }
+  }
+
   function owns(profileId) {
     return entries.has(profileId);
   }
 
-  return Object.freeze({ openProfile, closeProfile, closeAll, owns });
+  function activeCount() {
+    return entries.size + pendingOpens.size + pendingStateWrites.size;
+  }
+
+  return Object.freeze({ openProfile, closeProfile, closeAll, beginStateRecovery, containAllWithoutState, owns, activeCount });
 }

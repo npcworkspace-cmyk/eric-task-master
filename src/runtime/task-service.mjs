@@ -191,26 +191,99 @@ export function createTaskService({
   let cleanupPromise = null;
   let mutationTail = Promise.resolve();
   let closing = false;
+  let abandoningState = false;
+  let stateFailure = null;
+  let stateLoaded = false;
+  const activeOperations = new Set();
   let closePromise = null;
   let reaper = null;
   let readyResolve;
   let readyReject;
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
 
-  const serialize = (operation) => {
-    const result = mutationTail.then(operation, operation);
+  function fenceState(error = new TaskServiceError('MANAGER_STATE_CHANGED', 'Manager state changed; recover the Manager before continuing', 409)) {
+    stateFailure ||= error;
+    store.fence();
+    rawProfileStore.fence?.();
+    closing = true;
+    abandoningState = true;
+    clearInterval(reaper);
+    clearTimeout(progressTimer);
+    for (const entry of children.values()) clearInterval(entry.watchdog);
+    verificationNotifier?.close();
+    profileRuntime?.beginStateRecovery?.();
+    return stateFailure;
+  }
+
+  function observeFailure(error) {
+    if (['STATE_STORE_EXTERNALLY_MODIFIED', 'MANAGER_STATE_CHANGED'].includes(error?.code)) fenceState(error);
+    return error;
+  }
+
+  const rawProfileStore = profileStore;
+  async function checkState() {
+    if (stateFailure) throw stateFailure;
+    if (!stateLoaded) return;
+    try {
+      await Promise.all([store.assertUnchanged(), rawProfileStore.assertUnchanged?.()]);
+      if (stateFailure) throw stateFailure;
+    } catch (error) {
+      throw observeFailure(error);
+    }
+  }
+
+  // A tasks.json replacement must fence Profile writes too, and vice versa.
+  // Check at each store boundary, including renewals outside mutationTail.
+  profileStore = new Proxy(rawProfileStore, {
+    get(target, property) {
+      const value = target[property];
+      if (typeof value !== 'function') return value;
+      return async (...args) => {
+        await checkState();
+        try { return await track(() => {
+          if (stateFailure) throw stateFailure;
+          return value.apply(target, args);
+        }); }
+        catch (error) { throw observeFailure(error); }
+      };
+    }
+  });
+
+  function track(operation) {
+    let result;
+    try { result = Promise.resolve(operation()); }
+    catch (error) { result = Promise.reject(error); }
+    activeOperations.add(result);
+    result.then(() => activeOperations.delete(result), () => activeOperations.delete(result));
+    return result;
+  }
+
+  function background(promise) {
+    void promise.catch(observeFailure);
+  }
+
+  const serialize = (operation, { allowFenced = false } = {}) => {
+    const guarded = async () => {
+      if (!allowFenced) await checkState();
+      try { return await operation(); }
+      catch (error) { throw observeFailure(error); }
+    };
+    const result = mutationTail.then(guarded, guarded);
     mutationTail = result.catch(() => {});
     return result;
   };
 
-  const persist = () => store.replace({
+  const persist = async () => {
+    await checkState();
+    try { return await store.replace({
     version: 1,
     // Input exists only in this live Manager long enough to start the Worker.
     // A restarted Manager cannot resume an in-process module, so persisting
     // API keys or passwords provides no recovery value and creates exposure.
     tasks: [...tasks.values()].map((task) => ({ ...task, input: null })),
     tombstones: [...tombstones.values()]
-  });
+    }); } catch (error) { throw observeFailure(error); }
+  };
 
   function flushProgress(task) {
     if (pendingProgress.delete(task.id)) appendEvent(task, 'progress', task.progress);
@@ -228,7 +301,7 @@ export function createTaskService({
           else pendingProgress.delete(id);
         }
         await persist();
-      }).catch(() => {});
+      }).catch(observeFailure);
     }, progressFlushMs);
     progressTimer.unref?.();
   }
@@ -266,7 +339,7 @@ export function createTaskService({
     processAlive,
     leaseTtlMs,
     heartbeatTimeoutMs,
-    onProfileAvailable: () => schedule()
+    onProfileAvailable: () => background(schedule())
   });
 
   async function initialize() {
@@ -274,6 +347,7 @@ export function createTaskService({
       await mkdir(root, { recursive: true, mode: 0o700 });
       await store.init();
       const data = await store.read();
+      stateLoaded = true;
       for (const record of Array.isArray(data.tombstones) ? data.tombstones : []) {
         if (!record || !TASK_ID.test(record.id || '') || typeof record.profileId !== 'string') continue;
         tombstones.set(record.id, {
@@ -315,7 +389,7 @@ export function createTaskService({
       }
       await profileStore.recoverExpiredLeases();
       await persist();
-      for (const id of tombstones.keys()) void cleanupTombstone(id);
+      for (const id of tombstones.keys()) background(track(() => cleanupTombstone(id)));
       reaper = setInterval(() => {
       for (const [taskId, entry] of children) {
           if (!entry.finalized && !processAlive(entry.child.pid)) {
@@ -327,14 +401,14 @@ export function createTaskService({
             }).catch(() => {});
           }
         }
-        void profileStore.recoverExpiredLeases().then((recovered) => {
-          if (recovered.length) void schedule();
-          for (const id of tombstones.keys()) void cleanupTombstone(id);
-        }).catch(() => {});
+        background(profileStore.recoverExpiredLeases().then((recovered) => {
+          if (recovered.length) background(schedule());
+          for (const id of tombstones.keys()) background(track(() => cleanupTombstone(id)));
+        }));
       }, reaperIntervalMs);
       reaper.unref?.();
       readyResolve();
-      void schedule();
+      background(schedule());
     } catch (error) {
       readyReject(error);
     }
@@ -342,6 +416,7 @@ export function createTaskService({
   void initialize();
 
   async function stageModule(sourcePath, taskRoot, sourceBytes = null) {
+    await checkState();
     const resolved = path.resolve(sourcePath);
     const stats = sourceBytes === null ? await lstat(resolved).catch(() => null) : null;
     if (sourceBytes === null && (!stats?.isFile() || stats.isSymbolicLink() || stats.size < 1 || stats.size > MAX_MODULE_BYTES)) {
@@ -354,6 +429,7 @@ export function createTaskService({
       throw new TaskServiceError('TASK_MODULE_INVALID', 'Task module must use the .mjs extension');
     }
     const destination = path.join(taskRoot, 'task.mjs');
+    await checkState();
     if (sourceBytes === null) await copyFile(resolved, destination);
     else await writeFile(destination, sourceBytes, { mode: 0o600, flag: 'wx' });
     const bytes = sourceBytes ?? await readFile(destination);
@@ -371,6 +447,7 @@ export function createTaskService({
       );
     }
     try {
+      await checkState();
       await symlink(
         bundledModules,
         taskModules,
@@ -392,6 +469,7 @@ export function createTaskService({
   }
 
   async function removeModuleLink(modulePath) {
+    await checkState();
     if (!modulePath) return;
     const taskModules = path.join(path.dirname(modulePath), 'node_modules');
     const stats = await lstat(taskModules).catch((error) => {
@@ -406,10 +484,12 @@ export function createTaskService({
         500
       );
     }
+    await checkState();
     await unlink(taskModules);
   }
 
   async function disposeStagedModule(task) {
+    await checkState();
     if (!task) return;
     if (task.modulePath) {
       const expected = path.join(taskRootPath(root, task.id), 'task.mjs');
@@ -424,6 +504,7 @@ export function createTaskService({
   }
 
   async function cleanupTombstone(id) {
+    await checkState();
     if (!tombstones.has(id) || children.has(id)) return false;
     if (tombstoneCleanup.has(id)) return tombstoneCleanup.get(id);
     const attempt = (async () => {
@@ -434,8 +515,11 @@ export function createTaskService({
 
       const taskRoot = taskRootPath(root, id);
       const modulePath = path.join(taskRoot, 'task.mjs');
+      await checkState();
       await removeModuleLink(modulePath);
+      await checkState();
       await rm(modulePath, { force: true });
+      await checkState();
       await rm(taskRoot, { recursive: true, force: true });
       return serialize(async () => {
         if (children.has(id)) return false;
@@ -467,9 +551,11 @@ export function createTaskService({
   });
 
   function confirmEntryCleanup(entry) {
+    if (abandoningState) return Promise.resolve(false);
     if (!entry.generation) return Promise.resolve(false);
     if (entry.cleanupConfirmed) return Promise.resolve(true);
     entry.cleanupTail = entry.cleanupTail.catch(() => {}).then(async () => {
+      if (abandoningState) return false;
       if (entry.cleanupConfirmed) return true;
       entry.cleanupConfirmed = await profileStore.confirmLeaseCleanup(entry.profileId, leaseIdentity(entry));
       return entry.cleanupConfirmed;
@@ -478,12 +564,13 @@ export function createTaskService({
   }
 
   async function markEntryCleanupError(entry) {
+    if (abandoningState) return false;
     if (!entry.generation) return false;
     await entry.cleanupTail.catch(() => {});
     return profileStore.markLeaseError(entry.profileId, leaseIdentity(entry)).catch(() => false);
   }
 
-  async function terminateOwnedTask(entry) {
+  async function terminateOwnedTask(entry, { recordCleanup = true } = {}) {
     if (entry.terminationPromise) return entry.terminationPromise;
     const attempt = Promise.resolve().then(async () => {
       const terminated = await terminateTree(entry.child.pid, { graceMs: 3_000 }).catch(() => false);
@@ -491,7 +578,7 @@ export function createTaskService({
         ? await profileUsageProbe(entry.userDataDir).catch(() => 'unknown')
         : 'unknown';
       entry.treeTerminated = terminated === true && !processAlive(entry.child.pid) && usage === 'inactive';
-      if (entry.treeTerminated) await confirmEntryCleanup(entry).catch(() => {});
+      if (entry.treeTerminated && recordCleanup && !abandoningState) await confirmEntryCleanup(entry).catch(observeFailure);
       return entry.treeTerminated;
     });
     entry.terminationPromise = attempt;
@@ -508,6 +595,7 @@ export function createTaskService({
       await profileStore.recoverExpiredLeases();
       const occupied = activeProfileIds();
       for (const task of tasks.values()) {
+        if (closing) return;
         if (children.size >= maxConcurrentTasks) break;
         if (
           task.state !== 'queued' || occupied.has(task.profileId) ||
@@ -545,6 +633,7 @@ export function createTaskService({
         if (profile.lease || profile.state !== 'idle') continue;
         occupied.add(task.profileId);
         await launchTask(task, profile).catch(async (error) => {
+          if (abandoningState) throw error;
           task.state = 'error';
           task.error = normalizeError(error, 'TASK_START_FAILED');
           task.finishedAt = nowIso(now);
@@ -557,6 +646,8 @@ export function createTaskService({
   }
 
   async function launchTask(task, profile) {
+    await checkState();
+    if (closing) return;
     const child = workerFactory(TASK_WORKER, 'task');
     if (!child || !Number.isSafeInteger(child.pid) || child.pid <= 0) {
       throw new TaskServiceError('TASK_WORKER_START_FAILED', 'Task worker could not start', 500);
@@ -595,7 +686,9 @@ export function createTaskService({
     // body. Diagnostics must use structured progress/emit/error or artifacts.
     child.stdout?.resume();
     child.stderr?.resume();
-    child.on('message', (message) => void handleWorkerMessage(task.id, entry, message).catch(() => {
+    child.on('message', (message) => void handleWorkerMessage(task.id, entry, message).catch((error) => {
+      observeFailure(error);
+      if (abandoningState) return;
       void containTaskWorker(task.id, entry, {
         code: 'TASK_STATE_UPDATE_FAILED', message: 'Task state could not be recorded; stopping this worker.'
       }).catch(() => {});
@@ -609,7 +702,7 @@ export function createTaskService({
         pending.resolveAck({ accepted: false, reason: 'TASK_WORKER_EXITED' });
         if (entry.observedResumeWaitId !== pending.waitId) pending.resolveResumed(false);
       }
-      void finalizeTask(task.id, entry, code, signal).catch(() => {});
+      if (!abandoningState) void finalizeTask(task.id, entry, code, signal).catch(() => {});
     });
 
     try {
@@ -622,6 +715,8 @@ export function createTaskService({
         ttlMs: leaseTtlMs
       });
       entry.generation = leased.lease.generation;
+      await checkState();
+      if (closing) throw stateFailure || new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
       task.state = 'running';
       task.startedAt ||= nowIso(now);
       task.heartbeatAt = nowIso(now);
@@ -629,6 +724,7 @@ export function createTaskService({
       task.error = null;
       appendEvent(task, 'task.started', { pid: child.pid });
       await persist();
+      await checkState();
       const accepted = await send(child, {
         type: 'start',
         config: {
@@ -643,6 +739,7 @@ export function createTaskService({
       });
       if (!accepted) throw new TaskServiceError('TASK_WORKER_START_FAILED', 'Task worker did not accept startup', 500);
       task.input = null;
+      if (abandoningState) return;
       entry.watchdog = setInterval(() => {
         if (!entry.finalized && Date.now() - entry.lastHeartbeatAt > heartbeatTimeoutMs) {
           void failUnresponsiveTask(task.id, entry).catch(() => {});
@@ -650,6 +747,7 @@ export function createTaskService({
       }, Math.min(5_000, Math.max(1_000, Math.floor(heartbeatTimeoutMs / 3))));
       entry.watchdog.unref?.();
     } catch (error) {
+      if (abandoningState) throw error;
       entry.stopRequested = true;
       entry.terminalState = 'error';
       await send(child, { type: 'stop' });
@@ -669,6 +767,16 @@ export function createTaskService({
   }
 
   async function handleWorkerMessage(taskId, entry, message) {
+    if (abandoningState) {
+      if (message?.type === 'cleanup' && children.get(taskId) === entry) {
+        entry.browserClosed = message.browserClosed === true;
+        entry.resolveCleanup(true);
+        if (typeof message.cleanupId === 'string') {
+          await send(entry.child, { type: 'cleanup_ack', cleanupId: message.cleanupId });
+        }
+      }
+      return;
+    }
     if (message?.type === 'resume_ack') {
       if (children.get(taskId) === entry) entry.pendingResumes.get(message.requestId)?.resolveAck(message);
       return;
@@ -693,7 +801,7 @@ export function createTaskService({
         entry.lastHeartbeatAt = Date.now();
         task.heartbeatAt = timestamp;
         entry.renewTail = entry.renewTail.then(async () => {
-          if (entry.finalized || !entry.generation) return;
+          if (abandoningState || entry.finalized || !entry.generation) return;
           const renewed = await profileStore.renewLease(entry.profileId, {
             ownerId: entry.ownerId,
             nonce: entry.nonce,
@@ -701,7 +809,10 @@ export function createTaskService({
             ttlMs: leaseTtlMs
           });
           if (!renewed) throw new Error('Profile lease was lost');
-        }).catch(() => { void failUnresponsiveTask(taskId, entry).catch(() => {}); });
+        }).catch((error) => {
+          observeFailure(error);
+          if (!abandoningState) background(failUnresponsiveTask(taskId, entry));
+        });
         // Liveness is cheap in-memory state; lease renewal persists separately.
         return;
       } else if (message?.type === 'progress') {
@@ -785,6 +896,7 @@ export function createTaskService({
     message = 'Manager is terminating the owned task process tree.',
     details
   } = {}) {
+    if (abandoningState) return false;
     if (entry.finalized) return true;
     if (entry.containmentPromise) return entry.containmentPromise;
     const attempt = (async () => {
@@ -870,7 +982,7 @@ export function createTaskService({
       const task = tasks.get(taskId);
       if (!task) {
         children.delete(taskId);
-        setImmediate(() => void cleanupTombstone(taskId));
+        setImmediate(() => background(track(() => cleanupTombstone(taskId))));
         return true;
       }
       children.delete(taskId);
@@ -912,7 +1024,7 @@ export function createTaskService({
       // files remain readable until the task itself is deleted.
       await disposeStagedModule(task);
       await persist();
-      void schedule();
+      background(schedule());
       return true;
     });
     entry.finalizePromise = attempt;
@@ -1002,12 +1114,16 @@ export function createTaskService({
       const id = `task_${randomUUID().replaceAll('-', '')}`;
       const taskRoot = taskRootPath(root, id);
       const outputDir = path.join(taskRoot, 'output');
+      await checkState();
       await mkdir(outputDir, { recursive: true, mode: 0o700 });
       let staged;
       try {
         staged = await stageModule(body.modulePath, taskRoot, sourceBytes);
       } catch (error) {
-        await rm(taskRoot, { recursive: true, force: true }).catch(() => {});
+        if (!abandoningState) {
+          await checkState();
+          await rm(taskRoot, { recursive: true, force: true }).catch(() => {});
+        }
         throw error;
       }
       const timestamp = nowIso(now);
@@ -1040,7 +1156,7 @@ export function createTaskService({
       appendEvent(task, 'task.created', { moduleName: task.moduleName, profileId: profile.id });
       tasks.set(id, task);
       await persist();
-      void schedule();
+      background(schedule());
       return publicTask(task);
     });
   }
@@ -1379,10 +1495,11 @@ export function createTaskService({
       return current;
     });
     try {
+      await checkState();
       return await profileRuntime.openProfile(profile.id);
     } finally {
-      await serialize(async () => { profileOperations.delete(profile.id); });
-      void schedule();
+      profileOperations.delete(profile.id);
+      background(schedule());
     }
   }
 
@@ -1400,10 +1517,11 @@ export function createTaskService({
       return current;
     });
     try {
+      await checkState();
       return await profileRuntime.closeProfile(profile.id);
     } finally {
-      await serialize(async () => { profileOperations.delete(profile.id); });
-      void schedule();
+      profileOperations.delete(profile.id);
+      background(schedule());
     }
   }
 
@@ -1471,6 +1589,7 @@ export function createTaskService({
         categories: categories.map((id) => ({ id, bytes: 0, files: 0 }))
       };
       const clean = async (categoryId, subject, rootPath, relativePath, linkOnly = false) => {
+        await checkState();
         const parent = await lstat(path.dirname(rootPath)).catch(() => null);
         if (!parent?.isDirectory() || parent.isSymbolicLink()) {
           const issue = { path: relativePath, reason: 'MANAGED_DIRECTORY_UNSAFE' };
@@ -1485,6 +1604,7 @@ export function createTaskService({
             return { bytes: 0, files: 0, skipped: [], failed: [issue] };
           }
         }
+        await checkState();
         const value = await cleanManagedPath({ root: rootPath, relativePath, preview, linkOnly }).catch((error) => ({
           bytes: 0, files: 0, skipped: [],
           failed: [{ path: relativePath, reason: error.code || 'CLEANUP_IO_ERROR' }]
@@ -1526,8 +1646,8 @@ export function createTaskService({
               await clean('browser-cache', subject, profile.userDataDir, `Default/${cache}`);
             }
           } finally {
-            await serialize(() => { profileOperations.delete(profile.id); });
-            void schedule();
+            profileOperations.delete(profile.id);
+            background(schedule());
           }
         }
       }
@@ -1564,7 +1684,7 @@ export function createTaskService({
               });
             }
           } finally {
-            await serialize(() => { cleaningTasks.delete(task.id); });
+            cleaningTasks.delete(task.id);
           }
         }
       }
@@ -1592,20 +1712,84 @@ export function createTaskService({
     };
   }
 
-  async function prepareIdleStop() {
+  async function prepareIdleStop({ stateRecovery = false } = {}) {
     await ready;
+    if (stateRecovery && !(await waitFor(mutationTail.then(() => true), stopWaitMs))) {
+      throw new TaskServiceError('MANAGER_BUSY', 'A Manager state operation has not settled; retry recovery shortly', 409);
+    }
     await serialize(async () => {
-      const profiles = await profileStore.list();
+      // A replaced profiles.json cannot be read through the stale store. During
+      // state recovery, rely only on processes owned by this Manager and its
+      // in-memory task set. The replacement Manager will validate the new disk
+      // state after this process exits.
+      const profiles = stateRecovery ? [] : await profileStore.list();
       if (children.size || profileOperations.size || cleanupPromise || deletingProfiles.size ||
+          (stateRecovery && (activeOperations.size > 0 || tombstoneCleanup.size > 0)) ||
+          (stateRecovery && profileRuntime.activeCount() > 0) ||
           [...tasks.values()].some((task) => !isTerminalTask(task)) ||
           profiles.some((profile) => profile.lease || !['idle'].includes(profile.state))) {
         throw new TaskServiceError('MANAGER_BUSY', 'Manager has active tasks, Profiles or cleanup; maintenance was not started', 409);
       }
       closing = true;
-    });
+    }, { allowFenced: stateRecovery });
   }
 
-  async function close() {
+  async function assertStateUnchanged() {
+    await ready;
+    await checkState();
+    return true;
+  }
+
+  async function containForStateRecovery() {
+    await ready;
+    fenceState();
+    // Stop admitting lifecycle work before taking the process snapshot. The
+    // bounded drain includes calls already beyond mutationTail (open/delete/
+    // cleanup) and store renewals, so a late launch cannot escape containment.
+    const settled = await waitFor(Promise.allSettled([
+      mutationTail, ...activeOperations, ...tombstoneCleanup.values(),
+      ...(cleanupPromise ? [cleanupPromise] : [])
+    ]).then(() => true), stopWaitMs);
+    const targets = [...children.values()];
+    const taskContainment = Promise.all(targets.map(async (entry) => {
+      entry.stopRequested = true;
+      clearInterval(entry.watchdog);
+      await send(entry.child, { type: 'stop' });
+      await waitFor(entry.exitPromise, stopWaitMs);
+      if (processAlive(entry.child.pid)) {
+        await waitFor(terminateOwnedTask(entry, { recordCleanup: false }), terminationWaitMs);
+        await waitFor(entry.exitPromise, terminationWaitMs);
+      }
+    }));
+    const [taskResult, manualResult] = await Promise.allSettled([
+      taskContainment, profileRuntime.containAllWithoutState()
+    ]);
+    if (!settled || taskResult.status === 'rejected' || manualResult.status === 'rejected') {
+      throw new TaskServiceError('MANAGER_RECOVERY_CONTAINMENT_FAILED',
+        !settled ? 'An in-flight Manager operation has not settled; recovery was stopped'
+          : (taskResult.reason?.message || manualResult.reason?.message), 409);
+    }
+    const verification = await Promise.all(targets.map(async (entry) => {
+      if (processAlive(entry.child.pid)) {
+        return false;
+      }
+      const observed = await waitFor(profileUsageProbe(entry.userDataDir)
+        .then((value) => ({ value })).catch(() => ({ value: 'unknown' })), terminationWaitMs);
+      const usage = observed ? observed.value : 'unknown';
+      return usage === false || usage === 'inactive';
+    }));
+    const uncontained = targets.filter((_entry, index) => !verification[index]);
+    if (uncontained.length) {
+      throw new TaskServiceError(
+        'MANAGER_RECOVERY_CONTAINMENT_FAILED',
+        `${uncontained.length} task process(es) could not be contained; Manager recovery was stopped`,
+        409
+      );
+    }
+    return { tasks: targets.length, profiles: manualResult.value.profiles };
+  }
+
+  async function close({ abandonState = false } = {}) {
     if (closePromise) return closePromise;
     closing = true;
     try {
@@ -1614,6 +1798,14 @@ export function createTaskService({
         clearTimeout(progressTimer);
         verificationNotifier?.close();
         await ready.catch(() => {});
+        if (abandonState) {
+          fenceState();
+          if (!(await waitFor(Promise.allSettled([mutationTail, ...activeOperations,
+            ...(cleanupPromise ? [cleanupPromise] : [])]).then(() => true), stopWaitMs))) {
+            throw new TaskServiceError('MANAGER_RECOVERY_CONTAINMENT_FAILED', 'Manager lifecycle work is still settling', 409);
+          }
+          return;
+        }
         await cleanupPromise?.catch(() => {});
         const activeIds = [...children.keys()];
         const taskResults = await Promise.allSettled(activeIds.map(async (id) => {
@@ -1660,7 +1852,7 @@ export function createTaskService({
     }
   }
 
-  return Object.freeze({
+  const service = {
     status,
     list,
     get,
@@ -1679,6 +1871,20 @@ export function createTaskService({
     deleteProfile,
     cleanup,
     prepareIdleStop,
+    beginStateRecovery: () => { fenceState(); },
+    assertStateUnchanged,
+    containForStateRecovery,
     close
-  });
+  };
+  const lifecycle = new Set(['create', 'resume', 'stop', 'deleteTask', 'createProfile',
+    'updateProfile', 'openProfile', 'closeProfile', 'deleteProfile', 'cleanup']);
+  for (const name of ['status', 'list', 'get', 'events', 'listArtifacts', 'readArtifact', 'listProfiles', ...lifecycle]) {
+    const operation = service[name];
+    const invoke = async (...args) => { await ready; await checkState(); return operation(...args); };
+    // Lifecycle admission already checks state inside mutationTail. Do not
+    // add asynchronous work before that queue: create/open versus maintenance
+    // must keep the caller's admission order.
+    service[name] = lifecycle.has(name) ? (...args) => track(() => operation(...args)) : invoke;
+  }
+  return Object.freeze(service);
 }

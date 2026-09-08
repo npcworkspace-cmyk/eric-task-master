@@ -58,6 +58,7 @@ async function bodyFrom(request) {
 function contentType(file) {
   if (file.endsWith('.html')) return 'text/html; charset=utf-8';
   if (file.endsWith('.css')) return 'text/css; charset=utf-8';
+  if (file.endsWith('.svg')) return 'image/svg+xml; charset=utf-8';
   return 'text/javascript; charset=utf-8';
 }
 
@@ -152,7 +153,9 @@ async function handler(request, response) {
     ['/dashboard/', 'index.html'],
     ['/dashboard/index.html', 'index.html'],
     ['/dashboard/styles.css', 'styles.css'],
-    ['/dashboard/dashboard.js', 'dashboard.js']
+    ['/dashboard/dashboard.js', 'dashboard.js'],
+    ['/dashboard/npc-logo.svg', 'npc-logo.svg'],
+    ['/dashboard/npc-mark.svg', 'npc-mark.svg']
   ]);
   if (request.method === 'GET' && staticFiles.has(pathname)) {
     const relative = staticFiles.get(pathname);
@@ -613,6 +616,44 @@ try {
 
   await page.goto(`${baseUrl}/dashboard?task=task_running`, { waitUntil: 'domcontentloaded' });
   await page.getByRole('heading', { name: '当前任务', exact: true }).waitFor();
+  const brand = page.locator('img.npc-brand-mark');
+  assert.equal(await brand.getAttribute('alt'), 'NPC');
+  await brand.evaluate((image) => image.decode());
+  assert.equal(await brand.evaluate((image) => image.naturalWidth / image.naturalHeight), 3);
+  const favicon = await page.locator('link[rel="icon"]').getAttribute('href');
+  const faviconResponse = await page.request.get(new URL(favicon, baseUrl).href);
+  assert.equal(faviconResponse.status(), 200);
+  assert.match(faviconResponse.headers()['content-type'], /image\/svg\+xml/u);
+  checks.push('NPC vector logo and compact favicon load locally without external image dependencies');
+  assert.equal(context.pages().length, 1, 'Website navigation never opens automatically');
+  await context.route('https://www.npctech.site/**', (route) => route.fulfill({
+    status: 200, contentType: 'text/html', body: '<title>NPC website fixture</title>'
+  }));
+  for (const selector of ['.brand', '.website-link']) {
+    const link = page.locator(selector);
+    assert.equal(await link.getAttribute('href'), 'https://www.npctech.site/');
+    assert.equal(await link.getAttribute('target'), '_blank');
+    assert.match(await link.getAttribute('rel'), /noopener/u);
+    const panelUrl = page.url();
+    const [popup] = await Promise.all([page.waitForEvent('popup'), link.click()]);
+    await popup.waitForLoadState('domcontentloaded');
+    assert.equal(popup.url(), 'https://www.npctech.site/');
+    assert.equal(page.url(), panelUrl, 'Website link keeps the current task panel open');
+    await popup.close();
+  }
+  await context.unroute('https://www.npctech.site/**');
+  checks.push('NPC website button and Logo open one new tab only when clicked and preserve the task panel');
+  for (const width of [390, 768, 981, 1024, 1100, 1440]) {
+    await page.setViewportSize({ width, height: 960 });
+    const overlap = await page.locator('.brand, .primary-nav, .header-actions').evaluateAll((nodes) => {
+      const rects = nodes.map((node) => node.getBoundingClientRect());
+      return rects.some((a, i) => rects.slice(i + 1).some((b) =>
+        a.left < b.right - 1 && a.right > b.left + 1 && a.top < b.bottom - 1 && a.bottom > b.top + 1));
+    });
+    assert.equal(overlap, false, `Header controls overlap at ${width}px`);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  }
+  checks.push('Logo, website navigation and task controls do not overlap from phone through tablet and desktop widths');
   await page.locator('.task-card').first().waitFor();
   assert.equal(await page.locator('.task-card').count(), 2);
   assert.equal(await page.locator('#task-count-chip').textContent(), '2 个任务');
@@ -775,6 +816,11 @@ try {
   }));
   assert.equal(mobile.scrollWidth <= mobile.width, true);
   assert.deepEqual(mobile.shortTargets, []);
+  assert.ok(await page.locator('.brand').evaluate((node) => node.getBoundingClientRect().height >= 44));
+  assert.equal(await page.locator('.website-link').textContent(), 'NPC Site ↗');
+  if (screenshotPath) {
+    await page.screenshot({ path: path.join(path.dirname(screenshotPath), 'panel-mobile.png'), fullPage: true });
+  }
   await page.keyboard.press('Tab');
   assert.notEqual(await page.evaluate(() => document.activeElement?.tagName), 'BODY');
   checks.push('Chinese and English layouts remain keyboard-accessible with 44px targets and no mobile overflow');

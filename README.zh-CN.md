@@ -6,7 +6,9 @@ Eric Task Master 是运行在本机的全时浏览器任务底座。Agent 负责
 
 Codex、Claude Code、WorkBuddy、Hermes、Pi，以及任何能调用本机终端并读取 JSON 的 Agent，都可以通过同一套 CLI 使用它。
 
-[English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md)
+[English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md) | **[NPC 官网 ↗](https://www.npctech.site/)**
+
+由 **NPC 核子力文化科技**打造。[了解我们的作品、服务与 AI 工具 →](https://www.npctech.site/)
 
 ## 它能把什么交给 Agent
 
@@ -140,6 +142,8 @@ taskmaster files TASK_ID --json
 ```
 
 第一次 `follow` 不需要游标；后续调用使用返回的 `after` 值继续读取：`taskmaster follow TASK_ID --after AFTER --wait-ms 60000 --json`。不指定 `--profile` 时使用面板中的默认 Profile。Manager 未启动时，`run` 会自动在后台启动。所有命令都支持 `--json`，便于不同 Agent 稳定解析。
+
+`panel --json` 只返回固定面板地址，不打开浏览器。多个任务复用同一链接；明确需要打开面板时才执行 `taskmaster panel`。任务使用的浏览器窗口在任务结束后关闭，手动打开的管理面板保留。
 
 最小任务：
 

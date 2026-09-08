@@ -6,7 +6,9 @@ Eric Task Master is an always-on local browser task foundation. The Agent unders
 
 Codex, Claude Code, WorkBuddy, Hermes, Pi, and any other Agent that can run a local CLI and read JSON can use the same interface.
 
-English | [简体中文](README.zh-CN.md) | [Latest Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill)
+English | [简体中文](README.zh-CN.md) | [Latest Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) | **[NPC Website ↗](https://www.npctech.site/)**
+
+Built by **NPC**. [Explore our work, services, and AI tools →](https://www.npctech.site/)
 
 ## What Agents can do with it
 
@@ -140,6 +142,8 @@ taskmaster files TASK_ID --json
 ```
 
 The first `follow` call needs no cursor. On later calls, continue with the returned `after` value: `taskmaster follow TASK_ID --after AFTER --wait-ms 60000 --json`. Omit `--profile` to use the default Profile selected in the Dashboard. `run` starts the Manager in the background when needed. Every command supports `--json`, giving different Agents the same stable interface.
+
+`panel --json` returns the fixed Dashboard link without opening a browser. Reuse that link across tasks; use `taskmaster panel` only to explicitly open the panel. Task browser windows close when their task ends; a manually opened Dashboard stays open.
 
 Minimal task:
 

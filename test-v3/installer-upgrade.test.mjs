@@ -33,6 +33,27 @@ test('Windows upgrade stops the managed installation and replaces only managed a
   assert.doesNotMatch(installer, /ERIC_TASK_MASTER_HOME|\\eric-task-master(?:\\|')/u);
 });
 
+test('Windows installer puts its launcher first in user PATH and removes only that entry on uninstall', async () => {
+  const installer = await source('scripts/install/windows/installer.iss');
+  const addUserPath = installer.slice(
+    installer.indexOf('procedure AddUserPath'),
+    installer.indexOf('procedure RemoveUserPath')
+  );
+  const removeUserPath = installer.slice(
+    installer.indexOf('procedure RemoveUserPath'),
+    installer.indexOf('procedure CurStepChanged')
+  );
+
+  assert.match(installer, /function RemovePathEntry\(Value, Wanted: string\): string;/u);
+  assert.match(addUserPath, /Remaining := RemovePathEntry\(Current, Wanted\);/u);
+  assert.match(addUserPath, /Updated := Wanted;/u);
+  assert.match(addUserPath, /Updated := Updated \+ ';' \+ Remaining;/u);
+  assert.match(addUserPath, /RegWriteExpandStringValue\([^;]+, Updated\);/su);
+  assert.doesNotMatch(addUserPath, /Current \+ Wanted|Wanted \+ Current/u);
+  assert.match(removeUserPath, /Updated := RemovePathEntry\(Current, Wanted\);/u);
+  assert.match(removeUserPath, /RegWriteExpandStringValue\([^;]+, Updated\);/su);
+});
+
 test('macOS and Linux packages run fail-closed preinstall replacement scripts', async () => {
   const [macPackage, linuxPackage, macPreinstall, linuxPreinstall] = await Promise.all([
     source('scripts/build/package-macos.sh'),
