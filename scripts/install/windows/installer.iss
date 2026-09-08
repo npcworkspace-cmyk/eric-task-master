@@ -122,60 +122,14 @@ begin
   Sleep(1000);
 end;
 
-function PathContains(Value, Wanted: string): Boolean;
+function RemovePathEntry(Value, Wanted: string): string;
 var
-  Remaining: string;
-  Part: string;
-  Split: Integer;
-begin
-  Result := False;
-  Remaining := Value;
-  while Remaining <> '' do
-  begin
-    Split := Pos(';', Remaining);
-    if Split = 0 then
-    begin
-      Part := Remaining;
-      Remaining := '';
-    end
-    else
-    begin
-      Part := Copy(Remaining, 1, Split - 1);
-      Delete(Remaining, 1, Split);
-    end;
-    if NormalizedPath(Part) = NormalizedPath(Wanted) then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
-end;
-
-procedure AddUserPath(Wanted: string);
-var
-  Current: string;
-begin
-  RegQueryStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, 'Path', Current);
-  if not PathContains(Current, Wanted) then
-  begin
-    if Current <> '' then
-    begin
-      if Current[Length(Current)] <> ';' then Current := Current + ';';
-    end;
-    RegWriteExpandStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, 'Path', Current + Wanted);
-  end;
-end;
-
-procedure RemoveUserPath(Wanted: string);
-var
-  Current: string;
   Remaining: string;
   Part: string;
   Updated: string;
   Split: Integer;
 begin
-  if not RegQueryStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, 'Path', Current) then Exit;
-  Remaining := Current;
+  Remaining := Value;
   Updated := '';
   while Remaining <> '' do
   begin
@@ -196,6 +150,29 @@ begin
       Updated := Updated + Part;
     end;
   end;
+  Result := Updated;
+end;
+
+procedure AddUserPath(Wanted: string);
+var
+  Current: string;
+  Remaining: string;
+  Updated: string;
+begin
+  RegQueryStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, 'Path', Current);
+  Remaining := RemovePathEntry(Current, Wanted);
+  Updated := Wanted;
+  if Remaining <> '' then Updated := Updated + ';' + Remaining;
+  RegWriteExpandStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, 'Path', Updated);
+end;
+
+procedure RemoveUserPath(Wanted: string);
+var
+  Current: string;
+  Updated: string;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, 'Path', Current) then Exit;
+  Updated := RemovePathEntry(Current, Wanted);
   RegWriteExpandStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, 'Path', Updated);
 end;
 

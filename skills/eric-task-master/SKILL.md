@@ -16,7 +16,7 @@ Use the installed or extracted portable `taskmaster` launcher. For a normal requ
    taskmaster run ./job.mjs --input '@input.json' --detach --json
    ```
 
-3. Retain the returned task ID, run `taskmaster panel --json`, and immediately give the user its Dashboard URL.
+3. Retain the returned task ID, run `taskmaster panel --json`, and give the user its fixed Dashboard URL. This only returns the link; run `taskmaster panel` without JSON only when the user asks to open it. Reuse the same panel across tasks.
 4. Follow it with `taskmaster follow TASK_ID --json`; optionally add `--wait-ms 30000` to bound a call. Retain `after` and continue with `--after SEQUENCE`. Report meaningful processed counts during a long run.
 5. Read the output files and deliver every usable result, including partial results from a stopped or failed run.
 

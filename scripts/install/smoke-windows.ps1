@@ -17,15 +17,31 @@ $installLog = Join-Path $artifactRoot 'windows-installer-first-install.log'
 $upgradeLog = Join-Path $artifactRoot 'windows-installer-upgrade.log'
 $state = Join-Path $runnerTemp 'eric-task-master-installed-smoke-state'
 $job = (Resolve-Path (Join-Path $PSScriptRoot '..\build\fixtures\bare-playwright-task.mjs')).Path
+$originalUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$originalProcessPath = $env:Path
+$staleLauncherDir = Join-Path $runnerTemp 'eric-task-master-stale-launcher'
+New-Item -ItemType Directory -Force -Path $staleLauncherDir | Out-Null
+Set-Content -LiteralPath (Join-Path $staleLauncherDir 'taskmaster.cmd') -Value '@echo stale-taskmaster' -Encoding Ascii
+[Environment]::SetEnvironmentVariable('Path', "$staleLauncherDir;$originalUserPath", 'User')
+try {
 Remove-Item -LiteralPath $root,$state -Recurse -Force -ErrorAction SilentlyContinue
 
 $install = Start-Process -FilePath $installerPath -ArgumentList @(
   '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$installLog`""
-) -Wait -PassThru
+) -WindowStyle Hidden -Wait -PassThru
 if ($install.ExitCode -ne 0) { throw "Installer exited with $($install.ExitCode)" }
 
 $cli = Join-Path $root 'bin\taskmaster.cmd'
 if (-not (Test-Path -LiteralPath $cli)) { throw "Installed CLI is missing: $cli" }
+$installedUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($installedUserPath -split ';')[0].TrimEnd('\') -ine (Join-Path $root 'bin')) {
+  throw 'Installed launcher was not placed before the stale user PATH entry'
+}
+$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + $installedUserPath
+$resolvedLaunchers = @(& where.exe taskmaster)
+if (-not $resolvedLaunchers.Count -or $resolvedLaunchers[0] -ine $cli) {
+  throw 'A fresh PATH still resolves an old taskmaster before the installed launcher'
+}
 $env:ERIC_TASK_MASTER_HOME = $state
 $env:ERIC_TASK_MASTER_PORT = '29846'
 $env:NODE_OPTIONS = '--require=__eric_task_master_host_injection_must_not_load__'
@@ -53,7 +69,7 @@ $preUpgradeManagerProcessId = (Get-Content -LiteralPath $managerFile -Raw | Conv
 
 $upgrade = Start-Process -FilePath $installerPath -ArgumentList @(
   '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$upgradeLog`""
-) -Wait -PassThru
+) -WindowStyle Hidden -Wait -PassThru
 if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer exited with $($upgrade.ExitCode)" }
 $deadline = [DateTime]::UtcNow.AddSeconds(20)
 while ([DateTime]::UtcNow -lt $deadline -and (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue)) {
@@ -87,7 +103,7 @@ $managerProcessId = (Get-Content -LiteralPath $managerFile -Raw | ConvertFrom-Js
 
 $uninstaller = Join-Path $root 'unins000.exe'
 if (-not (Test-Path -LiteralPath $uninstaller)) { throw 'Uninstaller is missing' }
-$uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+$uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
 if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with $($uninstall.ExitCode)" }
 if (Test-Path -LiteralPath (Join-Path $root 'bin\taskmaster.cmd')) { throw 'Application files remain after uninstall' }
 $deadline = [DateTime]::UtcNow.AddSeconds(20)
@@ -95,6 +111,21 @@ while ([DateTime]::UtcNow -lt $deadline -and (Get-Process -Id $managerProcessId 
   Start-Sleep -Milliseconds 200
 }
 if (Get-Process -Id $managerProcessId -ErrorAction SilentlyContinue) { throw 'Uninstaller did not stop the Manager' }
+$remainingUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (@($remainingUserPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq (Join-Path $root 'bin') }).Count) {
+  throw 'Uninstaller left its launcher in user PATH'
+}
+$expectedRemainingPath = (@("$staleLauncherDir;$originalUserPath" -split ';' | Where-Object {
+  $_ -ne '' -and $_.TrimEnd('\') -ine (Join-Path $root 'bin')
+}) -join ';')
+if ($remainingUserPath -cne $expectedRemainingPath) {
+  throw 'Uninstaller changed unrelated user PATH entries'
+}
 Remove-Item -LiteralPath $state -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item Env:NODE_OPTIONS,Env:NODE_PATH -ErrorAction SilentlyContinue
-[ordered]@{ ok = $true; installedRuntime = 'bundled-node'; nativeUpgrade = 'passed'; staleV2PayloadRemoved = $true; userStatePreserved = $true; hostNodeInjectionIsolated = $true; barePlaywrightTask = 'passed'; uninstallStoppedManager = $true; uninstalled = $true } | ConvertTo-Json -Compress
+[ordered]@{ ok = $true; installedRuntime = 'bundled-node'; nativeUpgrade = 'passed'; launcherPrecedence = 'passed'; unrelatedPathPreserved = $true; staleV2PayloadRemoved = $true; userStatePreserved = $true; hostNodeInjectionIsolated = $true; barePlaywrightTask = 'passed'; uninstallStoppedManager = $true; uninstalled = $true } | ConvertTo-Json -Compress
+} finally {
+  [Environment]::SetEnvironmentVariable('Path', $originalUserPath, 'User')
+  $env:Path = $originalProcessPath
+  Remove-Item -LiteralPath (Join-Path $staleLauncherDir 'taskmaster.cmd') -Force -ErrorAction SilentlyContinue
+}

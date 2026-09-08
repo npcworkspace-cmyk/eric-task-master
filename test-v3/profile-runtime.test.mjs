@@ -335,3 +335,243 @@ test('normal Profile close confirms cleanup once and performs no extra usage pro
   assert.equal(probes, 0);
   assert.equal(runtime.owns('startup-profile'), false);
 });
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function recordLeaseWrites(store) {
+  const writes = [];
+  for (const method of ['confirmLeaseCleanup', 'renewLease', 'markLeaseError', 'releaseLease']) {
+    const original = store[method].bind(store);
+    store[method] = async (...args) => { writes.push(method); return original(...args); };
+  }
+  return writes;
+}
+
+test('state recovery fences an open paused before spawn and waits for its pending store call', async () => {
+  const store = startupStore();
+  const gate = deferred();
+  let entered = false;
+  let spawns = 0;
+  store.recoverExpiredLeases = async () => { entered = true; await gate.promise; };
+  const runtime = createProfileRuntime({ profileStore: store, workerFactory: () => { spawns += 1; } });
+  const opening = assert.rejects(runtime.openProfile('startup-profile'), { code: 'MANAGER_STATE_CHANGED' });
+  await eventually(() => entered, 'pending lease recovery');
+  assert.ok(runtime.activeCount() > 0, 'idle recovery must observe an open before its first spawn');
+  let contained = false;
+  const recovery = runtime.containAllWithoutState().then((result) => { contained = true; return result; });
+  await nextTurn();
+  assert.equal(contained, false);
+  gate.resolve();
+  assert.deepEqual(await recovery, { profiles: 0 });
+  await opening;
+  assert.equal(spawns, 0);
+  await assert.rejects(runtime.openProfile('startup-profile'), { code: 'MANAGER_STATE_CHANGED' });
+  assert.equal(runtime.activeCount(), 0);
+});
+
+test('state recovery is retryable when an in-flight open has not settled', async () => {
+  const store = startupStore();
+  const gate = deferred();
+  let entered = false;
+  let spawns = 0;
+  store.recoverExpiredLeases = async () => { entered = true; await gate.promise; };
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => { spawns += 1; }, closeTimeoutMs: 20
+  });
+  const opening = assert.rejects(runtime.openProfile('startup-profile'), { code: 'MANAGER_STATE_CHANGED' });
+  await eventually(() => entered, 'pending lease recovery');
+  await assert.rejects(runtime.containAllWithoutState(), { code: 'MANAGER_RECOVERY_CONTAINMENT_FAILED' });
+  gate.resolve();
+  await opening;
+  assert.deepEqual(await runtime.containAllWithoutState(), { profiles: 0 });
+  assert.equal(spawns, 0);
+});
+
+test('state recovery contains a Worker during lease acquisition without sending open or stale cleanup writes', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9501, alive);
+  const gate = deferred();
+  let acquiring = false;
+  let openMessages = 0;
+  const baseSend = worker.send.bind(worker);
+  worker.send = (message, ...args) => {
+    if (message.type === 'open') openMessages += 1;
+    return baseSend(message, ...args);
+  };
+  const store = startupStore(async () => { acquiring = true; await gate.promise; });
+  const writes = recordLeaseWrites(store);
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
+    closeTimeoutMs: 100,
+    terminateTree: async () => { if (alive.has(worker.pid)) worker.terminate(); return true; }
+  });
+  const opening = assert.rejects(runtime.openProfile('startup-profile'), { code: 'MANAGER_STATE_CHANGED' });
+  await eventually(() => acquiring, 'pending lease acquisition');
+  const recovery = runtime.containAllWithoutState();
+  await eventually(() => !alive.has(worker.pid), 'Worker containment');
+  gate.resolve();
+  await recovery;
+  await opening;
+  assert.equal(openMessages, 0);
+  assert.deepEqual(writes, []);
+  assert.equal(runtime.activeCount(), 0);
+});
+
+test('detecting replaced state fences startup without closing its Worker until explicit recovery', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9506, alive);
+  const gate = deferred();
+  let acquiring = false;
+  let closes = 0;
+  const baseSend = worker.send.bind(worker);
+  worker.send = (message, ...args) => {
+    if (message.type === 'close') closes += 1;
+    return baseSend(message, ...args);
+  };
+  const store = startupStore(async () => { acquiring = true; await gate.promise; });
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
+    closeTimeoutMs: 100,
+    terminateTree: async () => { worker.terminate(); return true; }
+  });
+  const opening = assert.rejects(runtime.openProfile('startup-profile'), { code: 'MANAGER_STATE_CHANGED' });
+  await eventually(() => acquiring, 'pending lease acquisition');
+  runtime.beginStateRecovery();
+  gate.resolve();
+  await opening;
+  assert.equal(closes, 0);
+  assert.equal(alive.has(worker.pid), true);
+  assert.equal(runtime.owns('startup-profile'), true);
+  await runtime.containAllWithoutState();
+  assert.equal(alive.has(worker.pid), false);
+});
+
+test('state recovery suppresses queued renewal and finalization writes after a pending confirmation', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9502, alive);
+  const store = startupStore();
+  const gate = deferred();
+  const writes = [];
+  let confirming = false;
+  store.confirmLeaseCleanup = async () => {
+    writes.push('confirm');
+    confirming = true;
+    await gate.promise;
+    return true;
+  };
+  store.releaseLease = async () => { writes.push('release'); return true; };
+  store.markLeaseError = async () => { writes.push('error'); return true; };
+  store.renewLease = async () => { writes.push('renew'); return true; };
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
+    closeTimeoutMs: 100,
+    terminateTree: async () => { if (alive.has(worker.pid)) worker.terminate(); return true; }
+  });
+  await runtime.openProfile('startup-profile');
+  worker.emit('message', { type: 'closed', browserClosed: true });
+  await eventually(() => confirming, 'cleanup confirmation');
+  worker.terminate();
+  worker.emit('message', { type: 'heartbeat' });
+  runtime.beginStateRecovery();
+  const recovery = runtime.containAllWithoutState();
+  gate.resolve();
+  await recovery;
+  await nextTurn();
+  assert.deepEqual(writes, ['confirm'], 'no queued renewal, lease release or error mark may write abandoned state');
+  assert.equal(runtime.owns('startup-profile'), false);
+});
+
+test('state recovery waits for dispatched renewal and skips a second queued renewal', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9503, alive);
+  const store = startupStore();
+  const gate = deferred();
+  let renewals = 0;
+  store.renewLease = async () => { renewals += 1; await gate.promise; return true; };
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
+    closeTimeoutMs: 100,
+    terminateTree: async () => { if (alive.has(worker.pid)) worker.terminate(); return true; }
+  });
+  await runtime.openProfile('startup-profile');
+  worker.emit('message', { type: 'heartbeat' });
+  await eventually(() => renewals === 1, 'first renewal');
+  worker.emit('message', { type: 'heartbeat' });
+  const recovery = runtime.containAllWithoutState();
+  gate.resolve();
+  await recovery;
+  await nextTurn();
+  assert.equal(renewals, 1);
+});
+
+test('state recovery retries failed process containment and never changes lease metadata', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9504, alive);
+  const store = startupStore();
+  const writes = recordLeaseWrites(store);
+  let terminationWorks = false;
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive',
+    closeTimeoutMs: 20,
+    terminateTree: async () => {
+      if (!terminationWorks) return false;
+      worker.terminate();
+      return true;
+    }
+  });
+  await runtime.openProfile('startup-profile');
+  await assert.rejects(runtime.containAllWithoutState(), { code: 'MANAGER_RECOVERY_CONTAINMENT_FAILED' });
+  assert.equal(runtime.owns('startup-profile'), true);
+  assert.equal(alive.has(worker.pid), true);
+  terminationWorks = true;
+  assert.deepEqual(await runtime.containAllWithoutState(), { profiles: 1 });
+  assert.deepEqual(writes, []);
+  assert.ok((await store.get()).lease, 'replacement Manager owns persisted-state recovery');
+});
+
+test('a normal recovery close still blocks on active or unknown Profile usage and can be retried', async () => {
+  const alive = new Set();
+  const worker = new CloseFailingWorker(9505, alive);
+  const store = startupStore();
+  const writes = recordLeaseWrites(store);
+  let usage = 'active';
+  const baseSend = worker.send.bind(worker);
+  worker.send = (message, ...args) => {
+    if (message.type === 'close') {
+      args.at(-1)?.(null);
+      setImmediate(() => worker.emit('message', { type: 'closed', browserClosed: true, cleanupId: 'recovery-close' }));
+      return;
+    }
+    if (message.type === 'closed_ack') {
+      args.at(-1)?.(null);
+      setImmediate(() => worker.terminate());
+      return;
+    }
+    return baseSend(message, ...args);
+  };
+  const runtime = createProfileRuntime({
+    profileStore: store, workerFactory: () => worker,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => usage,
+    closeTimeoutMs: 20,
+    terminateTree: async () => { throw new Error('normal close must not terminate'); }
+  });
+  await runtime.openProfile('startup-profile');
+  for (const current of ['active', 'unknown']) {
+    usage = current;
+    await assert.rejects(runtime.containAllWithoutState(), { code: 'MANAGER_RECOVERY_CONTAINMENT_FAILED' });
+    assert.equal(runtime.owns('startup-profile'), true);
+  }
+  usage = 'inactive';
+  assert.deepEqual(await runtime.containAllWithoutState(), { profiles: 1 });
+  assert.deepEqual(writes, []);
+  assert.equal(runtime.owns('startup-profile'), false);
+});

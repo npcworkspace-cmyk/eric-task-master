@@ -5,6 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { removeTestTree } from './test-fs.mjs';
 import { createManager } from '../src/manager.mjs';
+import { managerRecoveryProof } from '../src/lib/manager-state.mjs';
+import { TaskServiceError } from '../src/runtime/task-service.mjs';
 
 async function json(url, { token, method = 'GET', body } = {}) {
   const response = await fetch(url, {
@@ -61,7 +63,9 @@ test('Manager exposes the minimal v3 loopback API and passes through errors', as
   const base = manager.baseUrl;
   const token = JSON.parse(await readFile(path.join(root, 'config.json'), 'utf8')).managerToken;
 
-  assert.equal((await json(`${base}/v1/health`)).status, 200);
+  const health = await json(`${base}/v1/health`);
+  assert.equal(health.status, 200);
+  assert.match(health.body.stateId, /^state_[0-9A-Za-z_-]{24}$/u);
   assert.equal((await json(`${base}/v1/tasks`)).status, 401);
   assert.deepEqual((await json(`${base}/v1/tasks`, { token })).body.tasks, [task]);
   assert.equal((await json(`${base}/v1/tasks`, { token, method: 'POST', body: { modulePath: 'job.mjs' } })).status, 201);
@@ -90,6 +94,151 @@ test('Manager exposes the minimal v3 loopback API and passes through errors', as
   });
   assert.equal(badAction.status, 400);
   assert.equal(badAction.body.error.code, 'INVALID_TASK_ACTION');
+});
+
+test('Manager hot-reloads token rotation and requires a scoped proof for state recovery', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-manager-state-change-'));
+  let listCalls = 0;
+  let idleChecks = 0;
+  let containmentCalls = 0;
+  let busy = true;
+  const closeOptions = [];
+  const service = {
+    list: async () => {
+      listCalls += 1;
+      return [];
+    },
+    prepareIdleStop: async () => {
+      idleChecks += 1;
+      if (busy) throw new TaskServiceError('MANAGER_BUSY', 'Manager still has active work', 409);
+    },
+    containForStateRecovery: async () => {
+      containmentCalls += 1;
+      return { tasks: 1, profiles: 1 };
+    },
+    close: async (options) => { closeOptions.push(options); }
+  };
+  const manager = await createManager({
+    port: 0,
+    dataDir: root,
+    taskServiceFactory: async () => service,
+    profileProcessAlive: () => false
+  });
+  t.after(async () => {
+    await manager.stop().catch(() => {});
+    await removeTestTree(root);
+  });
+  await manager.start();
+  const base = manager.baseUrl;
+  const configPath = path.join(root, 'config.json');
+  const original = JSON.parse(await readFile(configPath, 'utf8'));
+  const rotatedToken = 't'.repeat(48);
+  await writeFile(configPath, `${JSON.stringify({ ...original, managerToken: rotatedToken }, null, 2)}\n`);
+  const afterRotation = await json(`${base}/v1/health`);
+  assert.equal(afterRotation.body.stateChanged, false);
+  assert.equal((await json(`${base}/v1/tasks`, { token: rotatedToken })).status, 200);
+  assert.equal((await json(`${base}/v1/tasks`, { token: original.managerToken })).status, 401);
+  assert.equal(listCalls, 1);
+
+  const replacementToken = 'r'.repeat(48);
+  await writeFile(configPath, `${JSON.stringify({
+    ...original,
+    managerToken: replacementToken,
+    stateInstanceId: 'replacement-state-instance-0001'
+  }, null, 2)}\n`);
+  const changedHealth = await json(`${base}/v1/health`);
+  assert.equal(changedHealth.body.stateChanged, true);
+  assert.match(changedHealth.body.recoveryNonce, /^[0-9A-Za-z_-]{32}$/u);
+
+  const blocked = await json(`${base}/v1/tasks`, { token: replacementToken });
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.body.error.code, 'MANAGER_STATE_CHANGED');
+  assert.match(blocked.body.nextAction, /manager recover/u);
+  assert.equal(listCalls, 1, 'stale service must not execute requests after state replacement');
+
+  const invalidProof = await json(`${base}/v1/manager/recover`, {
+    method: 'POST',
+    body: { force: false, proof: 'not-valid' }
+  });
+  assert.equal(invalidProof.status, 401);
+  assert.equal(invalidProof.body.error.code, 'RECOVERY_PROOF_REQUIRED');
+
+  const refused = await json(`${base}/v1/manager/recover`, {
+    method: 'POST',
+    body: {
+      force: false,
+      proof: managerRecoveryProof(
+        replacementToken,
+        changedHealth.body.stateId,
+        changedHealth.body.recoveryNonce
+      )
+    }
+  });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.error.code, 'MANAGER_BUSY');
+  assert.equal(manager.stopped, false);
+  assert.deepEqual(closeOptions, []);
+
+  const recovery = await json(`${base}/v1/manager/recover`, {
+    method: 'POST',
+    body: {
+      force: true,
+      proof: managerRecoveryProof(
+        replacementToken,
+        changedHealth.body.stateId,
+        changedHealth.body.recoveryNonce,
+        { force: true }
+      )
+    }
+  });
+  assert.equal(recovery.status, 202);
+  assert.deepEqual(recovery.body.contained, { tasks: 1, profiles: 1 });
+  const deadline = Date.now() + 2_000;
+  while (!manager.stopped && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(manager.stopped, true);
+  assert.equal(idleChecks, 1);
+  assert.equal(containmentCalls, 1);
+  assert.deepEqual(closeOptions, [{ abandonState: true }]);
+});
+
+test('Manager tolerates a partial token rewrite and recovers a legacy configuration', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-legacy-recovery-'));
+  const manager = await createManager({ port: 0, dataDir: root });
+  t.after(async () => { await manager.stop({ abandonState: true }); await removeTestTree(root); });
+  await manager.start();
+  const base = manager.baseUrl;
+  const configPath = path.join(root, 'config.json');
+  const original = JSON.parse(await readFile(configPath, 'utf8'));
+  const rotated = { ...original, managerToken: 'rotated-token-'.repeat(4) };
+  await writeFile(configPath, '{');
+  const rewrite = new Promise((resolve, reject) => setTimeout(() => {
+    writeFile(configPath, JSON.stringify(rotated)).then(resolve, reject);
+  }, 40));
+  const stable = await json(`${base}/v1/health`);
+  await rewrite;
+  assert.equal(stable.body.stateChanged, false);
+  assert.equal((await json(`${base}/v1/status`, { token: rotated.managerToken })).status, 200);
+  const unnecessaryRecovery = await json(`${base}/v1/manager/recover`, {
+    method: 'POST', body: { proof: 'expired-observation' }
+  });
+  assert.equal(unnecessaryRecovery.body.error.code, 'MANAGER_STATE_CURRENT');
+
+  const legacy = { version: 3, managerToken: 'legacy-token-'.repeat(4) };
+  await writeFile(configPath, JSON.stringify(legacy));
+  const changed = await json(`${base}/v1/health`);
+  assert.equal(changed.body.stateChanged, true);
+  const recovered = await json(`${base}/v1/manager/recover`, {
+    method: 'POST', body: {
+      proof: managerRecoveryProof(legacy.managerToken, changed.body.stateId, changed.body.recoveryNonce)
+    }
+  });
+  assert.equal(recovered.status, 202);
+  const deadline = Date.now() + 2_000;
+  while (!manager.stopped && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(manager.stopped, true);
+  assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), legacy, 'old process must not rewrite the restored config');
 });
 
 test('space cleanup is authenticated, defaults to preview, and accepts only fixed categories', async (t) => {

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">NPC Signal Cut compact mark</title>
+  <desc id="desc">Black square containing the warm-white signal-cut C and an orange square.</desc>
+  <rect width="256" height="256" rx="30" fill="#090909"/>
+  <path d="M181 72A78 78 0 1 0 181 184" fill="none" stroke="#FFFEF9" stroke-width="38" stroke-linecap="butt"/>
+  <rect x="194" y="116" width="24" height="24" fill="#FF4B23"/>
+</svg>

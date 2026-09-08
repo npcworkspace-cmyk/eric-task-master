@@ -11,6 +11,7 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { removeTestTree } from './test-fs.mjs';
 import { isProcessAlive } from '../src/lib/process-tree.mjs';
+import { managerRecoveryProof, managerStateId } from '../src/lib/manager-state.mjs';
 import { VERSION } from '../src/contracts.mjs';
 import {
   ensureManager,
@@ -56,6 +57,59 @@ async function reservePort() {
   await new Promise((resolve) => server.close(resolve));
   return port;
 }
+
+test('panel JSON requests only return the fixed URL while explicit panel opens once', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-panel-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'p'.repeat(48) }));
+  const spawnLog = path.join(root, 'spawn.jsonl');
+  const preload = path.join(root, 'intercept-browser-open.mjs');
+  await writeFile(spawnLog, '');
+  await writeFile(preload, `
+    import childProcess from 'node:child_process';
+    import { appendFileSync } from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    childProcess.spawn = (command, args, options) => {
+      appendFileSync(${JSON.stringify(spawnLog)}, JSON.stringify({ command, args, options }) + '\\n');
+      return { unref() {} };
+    };
+    syncBuiltinESMExports();
+  `);
+  const server = http.createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url !== '/v1/health') {
+      response.writeHead(404).end('{}');
+      return;
+    }
+    response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3 }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const common = ['panel', '--state-dir', root, '--port', String(server.address().port)];
+  const nodeArgs = ['--import', pathToFileURL(preload).href];
+  const url = `http://127.0.0.1:${server.address().port}/dashboard`;
+
+  for (const jsonFlag of ['--json', '--json=true']) {
+    const result = await runCli([...common, jsonFlag], { nodeArgs });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(lastJson(result.stdout), { ok: true, url });
+    assert.equal(await readFile(spawnLog, 'utf8'), '', 'returning a panel URL must not launch the default browser');
+  }
+
+  const opened = await runCli(common, { nodeArgs });
+  assert.equal(opened.code, 0, opened.stderr);
+  assert.deepEqual(JSON.parse(opened.stdout), { ok: true, url });
+  const calls = (await readFile(spawnLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(calls, [{
+    command: process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open',
+    args: [url],
+    options: { detached: true, stdio: 'ignore', windowsHide: true }
+  }]);
+
+  const help = await runCli(['help']);
+  assert.equal(help.code, 0, help.stderr);
+  assert.match(help.stdout, /panel --json returns its URL without opening a browser/u);
+});
 
 test('CLI integer options reject non-finite, fractional, negative, blank, and flag values locally', async () => {
   for (const invalid of [NaN, Infinity, -1, 1.5, 'NaN', 'Infinity', '-1', '1.5', ' ', true]) {
@@ -106,6 +160,229 @@ test('CLI integer options reject non-finite, fractional, negative, blank, and fl
     assert.match(lastJson(typo.stderr).error.message, /--profle/u);
   } finally {
     await removeTestTree(root);
+  }
+});
+
+test('CLI replaces an idle Manager whose on-disk state identity changed', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-state-change-'));
+  t.after(() => removeTestTree(root));
+  const staleInstanceId = 'stale-state-instance-00000001';
+  const currentInstanceId = 'current-state-instance-000001';
+  const currentToken = 'n'.repeat(48);
+  await writeFile(path.join(root, 'config.json'), `${JSON.stringify({
+    managerToken: currentToken,
+    stateInstanceId: currentInstanceId
+  })}\n`);
+  let recoveryAuthorization = null;
+  let recoveryBody = null;
+  const recoveryNonce = 'recovery-nonce-0000000000000001';
+  const staleStateId = managerStateId(staleInstanceId, root);
+  const server = http.createServer(async (request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({
+        service: 'eric-task-master',
+        version: VERSION,
+        apiVersion: 3,
+        capabilities: ['manager.state-recovery'],
+        stateId: staleStateId,
+        stateChanged: true,
+        recoveryNonce
+      }));
+      return;
+    }
+    if (request.url === '/v1/manager/recover' && request.method === 'POST') {
+      recoveryAuthorization = request.headers.authorization;
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      recoveryBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      response.end(JSON.stringify({ ok: true, state: 'stopping' }));
+      setImmediate(() => server.close());
+      return;
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'not found' } }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const config = {
+    host: '127.0.0.1',
+    port: server.address().port,
+    stateDir: root,
+    baseUrl: `http://127.0.0.1:${server.address().port}`
+  };
+  const replacement = { service: 'eric-task-master', version: VERSION, apiVersion: 3 };
+  let starts = 0;
+  assert.deepEqual(await ensureManager(config, {
+    startManager: async () => {
+      starts += 1;
+      return replacement;
+    }
+  }), replacement);
+  assert.equal(recoveryAuthorization, undefined);
+  assert.deepEqual(recoveryBody, {
+    force: false,
+    proof: managerRecoveryProof(currentToken, staleStateId, recoveryNonce)
+  });
+  assert.equal(starts, 1);
+});
+
+test('CLI never sends recovery credentials to a different current state', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-wrong-state-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), `${JSON.stringify({
+    managerToken: 'c'.repeat(48),
+    stateInstanceId: 'client-state-instance-0000001'
+  })}\n`);
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      service: 'eric-task-master', version: VERSION, apiVersion: 3,
+      capabilities: ['manager.state-recovery'],
+      stateId: managerStateId('server-state-instance-0000001', root),
+      stateChanged: false
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const config = {
+    host: '127.0.0.1', port: server.address().port, stateDir: root,
+    baseUrl: `http://127.0.0.1:${server.address().port}`
+  };
+  await assert.rejects(ensureManager(config), { code: 'MANAGER_STATE_MISMATCH' });
+  assert.deepEqual(requests, ['GET /v1/health']);
+});
+
+test('CLI rechecks identity when a transient state change settles before recovery', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-settled-state-'));
+  t.after(() => removeTestTree(root));
+  const instanceId = 'settled-state-instance-00000001';
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({
+    managerToken: 's'.repeat(48), stateInstanceId: instanceId
+  }));
+  let healthCalls = 0;
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push({ path: request.url, authorization: request.headers.authorization });
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      healthCalls += 1;
+      response.end(JSON.stringify({
+        service: 'eric-task-master', version: VERSION, apiVersion: 3,
+        capabilities: ['manager.state-recovery'],
+        stateId: managerStateId(instanceId, root), stateChanged: healthCalls === 1,
+        recoveryNonce: 'transient-observation-nonce-00001'
+      }));
+    } else {
+      request.resume();
+      response.statusCode = 409;
+      response.end(JSON.stringify({ error: { code: 'MANAGER_STATE_CURRENT', message: 'State is current' } }));
+    }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const config = { stateDir: root, host: '127.0.0.1', port: server.address().port,
+    baseUrl: `http://127.0.0.1:${server.address().port}` };
+  const result = await ensureManager(config, { startManager: () => assert.fail('must reuse healthy Manager') });
+  assert.equal(result.stateChanged, false);
+  assert.equal(healthCalls, 2);
+  assert.equal(requests.every((request) => request.authorization === undefined), true);
+});
+
+test('CLI refreshes a rotated token once after authorization rejected the request before dispatch', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-token-refresh-'));
+  t.after(() => removeTestTree(root));
+  const configPath = path.join(root, 'config.json');
+  const instanceId = 'request-token-instance-000000001';
+  const originalToken = 'original-token-'.repeat(4);
+  const rotatedToken = 'replacement-token-'.repeat(4);
+  await writeFile(configPath, JSON.stringify({ managerToken: originalToken, stateInstanceId: instanceId }));
+  const authorization = [];
+  const server = http.createServer(async (request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/v1/health') {
+      response.end(JSON.stringify({ service: 'eric-task-master', version: VERSION, apiVersion: 3,
+        stateId: managerStateId(instanceId, root), stateChanged: false }));
+      return;
+    }
+    authorization.push(request.headers.authorization);
+    if (authorization.length === 1) {
+      await writeFile(configPath, JSON.stringify({ managerToken: rotatedToken, stateInstanceId: instanceId }));
+      response.statusCode = 401;
+      response.end(JSON.stringify({ error: { code: 'AUTH_REQUIRED', message: 'Authorization required' } }));
+      return;
+    }
+    response.end(JSON.stringify({ ok: true, state: 'ready', tasks: { total: 0 }, profiles: 0 }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const result = await runCli(['status', '--state-dir', root, '--port', String(server.address().port), '--json']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(authorization, [`Bearer ${originalToken}`, `Bearer ${rotatedToken}`]);
+  assert.equal(lastJson(result.stdout).state, 'ready');
+  assert.equal(`${result.stdout}${result.stderr}`.includes(rotatedToken), false);
+});
+
+test('real CLI hot-reloads token rotation and recovers an idle replaced state', { timeout: 30_000 }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-live-state-change-'));
+  const port = await reservePort();
+  const common = ['--state-dir', root, '--port', String(port), '--json'];
+  t.after(async () => {
+    await runCli(['manager', 'stop', ...common]).catch(() => {});
+    await removeTestTree(root);
+  });
+
+  const started = await runCli(['manager', 'start', ...common]);
+  assert.equal(started.code, 0, started.stderr);
+  const originalPid = lastJson(started.stdout).manager.pid;
+  const configPath = path.join(root, 'config.json');
+  const config = JSON.parse(await readFile(configPath, 'utf8'));
+  const replacementToken = 'l'.repeat(48);
+  await writeFile(configPath, `${JSON.stringify({ ...config, managerToken: replacementToken }, null, 2)}\n`);
+
+  const rotated = await runCli(['status', ...common]);
+  assert.equal(rotated.code, 0, rotated.stderr);
+  assert.equal(lastJson(rotated.stdout).tasks.total, 0);
+  let current = await fetch(`http://127.0.0.1:${port}/v1/health`).then((response) => response.json());
+  assert.equal(current.pid, originalPid, 'token rotation must not restart the Manager');
+  assert.equal(current.stateChanged, false);
+  assert.equal(JSON.parse(await readFile(configPath, 'utf8')).managerToken, replacementToken);
+
+  const replacementInstanceId = 'replacement-state-instance-0002';
+  await writeFile(configPath, `${JSON.stringify({
+    ...config,
+    managerToken: replacementToken,
+    stateInstanceId: replacementInstanceId
+  }, null, 2)}\n`);
+  const recovered = await runCli(['status', ...common]);
+  assert.equal(recovered.code, 0, recovered.stderr);
+  current = await fetch(`http://127.0.0.1:${port}/v1/health`).then((response) => response.json());
+  assert.notEqual(current.pid, originalPid);
+  assert.equal(current.stateChanged, false);
+  assert.equal(current.stateId, managerStateId(replacementInstanceId, root));
+
+  for (const relative of ['tasks/tasks.json', 'profiles.json']) {
+    const previousPid = current.pid;
+    const filePath = path.join(root, relative);
+    const originalSource = await readFile(filePath, 'utf8');
+    await writeFile(filePath, `${originalSource}\n`);
+    const changed = await fetch(`http://127.0.0.1:${port}/v1/health`).then((response) => response.json());
+    assert.equal(changed.stateChanged, true, relative);
+    assert.equal(isProcessAlive(previousPid), true, 'store drift must not crash the Manager');
+    const reloaded = await runCli(['status', ...common]);
+    assert.equal(reloaded.code, 0, `${relative}: ${reloaded.stderr}`);
+    assert.equal(lastJson(reloaded.stdout).tasks.total, 0);
+    current = await fetch(`http://127.0.0.1:${port}/v1/health`).then((response) => response.json());
+    assert.notEqual(current.pid, previousPid, relative);
+    assert.equal(current.stateChanged, false, relative);
   }
 });
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.4 - 2026-09-08
+
+- Return the fixed Dashboard link without opening a browser for `panel --json`; explicit `taskmaster panel` still opens it. Align the Agent Skill and bilingual quick start so repeated tasks do not accumulate Dashboard windows.
+- Replace the Dashboard header and favicon with the current NPC Signal Flow brand assets; preserve task, Profile, and manually opened browser lifecycles.
+- Add an explicit NPC website link to Dashboard navigation, the Logo, and both README introductions; external links open only on user interaction.
+- Ignore stale containment callbacks after task finalization, so late lease-renewal failures cannot revive completed tasks or block output cleanup.
+
+## 3.1.3 - 2026-09-08
+
+- Reload local token changes without restarting Manager; refresh a long-running CLI request once when its former token is rejected before dispatch.
+- Detect a different state directory or replaced task/Profile state and return an actionable state error. Lightweight file-identity checks reject detected external changes and fence both stores; restoring data still requires stopping Manager first.
+- Replace an idle stale Manager automatically. Explicit `taskmaster manager recover` contains its active processes before reloading state, using a scoped proof instead of sending the primary token to a mismatched service.
+- Put the managed Windows CLI first in the user `PATH` while preserving unrelated entries, so old temporary launchers cannot shadow an installed update.
+- Add isolated and real-process regressions for token drift, legacy configuration, recovery races, active/waiting tasks, manual Profiles, state-write conflicts, and Windows launcher precedence.
+
 ## 3.1.2 - 2026-09-06
 
 - Keep the Dashboard task list limited to current work: queued, running, waiting, automatically paused, and stopping tasks. Finished, stopped, and failed tasks leave the list on refresh, including when opened through an old task link.

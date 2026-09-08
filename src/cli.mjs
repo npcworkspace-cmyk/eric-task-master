@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, PROFILE_ACTION_TIMEOUT_MS, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
 import { isProcessAlive } from './lib/process-tree.mjs';
 import { defaultDataDirectory, startManager } from './manager.mjs';
+import { managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -32,9 +33,10 @@ Profiles:
 
 Manager:
   taskmaster panel
-  taskmaster manager start|foreground|status|stop
+  taskmaster manager start|foreground|status|stop|recover
 
 All commands accept --json. Manager starts automatically when needed.
+panel opens the Dashboard; panel --json returns its URL without opening a browser.
 Compatible running Managers are reused. Only manager start maintains the installed version.
 follow --wait-ms returns current state and an after cursor when the wait expires.`;
 
@@ -153,7 +155,7 @@ function emit(value, json = false) {
   }
 }
 
-async function requestJson(config, pathname, { method = 'GET', body, token, timeoutMs = 30_000 } = {}) {
+async function requestJson(config, pathname, { method = 'GET', body, token, timeoutMs = 30_000, refreshAuth = true } = {}) {
   let response;
   let source;
   try {
@@ -177,6 +179,19 @@ async function requestJson(config, pathname, { method = 'GET', body, token, time
     throw cliError('INVALID_MANAGER_RESPONSE', `Manager returned invalid JSON (${response.status})`);
   }
   if (!response.ok) {
+    if (refreshAuth && token && response.status === 401 && payload.error?.code === 'AUTH_REQUIRED') {
+      const credentials = await readManagerCredentials(config).catch(() => null);
+      if (credentials?.stateId && credentials.token !== token) {
+        const current = await health(config);
+        if (current.apiVersion === API_VERSION) {
+          // AUTH_REQUIRED is returned before dispatch. Refresh once for a long
+          // follow/request that began before an on-disk token rotation.
+          return requestJson(config, pathname, {
+            method, body, token: credentials.token, timeoutMs, refreshAuth: false
+          });
+        }
+      }
+    }
     const error = cliError(
       payload.error?.code || `HTTP_${response.status}`,
       payload.error?.message || `Manager returned ${response.status}`,
@@ -190,20 +205,47 @@ async function requestJson(config, pathname, { method = 'GET', body, token, time
   return payload;
 }
 
-async function health(config, timeoutMs = 1_500) {
+async function rawHealth(config, timeoutMs = 1_500) {
   const result = await requestJson(config, '/v1/health', { timeoutMs });
   if (result.service !== 'eric-task-master') throw cliError('PORT_OCCUPIED', 'Manager port belongs to another service');
   return result;
 }
 
-async function readToken(config) {
+async function readManagerCredentials(config) {
   try {
-    const value = JSON.parse(await readFile(path.join(config.stateDir, 'config.json'), 'utf8'));
-    if (typeof value.managerToken !== 'string' || value.managerToken.length < 32) throw new Error();
-    return value.managerToken;
+    const value = await readManagerConfig(path.join(config.stateDir, 'config.json'));
+    return {
+      token: value.managerToken,
+      stateId: managerStateId(value.stateInstanceId, config.stateDir)
+    };
   } catch {
     throw cliError('MANAGER_TOKEN_UNAVAILABLE', 'Manager local token is unavailable');
   }
+}
+
+async function readToken(config) {
+  return (await readManagerCredentials(config)).token;
+}
+
+function managerStateMismatch(manager) {
+  const error = cliError(
+    'MANAGER_STATE_MISMATCH',
+    'The running Manager does not own the current local state',
+    'Run taskmaster manager start. An idle stale Manager will be replaced automatically; active work is never terminated automatically.'
+  );
+  error.manager = manager;
+  return error;
+}
+
+async function health(config, timeoutMs = 1_500) {
+  const result = await rawHealth(config, timeoutMs);
+  let mismatch = result.stateChanged === true;
+  if (typeof result.stateId === 'string') {
+    const credentials = await readManagerCredentials(config);
+    mismatch ||= credentials.stateId !== result.stateId;
+  }
+  if (mismatch) throw managerStateMismatch(result);
+  return result;
 }
 
 async function waitForManager(config, timeoutMs = 20_000) {
@@ -347,7 +389,7 @@ async function waitForManagerStop(config, timeoutMs = 20_000, managerPid = null)
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      await health(config, 500);
+      await rawHealth(config, 500);
     } catch (error) {
       if (error.code === 'MANAGER_UNREACHABLE') {
         if (!managerPid || !isProcessAlive(managerPid)) return true;
@@ -361,13 +403,53 @@ async function waitForManagerStop(config, timeoutMs = 20_000, managerPid = null)
   return false;
 }
 
+async function recoverChangedManager(config, mismatch, startManager, { force = false } = {}) {
+  const current = mismatch.manager;
+  if (!current?.capabilities?.includes('manager.state-recovery') ||
+      current.stateChanged !== true || typeof current.recoveryNonce !== 'string') throw mismatch;
+  const { token } = await readManagerCredentials(config);
+  const proof = managerRecoveryProof(token, current.stateId, current.recoveryNonce, { force });
+  if (!proof) throw mismatch;
+  try {
+    await requestJson(config, '/v1/manager/recover', {
+      method: 'POST',
+      body: { force, proof },
+      timeoutMs: force ? 90_000 : 30_000
+    });
+  } catch (error) {
+    if (error.code === 'RECOVERY_PROOF_REQUIRED' || error.code === 'MANAGER_STATE_CURRENT') {
+      // Another local client may already have recovered it, or a brief config
+      // rewrite may have completed. Recheck identity without sending a token.
+      const settled = await health(config).catch(() => null);
+      if (settled?.apiVersion === API_VERSION) return settled;
+      mismatch.nextAction = 'Another state directory owns this loopback port. Use its matching --state-dir/--port or stop that Manager explicitly.';
+      throw mismatch;
+    }
+    if (error.code === 'MANAGER_BUSY') {
+      error.nextAction = 'The stale Manager still has active work or an open Profile. Run taskmaster manager recover to contain that work explicitly, then reload the current state.';
+    }
+    throw error;
+  }
+  if (!(await waitForManagerStop(config, 20_000, current.pid))) {
+    throw cliError(
+      'MANAGER_RECOVERY_TIMEOUT',
+      'The stale Manager accepted recovery but did not stop in time',
+      'Close the stale Manager process, then run taskmaster manager start again.'
+    );
+  }
+  return startManager(config);
+}
+
 export async function ensureManager(config, { startManager = startBackgroundManager, maintainVersion = false } = {}) {
   let current;
   try {
     current = await health(config);
   } catch (error) {
-    if (error.code !== 'MANAGER_UNREACHABLE') throw error;
-    return startManager(config);
+    if (error.code === 'MANAGER_UNREACHABLE') return startManager(config);
+    if (error.code === 'MANAGER_STATE_MISMATCH') {
+      return recoverChangedManager(config, error, startManager);
+    }
+    throw error;
   }
   if (current.apiVersion !== API_VERSION) {
     throw cliError(
@@ -749,6 +831,41 @@ async function managerCommand(action, options, json) {
     emit({ ok: true, manager: current }, json);
     return;
   }
+  if (action === 'recover') {
+    const current = await rawHealth(config);
+    if (current.apiVersion !== API_VERSION) {
+      throw cliError('MANAGER_API_INCOMPATIBLE', `Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`);
+    }
+    if (current.stateChanged !== true) {
+      if (typeof current.stateId === 'string') {
+        const credentials = await readManagerCredentials(config);
+        if (credentials.stateId !== current.stateId) throw managerStateMismatch(current);
+      } else {
+        // Older Managers cannot advertise or recover credential drift. Verify
+        // their protected API before claiming that no recovery is needed.
+        try {
+          await requestJson(config, '/v1/status', { token: await readToken(config) });
+        } catch (error) {
+          if (error.code !== 'AUTH_REQUIRED') throw error;
+          throw cliError(
+            'LEGACY_MANAGER_RESTART_REQUIRED',
+            'The older Manager has stale local credentials and cannot recover them while running',
+            'Close the old Task Master Manager and its task windows, or restart the computer, then rerun the installer and taskmaster manager start. Keep the existing state directory.'
+          );
+        }
+      }
+      emit({ ok: true, manager: current, recovered: false }, json);
+      return;
+    }
+    const recovered = await recoverChangedManager(
+      config,
+      managerStateMismatch(current),
+      startBackgroundManager,
+      { force: true }
+    );
+    emit({ ok: true, manager: recovered, recovered: true }, json);
+    return;
+  }
   if (action === 'stop') {
     const current = await health(config).catch((error) => {
       if (error.code === 'MANAGER_UNREACHABLE') return null;
@@ -830,8 +947,9 @@ async function main() {
   if (command === 'panel') {
     assertAllowedOptions(options);
     const context = await apiContext(options);
-    openUrl(`${context.config.baseUrl}/dashboard`);
-    return emit({ ok: true, url: `${context.config.baseUrl}/dashboard` }, json);
+    const url = `${context.config.baseUrl}/dashboard`;
+    if (!json) openUrl(url);
+    return emit({ ok: true, url }, json);
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown command: ${command}`);
 }
