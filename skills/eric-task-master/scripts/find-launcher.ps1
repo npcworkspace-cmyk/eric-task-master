@@ -24,9 +24,26 @@ function Get-TaskMasterManager {
   if ($Port -lt 1 -or $Port -gt 65535) { return [pscustomobject]@{ state = 'unknown' } }
   try {
     $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/v1/health" -TimeoutSec 5 -ErrorAction Stop
-    $recognized = $health.ok -eq $true -and $health.apiVersion -eq 3 -and
-      $health.pid -gt 0 -and $health.stateId -like 'state_*'
-    [pscustomobject]@{ state = $(if ($recognized) { 'present' } else { 'unknown' }) }
+    $recognized = $health.ok -eq $true -and $health.service -eq 'eric-task-master' -and $health.apiVersion -eq 3 -and
+      $health.pid -is [int] -and $health.pid -gt 0 -and $health.stateId -like 'state_*'
+    if (-not $recognized) { return [pscustomobject]@{ state = 'unknown' } }
+    $launcher = $null
+    try {
+      $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($health.pid)" -OperationTimeoutSec 5 -ErrorAction Stop
+      $executable = [string]$process.ExecutablePath
+      $runtime = [System.IO.Path]::GetDirectoryName($executable)
+      if ([System.IO.Path]::GetFileName($executable) -ieq 'node.exe' -and
+          [System.IO.Path]::GetFileName($runtime) -ieq 'runtime') {
+        $root = [System.IO.Path]::GetDirectoryName($runtime)
+        $package = Get-Content -LiteralPath ([System.IO.Path]::Combine($root, 'app', 'package.json')) -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $candidate = [System.IO.Path]::Combine($root, 'bin', 'taskmaster.cmd')
+        if ($package.name -eq 'eric-task-master' -and $package.version -eq $health.version -and
+            (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction Stop)) {
+          $launcher = [System.IO.Path]::GetFullPath($candidate)
+        }
+      }
+    } catch { }
+    [pscustomobject]@{ state = 'present'; launcher = $launcher; pid = $health.pid; version = $health.version }
   } catch {
     $refused = $false
     $cause = $_.Exception
@@ -61,6 +78,23 @@ function Find-TaskMasterLauncher {
   $unknown = $false
   $roots = @()
   $candidates = @()
+  try { $manager = & $ReadManager } catch { $manager = [pscustomobject]@{ state = 'unknown' } }
+  # A live Manager identifies the runtime actually in use, even without registration.
+  if ($manager.state -eq 'present') {
+    try {
+      if ($manager.launcher -and [System.IO.Path]::IsPathRooted($manager.launcher) -and
+          (& $PathExists $manager.launcher 'Leaf')) {
+        return [pscustomobject]@{
+          status = 'found'; launcher = [System.IO.Path]::GetFullPath($manager.launcher); source = 'running-manager'
+          nextAction = 'verify_existing_launcher'; canFreshInstall = $false
+        }
+      }
+    } catch { }
+    return [pscustomobject]@{
+      status = 'unresolved'; launcher = $null; managerState = 'present'
+      nextAction = 'report_locator_error'; canFreshInstall = $false
+    }
+  }
   try {
     $installations = & $ReadInstallations
     $recorded = $installations.recorded -eq $true
@@ -105,7 +139,6 @@ function Find-TaskMasterLauncher {
     try { if (& $PathExists $root.path 'Container') { $recorded = $true } }
     catch { $unknown = $true }
   }
-  try { $manager = & $ReadManager } catch { $manager = [pscustomobject]@{ state = 'unknown' } }
   if ($recorded -or $unknown -or $manager.state -ne 'absent') {
     return [pscustomobject]@{
       status = 'unresolved'; launcher = $null; managerState = $manager.state

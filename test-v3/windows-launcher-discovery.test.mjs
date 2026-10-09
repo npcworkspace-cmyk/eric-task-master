@@ -27,7 +27,10 @@ async function discover(cases) {
 $cases = ConvertFrom-Json ${literal(JSON.stringify(cases))}
 $results = @($cases | ForEach-Object {
   $scenario = $_
-  Find-TaskMasterLauncher -DefaultRoot $scenario.defaultRoot -PortableRoot @($scenario.portableRoots) -ReadInstallations { $scenario.installations } -ReadCommands { @($scenario.commands) } -ReadManager { [pscustomobject]@{ state = $scenario.manager } }
+  Find-TaskMasterLauncher -DefaultRoot $scenario.defaultRoot -PortableRoot @($scenario.portableRoots) -ReadInstallations { $scenario.installations } -ReadCommands { @($scenario.commands) } -ReadManager {
+    if ($scenario.manager -is [string]) { [pscustomobject]@{ state = $scenario.manager } }
+    else { $scenario.manager }
+  }
 })
 ConvertTo-Json -InputObject $results -Depth 4 -Compress
 `);
@@ -76,6 +79,43 @@ test('registry finds a custom installation before stale PATH and never executes 
   await assert.rejects(access(path.join(registeredRoot, 'bin', 'unexpected-invocation')), { code: 'ENOENT' });
   await assert.rejects(access(path.join(path.dirname(old), 'unexpected-invocation')), { code: 'ENOENT' });
   assert.equal(await readFile(canary, 'utf8'), 'retained-login-canary');
+});
+
+test('running Manager wins over stale PATH, missing registration, and an older registered installation', windowsOnly, async (t) => {
+  const root = await fixture(t);
+  const current = await launcher(path.join(root, 'running installation'));
+  const oldRoot = path.join(root, 'older installation');
+  const old = await launcher(oldRoot);
+  const manager = { state: 'present', launcher: current, pid: 123, version: '3.1.7' };
+  const results = await discover([
+    scenario(root, { manager, commands: [old], defaultRoot: oldRoot }),
+    scenario(root, { manager, commands: [old], installations: { recorded: true, locations: [oldRoot], unknown: false } })
+  ]);
+  for (const result of results) {
+    assert.equal(result.status, 'found');
+    assert.equal(result.source, 'running-manager');
+    assert.equal(await realpath(result.launcher), await realpath(current));
+    assert.equal(result.canFreshInstall, false);
+  }
+  for (const file of [current, old]) {
+    await assert.rejects(access(path.join(path.dirname(file), 'unexpected-invocation')), { code: 'ENOENT' });
+  }
+});
+
+test('an unlocatable running Manager never falls back to an older launcher', windowsOnly, async (t) => {
+  const root = await fixture(t);
+  const oldRoot = path.join(root, 'older installation');
+  const old = await launcher(oldRoot);
+  const results = await discover([
+    scenario(root, { manager: { state: 'present', launcher: null }, commands: [old] }),
+    scenario(root, { manager: { state: 'present', launcher: path.join(root, 'missing.cmd') },
+      installations: { recorded: true, locations: [oldRoot], unknown: false } })
+  ]);
+  for (const result of results) {
+    assert.equal(result.status, 'unresolved');
+    assert.equal(result.canFreshInstall, false);
+    assert.equal(result.managerState, 'present');
+  }
 });
 
 test('missing launchers with installation evidence or uncertain discovery never authorize a fresh install', windowsOnly, async (t) => {
@@ -146,12 +186,58 @@ ConvertTo-Json -InputObject $results -Compress
   assert.deepEqual(result.map((entry) => entry.state), ['unknown', 'unknown', 'unknown']);
 });
 
+test('live Manager discovery verifies its embedded runtime and package version without executing it', windowsOnly, async (t) => {
+  const root = await fixture(t);
+  const application = path.join(root, 'verified running application');
+  const current = await launcher(application);
+  const executable = path.join(application, 'runtime', 'node.exe');
+  await mkdir(path.dirname(executable), { recursive: true });
+  await mkdir(path.join(application, 'app'), { recursive: true });
+  await writeFile(executable, 'fixture runtime must not be executed');
+  await writeFile(path.join(application, 'app', 'package.json'), JSON.stringify({ name: 'eric-task-master', version: '3.1.7' }));
+  const result = await powershell(`
+function Invoke-RestMethod { [pscustomobject]@{ ok = $true; service = 'eric-task-master'; apiVersion = 3; pid = 123; version = '3.1.7'; stateId = 'state_fixture' } }
+function Get-CimInstance { [pscustomobject]@{ ExecutablePath = ${literal(executable)} } }
+$verified = Get-TaskMasterManager
+$script:fixtureVersion = 'older-version'
+function Invoke-RestMethod { [pscustomobject]@{ ok = $true; service = 'eric-task-master'; apiVersion = 3; pid = 123; version = $script:fixtureVersion; stateId = 'state_fixture' } }
+$wrongVersion = Get-TaskMasterManager
+function Get-CimInstance { throw 'Fixture process query denied' }
+$unreadableProcess = Get-TaskMasterManager
+ConvertTo-Json -InputObject @($verified, $wrongVersion, $unreadableProcess) -Depth 4 -Compress
+`);
+  assert.equal(result[0].state, 'present');
+  assert.equal(await realpath(result[0].launcher), await realpath(current));
+  for (const entry of result.slice(1)) {
+    assert.equal(entry.state, 'present');
+    assert.equal(entry.launcher, null);
+  }
+  await assert.rejects(access(path.join(path.dirname(current), 'unexpected-invocation')), { code: 'ENOENT' });
+  assert.equal(await readFile(executable, 'utf8'), 'fixture runtime must not be executed');
+});
+
+test('unrelated health and invalid process identifiers cannot select a launcher', windowsOnly, async () => {
+  const results = await powershell(`
+function Get-CimInstance { throw 'Must not query unrecognized process' }
+$results = @(@(
+  [pscustomobject]@{ service = 'other-service'; pid = 123 },
+  [pscustomobject]@{ service = 'eric-task-master'; pid = '123 OR 1=1' }
+) | ForEach-Object {
+  $script:fixtureHealth = $_
+  function Invoke-RestMethod { [pscustomobject]@{ ok = $true; service = $script:fixtureHealth.service; apiVersion = 3; pid = $script:fixtureHealth.pid; stateId = 'state_fixture' } }
+  Get-TaskMasterManager
+})
+ConvertTo-Json -InputObject $results -Compress
+`);
+  assert.deepEqual(results.map((entry) => entry.state), ['unknown', 'unknown']);
+});
+
 test('loopback probing recognizes Task Master, preserves uncertainty, and distinguishes connection refusal', windowsOnly, async (t) => {
   let recognized = true;
   const server = createServer((_request, response) => {
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify(recognized
-      ? { ok: true, apiVersion: 3, pid: 123, stateId: 'state_fixture' }
+      ? { ok: true, service: 'eric-task-master', version: '3.1.7', apiVersion: 3, pid: 123, stateId: 'state_fixture' }
       : { ok: true, unrelated: true }));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
