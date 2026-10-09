@@ -65,7 +65,7 @@ test('v3 Dashboard is a two-page task and Profile control surface', async () => 
   assert.match(css, /--npc-signal:/u);
 });
 
-test('portable Skill contains only one CLI guide and its license', async () => {
+test('portable Skill keeps one CLI guide and routes path discovery to its packaged locator', async () => {
   const skillRoot = new URL('../skills/eric-task-master/', import.meta.url);
   const entries = (await readdir(skillRoot, { withFileTypes: true }))
     .filter((entry) => entry.isFile())
@@ -83,9 +83,8 @@ test('portable Skill contains only one CLI guide and its license', async () => {
   assert.match(skill, /Do not add a preflight check to a normal task/u);
   assert.match(skill, /When asked to deploy for a new Agent, first check `taskmaster --help`/u);
   assert.match(skill, /install only this Skill for the new Agent/u);
-  assert.match(skill, /a portable ZIP extracted there is one level deeper/u);
-  assert.match(skill, /MANAGER_STATE_MISMATCH` is not a reason to reinstall/u);
-  assert.match(skill, /%LOCALAPPDATA%\\Programs\\Eric Task Master\\bin\\taskmaster\.cmd/u);
+  assert.match(skill, /<SKILL_ROOT>\/scripts\/find-launcher\.ps1/u);
+  assert.ok((await readFile(new URL('scripts/find-launcher.ps1', skillRoot), 'utf8')).length > 0);
   assert.match(skill, /macOS `\/usr\/local\/bin\/taskmaster`; Linux `\/usr\/bin\/taskmaster`/u);
   assert.doesNotMatch(skill, /task type|surface-probe|full-human|journey|ephemeral/iu);
   assert.ok(skill.split(/\r?\n/u).length <= 70, 'Skill should stay one-page and cheap to read');

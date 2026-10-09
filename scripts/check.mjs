@@ -83,7 +83,6 @@ async function staticChecks() {
     'docs/TASK-PACK-SECURITY.md',
     'skills/eric-task-master/runtime.json',
     'skills/eric-task-master/references',
-    'skills/eric-task-master/scripts',
     'examples/tasks'
   ];
   for (const relative of forbidden) {
@@ -93,11 +92,11 @@ async function staticChecks() {
     invariant(!remains, `obsolete v2 surface remains: ${relative}`);
   }
 
-  const skillEntries = (await readdir(path.join(ROOT, 'skills', 'eric-task-master'), { withFileTypes: true }))
-    .filter((entry) => entry.isFile())
-    .map((entry) => entry.name)
-    .sort();
-  invariant(JSON.stringify(skillEntries) === JSON.stringify(['LICENSE', 'SKILL.md']), 'portable Skill must contain one guide and its license');
+  const skillRoot = path.join(ROOT, 'skills', 'eric-task-master');
+  const skillEntries = (await filesUnder('skills/eric-task-master'))
+    .map((file) => path.relative(skillRoot, file).split(path.sep).join('/')).sort();
+  invariant(JSON.stringify(skillEntries) === JSON.stringify(['LICENSE', 'SKILL.md', 'scripts/find-launcher.ps1']),
+    'portable Skill must contain its guide, license, and read-only Windows locator only');
   invariant(skill.split(/\r?\n/u).length <= 70, 'portable Skill is no longer one-page');
   invariant(!/@modelcontextprotocol|surface-probe|full-human|journey|task type|task pack/iu.test(skill),
     'portable Skill exposes a removed v2 concept');

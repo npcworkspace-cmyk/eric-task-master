@@ -87,7 +87,7 @@ Manager 只监听 `127.0.0.1`。不需要 MCP 注册、浏览器插件、配对�
 
 ### 第一步：先检查 Manager，缺少时才安装
 
-先运行 `taskmaster --help`。如果命令不在 `PATH`，还要检查现有安装器的启动文件（Windows：`%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`）和已知的便携包解压目录。启动文件可用，就说明这台电脑的当前系统用户已经部署 Manager：保留原有 Profile，跳过 Manager 安装；给另一个 Agent 只导入第三步的 Skill。如果 `127.0.0.1:19946` 已有 Task Master Manager，却找不到启动文件，或 CLI 报 `MANAGER_STATE_MISMATCH`，应找回原安装位置与状态目录，不要再安装第二份 Manager。
+先运行 `taskmaster --help`。如果 Windows 的 PATH 或预设启动路径不可用，使用 Skill 自带的[只读启动器定位工具](skills/eric-task-master/scripts/find-launcher.ps1)。它先读取系统安装登记中的 `InstallLocation`，再查 PATH、默认位置和便携目录；即使 Agent 进程仍沿用旧 PATH，也能找到自定义安装目录。用返回的启动器执行 `--help`，并在本次会话始终使用其绝对路径。启动文件可用，就说明这台电脑的当前系统用户已经部署 Manager：保留原有 Profile，跳过 Manager 安装；给另一个 Agent 只导入第三步的 Skill。无法定位、启动器执行失败、查询结果不确定或报 `MANAGER_STATE_MISMATCH` 时，应报告具体错误；发现已有安装或本机 Manager，不代表可以通过重装、改配置或重建 Profile 修复定位问题。结果含义见[部署文档](docs/INSTALLERS.md)。
 
 无论是否已有 Manager，电脑都需要稳定版 Google Chrome。确认没有 Manager 后，才从[最新 GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)下载两个文件：
 
