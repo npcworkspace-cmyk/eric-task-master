@@ -85,9 +85,11 @@ The Manager binds only to `127.0.0.1`. There is no MCP registration, browser ext
 
 ## Deploy in three steps
 
-### Step 1: install the Manager
+### Step 1: check for the Manager, install only if missing
 
-Install stable Google Chrome first. Then download two files from the [latest GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest):
+First run `taskmaster --help`. If the command is not on `PATH`, check the existing installer launcher (Windows: `%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`) and any known portable extraction. A working launcher means this computer and OS user already have the Manager: keep its Profiles and skip the Manager installation. For another Agent, import only the Skill in Step 3. If a Task Master Manager is already listening on `127.0.0.1:19946` but its launcher is missing, or the CLI reports `MANAGER_STATE_MISMATCH`, locate the original installation and state directory instead of installing a second Manager.
+
+Stable Google Chrome is required in either case. Only when no Manager is present, download two files from the [latest GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest):
 
 1. the Manager installer **or portable ZIP** matching the operating system and CPU;
 2. `eric-task-master-skill-v<VERSION>.zip`.
@@ -124,7 +126,7 @@ Run:
 taskmaster panel
 ```
 
-Create a Profile in the Dashboard, open its native Chrome window, and sign in. Close the window, then make that Profile the default. Automated tasks reuse the same browser state. Individual sites may still request verification later.
+If a default Profile already exists, keep using it. Otherwise create one in the Dashboard, open its native Chrome window, and sign in. Close the window, then make that Profile the default. Automated tasks reuse the same browser state. Individual sites may still request verification later.
 
 ### Step 3: give the Skill to the Agent
 
@@ -188,7 +190,7 @@ taskmaster panel
 
 - **A thin core:** the Manager owns tasks, processes, Profiles, progress, and results—not website-specific rules.
 - **Clear upgrade boundaries:** application files are stored separately from Profiles, signed-in state, task records, and outputs.
-- **A consistent runtime:** each release packages the Node.js and Playwright versions it has verified, reducing dependency drift across Agent hosts.
+- **A bundled runtime:** Agents use the Manager's tested browser automation dependencies; they do not install or select a Playwright version themselves.
 - **No script registration:** a new one-off task runs directly and does not become an asset or Task Type to maintain.
 - **Skills evolve separately:** website adapters, domain knowledge, and result validation can be released, replaced, and reused independently.
 - **One cross-platform contract:** Windows, macOS, and Linux use the same CLI and task-file model.

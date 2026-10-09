@@ -85,9 +85,11 @@ Manager 只监听 `127.0.0.1`。不需要 MCP 注册、浏览器插件、配对�
 
 ## 三步部署
 
-### 第一步：安装 Manager
+### 第一步：先检查 Manager，缺少时才安装
 
-电脑需要先安装稳定版 Google Chrome。然后从[最新 GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)下载两个文件：
+先运行 `taskmaster --help`。如果命令不在 `PATH`，还要检查现有安装器的启动文件（Windows：`%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`）和已知的便携包解压目录。启动文件可用，就说明这台电脑的当前系统用户已经部署 Manager：保留原有 Profile，跳过 Manager 安装；给另一个 Agent 只导入第三步的 Skill。如果 `127.0.0.1:19946` 已有 Task Master Manager，却找不到启动文件，或 CLI 报 `MANAGER_STATE_MISMATCH`，应找回原安装位置与状态目录，不要再安装第二份 Manager。
+
+无论是否已有 Manager，电脑都需要稳定版 Google Chrome。确认没有 Manager 后，才从[最新 GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)下载两个文件：
 
 1. 对应系统和 CPU 的 Manager **安装包或便携 ZIP**；
 2. `eric-task-master-skill-v<VERSION>.zip`。
@@ -124,7 +126,7 @@ Manager 只监听 `127.0.0.1`。不需要 MCP 注册、浏览器插件、配对�
 taskmaster panel
 ```
 
-在面板创建 Profile，打开它的原生 Chrome 窗口并完成登录；关闭窗口后，把该 Profile 设为默认。自动化任务会复用同一份登录状态。网站仍可能在之后要求重新验证。
+如果已有默认 Profile，继续使用即可。否则在面板创建 Profile，打开它的原生 Chrome 窗口并完成登录；关闭窗口后，把该 Profile 设为默认。自动化任务会复用同一份登录状态。网站仍可能在之后要求重新验证。
 
 ### 第三步：把 Skill 给 Agent
 
@@ -188,7 +190,7 @@ taskmaster panel
 
 - **核心很薄：**Manager 只维护任务、进程、Profile、进度和结果，不内置站点规则。
 - **升级边界清楚：**应用程序与用户 Profile、登录态、任务记录分开存放，升级 Manager 不需要重建业务能力。
-- **运行环境一致：**安装包自带经过当前版本验证的 Node.js 和 Playwright，减少不同 Agent 电脑上的依赖漂移。
+- **运行环境内置：**Agent 使用 Manager 已验证的浏览器自动化依赖，不需要自行安装或选择 Playwright 版本。
 - **脚本无需注册：**新任务不进入资产库，不用维护 Task Type；一次性脚本提交后即可运行。
 - **Skill 独立演进：**网站适配、行业知识和结果验收在各自 Skill 中维护，可以单独发布、替换和复用。
 - **跨平台一致：**Windows、macOS 和 Linux 使用同一 CLI 合约与同一种任务文件。
