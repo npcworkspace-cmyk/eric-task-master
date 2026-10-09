@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -67,7 +67,9 @@ test('registry finds a custom installation before stale PATH and never executes 
   for (const value of [result, missingPathResult]) {
     assert.equal(value.status, 'found');
     assert.equal(value.source, 'registry');
-    assert.equal(value.launcher, registered);
+    // Windows can expand an 8.3 alias in an inherited temporary path.
+    assert.ok(path.isAbsolute(value.launcher));
+    assert.equal(await realpath(value.launcher), await realpath(registered));
     assert.equal(value.nextAction, 'verify_existing_launcher');
     assert.equal(value.canFreshInstall, false);
   }
@@ -105,7 +107,8 @@ test('confirmed absence and a known nested portable extraction remain distinct',
   assert.equal(absent.canFreshInstall, true);
   assert.equal(absent.nextAction, 'fresh_install_if_requested');
   assert.equal(found.status, 'found');
-  assert.equal(found.launcher, portable);
+  assert.ok(path.isAbsolute(found.launcher));
+  assert.equal(await realpath(found.launcher), await realpath(portable));
   assert.equal(found.canFreshInstall, false);
 });
 
