@@ -242,17 +242,23 @@ test('an opening manual Profile prevents competing idle maintenance and remains 
 });
 
 test('the existing reaper completes containment and releases the Profile after a transient state-write outage', async (t) => {
+  // Advance the real reaper callback once after its failed attempt settles.
+  // A 10 ms wall-clock interval floods a slow CI filesystem with lease reads.
+  t.mock.timers.enable({ apis: ['setInterval'] });
   const env = await fixture(t, { reaperIntervalMs: 10 });
   const task = await env.service.create(env.body);
   await env.service.get(task.id);
   const worker = env.workers[0];
   const replace = JsonStore.prototype.replace;
   let failures = 0;
+  let failedAttempt;
+  const outageObserved = new Promise((resolve) => { failedAttempt = resolve; });
   t.mock.method(JsonStore.prototype, 'replace', async function (value) {
     if (this.filePath === path.join(env.root, 'tasks', 'tasks.json') && failures < 2) {
       failures += 1;
       // Lose the triggering event write and the first containment write only.
       // All later storage operations work normally.
+      if (failures === 2) failedAttempt();
       throw Object.assign(new Error('transient state-file sharing failure'), { code: 'EPERM' });
     }
     return replace.call(this, value);
@@ -262,7 +268,13 @@ test('the existing reaper completes containment and releases the Profile after a
   let timer;
   try {
     await Promise.race([
-      exited,
+      (async () => {
+        await outageObserved;
+        await nextTurn();
+        assert.equal(worker.messages.filter((message) => message.type === 'stop').length, 0);
+        t.mock.timers.tick(10);
+        await exited;
+      })(),
       new Promise((_resolve, reject) => {
         timer = setTimeout(() => reject(new Error('reaper did not recover containment after writes resumed')), 3_000);
       })

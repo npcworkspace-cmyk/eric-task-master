@@ -5,6 +5,7 @@
 - Prefer a running Windows Manager's verified embedded runtime over older PATH or installation entries, including when uninstall registration is unavailable. Keep an unlocatable live Manager unresolved instead of silently selecting an older launcher.
 - Include the CLI's resolved state directory, port, and expected/actual identity fingerprints in state-mismatch errors without exposing credentials or changing recovery safeguards.
 - Add regressions for missing/stale registration, old launcher coexistence, unreadable process ownership, package-version mismatch, and secret-free state diagnostics. Preserve the existing Windows path-canonicalization algorithm and user state.
+- Drive the transient-write recovery regression with controlled interval ticks instead of flooding slow CI storage with 10 ms wall-clock polls; retain its real three-second completion deadline and all production recovery behavior.
 
 ## 3.1.6 - 2026-10-09
 
