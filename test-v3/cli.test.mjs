@@ -238,8 +238,10 @@ test('CLI never sends recovery credentials to a different current state', async 
     stateInstanceId: 'client-state-instance-0000001'
   })}\n`);
   const requests = [];
+  const authorization = [];
   const server = http.createServer((request, response) => {
     requests.push(`${request.method} ${request.url}`);
+    authorization.push(request.headers.authorization);
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({
       service: 'eric-task-master', version: VERSION, apiVersion: 3,
@@ -261,9 +263,34 @@ test('CLI never sends recovery credentials to a different current state', async 
     assert.equal(error.code, 'MANAGER_STATE_MISMATCH');
     assert.match(error.nextAction, /another state view/u);
     assert.match(error.nextAction, /do not reinstall/u);
+    assert.deepEqual(error.details, {
+      stateDir: path.resolve(root), port: config.port,
+      expectedStateId: managerStateId('client-state-instance-0000001', root),
+      actualStateId: managerStateId('server-state-instance-0000001', root),
+      managerVersion: VERSION, stateChanged: false
+    });
+    assert.equal(JSON.stringify(error.details).includes('c'.repeat(48)), false);
+    assert.equal(JSON.stringify(error.details).includes('client-state-instance-0000001'), false);
     return true;
   });
-  assert.deepEqual(requests, ['GET /v1/health']);
+  const failed = await runCli(['status', '--state-dir', root, '--port', String(config.port), '--json']);
+  assert.equal(failed.code, 1);
+  const payload = JSON.parse(failed.stderr.trim());
+  assert.equal(payload.error.code, 'MANAGER_STATE_MISMATCH');
+  assert.equal(payload.error.details.stateDir, path.resolve(root));
+  assert.equal(payload.error.details.expectedStateId, managerStateId('client-state-instance-0000001', root));
+  assert.equal(payload.error.details.actualStateId, managerStateId('server-state-instance-0000001', root));
+  assert.equal(failed.stderr.includes('c'.repeat(48)), false);
+  assert.equal(failed.stderr.includes('client-state-instance-0000001'), false);
+  assert.deepEqual(requests, ['GET /v1/health', 'GET /v1/health']);
+  assert.deepEqual(authorization, [undefined, undefined]);
+});
+
+test('Windows state identity canonicalizes path separators and case without changing identity', { skip: process.platform !== 'win32' }, () => {
+  const instance = 'canonical-state-instance-000001';
+  const expected = managerStateId(instance, 'C:/Users/Fixture/AppData/Local/eric-task-master');
+  assert.equal(managerStateId(instance, 'c:\\users\\fixture\\appdata\\local\\eric-task-master'), expected);
+  assert.notEqual(managerStateId(instance, 'C:/Users/Fixture/AppData/Local/another-state'), expected);
 });
 
 test('CLI rechecks identity when a transient state change settles before recovery', async (t) => {

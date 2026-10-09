@@ -227,7 +227,7 @@ async function readToken(config) {
   return (await readManagerCredentials(config)).token;
 }
 
-function managerStateMismatch(manager) {
+function managerStateMismatch(manager, config, credentials = null) {
   const error = cliError(
     'MANAGER_STATE_MISMATCH',
     'The running Manager does not own the current local state',
@@ -236,17 +236,25 @@ function managerStateMismatch(manager) {
       : 'This port belongs to a Manager with another state view. Check the OS user, --state-dir and --port; keep the existing Profiles and do not reinstall. Stop that exact Manager only after confirming it has no active work, then start from the intended state.'
   );
   error.manager = manager;
+  error.details = {
+    stateDir: path.resolve(config.stateDir), port: config.port,
+    expectedStateId: credentials?.stateId ?? null,
+    actualStateId: manager?.stateId ?? null,
+    managerVersion: manager?.version ?? null,
+    stateChanged: manager?.stateChanged === true
+  };
   return error;
 }
 
 async function health(config, timeoutMs = 1_500) {
   const result = await rawHealth(config, timeoutMs);
   let mismatch = result.stateChanged === true;
+  let credentials = null;
   if (typeof result.stateId === 'string') {
-    const credentials = await readManagerCredentials(config);
+    credentials = await readManagerCredentials(config);
     mismatch ||= credentials.stateId !== result.stateId;
   }
-  if (mismatch) throw managerStateMismatch(result);
+  if (mismatch) throw managerStateMismatch(result, config, credentials);
   return result;
 }
 
@@ -838,10 +846,10 @@ async function managerCommand(action, options, json) {
     if (current.apiVersion !== API_VERSION) {
       throw cliError('MANAGER_API_INCOMPATIBLE', `Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`);
     }
+    const credentials = typeof current.stateId === 'string' ? await readManagerCredentials(config) : null;
     if (current.stateChanged !== true) {
       if (typeof current.stateId === 'string') {
-        const credentials = await readManagerCredentials(config);
-        if (credentials.stateId !== current.stateId) throw managerStateMismatch(current);
+        if (credentials.stateId !== current.stateId) throw managerStateMismatch(current, config, credentials);
       } else {
         // Older Managers cannot advertise or recover credential drift. Verify
         // their protected API before claiming that no recovery is needed.
@@ -861,7 +869,7 @@ async function managerCommand(action, options, json) {
     }
     const recovered = await recoverChangedManager(
       config,
-      managerStateMismatch(current),
+      managerStateMismatch(current, config, credentials),
       startBackgroundManager,
       { force: true }
     );
