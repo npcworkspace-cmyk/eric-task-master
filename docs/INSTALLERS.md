@@ -1,14 +1,20 @@
 # Self-contained installers
 
-Eric Task Master `v3.1.5` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, and local Dashboard. Users do not install Node.js, npm, Playwright, or a Playwright browser.
+Eric Task Master `v3.1.6` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, and local Dashboard. Users do not install Node.js, npm, Playwright, or a Playwright browser.
 
 Google Chrome is intentionally not redistributed. The Manager uses a locally installed stable Chrome channel and reports a direct installation instruction if Chrome cannot be found.
 
 ## Before deploying to another Agent
 
-One Manager installation and its Profile state are shared by Agents running as the same operating-system user. Check `taskmaster --help` before downloading another Manager. If it is not on `PATH`, check the existing installed launcher (Windows: `%LOCALAPPDATA%\Programs\Eric Task Master\bin\taskmaster.cmd`; macOS: `/usr/local/bin/taskmaster`; Linux: `/usr/bin/taskmaster`) and any known portable extraction, including `eric-task-master/bin/taskmaster.cmd` on Windows. A working launcher means the Manager is already deployed: leave the application and state directory in place, and import only the Skill ZIP into the new Agent.
+One Manager installation and its Profile state are shared by Agents running as the same operating-system user. Check `taskmaster --help` before downloading another Manager. A working launcher means the Manager is already deployed: leave the application and state directory in place, and import only the Skill ZIP into the new Agent. An already-running Agent host can retain a PATH from before installation; retain and use the discovered absolute launcher path rather than requiring a host restart.
 
-If a Task Master Manager responds on `127.0.0.1:19946` but no launcher is found, identify its existing installation before proceeding. `MANAGER_STATE_MISMATCH` means the caller and running Manager see different state; check the OS user, `--state-dir`, and `--port`. Do not install another Manager, overwrite `config.json`, or recreate Profiles as a troubleshooting step. Install the Manager below only when no existing installation is available for that user.
+On Windows, when PATH or an assumed location fails, run `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '<SKILL_ROOT>/scripts/find-launcher.ps1'`. This bundled read-only helper queries the exact Eric Task Master uninstall registration under HKCU/HKLM and uses `InstallLocation` before PATH. It checks `bin/taskmaster.cmd` and nested `eric-task-master/bin/taskmaster.cmd`; `%LOCALAPPDATA%\Programs\Eric Task Master` is a fallback, not the identity of an installation. Supply a known portable extraction with `-PortableRoot 'ABSOLUTE_DIRECTORY'`. The helper reads registration, file existence, and loopback health only; it does not execute the launcher, start/stop Manager, or write installation/state data.
+
+- `found`: execute the returned `launcher` with `--help`. If it succeeds, use that absolute path and install only the Agent Skill.
+- `unresolved`: existing registration/files/Manager or an uncertain query prevents confirming absence. Report the locator result; no deployment repair is authorized by this status. The helper exits with code 1 and `canFreshInstall: false`.
+- `absent`: no registration, launcher, application directory, or reachable Manager was found and queries completed. A fresh install is appropriate only for a user-requested deployment; retained user-state data must still be preserved.
+
+On macOS/Linux check `/usr/local/bin/taskmaster` or `/usr/bin/taskmaster`, known portable extractions, and the matching loopback health endpoint. A failed launcher or uncertain lookup is not confirmation of absence. `MANAGER_STATE_MISMATCH` means the caller and running Manager see different state; report the OS user, launcher, `--state-dir`, and `--port` for diagnosis. Do not install another Manager, overwrite `config.json`, or recreate Profiles as a troubleshooting step. A path failure alone does not authorize PATH/registry edits, state moves/deletions, or reinstalling; explicit repair work is a separate request.
 
 ## Release targets
 
@@ -20,21 +26,21 @@ If a Task Master Manager responds on `127.0.0.1:19946` but no launcher is found,
 | Debian/Ubuntu Linux x64 | `linux-x64.deb`, portable ZIP and tarball | system installer or per-user extraction |
 | Debian/Ubuntu Linux arm64 | `linux-arm64.deb`, portable ZIP and tarball | system installer or per-user extraction |
 
-The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.1.5` target. Windows arm64 is not a native `v3.1.5` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
+The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.1.6` target. Windows arm64 is not a native `v3.1.6` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
 
 ## Install
 
 Install stable Google Chrome first. Then use the package matching the operating system and CPU:
 
 - Windows x64: open the `setup.exe`. Start a new terminal after installation and run `taskmaster panel`. The portable ZIP needs no installer; extract it and run `bin\\taskmaster.cmd`.
-- macOS: run `sudo installer -pkg eric-task-master-v3.1.5-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
-- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.1.5-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
+- macOS: run `sudo installer -pkg eric-task-master-v3.1.6-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
+- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.1.6-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
 
 `taskmaster --help` is the installation check. User data is created only when the Manager or another command starts.
 
 ## Portable ZIP fallback
 
-Every target has `eric-task-master-v3.1.5-<target>-portable.zip`. Choose `windows-x64`, `macos-arm64` (Apple silicon), `macos-x64` (Intel), `linux-arm64`, or `linux-x64`. This is a complete Manager runtime, not the separate `eric-task-master-skill-v3.1.5.zip` instructions archive.
+Every target has `eric-task-master-v3.1.6-<target>-portable.zip`. Choose `windows-x64`, `macos-arm64` (Apple silicon), `macos-x64` (Intel), `linux-arm64`, or `linux-x64`. This is a complete Manager runtime, not the separate `eric-task-master-skill-v3.1.6.zip` instructions archive.
 
 1. Download the matching ZIP and `SHA256SUMS` from the same Release. Compare SHA-256 using `Get-FileHash` on Windows, `shasum -a 256` on macOS, or `sha256sum` on Linux.
 2. Extract into a permanent, user-writable folder. Preserve the entire `eric-task-master/` tree, including `runtime/` and `app/`. On macOS/Linux, `unzip PACKAGE.zip -d DESTINATION` preserves the launcher's executable permissions.
@@ -104,9 +110,9 @@ Local Windows acceptance proves the Windows package on the maintainer's machine.
 
 After native uninstall, each target also extracts its portable ZIP into a path containing spaces, verifies its payload hash and executable permissions, and invokes the extracted launcher with an isolated state directory. A real stable Chrome task must pass using bundled Node and Playwright, followed by verified Worker, Manager, Profile, and temporary-directory cleanup. This is separate evidence for the installer-free route.
 
-## Unsigned `v3.1.5` boundary
+## Unsigned `v3.1.6` boundary
 
-The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v3.1.5` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
+The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v3.1.6` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
 
 - Windows may display Microsoft Defender SmartScreen guidance.
 - macOS may require the Owner to approve an unidentified developer package.

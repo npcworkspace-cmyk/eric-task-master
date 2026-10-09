@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.6 - 2026-10-09
+
+- Include a read-only Windows launcher locator in the Agent Skill. Prefer the registered `InstallLocation` over an old Agent-host PATH and recognize custom installations and known nested portable extractions.
+- Distinguish a found launcher, unresolved installation evidence, and confirmed absence. Uncertain registry/path/loopback queries or an existing Manager never authorize automatic reinstall, configuration changes, or Profile recreation.
+- Verify stale/missing PATH discovery, both uninstall records, retained data, no launcher execution, portable fallback, and conservative loopback health handling with isolated Windows regressions.
+
 ## 3.1.5 - 2026-10-09
 
 - Recover retained v3 Profile directories into the Manager and Dashboard when their registry metadata is missing or incomplete. Preserve browser files and existing names/defaults; leave Profiles with active or uncertain Chrome ownership quarantined.
