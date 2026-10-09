@@ -1,10 +1,83 @@
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { removeTestTree } from './test-fs.mjs';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
+
+test('reinstall keeps registered Profiles and adopts retained directories without changing login data', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-reinstall-'));
+  t.after(() => removeTestTree(root));
+  const filePath = path.join(root, 'profiles.json');
+  const profilesRoot = path.join(root, 'profiles');
+  const options = { filePath, profilesRoot, profileUsageProbe: async () => 'inactive' };
+  const original = new ProfileStore(options);
+  await original.init();
+  const first = await original.create({ name: 'Default' });
+  const second = await original.create({ name: 'Research' });
+  await original.update(second.id, { isDefault: true });
+  const savedLogin = path.join(first.userDataDir, 'Local State');
+  await writeFile(savedLogin, 'retained-login-data');
+
+  const orphanId = `profile_${'c'.repeat(32)}`;
+  const orphanDir = path.join(profilesRoot, orphanId);
+  await mkdir(orphanDir);
+  await writeFile(path.join(orphanDir, 'Local State'), 'orphan-login-data');
+  await mkdir(path.join(profilesRoot, 'profile_invalid'));
+  await writeFile(path.join(profilesRoot, `profile_${'d'.repeat(32)}`), 'not a directory');
+
+  const reinstalled = new ProfileStore(options);
+  await reinstalled.init();
+  const profiles = await reinstalled.list();
+  assert.equal(profiles.length, 3);
+  assert.equal((await reinstalled.getDefault()).id, second.id);
+  assert.equal((await reinstalled.get(first.id)).name, 'Default');
+  assert.equal((await reinstalled.get(orphanId)).name, `Recovered ${orphanId}`);
+  assert.equal((await reinstalled.get(orphanId)).state, 'idle');
+  assert.equal(await readFile(savedLogin, 'utf8'), 'retained-login-data');
+  assert.equal(await readFile(path.join(orphanDir, 'Local State'), 'utf8'), 'orphan-login-data');
+
+  const restarted = new ProfileStore(options);
+  await restarted.init();
+  assert.equal((await restarted.list()).length, 3, 'repeated startup must not duplicate recovered Profiles');
+  assert.equal((await restarted.get(orphanId)).name, `Recovered ${orphanId}`);
+});
+
+test('directory-only recovery lists every Profile, requires a new default, and quarantines active Chrome', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-directory-only-'));
+  t.after(() => removeTestTree(root));
+  const profilesRoot = path.join(root, 'profiles');
+  const firstId = `profile_${'a'.repeat(32)}`;
+  const secondId = `profile_${'b'.repeat(32)}`;
+  await mkdir(path.join(profilesRoot, firstId), { recursive: true });
+  await mkdir(path.join(profilesRoot, secondId));
+  await writeFile(path.join(profilesRoot, firstId, 'Local State'), 'first-session');
+  await writeFile(path.join(profilesRoot, secondId, 'Local State'), 'second-session');
+  let secondUsage = 'unknown';
+  const store = new ProfileStore({
+    filePath: path.join(root, 'profiles.json'),
+    profilesRoot,
+    profileUsageProbe: async (userDataDir) => userDataDir.endsWith(secondId) ? secondUsage : 'inactive'
+  });
+  await store.init();
+  assert.equal((await store.list()).length, 2);
+  assert.equal(await store.getDefault(), null, 'an unknown former default must not select the wrong login');
+  assert.equal((await store.get(firstId)).state, 'idle');
+  assert.equal((await store.get(secondId)).state, 'error');
+  assert.equal((await store.get(secondId)).lease.identityUntrusted, true);
+  await assert.rejects(store.acquireLease(secondId, {
+    ownerId: 'task:recovery', kind: 'task', pid: process.pid, nonce: 'recovery-nonce'
+  }), { code: 'PROFILE_CLEANUP_UNCONFIRMED' });
+  secondUsage = 'active';
+  assert.deepEqual(await store.recoverExpiredLeases(), []);
+  assert.equal((await store.get(secondId)).state, 'error');
+  secondUsage = 'inactive';
+  assert.deepEqual(await store.recoverExpiredLeases(), [secondId]);
+  assert.equal((await store.get(secondId)).state, 'idle');
+  assert.equal(await readFile(path.join(profilesRoot, firstId, 'Local State'), 'utf8'), 'first-session');
+  assert.equal(await readFile(path.join(profilesRoot, secondId, 'Local State'), 'utf8'), 'second-session');
+});
 
 test('ProfileStore reaps dead leases after cleanup proof or inactive Profile expiry', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-'));

@@ -117,3 +117,5 @@ Removing those warnings requires an Authenticode certificate for Windows and App
 ## Uninstall and state
 
 Uninstall application files only after `taskmaster manager stop --json`. Windows' uninstaller attempts this automatically; Linux/macOS package removal should be preceded by the command. User Profiles, cookies, task records, and task outputs are retained by default because deleting them is destructive. Purging the user state directory is a separate explicit Owner action.
+
+On the next install/start, Manager reuses retained Profile metadata and directories in that state directory. Since 3.1.5, if `profiles.json` is missing or incomplete, valid retained v3 Profile directories are also re-listed automatically; directory-only entries receive a `Recovered profile_<id>` name. Choose the intended default again if its metadata is gone. Browser login files are preserved, although individual websites may still request verification. See [state backup and recovery](STATE-BACKUP-RECOVERY.md) for quarantine and scope limits.

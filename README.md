@@ -128,6 +128,8 @@ taskmaster panel
 
 If a default Profile already exists, keep using it. Otherwise create one in the Dashboard, open its native Chrome window, and sign in. Close the window, then make that Profile the default. Automated tasks reuse the same browser state. Individual sites may still request verification later.
 
+Reinstalling the Manager keeps Profiles in the separate user-state directory. If the Profile registry was lost but its v3 Profile directories remain, Manager 3.1.5+ lists them again as `Recovered profile_<id>` without changing their browser files; select the intended default in the Dashboard. See [state recovery](docs/STATE-BACKUP-RECOVERY.md) for the scope and safety limits.
+
 ### Step 3: give the Skill to the Agent
 
 Import `eric-task-master-skill-v<VERSION>.zip` with the Agent's Skill manager. For folder-based installation, extract it first and confirm that `SKILL.md` is at the Skill root. If the Agent has no Skill mechanism, give it this repository and ask it to read `skills/eric-task-master/SKILL.md`.

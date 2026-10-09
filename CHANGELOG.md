@@ -2,6 +2,7 @@
 
 ## 3.1.5 - 2026-10-09
 
+- Recover retained v3 Profile directories into the Manager and Dashboard when their registry metadata is missing or incomplete. Preserve browser files and existing names/defaults; leave Profiles with active or uncertain Chrome ownership quarantined.
 - Reclaim a stale Windows Manager lock when its recorded PID has been reused by a later process; record process creation identity for new locks and keep uncertain ownership fail-closed.
 - Tell a new Agent to check for an existing Manager and import only the Skill when one is present, including portable launchers not on `PATH`. Clarify state-mismatch recovery without reinstalling or recreating Profiles.
 - Clarify that Playwright is bundled with the Manager and does not require per-Agent version selection; leave the internal dependency pin in package metadata.

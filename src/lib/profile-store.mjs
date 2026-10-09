@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, rename, rm } from 'node:fs/promises';
+import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { JsonStore } from './json-store.mjs';
 import {
@@ -217,7 +217,57 @@ export class ProfileStore {
         : migrated[0]?.id ?? null;
     });
     await this.#recoverPendingDeletions();
+    await this.#recoverUnregisteredDirectories();
     await this.recoverExpiredLeases();
+  }
+
+  async #recoverUnregisteredDirectories() {
+    const data = await this.#store.read();
+    const known = new Set(data.profiles.map((profile) => profile.id));
+    const deleting = new Set(data.deletions.map((record) => record.profileId));
+    const candidates = (await readdir(this.#profilesRoot, { withFileTypes: true }))
+      .filter((entry) => PROFILE_ID.test(entry.name) && !known.has(entry.name) && !deleting.has(entry.name))
+      .map((entry) => entry.name)
+      .sort();
+    if (candidates.length === 0) return;
+
+    await this.#store.update(async (draft) => {
+      const names = new Set(draft.profiles.map((profile) => profile.name.toLowerCase()));
+      for (const id of candidates) {
+        if (draft.profiles.some((profile) => profile.id === id)) continue;
+        if (draft.deletions.some((record) => record.profileId === id)) continue;
+        const userDataDir = safeProfilePath(this.#profilesRoot, id);
+        const stats = await lstat(userDataDir).catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
+        if (!stats?.isDirectory() || stats.isSymbolicLink()) continue;
+        const baseName = `Recovered ${id}`;
+        let name = baseName;
+        for (let suffix = 2; names.has(name.toLowerCase()); suffix += 1) name = `${baseName} ${suffix}`;
+        names.add(name.toLowerCase());
+        const timestamp = nowIso(this.#now);
+        draft.profiles.push({
+          id,
+          name,
+          userDataDir,
+          state: 'error',
+          lease: {
+            ownerId: `legacy-quarantine:${id}`,
+            kind: 'task',
+            taskId: null,
+            pid: null,
+            nonce: `legacy-${randomUUID().replaceAll('-', '')}`,
+            generation: 1,
+            acquiredAt: timestamp,
+            heartbeatAt: timestamp,
+            expiresAt: timestamp,
+            identityUntrusted: true
+          },
+          leaseGeneration: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          lastUsedAt: null
+        });
+      }
+    });
   }
 
   async #recoverPendingDeletions() {

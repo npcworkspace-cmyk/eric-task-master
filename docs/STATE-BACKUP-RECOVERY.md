@@ -25,6 +25,8 @@ taskmaster status --json
 
 Manager never kills a process from a persisted PID alone because the operating system may have reused that number. A lease with cleanup proof is reclaimed after its Worker is dead. Without cleanup proof, Manager waits for lease expiry and checks the exact `--user-data-dir`; an active or unreadable result stays quarantined, while a confirmed inactive Profile is recovered automatically.
 
+If an uninstall left the `profiles/` directories but `profiles.json` is missing or incomplete, Manager 3.1.5 and later re-registers every direct child with a valid v3 Profile ID on startup. Existing names and the default are preserved when their metadata remains. A Profile known only by its directory appears as `Recovered profile_<id>`; its former display name and default cannot be inferred, so select the intended default explicitly in the Dashboard. Login files are not moved or rewritten. Active Chrome use or an uncertain process probe keeps the Profile visible but quarantined until inactivity can be confirmed. This scans only the current state directory, not other users' homes or arbitrary old installations. Back up the state directory before any manual repair; a malformed `profiles.json` still requires deliberate recovery rather than automatic replacement.
+
 Tasks that were active during an unclean Manager shutdown become `error`; their existing output files remain available. Task scripts that need restartable work should write their own checkpoints incrementally under `outputDir`.
 
 ## If state changes while Manager is running
