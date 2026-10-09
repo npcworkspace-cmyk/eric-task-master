@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const INCOMPLETE_LOCK_GRACE_MS = 5_000;
+const LEGACY_PID_REUSE_GRACE_MS = 60_000;
 const MAX_ACQUIRE_ATTEMPTS = 8;
 
 function delay(ms) {
@@ -21,6 +23,21 @@ function processAlive(pid) {
   }
 }
 
+function windowsProcessStartedAt(pid) {
+  if (process.platform !== 'win32') return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const command = `$owner = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' -ErrorAction Stop; if ($owner) { $owner.CreationDate.ToUniversalTime().ToString('o') }`;
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
+      timeout: 5_000,
+      maxBuffer: 2_048,
+      windowsHide: true
+    }, (error, stdout) => {
+      const startedAt = error ? NaN : Date.parse(stdout.trim());
+      resolve(Number.isFinite(startedAt) ? startedAt : null);
+    });
+  });
+}
+
 export class ManagerLockError extends Error {
   constructor(code, message) {
     super(message);
@@ -34,15 +51,40 @@ export class ManagerLock {
   #filePath;
   #recoveryPath;
   #recoveryHook;
+  #processStartedAt;
+  #ownStartedAt;
   #nonce = null;
 
-  constructor(filePath, { recoveryHook = null } = {}) {
+  constructor(filePath, { recoveryHook = null, processStartedAt = windowsProcessStartedAt } = {}) {
     if (recoveryHook !== null && typeof recoveryHook !== 'function') {
       throw new TypeError('recoveryHook must be a function when provided');
     }
+    if (typeof processStartedAt !== 'function') throw new TypeError('processStartedAt must be a function');
     this.#filePath = filePath;
     this.#recoveryPath = `${filePath}.recovery`;
     this.#recoveryHook = recoveryHook;
+    this.#processStartedAt = processStartedAt;
+  }
+
+  async #ownerRecord(nonce) {
+    this.#ownStartedAt ??= await this.#processStartedAt(process.pid);
+    return {
+      pid: process.pid,
+      nonce,
+      createdAt: new Date().toISOString(),
+      ...(Number.isFinite(this.#ownStartedAt) ? { processStartedAt: this.#ownStartedAt } : {})
+    };
+  }
+
+  async #ownerAlive(owner) {
+    if (!processAlive(owner.pid)) return false;
+    const startedAt = await this.#processStartedAt(owner.pid);
+    if (!Number.isFinite(startedAt)) return true;
+    if (Number.isFinite(owner.processStartedAt)) return startedAt === owner.processStartedAt;
+    const createdAt = Date.parse(owner.createdAt);
+    // Older locks have no process identity. Reclaim only when the PID was
+    // created well after the lock; an unavailable probe remains fail-closed.
+    return !Number.isFinite(createdAt) || startedAt <= createdAt + LEGACY_PID_REUSE_GRACE_MS;
   }
 
   async acquire() {
@@ -51,14 +93,11 @@ export class ManagerLock {
     for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt += 1) {
       await this.#assertNoRecoveryInProgress();
       const nonce = randomUUID();
+      const owner = await this.#ownerRecord(nonce);
       let handle;
       try {
         handle = await open(this.#filePath, 'wx', 0o600);
-        await handle.writeFile(`${JSON.stringify({
-          pid: process.pid,
-          nonce,
-          createdAt: new Date().toISOString()
-        })}\n`, 'utf8');
+        await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
         await handle.sync();
         await handle.close();
         this.#nonce = nonce;
@@ -70,7 +109,7 @@ export class ManagerLock {
 
       const existing = await this.#inspect(this.#filePath);
       if (!existing.exists) continue;
-      if (existing.owner && processAlive(existing.owner.pid)) {
+      if (existing.owner && await this.#ownerAlive(existing.owner)) {
         throw new ManagerLockError(
           'MANAGER_ALREADY_RUNNING',
           'Another Task Master Manager already owns this state directory'
@@ -152,7 +191,7 @@ export class ManagerLock {
   async #assertNoRecoveryInProgress() {
     const recovery = await this.#inspect(this.#recoveryPath);
     if (!recovery.exists) return;
-    if (recovery.owner && processAlive(recovery.owner.pid)) {
+    if (recovery.owner && await this.#ownerAlive(recovery.owner)) {
       throw new ManagerLockError(
         'MANAGER_LOCK_BUSY',
         'Another Task Master Manager is recovering this state directory'
@@ -169,14 +208,11 @@ export class ManagerLock {
 
   async #acquireRecoveryGuard() {
     const nonce = randomUUID();
+    const owner = await this.#ownerRecord(nonce);
     let handle;
     try {
       handle = await open(this.#recoveryPath, 'wx', 0o600);
-      await handle.writeFile(`${JSON.stringify({
-        pid: process.pid,
-        nonce,
-        createdAt: new Date().toISOString()
-      })}\n`, 'utf8');
+      await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
       await handle.sync();
       await handle.close();
       return nonce;
@@ -244,7 +280,7 @@ export class ManagerLock {
     try {
       const candidate = await this.#inspect(this.#filePath);
       if (!candidate.exists) return;
-      if (candidate.owner && processAlive(candidate.owner.pid)) {
+      if (candidate.owner && await this.#ownerAlive(candidate.owner)) {
         throw new ManagerLockError(
           'MANAGER_ALREADY_RUNNING',
           'Another Task Master Manager already owns this state directory'

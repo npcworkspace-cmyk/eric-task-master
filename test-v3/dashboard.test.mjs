@@ -81,10 +81,27 @@ test('portable Skill contains only one CLI guide and its license', async () => {
   assert.match(skill, /taskmaster resume TASK_ID/u);
   assert.match(skill, /taskmaster delete TASK_ID/u);
   assert.match(skill, /Do not add a preflight check to a normal task/u);
+  assert.match(skill, /When asked to deploy for a new Agent, first check `taskmaster --help`/u);
+  assert.match(skill, /install only this Skill for the new Agent/u);
+  assert.match(skill, /a portable ZIP extracted there is one level deeper/u);
+  assert.match(skill, /MANAGER_STATE_MISMATCH` is not a reason to reinstall/u);
   assert.match(skill, /%LOCALAPPDATA%\\Programs\\Eric Task Master\\bin\\taskmaster\.cmd/u);
   assert.match(skill, /macOS `\/usr\/local\/bin\/taskmaster`; Linux `\/usr\/bin\/taskmaster`/u);
   assert.doesNotMatch(skill, /task type|surface-probe|full-human|journey|ephemeral/iu);
   assert.ok(skill.split(/\r?\n/u).length <= 70, 'Skill should stay one-page and cheap to read');
+});
+
+test('deployment guides reuse the Manager and leave Playwright version selection to the bundle', async () => {
+  const [english, chinese, installers] = await Promise.all([
+    text('README.md'), text('README.zh-CN.md'), text('docs/INSTALLERS.md')
+  ]);
+  assert.match(english, /check for the Manager, install only if missing/u);
+  assert.match(english, /For another Agent, import only the Skill/u);
+  assert.match(chinese, /先检查 Manager，缺少时才安装/u);
+  assert.match(chinese, /给另一个 Agent 只导入第三步的 Skill/u);
+  assert.match(installers, /A working launcher means the Manager is already deployed/u);
+  assert.match(installers, /Do not install another Manager, overwrite `config\.json`, or recreate Profiles/u);
+  assert.doesNotMatch(`${english}\n${chinese}`, /Playwright\s+\d+\.\d+/u);
 });
 
 test('cleanup is one accessible dialog with opt-in historical output and matching-preview confirmation', async () => {

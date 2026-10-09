@@ -257,7 +257,12 @@ test('CLI never sends recovery credentials to a different current state', async 
     host: '127.0.0.1', port: server.address().port, stateDir: root,
     baseUrl: `http://127.0.0.1:${server.address().port}`
   };
-  await assert.rejects(ensureManager(config), { code: 'MANAGER_STATE_MISMATCH' });
+  await assert.rejects(ensureManager(config), (error) => {
+    assert.equal(error.code, 'MANAGER_STATE_MISMATCH');
+    assert.match(error.nextAction, /another state view/u);
+    assert.match(error.nextAction, /do not reinstall/u);
+    return true;
+  });
   assert.deepEqual(requests, ['GET /v1/health']);
 });
 

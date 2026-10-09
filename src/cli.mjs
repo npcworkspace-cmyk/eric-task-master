@@ -231,7 +231,9 @@ function managerStateMismatch(manager) {
   const error = cliError(
     'MANAGER_STATE_MISMATCH',
     'The running Manager does not own the current local state',
-    'Run taskmaster manager start. An idle stale Manager will be replaced automatically; active work is never terminated automatically.'
+    manager?.stateChanged === true
+      ? 'Run taskmaster manager start. An idle stale Manager will be replaced automatically; active work is never terminated automatically.'
+      : 'This port belongs to a Manager with another state view. Check the OS user, --state-dir and --port; keep the existing Profiles and do not reinstall. Stop that exact Manager only after confirming it has no active work, then start from the intended state.'
   );
   error.manager = manager;
   return error;

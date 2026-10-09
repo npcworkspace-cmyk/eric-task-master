@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.5 - 2026-10-09
+
+- Reclaim a stale Windows Manager lock when its recorded PID has been reused by a later process; record process creation identity for new locks and keep uncertain ownership fail-closed.
+- Tell a new Agent to check for an existing Manager and import only the Skill when one is present, including portable launchers not on `PATH`. Clarify state-mismatch recovery without reinstalling or recreating Profiles.
+- Clarify that Playwright is bundled with the Manager and does not require per-Agent version selection; leave the internal dependency pin in package metadata.
+
 ## 3.1.4 - 2026-09-08
 
 - Return the fixed Dashboard link without opening a browser for `panel --json`; explicit `taskmaster panel` still opens it. Align the Agent Skill and bilingual quick start so repeated tasks do not accumulate Dashboard windows.
