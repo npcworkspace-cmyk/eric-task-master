@@ -96,6 +96,28 @@ test('Manager exposes the minimal v3 loopback API and passes through errors', as
   assert.equal(badAction.body.error.code, 'INVALID_TASK_ACTION');
 });
 
+test('Manager lists retained Profile directories when registry metadata is missing', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-manager-profile-recovery-'));
+  const profilesRoot = path.join(root, 'profiles');
+  const ids = [`profile_${'a'.repeat(32)}`, `profile_${'b'.repeat(32)}`];
+  for (const id of ids) {
+    const userDataDir = path.join(profilesRoot, id);
+    await mkdir(userDataDir, { recursive: true });
+    await writeFile(path.join(userDataDir, 'Local State'), `login-${id}`);
+  }
+  const manager = await createManager({ port: 0, dataDir: root });
+  t.after(async () => { await manager.stop(); await removeTestTree(root); });
+  await manager.start();
+  const token = JSON.parse(await readFile(path.join(root, 'config.json'), 'utf8')).managerToken;
+  const result = await json(`${manager.baseUrl}/v1/profiles`, { token });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.profiles.map((profile) => profile.id), ids);
+  assert.deepEqual(result.body.profiles.map((profile) => profile.isDefault), [false, false]);
+  for (const id of ids) {
+    assert.equal(await readFile(path.join(profilesRoot, id, 'Local State'), 'utf8'), `login-${id}`);
+  }
+});
+
 test('Manager hot-reloads token rotation and requires a scoped proof for state recovery', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-manager-state-change-'));
   let listCalls = 0;

@@ -128,6 +128,8 @@ taskmaster panel
 
 如果已有默认 Profile，继续使用即可。否则在面板创建 Profile，打开它的原生 Chrome 窗口并完成登录；关闭窗口后，把该 Profile 设为默认。自动化任务会复用同一份登录状态。网站仍可能在之后要求重新验证。
 
+重装 Manager 会保留独立用户状态目录中的 Profile。如果登记文件丢失、但 v3 Profile 目录仍在，Manager 3.1.5 及后续版本会将它们以 `Recovered profile_<id>` 的名称重新列出，不改动浏览器文件；请在面板重新指定正确的默认 Profile。范围和安全边界见[状态恢复说明](docs/STATE-BACKUP-RECOVERY.md)。
+
 ### 第三步：把 Skill 给 Agent
 
 通过 Agent 的 Skill 管理界面导入 `eric-task-master-skill-v<VERSION>.zip`；如果使用目录式安装，先解压，再确认 Skill 根目录直接包含 `SKILL.md`。Agent 不支持 Skill 时，也可以直接把本仓库链接交给它，让它阅读 `skills/eric-task-master/SKILL.md`。
