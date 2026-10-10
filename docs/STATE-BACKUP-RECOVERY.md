@@ -5,16 +5,16 @@ The Manager state directory contains persistent Chrome Profiles, task metadata, 
 Back up only while Manager and Profile windows are closed:
 
 ```bash
-taskmaster manager stop
+taskmaster manager stop --if-idle
 ```
 
 Copy the state directory with operating-system permissions preserved:
 
-- Windows: `%LOCALAPPDATA%\eric-task-master`
+- Windows, new shared state: `%USERPROFILE%\.eric-task-master\state`
 - macOS: `~/Library/Application Support/eric-task-master`
 - Linux: `${XDG_DATA_HOME:-~/.local/share}/eric-task-master`
 
-If `ERIC_TASK_MASTER_HOME` is set, that explicit path is the state directory. Browser Profiles may contain logged-in sessions and must be encrypted at rest.
+Use `taskmaster manager status --json` to obtain `stateDirEffective`. After an explicit Windows Owner upgrade has consolidated legacy state, back up that complete physical directory. Before consolidation, a packaged host can expose fallback Profile files outside the configuration file's physical parent: back up the complete selected view from its original host, verify its configuration belongs to that Manager, and retain both source locations. Do not assume copying only the private LocalCache directory is complete. `manager start --upgrade` verifies and consolidates that view once without deleting its source; pass the same `--state-dir` for an isolated project. Keep the shared `default-state.json` and project location records under `%USERPROFILE%\.eric-task-master` with the backup. They contain locations, not credentials. Preserve `config.json` and Profile IDs/names/defaults together. Browser Profiles can contain logged-in sessions and must be encrypted at rest.
 
 To restore, install the same major version, stop Manager, replace the state directory, then run:
 
@@ -40,6 +40,6 @@ taskmaster manager recover --json
 taskmaster status --json
 ```
 
-Recovery keeps existing outputs and login data. Interrupted scripts must continue from their saved checkpoints in a new task; their former in-memory execution cannot be resumed. If process cleanup cannot be confirmed, recovery reports the reason and can be retried. A CLI pointing at another state directory must use the matching `--state-dir` and `--port`; it will not take over that Manager.
+Recovery keeps existing outputs and login data. Interrupted scripts must continue from checkpoints in a new task; former in-memory execution cannot be resumed. If process cleanup cannot be confirmed, recovery reports the reason and can be retried. Use the same `--state-dir` on every isolated-project command; its port is discovered automatically unless explicitly supplied. A different project cannot take over that Manager. `MANAGER_STATE_AMBIGUOUS` requires selecting the intended existing store explicitly, not merging or replacing its data.
 
 Versions before 3.1.3 do not implement this recovery protocol. If an older running Manager already has stale credentials, close that Manager and its task windows (or restart the computer), then update and start Manager again. Keep the existing state directory. The newer CLI reports this case as `LEGACY_MANAGER_RESTART_REQUIRED` from `manager recover`, instead of claiming recovery succeeded.

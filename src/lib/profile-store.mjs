@@ -38,12 +38,13 @@ function normalizeName(value) {
   return name;
 }
 
-function safeProfilePath(root, profileId, recordedPath = null) {
+function safeProfilePath(root, profileId, recordedPath = null, aliases = []) {
   if (!PROFILE_ID.test(profileId)) {
     throw new ProfileStoreError('INVALID_PROFILE_ID', 'Profile ID is invalid');
   }
   const expected = path.resolve(root, profileId);
-  if (recordedPath !== null && path.resolve(recordedPath) !== expected) {
+  if (recordedPath !== null && path.resolve(recordedPath) !== expected &&
+      !aliases.some((alias) => path.resolve(recordedPath) === path.resolve(alias, profileId))) {
     throw new ProfileStoreError('INVALID_PROFILE_PATH', 'Profile data path is invalid', 500);
   }
   const relative = path.relative(path.resolve(root), expected);
@@ -53,12 +54,13 @@ function safeProfilePath(root, profileId, recordedPath = null) {
   return expected;
 }
 
-function safeDeletionPath(root, profileId, deletionId, recordedPath = null) {
+function safeDeletionPath(root, profileId, deletionId, recordedPath = null, aliases = []) {
   if (!PROFILE_ID.test(profileId) || !DELETION_ID.test(deletionId)) {
     throw new ProfileStoreError('INVALID_PROFILE_DELETION', 'Profile deletion record is invalid', 500);
   }
   const expected = path.resolve(root, `.deleting-${profileId}-${deletionId}`);
-  if (recordedPath !== null && path.resolve(recordedPath) !== expected) {
+  if (recordedPath !== null && path.resolve(recordedPath) !== expected &&
+      !aliases.some((alias) => path.resolve(recordedPath) === path.resolve(alias, '.deleting-' + profileId + '-' + deletionId))) {
     throw new ProfileStoreError('INVALID_PROFILE_DELETION', 'Profile deletion path is invalid', 500);
   }
   const relative = path.relative(path.resolve(root), expected);
@@ -102,6 +104,7 @@ function sameLease(lease, { ownerId, nonce, generation } = {}) {
 export class ProfileStore {
   #store;
   #profilesRoot;
+  #pathAliases;
   #now;
   #processAlive;
   #profileUsageProbe;
@@ -109,6 +112,7 @@ export class ProfileStore {
   constructor({
     filePath,
     profilesRoot,
+    pathAliases = [],
     now = Date.now,
     processAlive = defaultProcessAlive,
     profileUsageProbe = defaultProfileUsageProbe
@@ -124,6 +128,10 @@ export class ProfileStore {
       version: 1, defaultProfileId: null, profiles: [], deletions: []
     });
     this.#profilesRoot = path.resolve(profilesRoot);
+    if (!Array.isArray(pathAliases) || pathAliases.length > 16 || pathAliases.some((alias) => !path.isAbsolute(alias))) {
+      throw new TypeError('Profile path aliases must be bounded absolute state-owned directories');
+    }
+    this.#pathAliases = pathAliases.map((alias) => path.resolve(alias));
     this.#now = now;
     this.#processAlive = processAlive;
     this.#profileUsageProbe = profileUsageProbe;
@@ -143,7 +151,7 @@ export class ProfileStore {
         let name;
         try {
           name = normalizeName(candidate.name);
-          safeProfilePath(this.#profilesRoot, candidate.id, candidate.userDataDir);
+          safeProfilePath(this.#profilesRoot, candidate.id, candidate.userDataDir, this.#pathAliases);
         } catch {
           continue;
         }
@@ -205,8 +213,10 @@ export class ProfileStore {
       data.profiles = migrated;
       data.deletions = (Array.isArray(data.deletions) ? data.deletions : []).filter((record) => {
         try {
-          safeProfilePath(this.#profilesRoot, record.profileId, record.userDataDir);
-          safeDeletionPath(this.#profilesRoot, record.profileId, record.id, record.tombstonePath);
+          safeProfilePath(this.#profilesRoot, record.profileId, record.userDataDir, this.#pathAliases);
+          safeDeletionPath(this.#profilesRoot, record.profileId, record.id, record.tombstonePath, this.#pathAliases);
+          record.userDataDir = safeProfilePath(this.#profilesRoot, record.profileId);
+          record.tombstonePath = safeDeletionPath(this.#profilesRoot, record.profileId, record.id);
           return true;
         } catch {
           return false;

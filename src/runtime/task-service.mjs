@@ -394,7 +394,7 @@ export function createTaskService({
       for (const [taskId, entry] of children) {
           if (!entry.finalized && !processAlive(entry.child.pid)) {
             void finalizeTask(taskId, entry, entry.child.exitCode, entry.child.signalCode).catch(() => {});
-          } else if (!entry.finalized && entry.stopRequested) {
+          } else if (!entry.finalized && entry.stopRequested && !entry.pendingStops) {
             void containTaskWorker(taskId, entry, {
               code: 'TASK_TERMINATION_RETRY',
               message: 'Retrying termination of the owned task process tree.'
@@ -666,6 +666,7 @@ export function createTaskService({
       generation: null,
       lastHeartbeatAt: Date.now(),
       stopRequested: false,
+      pendingStops: 0,
       terminalState: null,
       browserClosed: null,
       treeTerminated: false,
@@ -904,6 +905,7 @@ export function createTaskService({
         // A renewal failure can arrive while finalization owns mutationTail.
         // Recheck here so a queued callback cannot revive a completed task.
         if (entry.finalized || children.get(taskId) !== entry) return false;
+        if (code === 'TASK_TERMINATION_RETRY' && entry.pendingStops) return false;
         entry.stopRequested = true;
         entry.terminalState = 'error';
         const task = tasks.get(taskId);
@@ -1292,34 +1294,37 @@ export function createTaskService({
       verificationNotifier?.remove(task.id);
       appendEvent(task, 'task.stopping');
       await persist();
+      entry.pendingStops += 1;
       return { task, entry };
     });
     if (!marked.entry) return publicTask(marked.task);
-    await send(marked.entry.child, { type: 'stop' });
-    await waitFor(marked.entry.exitPromise, stopWaitMs);
-    if (processAlive(marked.entry.child.pid)) {
-      await terminateOwnedTask(marked.entry);
-      await waitFor(marked.entry.exitPromise, terminationWaitMs);
-    }
-    if (processAlive(marked.entry.child.pid)) {
-      await markEntryCleanupError(marked.entry);
-      throw new TaskServiceError(
-        'TASK_PROCESS_STILL_ALIVE',
-        'Task process tree could not be terminated; Profile lease was retained',
-        409
-      );
-    }
-    if (!marked.entry.finalized && !processAlive(marked.entry.child.pid)) {
-      await finalizeTask(id, marked.entry, marked.entry.child.exitCode, marked.entry.child.signalCode);
-    }
-    if (!marked.entry.finalized) {
-      throw new TaskServiceError(
-        'TASK_CLEANUP_UNCONFIRMED',
-        'Task cleanup could not be confirmed; Profile lease was retained',
-        409
-      );
-    }
-    return get(id);
+    try {
+      await send(marked.entry.child, { type: 'stop' });
+      await waitFor(marked.entry.exitPromise, stopWaitMs);
+      if (processAlive(marked.entry.child.pid)) {
+        await terminateOwnedTask(marked.entry);
+        await waitFor(marked.entry.exitPromise, terminationWaitMs);
+      }
+      if (processAlive(marked.entry.child.pid)) {
+        await markEntryCleanupError(marked.entry);
+        throw new TaskServiceError(
+          'TASK_PROCESS_STILL_ALIVE',
+          'Task process tree could not be terminated; Profile lease was retained',
+          409
+        );
+      }
+      if (!marked.entry.finalized && !processAlive(marked.entry.child.pid)) {
+        await finalizeTask(id, marked.entry, marked.entry.child.exitCode, marked.entry.child.signalCode);
+      }
+      if (!marked.entry.finalized) {
+        throw new TaskServiceError(
+          'TASK_CLEANUP_UNCONFIRMED',
+          'Task cleanup could not be confirmed; Profile lease was retained',
+          409
+        );
+      }
+      return get(id);
+    } finally { marked.entry.pendingStops -= 1; }
   }
 
   async function deleteTask(id) {

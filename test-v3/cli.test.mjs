@@ -11,8 +11,10 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { removeTestTree } from './test-fs.mjs';
 import { isProcessAlive } from '../src/lib/process-tree.mjs';
-import { managerRecoveryProof, managerStateId } from '../src/lib/manager-state.mjs';
+import { managerOwnershipProof, managerRecoveryProof, managerStateId } from '../src/lib/manager-state.mjs';
 import { VERSION } from '../src/contracts.mjs';
+import { createManager } from '../src/manager.mjs';
+import { stateEnvironment } from '../src/lib/state-directory.mjs';
 import {
   ensureManager,
   parseIntegerOption,
@@ -23,11 +25,18 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'src', 'cli.mjs');
 
-function runCli(args, { cwd = ROOT, nodeArgs = [] } = {}) {
+function runCli(args, { cwd = ROOT, nodeArgs = [], env = {} } = {}) {
+  const stateOption = args.indexOf('--state-dir');
+  const testHome = stateOption >= 0 && typeof args[stateOption + 1] === 'string'
+    ? path.join(args[stateOption + 1], '.agent-home') : null;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, CLI, ...args], {
       cwd,
-      env: { ...process.env, NODE_OPTIONS: '' },
+      env: {
+        ...process.env, NODE_OPTIONS: '',
+        ...(testHome ? { USERPROFILE: testHome, HOME: testHome } : {}),
+        ...env
+      },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -1139,4 +1148,152 @@ test('twelve concurrent CLI clients converge on one cold Manager across multiple
     assert.equal(stopped.code, 0, stopped.stderr);
     active.splice(active.indexOf(target), 1);
   }
+});
+
+test('separate data projects auto-select distinct endpoints while concurrent Agents reuse each project', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-projects-'));
+  const projects = [path.join(root, 'first'), path.join(root, 'second')];
+  t.after(async () => {
+    for (const stateDir of projects) {
+      const stopped = await runCli(['manager', 'stop', '--state-dir', stateDir, '--json']);
+      assert.equal(stopped.code, 0, stopped.stderr);
+    }
+    await removeTestTree(root);
+  });
+  const started = await Promise.all(projects.map((stateDir) => runCli(['manager', 'start', '--state-dir', stateDir, '--json'])));
+  const managers = started.map((result) => {
+    assert.equal(result.code, 0, result.stderr);
+    return lastJson(result.stdout).manager;
+  });
+  assert.notEqual(managers[0].pid, managers[1].pid);
+  assert.notEqual(managers[0].stateDirectoryId, managers[1].stateDirectoryId);
+  const endpoints = await Promise.all(projects.map(async (stateDir) =>
+    JSON.parse(await readFile(path.join(stateDir, 'manager.json'), 'utf8')).baseUrl));
+  assert.notEqual(endpoints[0], endpoints[1]);
+  for (let index = 0; index < projects.length; index += 1) {
+    const results = await Promise.all(Array.from({ length: 6 }, () =>
+      runCli(['manager', 'start', '--state-dir', projects[index], '--json'])));
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(lastJson(result.stdout).manager.pid, managers[index].pid);
+    }
+  }
+});
+
+test('a copied configuration cannot drive another project even when its token and instance ID are identical', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-copied-project-'));
+  const original = path.join(root, 'original');
+  const copy = path.join(root, 'copy');
+  await fsPromises.mkdir(copy, { recursive: true });
+  const started = await runCli(['manager', 'start', '--state-dir', original, '--json']);
+  assert.equal(started.code, 0, started.stderr);
+  t.after(async () => {
+    const stopped = await runCli(['manager', 'stop', '--state-dir', original, '--json']);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    await removeTestTree(root);
+  });
+  await fsPromises.copyFile(path.join(original, 'config.json'), path.join(copy, 'config.json'));
+  const endpoint = JSON.parse(await readFile(path.join(original, 'manager.json'), 'utf8'));
+  const result = await runCli(['profiles', 'list', '--state-dir', copy, '--port', new URL(endpoint.baseUrl).port, '--json']);
+  assert.equal(result.code, 1);
+  assert.equal(lastJson(result.stderr).error.code, 'MANAGER_STATE_MISMATCH');
+  await assert.rejects(readFile(path.join(copy, 'profiles.json')), { code: 'ENOENT' });
+});
+
+test('public state-location spoofing cannot obtain a client token without a nonce ownership proof', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-owner-proof-'));
+  t.after(() => removeTestTree(root));
+  const config = { managerToken: 's'.repeat(48), stateInstanceId: 'owner-state-instance-0000001' };
+  await writeFile(path.join(root, 'config.json'), JSON.stringify(config));
+  const physical = await fsPromises.realpath(root);
+  const claimed = {
+    service: 'eric-task-master', version: VERSION, apiVersion: 3,
+    capabilities: ['manager.state-location', 'manager.owner-proof'],
+    stateId: managerStateId(config.stateInstanceId, root),
+    stateDirectoryId: managerStateId(config.stateInstanceId, physical),
+    stateDirEffective: physical, stateDirLogical: root, scope: 'project',
+    pid: process.pid, stateChanged: false
+  };
+  const authorization = [];
+  let validProof = false;
+  const server = http.createServer((request, response) => {
+    authorization.push(request.headers.authorization);
+    response.setHeader('content-type', 'application/json');
+    const nonce = new URL(request.url, 'http://127.0.0.1').searchParams.get('nonce');
+    response.end(JSON.stringify({ ...claimed,
+      ...(nonce ? { ownerProof: managerOwnershipProof(validProof ? config.managerToken : 'wrong'.repeat(16), claimed, nonce) } : {})
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const args = ['manager', 'status', '--state-dir', root, '--port', String(server.address().port), '--json'];
+  const rejected = await runCli(args);
+  assert.equal(rejected.code, 1);
+  assert.equal(lastJson(rejected.stderr).error.code, 'MANAGER_OWNER_UNVERIFIED');
+  assert.equal(rejected.stderr.includes(config.managerToken), false);
+  assert.ok(authorization.every((value) => value === undefined));
+  validProof = true;
+  const accepted = await runCli(args);
+  assert.equal(accepted.code, 0, accepted.stderr);
+  assert.ok(authorization.every((value) => value === undefined));
+});
+
+test('a retained shared location preserves its legacy identity and Profiles after a physical-root restart', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-legacy-identity-'));
+  const home = path.join(root, 'agent-home');
+  const physical = path.join(root, 'selected-data');
+  const env = { USERPROFILE: home, HOME: home, LOCALAPPDATA: path.join(root, 'local'),
+    XDG_DATA_HOME: path.join(root, 'local'), ERIC_TASK_MASTER_HOME: '' };
+  const legacy = stateEnvironment({ env, home }).legacyRoot;
+  await fsPromises.mkdir(physical, { recursive: true });
+  await fsPromises.mkdir(path.dirname(legacy), { recursive: true });
+  await fsPromises.symlink(physical, legacy, 'junction');
+  const original = await createManager({ dataDir: legacy, scope: 'shared', port: 0 });
+  await original.start();
+  env.ERIC_TASK_MASTER_PORT = String(original.address.port);
+  t.after(async () => {
+    await original.stop();
+    const stopped = await runCli(['manager', 'stop', '--if-idle', '--state-dir', physical,
+      '--port', env.ERIC_TASK_MASTER_PORT, '--json'], { env });
+    assert.equal(stopped.code, 0, stopped.stderr);
+    await removeTestTree(root);
+  });
+  const profile = await original.profileStore.create({ name: 'Retained shared Profile' });
+  const identity = original.stateLocation.stateId;
+  const selected = await runCli(['profiles', 'list', '--json'], { env });
+  assert.equal(selected.code, 0, selected.stderr);
+  assert.deepEqual(lastJson(selected.stdout).profiles.map((item) => item.id), [profile.id]);
+  await original.stop();
+  const restarted = await runCli(['manager', 'start', '--json'], { env });
+  assert.equal(restarted.code, 0, restarted.stderr);
+  const current = lastJson(restarted.stdout).manager;
+  assert.equal(current.stateId, identity, 'resolving physical data must not replace its selected legacy identity');
+  assert.equal(current.stateDirLogical, path.resolve(legacy));
+  assert.equal(current.stateDirEffective, await fsPromises.realpath(physical));
+  const retained = await runCli(['profiles', 'list', '--json'], { env });
+  assert.equal(retained.code, 0, retained.stderr);
+  assert.deepEqual(lastJson(retained.stdout).profiles.map((item) => [item.id, item.name, item.isDefault]),
+    [[profile.id, 'Retained shared Profile', true]]);
+});
+
+test('ordinary manager start reuses newer versions and explicit maintenance cannot downgrade them', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-no-downgrade-'));
+  t.after(() => removeTestTree(root));
+  await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'm'.repeat(48) }));
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push(request.url);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ service: 'eric-task-master', apiVersion: 3, version: '99.0.0' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const args = ['manager', 'start', '--state-dir', root, '--port', String(server.address().port), '--json'];
+  const reused = await runCli(args);
+  assert.equal(reused.code, 0, reused.stderr);
+  assert.equal(lastJson(reused.stdout).manager.version, '99.0.0');
+  const maintenance = await runCli([...args, '--upgrade']);
+  assert.equal(maintenance.code, 1);
+  assert.equal(lastJson(maintenance.stderr).error.code, 'MANAGER_DOWNGRADE_REFUSED');
+  assert.deepEqual(requests, ['/v1/health', '/v1/health']);
 });

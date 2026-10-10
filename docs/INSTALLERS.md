@@ -1,6 +1,6 @@
 # Self-contained installers
 
-Eric Task Master `v3.1.7` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, and local Dashboard. Users do not install Node.js, npm, Playwright, or a Playwright browser.
+Eric Task Master `v3.1.8` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, and local Dashboard. Users do not install Node.js, npm, Playwright, or a Playwright browser.
 
 Google Chrome is intentionally not redistributed. The Manager uses a locally installed stable Chrome channel and reports a direct installation instruction if Chrome cannot be found.
 
@@ -8,7 +8,7 @@ Google Chrome is intentionally not redistributed. The Manager uses a locally ins
 
 One Manager installation and its Profile state are shared by Agents running as the same operating-system user. Check `taskmaster --help` before downloading another Manager. A working launcher means the Manager is already deployed: leave the application and state directory in place, and import only the Skill ZIP into the new Agent. An already-running Agent host can retain a PATH from before installation; retain and use the discovered absolute launcher path rather than requiring a host restart.
 
-On Windows, when PATH or an assumed location fails, run `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '<SKILL_ROOT>/scripts/find-launcher.ps1'`. This bundled read-only helper first identifies a live Manager through loopback health, its local process executable, and a matching embedded package. That runtime takes precedence over older registration/PATH entries, including when registration is missing. If the live runtime cannot be identified, discovery is `unresolved`; an older launcher is not a fallback. With no live Manager, the helper queries the exact Eric Task Master uninstall registration under HKCU/HKLM and uses `InstallLocation` before PATH. It checks `bin/taskmaster.cmd` and nested `eric-task-master/bin/taskmaster.cmd`; `%LOCALAPPDATA%\Programs\Eric Task Master` is only a fallback. Supply a known portable extraction with `-PortableRoot 'ABSOLUTE_DIRECTORY'`. The helper only reads local evidence; it does not execute the launcher, start/stop Manager, or write installation/state data.
+For new-Agent or Skill deployment on Windows, or when the assumed launcher fails, run `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '<SKILL_ROOT>/scripts/find-launcher.ps1'`. This read-only helper prefers a live Manager's verified embedded runtime, then the selected shared launcher, then the exact HKCU/HKLM uninstall record's `InstallLocation`, PATH and known portable extractions. The shared locator supplies the port when it is not the default. An unlocatable live Manager or damaged selected location remains `unresolved`; an older launcher is not a fallback. `%LOCALAPPDATA%\Programs\Eric Task Master` is only a fallback. Supply a known extraction with `-PortableRoot 'ABSOLUTE_DIRECTORY'`. The helper never executes a launcher, starts/stops Manager, or writes installation/state data. This is deployment discovery, not a mandatory preflight before ordinary tasks.
 
 - `found`: execute the returned `launcher` with `--help`. If it succeeds, use that absolute path and install only the Agent Skill.
 - `unresolved`: existing registration/files/Manager or an uncertain query prevents confirming absence. Report the locator result; no deployment repair is authorized by this status. The helper exits with code 1 and `canFreshInstall: false`.
@@ -26,21 +26,21 @@ On macOS/Linux check `/usr/local/bin/taskmaster` or `/usr/bin/taskmaster`, known
 | Debian/Ubuntu Linux x64 | `linux-x64.deb`, portable ZIP and tarball | system installer or per-user extraction |
 | Debian/Ubuntu Linux arm64 | `linux-arm64.deb`, portable ZIP and tarball | system installer or per-user extraction |
 
-The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.1.7` target. Windows arm64 is not a native `v3.1.7` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
+The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.1.8` target. Windows arm64 is not a native `v3.1.8` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
 
 ## Install
 
 Install stable Google Chrome first. Then use the package matching the operating system and CPU:
 
 - Windows x64: open the `setup.exe`. Start a new terminal after installation and run `taskmaster panel`. The portable ZIP needs no installer; extract it and run `bin\\taskmaster.cmd`.
-- macOS: run `sudo installer -pkg eric-task-master-v3.1.7-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
-- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.1.7-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
+- macOS: run `sudo installer -pkg eric-task-master-v3.1.8-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
+- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.1.8-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
 
 `taskmaster --help` is the installation check. User data is created only when the Manager or another command starts.
 
 ## Portable ZIP fallback
 
-Every target has `eric-task-master-v3.1.7-<target>-portable.zip`. Choose `windows-x64`, `macos-arm64` (Apple silicon), `macos-x64` (Intel), `linux-arm64`, or `linux-x64`. This is a complete Manager runtime, not the separate `eric-task-master-skill-v3.1.7.zip` instructions archive.
+Every target has `eric-task-master-v3.1.8-<target>-portable.zip`. Choose `windows-x64`, `macos-arm64` (Apple silicon), `macos-x64` (Intel), `linux-arm64`, or `linux-x64`. This is a complete Manager runtime, not the separate `eric-task-master-skill-v3.1.8.zip` instructions archive.
 
 1. Download the matching ZIP and `SHA256SUMS` from the same Release. Compare SHA-256 using `Get-FileHash` on Windows, `shasum -a 256` on macOS, or `sha256sum` on Linux.
 2. Extract into a permanent, user-writable folder. Preserve the entire `eric-task-master/` tree, including `runtime/` and `app/`. On macOS/Linux, `unzip PACKAGE.zip -d DESTINATION` preserves the launcher's executable permissions.
@@ -56,11 +56,11 @@ Every target has `eric-task-master-v3.1.7-<target>-portable.zip`. Choose `window
 
 Use that same absolute launcher for `run`, `follow`, and other commands. No administrator access is needed for extraction or startup. Stable Chrome and the platform requirements above still apply. Unsigned binaries may still require OS approval; a ZIP does not bypass Gatekeeper or SmartScreen.
 
-Before replacing or moving a portable runtime, stop its Manager with `manager stop --json`. Extract updates into a fresh application folder rather than merging files. User Profiles and task data remain in the separate Task Master user-state directory.
+Before replacing or moving a portable runtime, finish tasks, close Profile windows and explicitly stop its idle Manager with `manager stop --if-idle --json`. Extract updates into a fresh application folder rather than merging files. Keep user Profiles and task data outside the application directory. Installing or updating an Agent Skill requires none of these runtime changes.
 
 ## Upgrading from 2.x
 
-Run the v3 native installer over the existing managed installation. It first asks the previous Manager to stop cleanly, then replaces the application payload so removed MCP, registration, Task Pack, and other v2 files cannot remain beside v3. If the previous installation cannot be identified or stopped safely, the upgrade aborts instead of deleting it. The user-state directory is outside the application root and is never part of installer cleanup, so Profiles, login state, task records, and outputs remain in place.
+Run the v3 native installer only after the Owner has explicitly stopped the idle Manager. The installer checks whether its embedded runtime is still in use and refuses rather than stopping any Agent. Failed process inspection also aborts. Once unused, it replaces only the managed application payload so removed v2 files cannot remain. User state is never part of installer cleanup. Do not run an uncoordinated runtime update while Agents can start new work.
 
 Portable ZIP and tar users must replace the entire extracted `eric-task-master` directory rather than merge v3 files into an older directory. Keep the separate user-state directory unchanged.
 
@@ -69,6 +69,16 @@ Portable ZIP and tar users must replace the entire extracted `eric-task-master` 
 `taskmaster` always launches the Node binary inside the installation. The launcher clears inherited `NODE_OPTIONS` and `NODE_PATH` first, so preload hooks and module paths injected by an Agent host cannot enter the Manager or its Workers. Any CLI command can lazily start the loopback Manager, so Agent hosts do not register MCP tools and do not need a restart. Manager state and Chrome Profiles remain in the current user's Task Master home; application files are treated as read-only.
 
 The installer never runs `npm`, `npx`, or a browser download. Build jobs set `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` and reject Playwright `.local-browsers` payloads. Every bundle contains `release-manifest.json`, an SPDX dependency inventory, the Node.js license, and third-party notices.
+
+## Shared default and isolated data projects
+
+Same-user Agents share one selected Manager and Profile pool by default. Different working directories do not create different default stores. On Windows, fresh state is `%USERPROFILE%\.eric-task-master\state`, outside virtualized AppData. `%USERPROFILE%\.eric-task-master\default-state.json` records the selected physical directory, port and optional launcher, never tokens. Existing state is reused in place, including a packaged host's legacy physical store; it is not silently moved or merged. If multiple cold legacy stores exist without a selection, startup reports `MANAGER_STATE_AMBIGUOUS` instead of choosing one or creating blank Profiles. An Owner may explicitly select the intended existing store with `manager start --state-dir ABSOLUTE_DIRECTORY --shared`.
+
+For isolation, pass `--state-dir ABSOLUTE_DIRECTORY` on every command (or set `ERIC_TASK_MASTER_HOME`). Without an explicit port, the project selects a free loopback port and publishes it atomically. Windows AppData projects use a small shared location record outside AppData so packaged and unpackaged clients converge on the same physical project. Profile/task stores and lifetime locks remain per project. State beneath a replaceable application directory is rejected. Copied credentials cannot authorize controlling a different physical project; the CLI verifies physical identity and a nonce ownership proof before sending a token.
+
+Normal `run` and `manager start` reuse a compatible Manager without replacing its version. `manager start --upgrade` is explicit, idle-only and refuses downgrades. No new service, dependency or per-Agent deployment is required, and the normal one-command task path is unchanged.
+
+An explicit Windows Owner upgrade also consolidates selected legacy AppData state once. Windows can expose a union of private packaged files and fallback files; a configuration file's physical parent alone may not contain every Profile. The upgrade must run from a host that reads the selected complete view. It copies and verifies the entire tree before publishing the new location, preserves credentials, IDs, names, defaults and the logical identity, and retains the original tree. Shared state goes to the shared home above; AppData projects go to separate keyed directories under `%USERPROFILE%\.eric-task-master\project-state`, while their requested `--state-dir` stays unchanged. Existing destinations are never overwritten or merged. Occupied or unverified Profiles block the copy. Normal startup refuses incomplete Profile rebasing with `MANAGER_STATE_UPGRADE_REQUIRED`; it never opens a blank replacement. This copy/hash work belongs only to explicit upgrade, never normal task or Agent startup.
 
 ## Build commands
 
@@ -110,9 +120,9 @@ Local Windows acceptance proves the Windows package on the maintainer's machine.
 
 After native uninstall, each target also extracts its portable ZIP into a path containing spaces, verifies its payload hash and executable permissions, and invokes the extracted launcher with an isolated state directory. A real stable Chrome task must pass using bundled Node and Playwright, followed by verified Worker, Manager, Profile, and temporary-directory cleanup. This is separate evidence for the installer-free route.
 
-## Unsigned `v3.1.7` boundary
+## Unsigned `v3.1.8` boundary
 
-The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v3.1.7` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
+The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v3.1.8` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
 
 - Windows may display Microsoft Defender SmartScreen guidance.
 - macOS may require the Owner to approve an unidentified developer package.
@@ -122,6 +132,6 @@ Removing those warnings requires an Authenticode certificate for Windows and App
 
 ## Uninstall and state
 
-Uninstall application files only after `taskmaster manager stop --json`. Windows' uninstaller attempts this automatically; Linux/macOS package removal should be preceded by the command. User Profiles, cookies, task records, and task outputs are retained by default because deleting them is destructive. Purging the user state directory is a separate explicit Owner action.
+Uninstall application files only after an explicit `taskmaster manager stop --if-idle --json`. Windows and Linux refuse removal while the embedded runtime is in use; they never stop Agents automatically. Manual macOS application removal must also wait until the runtime is unused. User Profiles, cookies, task records and outputs are retained; purging state is a separate explicit Owner action.
 
 On the next install/start, Manager reuses retained Profile metadata and directories in that state directory. Since 3.1.5, if `profiles.json` is missing or incomplete, valid retained v3 Profile directories are also re-listed automatically; directory-only entries receive a `Recovered profile_<id>` name. Choose the intended default again if its metadata is gone. Browser login files are preserved, although individual websites may still request verification. See [state backup and recovery](STATE-BACKUP-RECOVERY.md) for quarantine and scope limits.

@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.1.8 - 2026-10-10
+
+- Keep one selected same-user Manager and Profile pool across Agent hosts. Resolve Windows packaged/unpackaged state views to their physical store while preserving the selected legacy identity and Profiles across restarts, without silently merging or creating a replacement pool.
+- Isolate explicitly selected data projects, discover their own ports and publish locations atomically. Verify physical identity and a nonce ownership proof before transmitting credentials; copied state cannot take over another project.
+- Reuse compatible running Managers during ordinary startup. Make runtime replacement an explicit idle-only `--upgrade` action; refuse downgrades and occupied native install/uninstall without stopping other Agents.
+- Preserve Profile names, IDs, defaults and browser files when a verified state alias is rebased. Reject data within replaceable application payloads, and complete shutdown after task cleanup even when an HTTP client is unfinished.
+- Keep background cleanup from racing an in-progress graceful task stop or changing a successful stop into a termination error; other Profiles continue running independently.
+- Consolidate a selected legacy Windows union view only during explicit Owner upgrade, verify its complete copied tree, retain the original, and keep shared/project locations separate. Refuse incomplete Profile rebasing instead of opening an empty replacement Profile.
+- Retain the one-script/one-command workflow with no new dependency, per-Agent service or normal-task preflight. Add real Windows packaged/unpackaged and concurrency regressions alongside native installer safety acceptance.
+
 ## 3.1.7 - 2026-10-10
 
 - Prefer a running Windows Manager's verified embedded runtime over older PATH or installation entries, including when uninstall registration is unavailable. Keep an unlocatable live Manager unresolved instead of silently selecting an older launcher.

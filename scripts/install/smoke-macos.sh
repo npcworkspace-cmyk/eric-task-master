@@ -24,6 +24,13 @@ printf 'stale-v2-task-pack' | sudo tee "${stale_pack}" >/dev/null
 manager_pid="$(NODE_OPTIONS= NODE_PATH= '/Library/Application Support/Eric Task Master/runtime/node' \
   -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).pid' "${state}/manager.json")"
 
+if sudo installer -pkg "${package}" -target /; then
+  echo 'Upgrade must refuse a live shared runtime' >&2
+  exit 1
+fi
+kill -0 "${manager_pid}"
+test -e "${stale_mcp}"
+/usr/local/bin/taskmaster manager stop --if-idle --json >/dev/null
 sudo installer -pkg "${package}" -target /
 attempts=0
 while [ "${attempts}" -lt 100 ] && kill -0 "${manager_pid}" 2>/dev/null; do
@@ -31,7 +38,7 @@ while [ "${attempts}" -lt 100 ] && kill -0 "${manager_pid}" 2>/dev/null; do
   attempts=$((attempts + 1))
 done
 if kill -0 "${manager_pid}" 2>/dev/null; then
-  echo 'Upgrade did not stop the previous Manager' >&2
+  echo 'Explicit idle stop did not release the runtime' >&2
   exit 1
 fi
 test ! -e "${stale_mcp}"
@@ -53,4 +60,4 @@ sudo pkgutil --forget com.npcworkspace.eric-task-master >/dev/null
 test ! -e /usr/local/bin/taskmaster
 rm -rf "${state}"
 unset NODE_OPTIONS NODE_PATH
-printf '{"ok":true,"installedRuntime":"bundled-node","nativeUpgrade":"passed","staleV2PayloadRemoved":true,"userStatePreserved":true,"hostNodeInjectionIsolated":true,"barePlaywrightTask":"passed","managerLifecycle":"passed","uninstalled":true}\n'
+printf '{"ok":true,"installedRuntime":"bundled-node","nativeUpgrade":"passed","liveUpgradeRefused":true,"staleV2PayloadRemoved":true,"userStatePreserved":true,"hostNodeInjectionIsolated":true,"barePlaywrightTask":"passed","managerLifecycle":"passed","uninstalled":true}\n'

@@ -67,6 +67,15 @@ $managerFile = Join-Path $state 'manager.json'
 if (-not (Test-Path -LiteralPath $managerFile)) { throw 'Pre-upgrade Manager PID file is missing' }
 $preUpgradeManagerProcessId = (Get-Content -LiteralPath $managerFile -Raw | ConvertFrom-Json).pid
 
+$blockedUpgrade = Start-Process -FilePath $installerPath -ArgumentList @(
+  '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$upgradeLog.blocked`""
+) -WindowStyle Hidden -Wait -PassThru
+if ($blockedUpgrade.ExitCode -eq 0) { throw 'Upgrade must refuse a live shared runtime' }
+if (-not (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue)) { throw 'Refused upgrade stopped another Agent Manager' }
+if (-not (Test-Path -LiteralPath $staleMcp)) { throw 'Refused upgrade changed application files' }
+& $cli manager stop --if-idle --json | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Explicit idle-only stop before upgrade failed' }
+
 $upgrade = Start-Process -FilePath $installerPath -ArgumentList @(
   '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$upgradeLog`""
 ) -WindowStyle Hidden -Wait -PassThru
@@ -75,7 +84,7 @@ $deadline = [DateTime]::UtcNow.AddSeconds(20)
 while ([DateTime]::UtcNow -lt $deadline -and (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue)) {
   Start-Sleep -Milliseconds 200
 }
-if (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue) { throw 'Upgrade did not stop the previous Manager' }
+if (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue) { throw 'Explicit idle stop did not release the runtime' }
 if (Test-Path -LiteralPath $staleMcp) { throw 'Upgrade retained a stale v2 MCP application file' }
 if (Test-Path -LiteralPath $stalePack) { throw 'Upgrade retained a stale v2 Task Pack application file' }
 if ((Get-Content -LiteralPath $stateSentinel -Raw) -ne 'preserve-user-state') { throw 'Upgrade modified external user state' }
@@ -103,6 +112,12 @@ $managerProcessId = (Get-Content -LiteralPath $managerFile -Raw | ConvertFrom-Js
 
 $uninstaller = Join-Path $root 'unins000.exe'
 if (-not (Test-Path -LiteralPath $uninstaller)) { throw 'Uninstaller is missing' }
+$blockedUninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
+if ($blockedUninstall.ExitCode -eq 0) { throw 'Uninstall must refuse a live shared runtime' }
+if (-not (Get-Process -Id $managerProcessId -ErrorAction SilentlyContinue)) { throw 'Refused uninstall stopped another Agent Manager' }
+if (-not (Test-Path -LiteralPath $cli)) { throw 'Refused uninstall removed application files' }
+& $cli manager stop --if-idle --json | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Explicit idle-only stop before uninstall failed' }
 $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
 if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with $($uninstall.ExitCode)" }
 if (Test-Path -LiteralPath (Join-Path $root 'bin\taskmaster.cmd')) { throw 'Application files remain after uninstall' }
@@ -110,7 +125,7 @@ $deadline = [DateTime]::UtcNow.AddSeconds(20)
 while ([DateTime]::UtcNow -lt $deadline -and (Get-Process -Id $managerProcessId -ErrorAction SilentlyContinue)) {
   Start-Sleep -Milliseconds 200
 }
-if (Get-Process -Id $managerProcessId -ErrorAction SilentlyContinue) { throw 'Uninstaller did not stop the Manager' }
+if (Get-Process -Id $managerProcessId -ErrorAction SilentlyContinue) { throw 'Explicit idle stop did not finish before uninstall' }
 $remainingUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (@($remainingUserPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq (Join-Path $root 'bin') }).Count) {
   throw 'Uninstaller left its launcher in user PATH'
@@ -123,7 +138,7 @@ if ($remainingUserPath -cne $expectedRemainingPath) {
 }
 Remove-Item -LiteralPath $state -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item Env:NODE_OPTIONS,Env:NODE_PATH -ErrorAction SilentlyContinue
-[ordered]@{ ok = $true; installedRuntime = 'bundled-node'; nativeUpgrade = 'passed'; launcherPrecedence = 'passed'; unrelatedPathPreserved = $true; staleV2PayloadRemoved = $true; userStatePreserved = $true; hostNodeInjectionIsolated = $true; barePlaywrightTask = 'passed'; uninstallStoppedManager = $true; uninstalled = $true } | ConvertTo-Json -Compress
+[ordered]@{ ok = $true; installedRuntime = 'bundled-node'; nativeUpgrade = 'passed'; liveUpgradeRefused = $true; liveUninstallRefused = $true; launcherPrecedence = 'passed'; unrelatedPathPreserved = $true; staleV2PayloadRemoved = $true; userStatePreserved = $true; hostNodeInjectionIsolated = $true; barePlaywrightTask = 'passed'; idleStopConfirmed = $true; uninstalled = $true } | ConvertTo-Json -Compress
 } finally {
   [Environment]::SetEnvironmentVariable('Path', $originalUserPath, 'User')
   $env:Path = $originalProcessPath

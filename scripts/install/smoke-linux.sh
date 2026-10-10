@@ -24,6 +24,13 @@ printf 'stale-v2-task-pack' | sudo tee "${stale_pack}" >/dev/null
 manager_pid="$(NODE_OPTIONS= NODE_PATH= /opt/eric-task-master/runtime/node \
   -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).pid' "${state}/manager.json")"
 
+if sudo dpkg -i "${package}"; then
+  echo 'Upgrade must refuse a live shared runtime' >&2
+  exit 1
+fi
+kill -0 "${manager_pid}"
+test -e "${stale_mcp}"
+/usr/bin/taskmaster manager stop --if-idle --json >/dev/null
 sudo dpkg -i "${package}"
 attempts=0
 while [ "${attempts}" -lt 100 ] && kill -0 "${manager_pid}" 2>/dev/null; do
@@ -31,7 +38,7 @@ while [ "${attempts}" -lt 100 ] && kill -0 "${manager_pid}" 2>/dev/null; do
   attempts=$((attempts + 1))
 done
 if kill -0 "${manager_pid}" 2>/dev/null; then
-  echo 'Upgrade did not stop the previous Manager' >&2
+  echo 'Explicit idle stop did not release the runtime' >&2
   exit 1
 fi
 test ! -e "${stale_mcp}"
@@ -46,9 +53,15 @@ task_output="$(/usr/bin/taskmaster run "${job}" --label "Installed bare Playwrig
 printf '%s\n' "${task_output}" | grep -Fq '"state":"finished"'
 printf '%s\n' "${task_output}" | grep -Fq '"barePlaywrightImport":true'
 printf '%s\n' "${task_output}" | grep -Fq '"hostNodeInjectionIsolated":true'
-/usr/bin/taskmaster manager stop --json >/dev/null
+if sudo dpkg -r eric-task-master; then
+  echo 'Uninstall must refuse a live shared runtime' >&2
+  exit 1
+fi
+test -x /usr/bin/taskmaster
+/usr/bin/taskmaster manager status --json >/dev/null
+/usr/bin/taskmaster manager stop --if-idle --json >/dev/null
 sudo dpkg -r eric-task-master
 test ! -e /usr/bin/taskmaster
 rm -rf "${state}"
 unset NODE_OPTIONS NODE_PATH
-printf '{"ok":true,"installedRuntime":"bundled-node","nativeUpgrade":"passed","staleV2PayloadRemoved":true,"userStatePreserved":true,"hostNodeInjectionIsolated":true,"barePlaywrightTask":"passed","managerLifecycle":"passed","uninstalled":true}\n'
+printf '{"ok":true,"installedRuntime":"bundled-node","nativeUpgrade":"passed","liveUpgradeRefused":true,"liveUninstallRefused":true,"staleV2PayloadRemoved":true,"userStatePreserved":true,"hostNodeInjectionIsolated":true,"barePlaywrightTask":"passed","managerLifecycle":"passed","uninstalled":true}\n'

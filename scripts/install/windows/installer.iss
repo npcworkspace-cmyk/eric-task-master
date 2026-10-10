@@ -24,6 +24,8 @@ SolidCompression=yes
 WizardStyle=modern
 ChangesEnvironment=yes
 UninstallDisplayName=Eric Task Master
+CloseApplications=no
+RestartApplications=no
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\app"; Check: IsManagedUpgradeRoot
@@ -34,6 +36,7 @@ Type: files; Name: "{app}\sbom.spdx.json"; Check: IsManagedUpgradeRoot
 Type: files; Name: "{app}\THIRD_PARTY_NOTICES.txt"; Check: IsManagedUpgradeRoot
 
 [Files]
+Source: "{#SourceRoot}\app\src\lib\assert-runtime-idle.ps1"; Flags: dontcopy
 Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -41,9 +44,6 @@ Name: "{group}\Eric Task Master Panel"; Filename: "{app}\bin\taskmaster.cmd"; Pa
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\AppUserModelId\NPCWorkspace.EricTaskMaster"; ValueType: string; ValueName: "DisplayName"; ValueData: "Eric Task Master"; Flags: uninsdeletekey
-
-[UninstallRun]
-Filename: "{app}\bin\taskmaster.cmd"; Parameters: "manager stop --json"; Flags: runhidden shellexec waituntilterminated skipifdoesntexist; RunOnceId: "StopManager"
 
 [UninstallDelete]
 Type: files; Name: "{userprograms}\Eric Task Master\Eric Task Master Notifications.lnk"
@@ -71,55 +71,31 @@ begin
     (NormalizedPath(PreviousRoot) = NormalizedPath(ExpandConstant('{app}')));
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function CheckRuntimeIdle(GuardPath: string): Boolean;
 var
-  OldCli: string;
-  StopScript: string;
-  StopScriptContent: string;
-  StopStarted: Boolean;
   ResultCode: Integer;
 begin
-  Result := '';
-  if not IsManagedUpgradeRoot() then Exit;
+  Result := FileExists(GuardPath) and Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + GuardPath +
+      '" -AppRoot "' + ExpandConstant('{app}') + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode
+  ) and (ResultCode = 0);
+end;
 
-  OldCli := ExpandConstant('{app}\bin\taskmaster.cmd');
-  if not FileExists(OldCli) then
-  begin
-    Result := 'The previous Eric Task Master launcher is missing. Stop the previous Manager and remove the damaged application installation before retrying.';
-    Exit;
-  end;
-  StopScript := ExpandConstant('{tmp}\eric-task-master-stop-old.cmd');
-  StopScriptContent :=
-    '@echo off'#13#10 +
-    'setlocal'#13#10 +
-    'set "NODE_OPTIONS="'#13#10 +
-    'set "NODE_PATH="'#13#10 +
-    'call "' + OldCli + '" manager stop --json'#13#10 +
-    'exit /b %errorlevel%'#13#10;
-  if not SaveStringToFile(StopScript, StopScriptContent, False) then
-  begin
-    Result := 'The installer could not prepare the previous Manager shutdown helper.';
-    Exit;
-  end;
-  StopStarted := Exec(
-    ExpandConstant('{cmd}'),
-    '/d /s /c ""' + StopScript + '""',
-    '',
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode
-  );
-  DeleteFile(StopScript);
-  if not StopStarted or
-     (ResultCode <> 0) then
-  begin
-    Result := 'The previous Eric Task Master Manager could not be stopped safely. Close running tasks and retry the upgrade.';
-    Exit;
-  end;
-  { Older launchers can report the closed port just before their Node process
-    releases node.exe. Give that bounded teardown a chance to finish; the
-    Restart Manager remains fail-closed if any process still owns the files. }
-  Sleep(1000);
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  ExtractTemporaryFile('assert-runtime-idle.ps1');
+  if not CheckRuntimeIdle(ExpandConstant('{tmp}\assert-runtime-idle.ps1')) then
+    Result := 'Eric Task Master runtime is still in use or could not be inspected. No Agent was stopped. Finish tasks, close Profiles, explicitly stop the idle Manager, then retry.';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := CheckRuntimeIdle(ExpandConstant('{app}\app\src\lib\assert-runtime-idle.ps1'));
+  if not Result and not UninstallSilent then
+    MsgBox('Eric Task Master runtime is still in use or could not be inspected. Finish tasks and explicitly stop the idle Manager before uninstalling.', mbError, MB_OK);
 end;
 
 function RemovePathEntry(Value, Wanted: string): string;

@@ -23,6 +23,8 @@ cp -a "${runtime_root}/." "${deb_root}/opt/eric-task-master/"
 ln -s /opt/eric-task-master/bin/taskmaster "${deb_root}/usr/bin/taskmaster"
 cp "$(cd "$(dirname "$0")/../install/linux" && pwd)/preinst" "${deb_root}/DEBIAN/preinst"
 chmod 0755 "${deb_root}/DEBIAN/preinst"
+cp "$(cd "$(dirname "$0")/../install/linux" && pwd)/prerm" "${deb_root}/DEBIAN/prerm"
+chmod 0755 "${deb_root}/DEBIAN/prerm"
 installed_size="$(du -sk "${deb_root}/opt/eric-task-master" | cut -f1)"
 cat > "${deb_root}/DEBIAN/control" <<EOF
 Package: eric-task-master

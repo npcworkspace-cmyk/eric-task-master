@@ -1,13 +1,19 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { appendFile, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { access, appendFile, mkdir, open, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, PROFILE_ACTION_TIMEOUT_MS, TERMINAL_TASK_STATES, VERSION } from './contracts.mjs';
 import { isProcessAlive } from './lib/process-tree.mjs';
+import { ManagerLock } from './lib/manager-lock.mjs';
+import { consolidateLegacySharedState } from './lib/state-upgrade.mjs';
 import { defaultDataDirectory, startManager } from './manager.mjs';
-import { managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
+import { managerOwnershipProof, managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
+import {
+  chooseDefaultState, projectStateEnvironment, readDefaultStateLocation, readStateEndpoint,
+  rememberDefaultStateLocation, stateEnvironment, writeStateEndpoint
+} from './lib/state-directory.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -33,11 +39,14 @@ Profiles:
 
 Manager:
   taskmaster panel
-  taskmaster manager start|foreground|status|stop|recover
+  taskmaster manager start [--upgrade]
+  taskmaster manager foreground|status|stop|recover
 
 All commands accept --json. Manager starts automatically when needed.
 panel opens the Dashboard; panel --json returns its URL without opening a browser.
-Compatible running Managers are reused. Only manager start maintains the installed version.
+Compatible running Managers are reused, including manager start. --upgrade is explicit and idle-only.
+Data is independent of the application and Agent host. Defaults share one selected state.
+--state-dir DIR isolates a project and discovers its own port unless --port is supplied.
 follow --wait-ms returns current state and an after cursor when the wait expires.`;
 
 function parseArgs(argv) {
@@ -134,15 +143,37 @@ export function parseOutputBudgetOptions(options = {}) {
   };
 }
 
-function settings(options = {}) {
+async function settings(options = {}, { serving = false } = {}) {
   const host = options.host || process.env.ERIC_TASK_MASTER_HOST || DEFAULT_HOST;
   if (host !== DEFAULT_HOST) throw cliError('LOOPBACK_REQUIRED', `Manager must use ${DEFAULT_HOST}`);
-  const port = parseIntegerOption(
-    options.port ?? process.env.ERIC_TASK_MASTER_PORT ?? DEFAULT_PORT,
-    { name: '--port', minimum: 1, maximum: 65_535 }
+  const explicitState = Boolean(options['state-dir'] || process.env.ERIC_TASK_MASTER_HOME);
+  const shared = options.shared === true || !explicitState;
+  const environment = stateEnvironment();
+  const location = !explicitState ? await readDefaultStateLocation(environment) : null;
+  const requestedStateDir = path.resolve(options['state-request'] || options['state-dir'] ||
+    process.env.ERIC_TASK_MASTER_HOME || location?.stateDir || defaultDataDirectory());
+  const projectEnvironment = !shared ? projectStateEnvironment(requestedStateDir, environment) : null;
+  const projectLocation = projectEnvironment ? await readDefaultStateLocation(projectEnvironment) : null;
+  const stateDir = projectLocation?.stateDir || path.resolve(options['state-dir'] ||
+    process.env.ERIC_TASK_MASTER_HOME || location?.stateDir || defaultDataDirectory());
+  const explicitPort = options.port !== undefined || process.env.ERIC_TASK_MASTER_PORT !== undefined;
+  const autoPort = !shared && !explicitPort && !serving;
+  let port = autoPort ? 0 : parseIntegerOption(
+    options.port ?? process.env.ERIC_TASK_MASTER_PORT ?? location?.port ?? DEFAULT_PORT,
+    { name: '--port', minimum: serving ? 0 : 1, maximum: 65_535 }
   );
-  const stateDir = path.resolve(options['state-dir'] || defaultDataDirectory());
-  return { host, port, stateDir, baseUrl: `http://${host}:${port}` };
+  if (autoPort) {
+    const endpoint = await readStateEndpoint(stateDir);
+    if (endpoint && isProcessAlive(endpoint.pid)) port = endpoint.port;
+  }
+  return {
+    host, port, stateDir, baseUrl: `http://${host}:${port}`,
+    shared, autoPort, discoverDefault: shared && !explicitState, environment,
+    identityDir: projectLocation?.identityDir || location?.identityDir || stateDir,
+    requestedStateDir, projectEnvironment,
+    stateDirAliases: options['state-alias'] ? [path.resolve(options['state-alias'])] :
+      projectLocation?.identityDir !== undefined && projectLocation.identityDir !== stateDir ? [projectLocation.identityDir] : []
+  };
 }
 
 function emit(value, json = false) {
@@ -205,8 +236,23 @@ async function requestJson(config, pathname, { method = 'GET', body, token, time
   return payload;
 }
 
-async function rawHealth(config, timeoutMs = 1_500) {
-  const result = await requestJson(config, '/v1/health', { timeoutMs });
+async function rawHealth(config, timeoutMs = 1_500, nonce = null) {
+  if (config.projectEnvironment) {
+    const location = await readDefaultStateLocation(config.projectEnvironment);
+    if (location) {
+      config.stateDir = location.stateDir;
+      config.identityDir = location.identityDir;
+    }
+  }
+  if (config.autoPort) {
+    const endpoint = await readStateEndpoint(config.stateDir);
+    if (endpoint && isProcessAlive(endpoint.pid)) {
+      config.port = endpoint.port;
+      config.baseUrl = endpoint.baseUrl;
+    }
+  }
+  if (!config.port) throw cliError('MANAGER_UNREACHABLE', 'The project Manager has not published its endpoint');
+  const result = await requestJson(config, '/v1/health' + (nonce ? '?nonce=' + encodeURIComponent(nonce) : ''), { timeoutMs });
   if (result.service !== 'eric-task-master') throw cliError('PORT_OCCUPIED', 'Manager port belongs to another service');
   return result;
 }
@@ -214,9 +260,12 @@ async function rawHealth(config, timeoutMs = 1_500) {
 async function readManagerCredentials(config) {
   try {
     const value = await readManagerConfig(path.join(config.stateDir, 'config.json'));
+    const physicalDir = path.dirname(await realpath(path.join(config.stateDir, 'config.json')));
     return {
       token: value.managerToken,
-      stateId: managerStateId(value.stateInstanceId, config.stateDir)
+      stateId: managerStateId(value.stateInstanceId, config.identityDir || config.stateDir),
+      stateDirectoryId: managerStateId(value.stateInstanceId, physicalDir),
+      stateDirEffective: physicalDir
     };
   } catch {
     throw cliError('MANAGER_TOKEN_UNAVAILABLE', 'Manager local token is unavailable');
@@ -241,21 +290,93 @@ function managerStateMismatch(manager, config, credentials = null) {
     expectedStateId: credentials?.stateId ?? null,
     actualStateId: manager?.stateId ?? null,
     managerVersion: manager?.version ?? null,
-    stateChanged: manager?.stateChanged === true
+    stateChanged: manager?.stateChanged === true,
+    ...(manager?.stateDirectoryId ? {
+      expectedDirectoryId: credentials?.stateDirectoryId ?? null,
+      actualDirectoryId: manager.stateDirectoryId,
+      stateDirEffective: credentials?.stateDirEffective ?? null
+    } : {})
   };
   return error;
 }
 
 async function health(config, timeoutMs = 1_500) {
   const result = await rawHealth(config, timeoutMs);
+  if (config.discoverDefault && typeof result.stateId === 'string') {
+    try {
+      const selected = await chooseDefaultState({ environment: config.environment, manager: result });
+      config.stateDir = selected.stateDir;
+      config.identityDir = selected.identityDir;
+      config.stateDirAliases = selected.identityDir === selected.stateDir ? [] : [selected.identityDir];
+    } catch (error) {
+      if (error.code !== 'MANAGER_STATE_MISMATCH') throw error;
+      throw managerStateMismatch(result, config);
+    }
+  }
   let mismatch = result.stateChanged === true;
   let credentials = null;
   if (typeof result.stateId === 'string') {
+    if (result.stateDirectoryId && typeof result.stateDirLogical === 'string' && path.isAbsolute(result.stateDirLogical)) {
+      config.identityDir = path.resolve(result.stateDirLogical);
+    }
     credentials = await readManagerCredentials(config);
     mismatch ||= credentials.stateId !== result.stateId;
+    if (result.stateDirectoryId) {
+      mismatch ||= credentials.stateDirectoryId !== result.stateDirectoryId;
+      if (result.stateChanged !== true &&
+          credentials.stateDirEffective.toLowerCase() !== result.stateDirEffective?.toLowerCase()) mismatch = true;
+      if (!mismatch || result.stateChanged === true) {
+        if (!result.capabilities?.includes('manager.owner-proof')) {
+          throw cliError('MANAGER_OWNER_UNVERIFIED', 'Manager cannot prove ownership of the advertised state location');
+        }
+        const nonce = randomUUID();
+        const proven = await rawHealth(config, timeoutMs, nonce);
+        const expected = managerOwnershipProof(credentials.token, result, nonce);
+        const supplied = typeof proven.ownerProof === 'string' ? proven.ownerProof : '';
+        if (!expected || supplied.length !== expected.length ||
+            !timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) {
+          throw cliError('MANAGER_OWNER_UNVERIFIED', 'Manager state ownership proof did not match; no credentials were sent');
+        }
+      }
+    }
   }
   if (mismatch) throw managerStateMismatch(result, config, credentials);
   return result;
+}
+
+async function prepareStateForStart(config, { upgrade = false } = {}) {
+  if (config.discoverDefault) {
+    const selected = await chooseDefaultState({ environment: config.environment });
+    config.stateDir = selected.stateDir;
+    config.identityDir = selected.identityDir;
+    config.stateDirAliases = selected.identityDir === selected.stateDir ? [] : [selected.identityDir];
+  }
+  if (config.autoPort) {
+    config.port = 0;
+    config.baseUrl = 'http://' + config.host + ':0';
+  }
+  if (upgrade) await consolidateLegacySharedState(config);
+}
+
+async function rememberSharedState(config, manager) {
+  if (!config.shared || manager.scope === 'project') return;
+  // Legacy Managers have no ownership proof. Validate the retained credentials
+  // against a read-only protected request before recording a shared location.
+  if (!manager.stateDirectoryId) {
+    await requestJson(config, '/v1/status', { token: await readToken(config) });
+  }
+  let launcher = null;
+  const candidate = path.resolve(path.dirname(CLI_PATH), '..', '..', 'bin',
+    process.platform === 'win32' ? 'taskmaster.cmd' : 'taskmaster');
+  try {
+    await access(candidate);
+    launcher = await realpath(candidate);
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const credentials = await readManagerCredentials(config);
+  await rememberDefaultStateLocation({
+    stateDir: credentials.stateDirEffective, identityDir: config.identityDir || config.stateDir,
+    port: config.port, ...(launcher ? { launcher } : {})
+  }, config.environment);
 }
 
 async function waitForManager(config, timeoutMs = 20_000) {
@@ -308,7 +429,29 @@ async function startupError({ startupLog, code = null, signal = null, cause = nu
   return error;
 }
 
-export async function startBackgroundManager(config, {
+export async function startBackgroundManager(config, options = {}) {
+  if (!config.projectEnvironment) return spawnBackgroundManager(config, options);
+  // A lexical AppData path can resolve to different stores in different hosts.
+  // This short bootstrap lock is deliberately outside AppData, unlike the
+  // lifetime lock held inside the selected physical data project.
+  const bootstrap = new ManagerLock(config.projectEnvironment.locatorFile + '.startup.lock');
+  try {
+    await bootstrap.acquire();
+  } catch (error) {
+    if (!['MANAGER_ALREADY_RUNNING', 'MANAGER_LOCK_BUSY'].includes(error.code)) throw error;
+    return (options.waitForReady || waitForManager)(config);
+  }
+  try {
+    try { return await health(config); } catch (error) {
+      if (error.code !== 'MANAGER_UNREACHABLE') throw error;
+    }
+    return await spawnBackgroundManager(config, options);
+  } finally {
+    await bootstrap.release();
+  }
+}
+
+async function spawnBackgroundManager(config, {
   spawnProcess = spawn,
   waitForReady = waitForManager,
   executable = process.execPath,
@@ -335,6 +478,9 @@ export async function startBackgroundManager(config, {
       '--host', config.host,
       '--port', String(config.port),
       '--state-dir', config.stateDir,
+      ...(config.shared ? ['--shared'] : []),
+      ...(config.stateDirAliases?.[0] ? ['--state-alias', config.stateDirAliases[0]] : []),
+      ...(config.projectEnvironment ? ['--state-request', config.requestedStateDir] : []),
       '--json'
     ], {
       detached: true,
@@ -398,6 +544,7 @@ export async function startBackgroundManager(config, {
 async function waitForManagerStop(config, timeoutMs = 20_000, managerPid = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (managerPid && !isProcessAlive(managerPid)) return true;
     try {
       await rawHealth(config, 500);
     } catch (error) {
@@ -455,9 +602,16 @@ export async function ensureManager(config, { startManager = startBackgroundMana
   try {
     current = await health(config);
   } catch (error) {
-    if (error.code === 'MANAGER_UNREACHABLE') return startManager(config);
+    if (error.code === 'MANAGER_UNREACHABLE') {
+      await prepareStateForStart(config, { upgrade: maintainVersion });
+      const started = await startManager(config);
+      await rememberSharedState(config, started);
+      return started;
+    }
     if (error.code === 'MANAGER_STATE_MISMATCH') {
-      return recoverChangedManager(config, error, startManager);
+      const recovered = await recoverChangedManager(config, error, startManager);
+      await rememberSharedState(config, recovered);
+      return recovered;
     }
     throw error;
   }
@@ -465,10 +619,24 @@ export async function ensureManager(config, { startManager = startBackgroundMana
     throw cliError(
       'MANAGER_API_INCOMPATIBLE',
       `Running Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`,
-      'Finish or stop the existing work with its compatible CLI, then run manager start.'
+      'Finish or stop the existing work, stop the Manager with its compatible CLI, then run manager start.'
     );
   }
-  if (!maintainVersion || current.version === VERSION) return current;
+  if (!maintainVersion || current.version === VERSION) {
+    await rememberSharedState(config, current);
+    return current;
+  }
+  const runningVersion = String(current.version || '').split('.').map(Number);
+  const installedVersion = VERSION.split('.').map(Number);
+  if (runningVersion.length !== 3 || !runningVersion.every(Number.isSafeInteger)) {
+    throw cliError('MANAGER_VERSION_UNVERIFIED', 'Manager version cannot be compared safely for an explicit upgrade');
+  }
+  if (runningVersion.some((part, index) => part !== installedVersion[index])) {
+    const index = runningVersion.findIndex((part, offset) => part !== installedVersion[offset]);
+    if (runningVersion[index] > installedVersion[index]) {
+      throw cliError('MANAGER_DOWNGRADE_REFUSED', 'An older Agent CLI cannot downgrade the shared Manager');
+    }
+  }
   if (!current.capabilities?.includes('manager.idle-stop')) {
     throw cliError(
       'MANAGER_CAPABILITY_UNAVAILABLE',
@@ -484,7 +652,7 @@ export async function ensureManager(config, { startManager = startBackgroundMana
     throw cliError(
       'MANAGER_VERSION_MISMATCH',
       `Manager ${current.version || 'unknown'} has ${activeTasks} active task(s) and cannot be replaced by CLI ${VERSION}`,
-      'Let the active tasks finish or stop them, then run taskmaster manager start again.'
+      'Let the active tasks finish or stop them, then run taskmaster manager start --upgrade.'
     );
   }
   const { profiles } = await requestJson(config, '/v1/profiles', { token });
@@ -496,7 +664,7 @@ export async function ensureManager(config, { startManager = startBackgroundMana
     throw cliError(
       'MANAGER_VERSION_MISMATCH',
       `Manager ${current.version || 'unknown'} has ${occupiedProfiles.length} occupied Profile(s) and cannot be replaced by CLI ${VERSION}`,
-      'Close the occupied Profiles, then run taskmaster manager start again. Existing task and Profile controls remain available.'
+      'Close the occupied Profiles, then run taskmaster manager start --upgrade. Existing task and Profile controls remain available.'
     );
   }
   await requestJson(config, '/v1/manager/stop', { method: 'POST', body: { onlyIfIdle: true }, token });
@@ -507,11 +675,14 @@ export async function ensureManager(config, { startManager = startBackgroundMana
       'Stop the old Manager manually, then run the command again.'
     );
   }
-  return startManager(config);
+  await prepareStateForStart(config, { upgrade: maintainVersion });
+  const started = await startManager(config);
+  await rememberSharedState(config, started);
+  return started;
 }
 
 async function apiContext(options) {
-  const config = settings(options);
+  const config = await settings(options);
   const manager = await ensureManager(config);
   return { config, token: await readToken(config), manager };
 }
@@ -652,7 +823,7 @@ async function runCommand(args, options, json) {
     throw cliError(
       'MANAGER_CAPABILITY_UNAVAILABLE',
       `Manager ${context.manager.version || 'unknown'} does not support --request-key`,
-      'Finish the existing work and close its Profiles, then run taskmaster manager start to update the Manager. Task controls remain available.'
+      'Finish the existing work and close its Profiles, then run taskmaster manager start --upgrade to update the Manager. Task controls remain available.'
     );
   }
   const created = await requestJson(context.config, '/v1/tasks', {
@@ -804,12 +975,28 @@ function openUrl(url) {
   child.unref();
 }
 
-async function serveCommand(config, json) {
-  const manager = await startManager({ host: config.host, port: config.port, dataDir: config.stateDir });
-  const pidFile = path.join(config.stateDir, 'manager.json');
-  await writeFile(pidFile, `${JSON.stringify({ pid: process.pid, version: VERSION, baseUrl: manager.baseUrl })}\n`, {
-    mode: 0o600
+async function serveCommand(config, json, { onReady = async () => {} } = {}) {
+  const manager = await startManager({
+    host: config.host, port: config.port, dataDir: config.stateDir,
+    identityDir: config.stateDirAliases[0] || config.identityDir,
+    scope: config.shared ? 'shared' : 'project', stateDirAliases: config.stateDirAliases
   });
+  try {
+    await writeStateEndpoint(manager.stateLocation.stateDirEffective, {
+      pid: process.pid, version: VERSION, baseUrl: manager.baseUrl
+    });
+    if (config.projectEnvironment) {
+      await rememberDefaultStateLocation({
+        stateDir: manager.stateLocation.stateDirEffective,
+        identityDir: manager.stateLocation.stateDirLogical,
+        port: manager.address.port
+      }, config.projectEnvironment);
+    }
+    await onReady();
+  } catch (error) {
+    await manager.stop();
+    throw error;
+  }
   emit({ ok: true, event: 'manager-ready', version: VERSION, pid: process.pid, baseUrl: manager.baseUrl }, json);
   let stopping = false;
   const stop = async () => {
@@ -825,14 +1012,39 @@ async function serveCommand(config, json) {
   process.once('SIGINT', () => void stop());
   process.once('SIGTERM', () => void stop());
   while (!manager.stopped) await new Promise((resolve) => setTimeout(resolve, 200));
-  await rm(pidFile, { force: true }).catch(() => {});
+  // Retain the last endpoint for diagnostics. Discovery checks its live PID;
+  // deleting it after releasing the lifetime lock could erase a successor's endpoint.
 }
 
 async function managerCommand(action, options, json) {
-  const config = settings(options);
-  if (action === 'foreground') return serveCommand(config, json);
+  const config = await settings(options);
+  if (action === 'foreground') {
+    try {
+      const current = await health(config);
+      emit({ ok: true, manager: current, reused: true }, json);
+      return;
+    } catch (error) { if (error.code !== 'MANAGER_UNREACHABLE') throw error; }
+    await prepareStateForStart(config);
+    if (config.projectEnvironment) {
+      const bootstrap = new ManagerLock(config.projectEnvironment.locatorFile + '.startup.lock');
+      try { await bootstrap.acquire(); } catch (error) {
+        if (!['MANAGER_ALREADY_RUNNING', 'MANAGER_LOCK_BUSY'].includes(error.code)) throw error;
+        emit({ ok: true, manager: await waitForManager(config), reused: true }, json);
+        return;
+      }
+      try {
+        try {
+          const current = await health(config);
+          emit({ ok: true, manager: current, reused: true }, json);
+          return;
+        } catch (error) { if (error.code !== 'MANAGER_UNREACHABLE') throw error; }
+        return await serveCommand(config, json, { onReady: () => bootstrap.release() });
+      } finally { await bootstrap.release(); }
+    }
+    return serveCommand(config, json);
+  }
   if (action === 'start') {
-    const current = await ensureManager(config, { maintainVersion: true });
+    const current = await ensureManager(config, { maintainVersion: options.upgrade === true });
     emit({ ok: true, manager: current }, json);
     return;
   }
@@ -842,7 +1054,11 @@ async function managerCommand(action, options, json) {
     return;
   }
   if (action === 'recover') {
-    const current = await rawHealth(config);
+    let current;
+    try { current = await health(config); } catch (error) {
+      if (error.code !== 'MANAGER_STATE_MISMATCH') throw error;
+      current = error.manager;
+    }
     if (current.apiVersion !== API_VERSION) {
       throw cliError('MANAGER_API_INCOMPATIBLE', `Manager API ${current.apiVersion} is incompatible with ${API_VERSION}`);
     }
@@ -886,13 +1102,22 @@ async function managerCommand(action, options, json) {
       return;
     }
     const token = await readToken(config);
-    await requestJson(config, '/v1/manager/stop', { method: 'POST', body: {}, token });
+    await requestJson(config, '/v1/manager/stop', {
+      method: 'POST', body: options['if-idle'] === true ? { onlyIfIdle: true } : {}, token
+    });
     const managerPid = Number.isSafeInteger(current.pid) && current.pid > 0 ? current.pid : null;
     const deadline = Date.now() + 20_000;
+    let stopObservation = null;
     while (Date.now() < deadline) {
+      if (managerPid && !isProcessAlive(managerPid)) {
+        emit({ ok: true, state: 'stopped' }, json);
+        return;
+      }
       try {
-        await health(config, 500);
+        const observed = await health(config, 500);
+        stopObservation = { state: observed.state, pid: observed.pid };
       } catch (error) {
+        stopObservation = { error: error.code };
         if (error.code === 'MANAGER_UNREACHABLE') {
           while (managerPid && Date.now() < deadline && isProcessAlive(managerPid)) {
             await new Promise((resolve) => setTimeout(resolve, 50));
@@ -906,7 +1131,9 @@ async function managerCommand(action, options, json) {
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    throw cliError('MANAGER_STOP_TIMEOUT', 'Manager did not stop in time');
+    const error = cliError('MANAGER_STOP_TIMEOUT', 'Manager did not stop in time');
+    error.details = { pid: managerPid, processAlive: managerPid ? isProcessAlive(managerPid) : null, lastObservation: stopObservation };
+    throw error;
   }
   throw cliError('UNKNOWN_COMMAND', `Unknown manager command: ${action}`);
 }
@@ -922,8 +1149,8 @@ async function main() {
     return emit(HELP);
   }
   if (command === 'serve') {
-    assertAllowedOptions(options);
-    return serveCommand(settings(options), json);
+    assertAllowedOptions(options, ['shared', 'state-alias', 'state-request']);
+    return serveCommand(await settings(options, { serving: true }), json);
   }
   if (command === 'run') {
     assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'request-key', 'timeout']);
@@ -951,8 +1178,10 @@ async function main() {
     return profileCommand(action, args, options, json);
   }
   if (command === 'manager') {
-    assertAllowedOptions(options);
-    return managerCommand(args.shift() || 'status', options, json);
+    const action = args.shift() || 'status';
+    assertAllowedOptions(options, action === 'start' ? ['upgrade', 'shared'] :
+      action === 'foreground' ? ['shared'] : action === 'stop' ? ['if-idle'] : []);
+    return managerCommand(action, options, json);
   }
   if (command === 'panel') {
     assertAllowedOptions(options);
