@@ -26,6 +26,7 @@ async function port() {
 
 test('real Windows legacy union view is preserved by one explicit Owner upgrade and read by an unpackaged client',
   { skip: process.platform !== 'win32', timeout: 180_000 }, async (t) => {
+    await mkdir(path.join(ROOT, 'artifacts'), { recursive: true });
     const root = await mkdtemp(path.join(ROOT, 'artifacts', 'windows-upgrade-'));
     const home = path.join(root, 'home');
     const local = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'taskmaster-upgrade-test-' + randomUUID());
@@ -101,6 +102,7 @@ test('real packaged and unpackaged Windows clients share defaults and each expli
   { skip: process.platform !== 'win32', timeout: 180_000 }, async (t) => {
     // The homes are outside AppData. The explicit project is inside actual
     // AppData so Windows, not a fake resolver, supplies the differing views.
+    await mkdir(path.join(ROOT, 'artifacts'), { recursive: true });
     const root = await mkdtemp(path.join(ROOT, 'artifacts', 'windows-host-'));
     const home = path.join(root, 'home');
     await mkdir(home);

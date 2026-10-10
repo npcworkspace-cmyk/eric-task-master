@@ -115,7 +115,8 @@ Find-TaskMasterLauncher -DefaultRoot ${literal(path.join(root, 'absent'))} -Read
 `);
   assert.equal(result.status, 'found');
   assert.equal(result.source, 'running-manager');
-  assert.equal(result.launcher, current);
+  assert.ok(path.isAbsolute(result.launcher));
+  assert.equal(await realpath(result.launcher), await realpath(current));
 });
 
 test('running Manager wins over stale PATH, missing registration, and an older registered installation', windowsOnly, async (t) => {

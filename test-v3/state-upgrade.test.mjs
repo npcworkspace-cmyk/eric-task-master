@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -53,7 +53,8 @@ test('explicit Windows Owner upgrade materializes and verifies data without repl
   assert.equal(manager.stateLocation.stateId, managerStateId(secret.stateInstanceId, item.source));
   const profile = (await manager.profileStore.list())[0];
   assert.deepEqual([profile.id, profile.name, (await manager.profileStore.getDefault()).id], [id, 'Retained owner Profile', id]);
-  assert.equal(profile.userDataDir, path.join(target, 'profiles', id));
+  // Admission resolves macOS /var aliases and Windows inherited 8.3 paths.
+  assert.equal(profile.userDataDir, path.join(await realpath(target), 'profiles', id));
 });
 
 test('isolated AppData project upgrades retain their requested key without changing the shared selection', async (t) => {
