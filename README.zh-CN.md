@@ -87,7 +87,9 @@ Manager 只监听 `127.0.0.1`。不需要 MCP 注册、浏览器插件、配对�
 
 ### 第一步：先检查 Manager，缺少时才安装
 
-先运行 `taskmaster --help`。如果 Windows 的 PATH 或预设启动路径不可用，使用 Skill 自带的[只读启动器定位工具](skills/eric-task-master/scripts/find-launcher.ps1)。它先读取系统安装登记中的 `InstallLocation`，再查 PATH、默认位置和便携目录；即使 Agent 进程仍沿用旧 PATH，也能找到自定义安装目录。用返回的启动器执行 `--help`，并在本次会话始终使用其绝对路径。启动文件可用，就说明这台电脑的当前系统用户已经部署 Manager：保留原有 Profile，跳过 Manager 安装；给另一个 Agent 只导入第三步的 Skill。无法定位、启动器执行失败、查询结果不确定或报 `MANAGER_STATE_MISMATCH` 时，应报告具体错误；发现已有安装或本机 Manager，不代表可以通过重装、改配置或重建 Profile 修复定位问题。结果含义见[部署文档](docs/INSTALLERS.md)。
+在 Windows 部署时，先使用 Skill 自带的[只读启动器定位工具](skills/eric-task-master/scripts/find-launcher.ps1)，即使旧 PATH 中已经有启动器也一样。它优先确认正在运行的 Manager，再读取已选共享位置和系统安装登记；macOS/Linux 使用已安装或已知便携目录中的启动器。用返回的绝对路径执行 `--help`，本次会话始终沿用它。启动器可用，就保留现有 Profile，只给新 Agent 安装或更新 Skill。定位不确定或状态位置报错时，应报告证据，不能重装、合并数据或重建 Profile。结果含义见[部署文档](docs/INSTALLERS.md)。
+
+同一系统用户的多个 Agent 默认共用已选 Manager 和 Profile 池，切换工作目录不会另建默认库。需要独立数据项目时，在每条命令显式传入 `--state-dir 绝对目录`；未指定 `--port` 时自动发现自己的端口。普通启动只复用 Manager，不替换版本；运行时升级由 Owner 显式执行 `manager start --upgrade`，且必须空闲。原生安装、卸载会拒绝使用中的运行时；更新 Skill 不会停止共享 Manager。
 
 无论是否已有 Manager，电脑都需要稳定版 Google Chrome。确认没有 Manager 后，才从[最新 GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)下载两个文件：
 

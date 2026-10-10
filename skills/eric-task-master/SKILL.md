@@ -5,7 +5,9 @@ description: Run durable local Chrome automation with the installed Task Master 
 
 # Eric Task Master
 
-Use the installed or extracted portable `taskmaster` launcher. For a normal request, do not inspect the project source or create another controller. When asked to deploy for a new Agent, first check `taskmaster --help`, then locate the registered installation and known portable extractions as below. If a launcher works, keep the existing Manager and Profiles and install only this Skill for the new Agent; the Manager is shared by Agents running as the same OS user. Retain its absolute launcher path for this session because an already-running Agent host may still have an old PATH.
+Use the installed or extracted portable `taskmaster` launcher. For a normal request, do not inspect the project source or create another controller. For a new Agent or Skill update, locate the existing application as below, verify its absolute launcher with `--help`, and install/update only this Skill when the launcher works. Agents running as the same OS user share the selected Manager and Profiles; different working folders do not create new defaults. Retain the absolute launcher because an Agent host may still have an old PATH.
+
+Use `--state-dir ABSOLUTE_DIRECTORY` on every command only when the user requests an isolated data project. Its Manager selects its own port unless `--port` is explicitly supplied. Normal startup, including `manager start`, reuses a compatible Manager without replacing it. Runtime upgrade is an explicit Owner action: `manager start --upgrade`; on Windows it can consolidate the complete selected legacy view once while retaining its source. Incomplete-view errors require Owner upgrade, not replacement Profiles. Native install/uninstall refuse an in-use runtime. Never stop the shared Manager to install or update an Agent Skill.
 
 ## Run the task
 
@@ -20,13 +22,13 @@ Use the installed or extracted portable `taskmaster` launcher. For a normal requ
 4. Follow it with `taskmaster follow TASK_ID --json`; optionally add `--wait-ms 30000` to bound a call. Retain `after` and continue with `--after SEQUENCE`. Report meaningful processed counts during a long run.
 5. Read the output files and deliver every usable result, including partial results from a stopped or failed run.
 
-Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. When Windows PATH or the assumed launcher is unavailable, run the bundled read-only locator (replace `<SKILL_ROOT>` with this Skill folder; optionally pass `-PortableRoot 'KNOWN_EXTRACTION'`):
+Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. For new-Agent/Skill deployment on Windows, or when PATH or the assumed launcher fails, run the bundled read-only locator (replace `<SKILL_ROOT>` with this Skill folder; optionally pass `-PortableRoot 'KNOWN_EXTRACTION'`):
 
 ```powershell
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '<SKILL_ROOT>/scripts/find-launcher.ps1'
 ```
 
-It first identifies a live Manager's embedded runtime and matching package, then reads the install record's `InstallLocation` before PATH; `%LOCALAPPDATA%\Programs\Eric Task Master` is only a fallback. An unlocatable live Manager is `unresolved`, never permission to fall back to an older launcher. For `found`, run the returned absolute launcher with `--help`, then use it for every command. A failed launcher, `unresolved`, query/permission failure, or `MANAGER_STATE_MISMATCH` requires reporting the observed path/error and stopping deployment repair: do not reinstall, edit PATH/registry/configuration, move/delete state, or recreate Profiles. For state mismatch, retain the CLI's `error.details` (state directory, port and both identity fingerprints); do not hand-recompute identity from a differently normalized path. Only `absent` supports a fresh install when requested. macOS `/usr/local/bin/taskmaster`; Linux `/usr/bin/taskmaster`; otherwise use a known portable launcher. For `DEFAULT_PROFILE_REQUIRED`, ask the user to choose an existing Profile in `taskmaster panel`, including a recovered directory-only Profile, or create one only if none is available.
+It identifies a live Manager's embedded runtime and matching package, then the shared location and installation record before PATH; `%LOCALAPPDATA%\Programs\Eric Task Master` is only a fallback. An unlocatable live Manager is `unresolved`, never permission to select an older launcher. For `found`, verify and use the returned absolute launcher. A failed launcher, `unresolved`, query/permission failure, `MANAGER_STATE_MISMATCH`, `MANAGER_STATE_AMBIGUOUS`, or `MANAGER_LOCATION_INVALID` requires reporting the observed path/error and stopping deployment repair: do not reinstall, edit PATH/registry/configuration, move/delete state, merge data or recreate Profiles. Retain state-error `error.details`, including physical state and identity fingerprints; do not hand-recompute identity. Only `absent` supports a user-requested fresh install. macOS `/usr/local/bin/taskmaster`; Linux `/usr/bin/taskmaster`; otherwise use a known portable launcher. For `DEFAULT_PROFILE_REQUIRED`, ask the user to choose an existing Profile in `taskmaster panel`, including a recovered directory-only Profile, or create one only if none is available.
 
 When no launcher is available, the Windows locator also checks `127.0.0.1:19946` (or `ERIC_TASK_MASTER_PORT`); on other systems check the matching loopback endpoint before installing. Existing installation evidence or an uncertain probe requires reporting the locator error. For confirmed absence, use the [latest Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest). If the installer fails, download its `eric-task-master-v<VERSION>-<TARGET>-portable.zip`: TARGET is `windows-x64`, `macos-arm64`, `macos-x64`, `linux-x64`, or `linux-arm64`, matching this computer. Verify `SHA256SUMS`, extract to a permanent folder, and use the absolute `eric-task-master/bin/taskmaster.cmd` (Windows) or `eric-task-master/bin/taskmaster` (macOS/Linux) path for every command. It bundles Node.js and Playwright; only stable Chrome must already be installed. The separate Skill ZIP includes instructions and a read-only locator, not the Manager. OS security approval may still be required; ZIP does not bypass it.
 
@@ -59,11 +61,9 @@ At 20 minutes Manager automatically pauses and stops reminders, preserving the b
 
 ```text
 taskmaster status TASK_ID --json
-taskmaster follow TASK_ID --json
 taskmaster stop TASK_ID --json
 taskmaster resume TASK_ID --json
 taskmaster delete TASK_ID --json
-taskmaster panel
 ```
 
 Manager owns browser startup, one-writer Profile leases, process cleanup, and task persistence. The task module owns the work. For manual sign-in, open the Profile in the Dashboard or with `taskmaster profiles open NAME_OR_ID`: this is native Chrome without a debugging connection. Close all its windows before starting a task. Automation reuses that same Profile; individual sites can still require verification again.

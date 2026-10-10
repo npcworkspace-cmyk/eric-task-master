@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# dpkg also calls prerm before an upgrade. Never interrupt another Agent.
+processes="$(ps -ax -o pid= -o command=)" || exit 1
+pids="$(printf '%s\n' "${processes}" | awk \
+  -v node_path='/opt/eric-task-master/runtime/node' 'index($0, node_path) { print $1 }')"
+if [ -n "${pids}" ]; then
+  echo 'Eric Task Master removal stopped: runtime is still in use. Explicitly stop the idle Manager before retrying; no Agent was stopped.' >&2
+  exit 1
+fi
+exit 0

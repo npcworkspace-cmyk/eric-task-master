@@ -1,14 +1,15 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, VERSION } from './contracts.mjs';
 import { HttpError, readJson, sendJson, serveStatic } from './lib/http-utils.mjs';
 import { JsonStore, JsonStoreConflictError } from './lib/json-store.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
-import { managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
+import { managerOwnershipProof, managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
+import { assertStateOutsideApplication, inspectStateDirectory, stateEnvironment } from './lib/state-directory.mjs';
+import { assertRetainedProfileView } from './lib/state-upgrade.mjs';
 import { OperationalJournal } from './lib/operational-journal.mjs';
 import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
@@ -19,13 +20,7 @@ const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 export function defaultDataDirectory() {
   if (process.env.ERIC_TASK_MASTER_HOME) return path.resolve(process.env.ERIC_TASK_MASTER_HOME);
-  if (process.platform === 'win32') {
-    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'eric-task-master');
-  }
-  if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library', 'Application Support', 'eric-task-master');
-  }
-  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'eric-task-master');
+  return stateEnvironment().sharedRoot;
 }
 
 function secureEqual(left, right) {
@@ -110,6 +105,9 @@ export async function createManager({
   host = DEFAULT_HOST,
   port = DEFAULT_PORT,
   dataDir = defaultDataDirectory(),
+  identityDir = dataDir,
+  scope = 'project',
+  stateDirAliases = [],
   dashboardDir = path.resolve(MODULE_DIR, '..', 'dashboard'),
   taskServiceFactory = createTaskService,
   profileProcessAlive,
@@ -118,6 +116,9 @@ export async function createManager({
   if (host !== DEFAULT_HOST) throw new TypeError(`Manager must bind to ${DEFAULT_HOST}`);
   if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new TypeError('port is invalid');
   const resolvedDataDir = path.resolve(dataDir);
+  const resolvedIdentityDir = path.resolve(identityDir);
+  if (!['shared', 'project'].includes(scope)) throw new TypeError('Manager scope must be shared or project');
+  await assertStateOutsideApplication(resolvedDataDir);
   await mkdir(resolvedDataDir, { recursive: true, mode: 0o700 });
   const managerLock = new ManagerLock(path.join(resolvedDataDir, '.manager.lock'));
   await managerLock.acquire();
@@ -157,19 +158,36 @@ export async function createManager({
         }
       });
     }
+    const physicalState = await inspectStateDirectory(resolvedDataDir);
+    const effectiveDataDir = physicalState.stateDir;
+    const aliases = [...new Set([
+      resolvedDataDir, resolvedIdentityDir, ...stateDirAliases,
+      ...(Array.isArray(config.stateDirAliases) ? config.stateDirAliases : [])
+    ].filter((alias) => typeof alias === 'string' && path.isAbsolute(alias) && path.resolve(alias) !== effectiveDataDir))];
+    if (aliases.length > 16) throw new TypeError('Too many state directory aliases');
+    await assertRetainedProfileView(effectiveDataDir, aliases);
+    if (aliases.length && JSON.stringify(config.stateDirAliases) !== JSON.stringify(aliases)) {
+      config = await configStore.update((draft) => { draft.stateDirAliases = aliases; });
+    }
     const stateInstanceId = config.stateInstanceId;
-    const stateId = managerStateId(stateInstanceId, resolvedDataDir);
+    const stateId = managerStateId(stateInstanceId, resolvedIdentityDir);
+    const stateDirectoryId = managerStateId(stateInstanceId, effectiveDataDir);
+    const stateLocation = Object.freeze({
+      stateId, stateDirectoryId, stateDirEffective: effectiveDataDir,
+      stateDirLogical: resolvedIdentityDir, scope, pid: process.pid
+    });
     const recoveryNonce = randomBytes(24).toString('base64url');
     let stateConflict = false;
 
     const profileStore = new ProfileStore({
-      filePath: path.join(resolvedDataDir, 'profiles.json'),
-      profilesRoot: path.join(resolvedDataDir, 'profiles'),
+      filePath: path.join(effectiveDataDir, 'profiles.json'),
+      profilesRoot: path.join(effectiveDataDir, 'profiles'),
+      pathAliases: aliases.map((alias) => path.join(alias, 'profiles')),
       ...(profileProcessAlive ? { processAlive: profileProcessAlive } : {})
     });
     await profileStore.init();
     taskService = await taskServiceFactory({
-      stateDir: path.join(resolvedDataDir, 'tasks'),
+      stateDir: path.join(effectiveDataDir, 'tasks'),
       profileStore,
       verificationNotifier,
       ...taskServiceOptions
@@ -231,11 +249,15 @@ export async function createManager({
             service: 'eric-task-master',
             version: VERSION,
             apiVersion: API_VERSION,
-            capabilities: ['task.request-key', 'manager.idle-stop', 'manager.state-recovery', 'verification.notifications'],
+            capabilities: ['task.request-key', 'manager.idle-stop', 'manager.state-recovery',
+              'manager.state-location', 'manager.owner-proof', 'verification.notifications'],
             state: stopping ? 'stopping' : 'ready',
-            pid: process.pid,
-            stateId,
+            ...stateLocation,
             stateChanged,
+            ...(url.searchParams.has('nonce') ? {
+              ownerProof: managerOwnershipProof((await readCurrentConfig({ requireSameInstance: false })).managerToken,
+                stateLocation, url.searchParams.get('nonce'))
+            } : {}),
             ...(stateChanged ? { recoveryNonce } : {})
           });
           return;
@@ -499,7 +521,12 @@ export async function createManager({
         await taskService.close({ abandonState });
         verificationNotifier.close();
         if (address) {
-          await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+          await new Promise((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+            // All task/Profile cleanup has completed. Incomplete or pooled
+            // client connections must not keep the stopped Manager alive.
+            server.closeAllConnections();
+          });
         }
         address = null;
         stopped = true;
@@ -521,7 +548,8 @@ export async function createManager({
       get address() { return address; },
       get stopped() { return stopped; },
       taskService,
-      profileStore
+      profileStore,
+      stateLocation
     });
   } catch (error) {
     verificationNotifier.close();

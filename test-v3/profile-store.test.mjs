@@ -44,6 +44,46 @@ test('reinstall keeps registered Profiles and adopts retained directories withou
   assert.equal((await restarted.get(orphanId)).name, `Recovered ${orphanId}`);
 });
 
+test('a proven state-directory alias preserves names, defaults and login bytes when rebasing Profile paths', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-alias-'));
+  t.after(() => removeTestTree(root));
+  const originalRoot = path.join(root, 'old-location');
+  const physicalRoot = path.join(root, 'physical-location');
+  const firstStore = new ProfileStore({ filePath: path.join(originalRoot, 'profiles.json'),
+    profilesRoot: path.join(originalRoot, 'profiles'), profileUsageProbe: async () => 'inactive' });
+  await firstStore.init();
+  const first = await firstStore.create({ name: 'Account A' });
+  const second = await firstStore.create({ name: 'Account B default' });
+  await firstStore.update(second.id, { isDefault: true });
+  await writeFile(path.join(first.userDataDir, 'Local State'), 'login-byte-canary');
+  await rename(originalRoot, physicalRoot);
+  const options = { filePath: path.join(physicalRoot, 'profiles.json'), profilesRoot: path.join(physicalRoot, 'profiles'),
+    pathAliases: [path.join(originalRoot, 'profiles')], profileUsageProbe: async () => 'inactive' };
+  const rebased = new ProfileStore(options);
+  await rebased.init();
+  assert.equal((await rebased.get(first.id)).name, first.name);
+  assert.equal((await rebased.get(second.id)).name, second.name);
+  assert.equal((await rebased.getDefault()).id, second.id);
+  assert.equal((await rebased.get(first.id)).userDataDir, path.join(physicalRoot, 'profiles', first.id));
+  assert.equal(await readFile(path.join(physicalRoot, 'profiles', first.id, 'Local State'), 'utf8'), 'login-byte-canary');
+  const restarted = new ProfileStore(options);
+  await restarted.init();
+  assert.deepEqual((await restarted.list()).map((item) => item.id), [first.id, second.id]);
+});
+
+test('a state-directory alias never adopts arbitrary outside Profile paths', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-alias-reject-'));
+  t.after(() => removeTestTree(root));
+  const profileId = 'profile_' + 'a'.repeat(32);
+  await writeFile(path.join(root, 'profiles.json'), JSON.stringify({ version: 1, defaultProfileId: profileId,
+    profiles: [{ id: profileId, name: 'Untrusted outside', userDataDir: path.join(root, 'unrelated', profileId) }], deletions: [] }));
+  const store = new ProfileStore({ filePath: path.join(root, 'profiles.json'), profilesRoot: path.join(root, 'profiles'),
+    pathAliases: [path.join(root, 'owned-old-location', 'profiles')], profileUsageProbe: async () => 'inactive' });
+  await store.init();
+  assert.deepEqual(await store.list(), []);
+  assert.equal(await store.getDefault(), null);
+});
+
 test('directory-only recovery lists every Profile, requires a new default, and quarantines active Chrome', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-directory-only-'));
   t.after(() => removeTestTree(root));

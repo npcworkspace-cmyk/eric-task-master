@@ -261,6 +261,35 @@ test('a late lease-renewal failure cannot move a finalized task back to stopping
   assert.equal(events.events.some((event) => event.type === 'task.stopping'), false);
 });
 
+test('background reaping cannot turn an in-progress graceful stop into a termination error', async (t) => {
+  const realInterval = globalThis.setInterval;
+  let reap;
+  t.mock.method(globalThis, 'setInterval', (callback, delay, ...args) => {
+    if (delay === 60_000) reap = () => callback(...args);
+    return realInterval(callback, delay, ...args);
+  });
+  const f = await fixture(t);
+  const item = await f.createTask();
+  const stopSent = deferred();
+  t.mock.method(item.worker, 'send', function (message, _handle, _options, callback) {
+    this.messages.push(message);
+    callback?.(null);
+    if (message.type === 'stop') stopSent.resolve();
+  });
+  const stopping = f.service.stop(item.task.id);
+  try {
+    await bounded(stopSent.promise);
+    assert.equal(typeof reap, 'function');
+    reap();
+    await f.service.cleanup(); // Drain the shared mutation queue after the reaper tick.
+    assert.equal((await f.service.get(item.task.id)).error, null);
+  } finally { item.worker.finish('stopped'); }
+  assert.equal((await stopping).state, 'stopped');
+  assert.equal((await f.profileStore.get(f.profile.id)).lease, null);
+  const history = await f.service.events(item.task.id);
+  assert.equal(history.events.some((event) => event.data?.code === 'TASK_TERMINATION_RETRY'), false);
+});
+
 test('busy manual Profiles and physically active or unknown Chrome Profiles keep every cache', async (t) => {
   const usage = new Map();
   const probes = [];

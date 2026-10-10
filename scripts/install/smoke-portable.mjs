@@ -5,7 +5,7 @@ import { constants } from 'node:fs';
 import { access, mkdir, mkdtemp, readdir, realpath, rm, stat } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { ROOT, hashTree, parseArgs, readJson, writeJson } from '../build/lib.mjs';
@@ -26,6 +26,7 @@ const windowsTar = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'ta
 let port;
 let manifest;
 let managerPid;
+let physicalStateDir;
 let workerPid;
 let profileId;
 let taskId;
@@ -163,7 +164,10 @@ try {
   port = await freePort();
   await cli(['--help']);
   assert.equal((await cli(['status', '--json'])).last.profiles, 0, 'Portable state must start empty');
-  managerPid = (await cli(['manager', 'status', '--json'])).last.manager.pid;
+  const manager = (await cli(['manager', 'status', '--json'])).last.manager;
+  managerPid = manager.pid;
+  physicalStateDir = manager.stateDirEffective;
+  assert.ok(typeof physicalStateDir === 'string' && isAbsolute(physicalStateDir), 'Manager physical state evidence is missing');
   assert.ok(samePath(await executablePath(managerPid), await realpath(nodeBinary)), 'Manager did not start with the portable embedded Node');
   report.embeddedNode = await executablePath(managerPid);
   report.checks.push('portable launcher starts its own embedded Node despite poisoned host Node environment');
@@ -196,7 +200,7 @@ try {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline && (isProcessAlive(managerPid) || isProcessAlive(workerPid) || await portOpen())) await sleep(100);
   }
-  const profileUsage = profileId ? await probeChromeProfileUsage(join(stateDir, 'profiles', profileId)) : 'inactive';
+  const profileUsage = profileId ? await probeChromeProfileUsage(join(physicalStateDir, 'profiles', profileId)) : 'inactive';
   report.launcherInvoked = launcherInvoked;
   report.cleanup = { managerExited: !isProcessAlive(managerPid), workerExited: !isProcessAlive(workerPid), portClosed: !(await portOpen()), profileUsage, errors: cleanupErrors };
   if (!report.cleanup.managerExited || !report.cleanup.workerExited || !report.cleanup.portClosed || profileUsage !== 'inactive') cleanupErrors.push('Portable process or Profile cleanup is unconfirmed');

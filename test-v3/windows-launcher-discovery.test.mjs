@@ -27,7 +27,9 @@ async function discover(cases) {
 $cases = ConvertFrom-Json ${literal(JSON.stringify(cases))}
 $results = @($cases | ForEach-Object {
   $scenario = $_
-  Find-TaskMasterLauncher -DefaultRoot $scenario.defaultRoot -PortableRoot @($scenario.portableRoots) -ReadInstallations { $scenario.installations } -ReadCommands { @($scenario.commands) } -ReadManager {
+  Find-TaskMasterLauncher -DefaultRoot $scenario.defaultRoot -PortableRoot @($scenario.portableRoots) -ReadSharedLocation {
+    if ($scenario.sharedLocation) { $scenario.sharedLocation } else { [pscustomobject]@{ recorded = $false; unknown = $false } }
+  } -ReadInstallations { $scenario.installations } -ReadCommands { @($scenario.commands) } -ReadManager {
     if ($scenario.manager -is [string]) { [pscustomobject]@{ state = $scenario.manager } }
     else { $scenario.manager }
   }
@@ -79,6 +81,42 @@ test('registry finds a custom installation before stale PATH and never executes 
   await assert.rejects(access(path.join(registeredRoot, 'bin', 'unexpected-invocation')), { code: 'ENOENT' });
   await assert.rejects(access(path.join(path.dirname(old), 'unexpected-invocation')), { code: 'ENOENT' });
   assert.equal(await readFile(canary, 'utf8'), 'retained-login-canary');
+});
+
+test('a selected shared launcher survives stopped Manager and absent host registration without falling back to stale PATH', windowsOnly, async (t) => {
+  const root = await fixture(t);
+  const selected = await launcher(path.join(root, 'selected application'));
+  const old = await launcher(path.join(root, 'stale application'));
+  const [result, damaged, missing] = await discover([
+    scenario(root, { commands: [old], sharedLocation: { recorded: true, unknown: false, launcher: selected } }),
+    scenario(root, { commands: [old], sharedLocation: { recorded: true, unknown: true } }),
+    scenario(root, { commands: [old], sharedLocation: { recorded: true, unknown: false, launcher: path.join(root, 'missing.cmd') } })
+  ]);
+  assert.equal(result.launcher, selected);
+  assert.equal(result.source, 'shared-location');
+  for (const rejected of [damaged, missing]) {
+    assert.equal(rejected.status, 'unresolved');
+    assert.equal(rejected.canFreshInstall, false);
+    assert.equal(rejected.launcher, null);
+  }
+});
+
+test('shared locator port is used for live Manager discovery instead of assuming 19946', windowsOnly, async (t) => {
+  const root = await fixture(t);
+  const current = await launcher(path.join(root, 'custom port application'));
+  const result = await powershell(`
+Find-TaskMasterLauncher -DefaultRoot ${literal(path.join(root, 'absent'))} -ReadSharedLocation {
+  [pscustomobject]@{ recorded = $true; unknown = $false; port = 24321 }
+} -ReadManager {
+  param([int]$Port)
+  if ($Port -ne 24321) { throw 'The selected shared port was ignored' }
+  [pscustomobject]@{ state = 'present'; launcher = ${literal(current)} }
+} | ConvertTo-Json -Compress
+`);
+  assert.equal(result.status, 'found');
+  assert.equal(result.source, 'running-manager');
+  assert.ok(path.isAbsolute(result.launcher));
+  assert.equal(await realpath(result.launcher), await realpath(current));
 });
 
 test('running Manager wins over stale PATH, missing registration, and an older registered installation', windowsOnly, async (t) => {

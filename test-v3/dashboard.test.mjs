@@ -81,8 +81,10 @@ test('portable Skill keeps one CLI guide and routes path discovery to its packag
   assert.match(skill, /taskmaster resume TASK_ID/u);
   assert.match(skill, /taskmaster delete TASK_ID/u);
   assert.match(skill, /Do not add a preflight check to a normal task/u);
-  assert.match(skill, /When asked to deploy for a new Agent, first check `taskmaster --help`/u);
-  assert.match(skill, /install only this Skill for the new Agent/u);
+  assert.match(skill, /For a new Agent or Skill update, locate the existing application/u);
+  assert.match(skill, /install\/update only this Skill/u);
+  assert.match(skill, /Never stop the shared Manager to install or update an Agent Skill/u);
+  assert.match(skill, /--state-dir ABSOLUTE_DIRECTORY/u);
   assert.match(skill, /<SKILL_ROOT>\/scripts\/find-launcher\.ps1/u);
   assert.ok((await readFile(new URL('scripts/find-launcher.ps1', skillRoot), 'utf8')).length > 0);
   assert.match(skill, /macOS `\/usr\/local\/bin\/taskmaster`; Linux `\/usr\/bin\/taskmaster`/u);
@@ -95,9 +97,9 @@ test('deployment guides reuse the Manager and leave Playwright version selection
     text('README.md'), text('README.zh-CN.md'), text('docs/INSTALLERS.md')
   ]);
   assert.match(english, /check for the Manager, install only if missing/u);
-  assert.match(english, /For another Agent, import only the Skill/u);
+  assert.match(english, /install\/update only the Agent Skill/u);
   assert.match(chinese, /先检查 Manager，缺少时才安装/u);
-  assert.match(chinese, /给另一个 Agent 只导入第三步的 Skill/u);
+  assert.match(chinese, /只给新 Agent 安装或更新 Skill/u);
   assert.match(installers, /A working launcher means the Manager is already deployed/u);
   assert.match(installers, /Do not install another Manager, overwrite `config\.json`, or recreate Profiles/u);
   assert.doesNotMatch(`${english}\n${chinese}`, /Playwright\s+\d+\.\d+/u);

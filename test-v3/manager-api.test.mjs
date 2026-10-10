@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
+import net from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
 import { removeTestTree } from './test-fs.mjs';
@@ -19,6 +20,26 @@ async function json(url, { token, method = 'GET', body } = {}) {
   });
   return { status: response.status, body: await response.json() };
 }
+
+test('Manager shutdown drains tasks then closes unfinished HTTP connections', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-manager-http-close-'));
+  let taskCleanup = false;
+  const manager = await createManager({ port: 0, dataDir: root,
+    taskServiceFactory: async () => ({ close: async () => { taskCleanup = true; } }) });
+  await manager.start();
+  const socket = net.connect(manager.address.port, '127.0.0.1');
+  socket.on('error', (error) => { assert.equal(error.code, 'ECONNRESET'); });
+  await new Promise((resolve) => socket.once('connect', resolve));
+  socket.write('GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n');
+  t.after(async () => { socket.destroy(); await manager.stop(); await removeTestTree(root); });
+  const stopped = manager.stop();
+  await Promise.race([stopped, new Promise((_resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('unfinished client blocked Manager shutdown')), 1_500);
+    timeout.unref();
+  })]);
+  assert.equal(taskCleanup, true);
+  assert.equal(manager.stopped, true);
+});
 
 test('Manager exposes the minimal v3 loopback API and passes through errors', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-manager-'));

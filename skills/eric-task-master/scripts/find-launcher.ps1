@@ -56,6 +56,33 @@ function Get-TaskMasterManager {
   }
 }
 
+function Get-TaskMasterSharedLocation {
+  $file = [System.IO.Path]::Combine($env:USERPROFILE, '.eric-task-master', 'default-state.json')
+  try {
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf -ErrorAction Stop)) {
+      return [pscustomobject]@{ recorded = $false; unknown = $false }
+    }
+    $record = Get-Content -LiteralPath $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($record.version -ne 1 -or ($record.port -isnot [int] -and $record.port -isnot [long]) -or
+        $record.port -lt 1 -or $record.port -gt 65535 -or
+        -not [System.IO.Path]::IsPathRooted($record.stateDir) -or
+        -not [System.IO.Path]::IsPathRooted($record.identityDir)) { throw 'Invalid shared location' }
+    $candidate = $null
+    if ($record.launcher) {
+      if (-not [System.IO.Path]::IsPathRooted($record.launcher)) { throw 'Invalid selected launcher' }
+      $candidate = [System.IO.Path]::GetFullPath($record.launcher)
+      if ([System.IO.Path]::GetFileName($candidate) -ine 'taskmaster.cmd' -or
+          [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($candidate)) -ine 'bin') { throw 'Invalid selected launcher' }
+      $root = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetDirectoryName($candidate))
+      $package = Get-Content -LiteralPath ([System.IO.Path]::Combine($root, 'app', 'package.json')) -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+      if ($package.name -ne 'eric-task-master' -or -not (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction Stop)) {
+        throw 'Selected application is missing'
+      }
+    }
+    [pscustomobject]@{ recorded = $true; unknown = $false; launcher = $candidate; port = [int]$record.port }
+  } catch { [pscustomobject]@{ recorded = $true; unknown = $true } }
+}
+
 function Find-TaskMasterLauncher {
   param(
     [string[]]$PortableRoot = @(),
@@ -66,8 +93,9 @@ function Find-TaskMasterLauncher {
       catch [System.Management.Automation.CommandNotFoundException] { @() }
     },
     [scriptblock]$PathExists = { param($target, $kind) Test-Path -LiteralPath $target -PathType $kind -ErrorAction Stop },
+    [scriptblock]$ReadSharedLocation = { Get-TaskMasterSharedLocation },
     [scriptblock]$ReadManager = {
-      $port = 19946
+      param([int]$Port = 19946)
       if ($env:ERIC_TASK_MASTER_PORT -and -not [int]::TryParse($env:ERIC_TASK_MASTER_PORT, [ref]$port)) {
         return [pscustomobject]@{ state = 'unknown' }
       }
@@ -78,7 +106,13 @@ function Find-TaskMasterLauncher {
   $unknown = $false
   $roots = @()
   $candidates = @()
-  try { $manager = & $ReadManager } catch { $manager = [pscustomobject]@{ state = 'unknown' } }
+  try { $sharedLocation = & $ReadSharedLocation } catch { $sharedLocation = [pscustomobject]@{ recorded = $true; unknown = $true } }
+  if ($sharedLocation.unknown -eq $true) {
+    return [pscustomobject]@{ status = 'unresolved'; launcher = $null; nextAction = 'report_locator_error'; canFreshInstall = $false }
+  }
+  $recorded = $sharedLocation.recorded -eq $true
+  $probePort = if ($sharedLocation.port) { [int]$sharedLocation.port } else { 19946 }
+  try { $manager = & $ReadManager $probePort } catch { $manager = [pscustomobject]@{ state = 'unknown' } }
   # A live Manager identifies the runtime actually in use, even without registration.
   if ($manager.state -eq 'present') {
     try {
@@ -95,9 +129,18 @@ function Find-TaskMasterLauncher {
       nextAction = 'report_locator_error'; canFreshInstall = $false
     }
   }
+  if ($sharedLocation.launcher) {
+    try {
+      if (& $PathExists $sharedLocation.launcher 'Leaf') {
+        return [pscustomobject]@{ status = 'found'; launcher = $sharedLocation.launcher; source = 'shared-location'
+          nextAction = 'verify_existing_launcher'; canFreshInstall = $false }
+      }
+    } catch { }
+    return [pscustomobject]@{ status = 'unresolved'; launcher = $null; nextAction = 'report_locator_error'; canFreshInstall = $false }
+  }
   try {
     $installations = & $ReadInstallations
-    $recorded = $installations.recorded -eq $true
+    $recorded = $recorded -or $installations.recorded -eq $true
     $unknown = $installations.unknown -eq $true
     foreach ($location in $installations.locations) {
       $roots += [pscustomobject]@{ path = $location; source = 'registry' }

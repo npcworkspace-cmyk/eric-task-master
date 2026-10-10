@@ -26,6 +26,17 @@ export function managerStateId(stateInstanceId, stateDir) {
   return `state_${createHash('sha256').update(`${stateInstanceId}\0${canonical}`).digest('base64url').slice(0, 24)}`;
 }
 
+export function managerOwnershipProof(managerToken, manager, nonce) {
+  if (typeof managerToken !== 'string' || managerToken.length < 32 ||
+      typeof nonce !== 'string' || !/^[0-9A-Za-z_-]{16,128}$/u.test(nonce) ||
+      typeof manager?.stateId !== 'string' || typeof manager.stateDirectoryId !== 'string' ||
+      typeof manager.stateDirEffective !== 'string' || typeof manager.stateDirLogical !== 'string') return null;
+  return createHmac('sha256', managerToken)
+    .update(JSON.stringify(['eric-task-master:owner:v1', manager.stateId, manager.stateDirectoryId,
+      manager.stateDirEffective, manager.stateDirLogical, manager.scope, manager.pid, nonce]))
+    .digest('base64url');
+}
+
 export function managerRecoveryProof(managerToken, stateId, nonce, { force = false } = {}) {
   if (typeof managerToken !== 'string' || managerToken.length < 32 ||
       typeof stateId !== 'string' || !stateId || typeof nonce !== 'string' || nonce.length < 16) return null;
