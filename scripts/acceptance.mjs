@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback } from 'node:child_process';
 import http from 'node:http';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -263,7 +263,8 @@ async function main() {
 
     await cli(['profiles', 'open', profileA.id, '--json'], 120_000);
     const opened = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles.find((profile) => profile.id === profileA.id);
-    const manualSandbox = await inspectManualChromeSandbox(path.join(stateDir, 'profiles', profileA.id));
+    const physicalStateDir = path.dirname(await realpath(path.join(stateDir, 'config.json')));
+    const manualSandbox = await inspectManualChromeSandbox(path.join(physicalStateDir, 'profiles', profileA.id));
     await cli(['profiles', 'close', profileA.id, '--json'], 60_000);
     const closed = (await cli(['profiles', 'list', '--json'])).records.at(-1).profiles.find((profile) => profile.id === profileA.id);
     add('native Profile opens and closes without an automation connection',
