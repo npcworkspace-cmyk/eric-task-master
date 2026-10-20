@@ -1,6 +1,6 @@
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
-export const VERSION = '3.1.8';
+export const VERSION = '3.1.9';
 export const API_VERSION = 3;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -58,6 +58,11 @@ function publicProgress(progress) {
   };
 }
 
+function publicFailureScreenshot(task) {
+  if (task.outputClearedAt) return null;
+  return task.failureScreenshot === 'failure.png' ? 'failure.png' : null;
+}
+
 export function publicTask(task) {
   if (!task || typeof task !== 'object') return null;
   const end = Date.parse(task.finishedAt ?? '') || Date.now();
@@ -97,6 +102,7 @@ export function publicTask(task) {
     startedAt: task.startedAt ?? null,
     finishedAt: task.finishedAt ?? null,
     outputClearedAt: task.outputClearedAt ?? null,
+    failureScreenshot: publicFailureScreenshot(task),
     heartbeatAt: task.heartbeatAt ?? null,
     canResume: task.state === 'waiting',
     elapsedMs: Number.isFinite(start) ? Math.max(0, end - start) : 0,

@@ -41,6 +41,8 @@ Scripts are free to use Playwright, evaluate, CDP, network and filesystem APIs. 
 
 Current task state is stored atomically, and the Manager retains a bounded event history for progress and diagnostics. Output files are available while the task is running and remain useful after stop or error. A task that needs checkpoints writes them incrementally under `outputDir` and decides how a later task consumes them.
 
+`status` and `follow` expose a nullable `failureScreenshot` artifact reference for the existing failure capture. This is a recorded diagnostic hint, not a filesystem path or proof of current file availability; use `files` to inspect/read it. Output cleanup clears the reference. Task handoff and result summaries compose these existing CLI responses in the Skill, while checkpoint interpretation stays in task code and Agent wakeup stays in the authorized host.
+
 Frequent progress updates coalesce to the latest value once per second; state transitions flush pending progress first. Heartbeats renew the lease without rewriting task history. Output-budget scans share in-flight work and a five-second cache on progress; startup, periodic checks, diagnostics, and completion still enforce the budget directly.
 
 An optional `run --request-key KEY` makes submission retries return the existing task. A key is bound to the frozen module bytes and canonical request parameters; conflicting reuse is rejected. Different keys permit intentional repeats. `follow` drains retained terminal events and returns a cursor; `--wait-ms` optionally bounds one call. A compatible Manager is reused without maintenance on normal commands. Explicit idle maintenance is serialized with task creation and Profile operations.

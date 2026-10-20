@@ -20,7 +20,9 @@ Use `--state-dir ABSOLUTE_DIRECTORY` on every command only when the user request
 
 3. Retain the returned task ID, run `taskmaster panel --json`, and give the user its fixed Dashboard URL. This only returns the link; run `taskmaster panel` without JSON only when the user asks to open it. Reuse the same panel across tasks.
 4. Follow it with `taskmaster follow TASK_ID --json`; optionally add `--wait-ms 30000` to bound a call. Retain `after` and continue with `--after SEQUENCE`. Report meaningful processed counts during a long run.
-5. Read the output files and deliver every usable result, including partial results from a stopped or failed run.
+5. Use `taskmaster files TASK_ID --json` and `files TASK_ID --read RELATIVE_PATH --json` to inspect outputs, following listing/read pagination when truncated. `follow` exits 1 for error/stopped after printing JSON: still read that output and deliver usable partial results. Summarize task state separately from business completion: report evidenced counts, missing work and artifact references, not an assumed success from `finished`. If outputs were cleared or unavailable, say so.
+
+When handing work to another Agent or conversation, retain a secret-free receipt: absolute launcher, explicit state/port selectors if used, task ID, Profile identity, `after`, latest state/progress, pending wait/probe and artifact references. The receiving Agent refreshes `status` and continues `follow --after` for that same task; stale receipt state or `canResume` is not authority to resume, repeat actions or create another task. Report truncated event history as incomplete. No Agent registration is needed.
 
 Use `--profile NAME_OR_ID` only when the user names a Profile. Do not add a preflight check to a normal task. For new-Agent/Skill deployment on Windows, or when PATH or the assumed launcher fails, run the bundled read-only locator (replace `<SKILL_ROOT>` with this Skill folder; optionally pass `-PortableRoot 'KNOWN_EXTRACTION'`):
 
@@ -43,11 +45,11 @@ export async function run({ page, context, input, outputDir, progress, wait, sig
 }
 ```
 
-The `page` and `context` values are normal Playwright objects. The task decides navigation, selectors, concurrency, retry, pacing, waiting, recovery, and result format. Write valuable output incrementally under `outputDir`; do not wait until the end to persist a large batch. Use `progress()` after meaningful units. Use generic `wait()` only when this task chooses to pause.
+The `page` and `context` values are normal Playwright objects. The task decides navigation, selectors, concurrency, retry, pacing, waiting, recovery, and result format. Write valuable output incrementally under `outputDir`; do not wait until the end to persist a large batch. For restartable work, the script atomically saves a secret-free checkpoint with its version/input fingerprint, committed IDs or cursor, pending external effects and next step. The script validates and consumes it; Manager does not interpret business checkpoints. Use `progress()` after meaningful units and generic `wait()` only when this task chooses to pause.
 
-Only the entry `.mjs` is copied and frozen. Keep it self-contained: use Node built-ins, bare `playwright`, task `input`, absolute paths, or `outputDir`. Relative sibling imports/files are not copied. For uncertain submission retries, optionally use `run --request-key KEY` (1-160 ASCII letters/digits/`._:-`, starting with a letter/digit): identical submissions return the same task; changed content requires a new key.
+Only the entry `.mjs` is copied and frozen. Keep it self-contained: use Node built-ins, bare `playwright`, task `input`, absolute paths, or `outputDir`. Relative sibling imports/files are not copied. For uncertain submission retries, optionally use `run --request-key KEY` (1-160 ASCII letters/digits/`._:-`, starting with a letter/digit): identical submissions return the same task; changed content requires a new key. This prevents duplicate submission, not duplicate business actions. After `MANAGER_RESTARTED`, the old Worker cannot resume and original input is not retained. Read partial outputs first; only explicitly start a new attempt with a compatible script/checkpoint, freshly supplied authorized input and a distinct attempt key when continuation is safe.
 
-If an action with an external effect has an unknown outcome, inspect the page or service before repeating it. Never put cookies, tokens, passwords, or authorization headers in progress messages or output files.
+For errors, inspect `status`/`follow` error details, last progress and nullable `task.failureScreenshot`. When present, it is an artifact-relative hint: confirm it through `files`, decode base64 if returned, and inspect locally; it is not a filesystem path or proof of the current page. For older Managers or a missing reference, inspect the artifact listing; do not assume a screenshot exists. If an external effect has an unknown outcome, inspect the page/service before repeating it; if still uncertain, stop and ask. Never put cookies, tokens, passwords or authorization headers in progress, outputs, checkpoints or handoff receipts. Artifacts are raw task-written bytes, not automatically redacted; review files and screenshots before sharing.
 
 ## Verification waits
 
@@ -55,15 +57,10 @@ When the task detects a verification page, stop dispatching work and call `await
 
 Manager retains Chrome, Worker and heartbeat, freezes execution timeout, and requests a system notification immediately and every 30 seconds until actual resume or the 20-minute deadline. Page screenshots occur at 5/10/15/20 minutes. Before the deadline, `follow` returns screenshot `attention` and an `after` cursor. Open `attention.screenshotPath`; only if clearly recovered, run `taskmaster resume TASK_ID --probe PROBE_ID --json` with `attention.probeId`. Otherwise continue following with `--after SEQUENCE`; uncertainty means stay waiting.
 
-At 20 minutes Manager automatically pauses and stops reminders, preserving the browser and checkpoint. `follow` returns `manualResumeRequired`; the final screenshot is diagnostic only and must not trigger probe-based resume. The Dashboard Resume button or user's resume request maps to `taskmaster resume TASK_ID --json`. `stop`/`delete` cancel reminders and end the task. Keep following before automatic pause: CLI cannot wake an Agent whose turn or terminal session ended. Notification presentation follows OS settings; failures never block task control.
+At 20 minutes Manager automatically pauses and stops reminders, preserving the browser and checkpoint. `follow` returns `manualResumeRequired`; the final screenshot is diagnostic only and must not trigger probe-based resume. The Dashboard Resume button or user's resume request maps to `taskmaster resume TASK_ID --json`. `stop`/`delete` cancel reminders and end the task. Keep following before automatic pause: CLI cannot wake an Agent whose turn or terminal session ended. Any later wakeup belongs to a supported, user-authorized Agent-host mechanism, not Manager; otherwise hand off the receipt without promising automatic continuation. Notification presentation follows OS settings; failures never block task control.
 
 ## Control
 
-```text
-taskmaster status TASK_ID --json
-taskmaster stop TASK_ID --json
-taskmaster resume TASK_ID --json
-taskmaster delete TASK_ID --json
-```
+Use `taskmaster status TASK_ID --json`, `taskmaster stop TASK_ID --json`, `taskmaster resume TASK_ID --json` or `taskmaster delete TASK_ID --json`. Resume requires a live waiting Worker; it does not restart a dead script.
 
 Manager owns browser startup, one-writer Profile leases, process cleanup, and task persistence. The task module owns the work. For manual sign-in, open the Profile in the Dashboard or with `taskmaster profiles open NAME_OR_ID`: this is native Chrome without a debugging connection. Close all its windows before starting a task. Automation reuses that same Profile; individual sites can still require verification again.

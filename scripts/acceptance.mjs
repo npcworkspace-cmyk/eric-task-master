@@ -312,6 +312,14 @@ async function main() {
     add('failure preserves partial output and captures the page', failed.state === 'error' &&
       failed.error.code === 'ACCEPTANCE_INTENTIONAL' &&
       failedFiles.includes('partial.json') && failedFiles.includes('failure.png'));
+    const failedStatus = taskFrom(await cli(['status', failed.id, '--json']));
+    add('status and follow expose the same relative failure screenshot',
+      failed.failureScreenshot === 'failure.png' && failedStatus.failureScreenshot === failed.failureScreenshot);
+    const diagnostic = (await cli(['files', failed.id, '--read', failed.failureScreenshot,
+      '--max-bytes', '131072', '--json'])).records.at(-1).artifact;
+    add('failure screenshot reference is readable through the existing files command',
+      diagnostic.encoding === 'base64' && Buffer.from(diagnostic.data, 'base64')
+        .subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])));
 
     const endless = taskFrom(await cli([
       'run', endlessJob, '--input', JSON.stringify({ url: fixture.url }), '--detach', '--json'

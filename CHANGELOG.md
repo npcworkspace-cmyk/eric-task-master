@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.1.9 - 2026-10-20
+
+- Expose the existing failure screenshot as a nullable, artifact-relative reference in task snapshots returned by status/follow. Allow only the Worker's fixed `failure.png` artifact name and hide the reference after output cleanup; preserve old task compatibility without new storage, I/O, commands or services.
+- Keep task handoff and result summaries in the existing Skill by composing status/follow/files. Distinguish partial business results from terminal process state, refresh stale handoff state, and preserve secret-free cursor and artifact references.
+- Clarify script-owned atomic checkpoints, explicit new attempts after Manager restart, uncertain external-effect handling, and host-owned Agent wakeup. Do not automatically replay failed scripts or persist secret task input for recovery.
+- Verify the diagnostic reference through isolated service regressions and a real Chrome failure followed by the existing CLI artifact reader.
+- Launch Windows cross-host test fixtures through a no-console GUI bridge and assert that packaged and breakaway fixture hosts have no console window; keep the production runtime unchanged.
+
 ## 3.1.8 - 2026-10-10
 
 - Keep one selected same-user Manager and Profile pool across Agent hosts. Resolve Windows packaged/unpackaged state views to their physical store while preserving the selected legacy identity and Profiles across restarts, without silently merging or creating a replacement pool.
