@@ -7,6 +7,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class TaskMasterHostContext {
+  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
   [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
@@ -47,10 +48,29 @@ if ($Breakaway -or $Packaged) {
     if (-not $application) { throw 'The calling Agent package has no full-trust desktop application' }
     $powershellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Payload ' + $Payload
+    # A GUI executable prevents the package activation service from creating
+    # a console before PowerShell can process its WindowStyle argument.
+    $launcher = $configuration.output + '.launcher.exe'
+    Add-Type -OutputType WindowsApplication -OutputAssembly $launcher -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Text;
+public static class TaskMasterNoConsoleHost {
+  public static int Main(string[] args) {
+    try {
+      var start = new ProcessStartInfo(args[0], Encoding.UTF8.GetString(Convert.FromBase64String(args[1])));
+      start.UseShellExecute = false;
+      start.CreateNoWindow = true;
+      using (var child = Process.Start(start)) { child.WaitForExit(); return child.ExitCode; }
+    } catch { return 1; }
+  }
+}
+'@
+    $launcherArguments = '"' + $powershellPath + '" ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($arguments))
     # Official Windows diagnostic API; no package files or running Agent are changed.
     # PreventBreakaway keeps descendants packaged; omitting it creates an unpackaged CLI.
     # https://learn.microsoft.com/en-us/powershell/module/appx/invoke-commandindesktoppackage
-    Invoke-CommandInDesktopPackage -PackageFamilyName $package.PackageFamilyName -AppId $application.Id -Command $powershellPath -Args $arguments -PreventBreakaway:$Packaged | Out-Null
+    Invoke-CommandInDesktopPackage -PackageFamilyName $package.PackageFamilyName -AppId $application.Id -Command $launcher -Args $launcherArguments -PreventBreakaway:$Packaged | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     while (-not (Test-Path -LiteralPath $configuration.output) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
     if (-not (Test-Path -LiteralPath $configuration.output)) { throw 'Packaged fixture did not return within 60 seconds' }
@@ -83,6 +103,6 @@ $nodePackaged = [bool][TaskMasterHostContext]::PackageName($child.Id)
 $stdout = $child.StandardOutput.ReadToEndAsync()
 $stderr = $child.StandardError.ReadToEndAsync()
 if (-not $child.WaitForExit(55000)) { throw 'Fixture CLI exceeded its bounded wait' }
-$record = [ordered]@{ exitCode = $child.ExitCode; packaged = $nodePackaged; stdout = $stdout.Result; stderr = $stderr.Result }
+$record = [ordered]@{ exitCode = $child.ExitCode; packaged = $nodePackaged; hostConsoleWindow = [TaskMasterHostContext]::GetConsoleWindow().ToInt64(); stdout = $stdout.Result; stderr = $stderr.Result }
 [IO.File]::WriteAllText($configuration.output, ($record | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
 $child.Dispose()

@@ -64,10 +64,12 @@ test('real Windows legacy union view is preserved by one explicit Owner upgrade 
     };
     const normal = await call(['help']);
     if (!normal.packaged) { await removeTestTree(root); t.skip('requires an actual MSIX Agent host'); return; }
+    assert.equal(normal.hostConsoleWindow, 0, 'the packaged fixture must run without an allocated console');
     const overlay = await call(['packaged'], false, setup);
     assert.equal(overlay.exitCode, 0, overlay.stderr);
     const base = await call(['base'], true, setup);
     assert.equal(base.packaged, false);
+    assert.equal(base.hostConsoleWindow, 0, 'the breakaway fixture must run without an allocated console');
     assert.equal(base.exitCode, 0, base.stderr);
     const physical = path.dirname(await import('node:fs/promises').then(({ realpath }) => realpath(path.join(legacy, 'config.json'))));
     await assert.rejects(readFile(path.join(physical, 'profiles', profileId, 'Local State')), { code: 'ENOENT' });
@@ -133,6 +135,8 @@ test('real packaged and unpackaged Windows clients share defaults and each expli
       return;
     }
     const active = [];
+    assert.equal(normal.hostConsoleWindow, 0, 'the packaged fixture must run without an allocated console');
+    assert.equal(unpackaged.hostConsoleWindow, 0, 'the breakaway fixture must run without an allocated console');
     const managersByScope = new Map();
     t.after(async () => {
       for (const target of active) {
