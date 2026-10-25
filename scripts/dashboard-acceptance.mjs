@@ -132,7 +132,7 @@ const calls = {
 };
 const cleanupBehavior = {
   failPreview: false, failExecution: false, partial: false, historicalOutputPresent: true,
-  summary: undefined, holdNext: null
+  summary: undefined, busySummary: null, holdNext: null
 };
 let cleanupOperationSequence = 0;
 const cleanupSizes = { 'browser-cache': 1024 * 1024, 'temporary-files': 64 * 1024, 'task-output': 5 * 1024 * 1024 };
@@ -200,6 +200,10 @@ async function handler(request, response) {
     assert.ok(Array.isArray(body.categories) && body.categories.length > 0);
     assert.ok(body.categories.every((category) => Object.hasOwn(cleanupSizes, category)));
     if (body.preview && cleanupBehavior.failPreview) {
+      if (cleanupBehavior.busySummary) {
+        cleanupBehavior.summary = cleanupBehavior.busySummary;
+        cleanupBehavior.busySummary = null;
+      }
       cleanupBehavior.failPreview = false;
       json(response, 409, { error: { code: 'CLEANUP_BUSY', message: 'Cleanup is busy. Retry preview.' } });
       return;
@@ -631,8 +635,11 @@ async function checkSlowCleanup(page, checks) {
   const errors = page.locator('#cleanup-error');
   const requestCount = () => calls.cleanup.length;
   const deletionCount = () => calls.cleanup.filter((entry) => !entry.preview).length;
-  const refreshStatus = async () => {
-    await page.locator('#refresh-all').evaluate((node) => node.click());
+  const refreshStatus = async (releasePrevious) => {
+    // The modal covers this button, and a disabled HTMLElement.click() is a
+    // no-op. Dispatch through the handler so an in-flight read queues a fresh one.
+    await page.locator('#refresh-all').dispatchEvent('click');
+    releasePrevious?.();
     await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
   };
   const holdNext = (preview, disconnect = false) => {
@@ -682,9 +689,28 @@ async function checkSlowCleanup(page, checks) {
   await page.locator('#open-cleanup').click();
   assert.equal(requestCount(), runningRequests, 'reopening a running cleanup never posts another request');
   assert.equal(await confirm.isDisabled(), true);
-  Object.assign(cleanupBehavior.summary, { phase: 'tasks', current: 2, files: 4, bytes: 4096, skipped: 1 });
-  await refreshStatus();
-  assert.match(await summary.textContent(), /已检查 2 \/ 3 项.*任务文件.*4 KB.*4 个文件.*已跳过 1 项/u);
+  let releaseOldStatus;
+  let oldStatusCaptured = false;
+  const oldStatus = new Promise((resolve) => { releaseOldStatus = resolve; });
+  const holdOldStatus = async (route) => {
+    const response = await route.fetch();
+    oldStatusCaptured = true;
+    await oldStatus;
+    await route.fulfill({ response });
+  };
+  await page.route('**/v1/status', holdOldStatus);
+  try {
+    await page.locator('#refresh-all').dispatchEvent('click');
+    await waitUntil(() => oldStatusCaptured, 'old progress snapshot is held');
+    assert.equal(await page.locator('#refresh-all').isDisabled(), true);
+    Object.assign(cleanupBehavior.summary, { phase: 'tasks', current: 2, files: 4, bytes: 4096, skipped: 1 });
+    await refreshStatus(releaseOldStatus);
+    assert.match(await summary.textContent(), /已检查 2 \/ 3 项.*任务文件.*4 KB.*4 个文件.*已跳过 1 项/u);
+  } finally {
+    releaseOldStatus();
+    await page.unroute('**/v1/status', holdOldStatus);
+  }
+  checks.push('refresh during an in-flight older progress snapshot waits for the queued fresh read, not only the old read');
   release();
   await waitUntil(() => replyReceived, 'completed deletion response is held');
   await refreshStatus();
@@ -698,10 +724,16 @@ async function checkSlowCleanup(page, checks) {
   checks.push('preview and deletion survive 65 seconds of browser time; progress remains visible and reopening sends no duplicate POST');
 
   // A busy response belongs to the existing operation, not another retry loop.
-  cleanupBehavior.summary = {
+  cleanupBehavior.busySummary = {
     ...cleanupBehavior.summary, id: 'cleanup_external', state: 'running', phase: 'tasks',
     preview: false, current: 1, finishedAt: null
   };
+  // Publish the previously unknown operation atomically with the 409 response.
+  // Publishing it earlier lets polling correctly disable this preview first.
+  assert.equal(cleanupBehavior.summary.state, 'finished');
+  await refreshStatus();
+  assert.notEqual(cleanupBehavior.summary.id, 'cleanup_external');
+  assert.equal(await page.locator('#retry-cleanup').isDisabled(), false);
   cleanupBehavior.failPreview = true;
   await page.locator('#retry-cleanup').click();
   await waitUntil(() => !cleanupBehavior.failPreview, 'busy preview response');
@@ -775,7 +807,7 @@ async function checkCleanupStatusRace(page, checks) {
     };
     await page.route('**/v1/status', holdStatus);
     try {
-      await page.locator('#refresh-all').evaluate((node) => node.click());
+      await page.locator('#refresh-all').dispatchEvent('click');
       await waitUntil(() => captured, 'old status snapshot is held');
       cleanupBehavior.summary = null;
       await action();
@@ -824,7 +856,7 @@ async function checkNewerCleanupStatus(page, checks) {
         ...cleanupBehavior.summary, id: `cleanup_newer_${preview}`, state: 'running', preview: false,
         categories: ['task-output'], phase: 'tasks', current: 8, total: 10, finishedAt: null
       };
-      await page.locator('#refresh-all').evaluate((node) => node.click());
+      await page.locator('#refresh-all').dispatchEvent('click');
       await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
       assert.match(await summary.textContent(), /已检查 8 \/ 10 项/u);
       release();
@@ -837,7 +869,7 @@ async function checkNewerCleanupStatus(page, checks) {
       await page.unroute('**/v1/cleanup', holdResponse);
     }
     Object.assign(cleanupBehavior.summary, { state: 'finished', phase: 'done', current: 10, finishedAt: now() });
-    await page.locator('#refresh-all').evaluate((node) => node.click());
+    await page.locator('#refresh-all').dispatchEvent('click');
     await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
     if (preview) {
       cleanupBehavior.summary = null;
