@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.1.10 - 2026-10-25
+
+- Batch cleanup metadata snapshots instead of rewriting the full task history after every output directory; persist completed batches and the final partial batch, and avoid no-op updates while still checking for late-arriving files.
+- Delete at most four ordinary sibling files concurrently while preserving managed-root, ancestor, link, identity and Profile-login safeguards; recurse into directories only after the current leaf batch finishes.
+- Keep cleanup progress and the latest outcome in the existing status response. Let the Dashboard follow a long-running cleanup across dialog reopening or request interruption without duplicate deletion requests or a misleading one-minute timeout.
+- Add large-history write-count, repeat-cleanup, partial-failure, bounded-concurrency and isolated Dashboard regressions. No new service, database, scheduling engine or runtime dependency.
+
 ## 3.1.9 - 2026-10-20
 
 - Expose the existing failure screenshot as a nullable, artifact-relative reference in task snapshots returned by status/follow. Allow only the Worker's fixed `failure.png` artifact name and hide the reference after output cleanup; preserve old task compatibility without new storage, I/O, commands or services.

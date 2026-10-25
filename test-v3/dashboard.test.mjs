@@ -125,7 +125,11 @@ test('cleanup is one accessible dialog with opt-in historical output and matchin
   assert.match(source, /body: \{ categories, preview: false \}/u);
   assert.match(source, /cleanup\.executing \|\| cleanup\.loading/u);
   assert.match(source, /cleanup\.preview = null/u);
-  assert.match(source, /cleanupDialog\.addEventListener\('cancel'/u);
+  assert.match(source, /timeoutMs > 0 \? setTimeout/u);
+  assert.equal((source.match(/requestTimeoutMs: 0/gu) || []).length, 2, 'only cleanup requests disable the fixed mutation timeout');
+  assert.match(source, /syncCleanupStatus\(state\.manager\)/u);
+  assert.match(source, /operation\.id === cleanup\.ignoredOperationId/u);
+  assert.match(source, /ui\.closeCleanup\.disabled = false/u);
   assert.match(source, /'cleanup\.open': '清理空间'/u);
   assert.match(source, /'cleanup\.open': 'Clean up space'/u);
   assert.match(source, /'cleanup\.freed': '已清理文件大小'/u);
@@ -134,7 +138,8 @@ test('cleanup is one accessible dialog with opt-in historical output and matchin
   assert.match(css, /\.cleanup-dialog::backdrop/u);
   assert.match(css, /max-height: calc\(100dvh - 32px\)/u);
   assert.match(css, /\.cleanup-option[^}]+min-height: 44px/u);
-  for (const evidence of ['historicalOutputPresent', 'previewHeld', 'failPreview', 'failExecution', 'cleanupScreenshotPaths']) {
+  for (const evidence of ['historicalOutputPresent', 'previewHeld', 'failPreview', 'failExecution', 'cleanupScreenshotPaths',
+    'fastForward(65_000)', 'disconnectedDeletions', 'cleanup_external']) {
     assert.ok(acceptance.includes(evidence), `Browser acceptance must cover ${evidence}`);
   }
 });

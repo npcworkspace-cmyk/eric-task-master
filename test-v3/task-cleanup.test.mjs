@@ -72,7 +72,9 @@ class Worker extends EventEmitter {
   }
 }
 
-async function fixture(t, { profileUsageProbe = async () => 'inactive', useRootAlias = false } = {}) {
+async function fixture(t, {
+  profileUsageProbe = async () => 'inactive', useRootAlias = false, allowStateConflict = false
+} = {}) {
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cleanup-test-'));
   let root = fixtureRoot;
   if (useRootAlias) {
@@ -109,8 +111,10 @@ async function fixture(t, { profileUsageProbe = async () => 'inactive', useRootA
     stopWaitMs: 30, terminationWaitMs: 30
   });
   t.after(async () => {
-    await service.close();
-    await removeTestTree(fixtureRoot);
+    try { await service.close(); }
+    catch (error) {
+      if (!allowStateConflict || error.code !== 'STATE_STORE_EXTERNALLY_MODIFIED') throw error;
+    } finally { await removeTestTree(fixtureRoot); }
   });
   const createTask = async (selectedProfile = profile) => {
     const task = await service.create({ modulePath: source, profileId: selectedProfile.id });
@@ -369,11 +373,21 @@ test('Profile cleanup reserves only its Profile while other reads run and task l
     await release.promise;
     return 'inactive';
   } });
+  assert.equal((await f.service.status()).cleanup, null);
   await put(path.join(f.profile.userDataDir, 'Default', 'Cache', 'entry'));
   const cleaning = f.service.cleanup({ categories: ['browser-cache'], preview: false });
   cleaning.catch(() => {});
   try {
     await bounded(entered.promise);
+    const progress = (await bounded(f.service.status())).cleanup;
+    assert.equal(progress.state, 'running');
+    assert.equal(progress.preview, false);
+    assert.equal(progress.phase, 'profiles');
+    assert.equal(progress.current, 0);
+    assert.equal(progress.total, 1);
+    assert.deepEqual(progress.categories, ['browser-cache']);
+    progress.categories.push('not-shared-state');
+    assert.deepEqual((await f.service.status()).cleanup.categories, ['browser-cache']);
     await assert.rejects(bounded(f.service.cleanup()), { code: 'CLEANUP_BUSY', statusCode: 409 });
     await assert.rejects(bounded(f.service.openProfile(f.profile.id)), { code: 'PROFILE_OPERATION_ACTIVE' });
     await assert.rejects(bounded(f.service.deleteProfile(f.profile.id)), { code: 'PROFILE_OPERATION_ACTIVE' });
@@ -381,7 +395,17 @@ test('Profile cleanup reserves only its Profile while other reads run and task l
     assert.equal((await bounded(f.service.get(queued.id))).state, 'queued');
     assert.equal(f.workers.length, 0, 'the reserved Profile cannot launch a task');
     release.resolve();
-    await cleaning;
+    const report = await cleaning;
+    const completed = (await f.service.status()).cleanup;
+    assert.equal(completed.id, report.operationId);
+    assert.equal(completed.state, 'finished');
+    assert.equal(completed.phase, 'done');
+    assert.equal(completed.current, 1);
+    assert.equal(completed.files, 1);
+    assert.equal(completed.skipped, 0);
+    assert.equal(completed.failed, 0);
+    assert.ok(Date.parse(completed.startedAt));
+    assert.ok(Date.parse(completed.finishedAt));
     await until(() => f.workers.length === 1 && f.workers[0].config?.taskId === queued.id);
   } finally {
     release.resolve();
@@ -421,6 +445,82 @@ test('task cleanup holds only its task reservation and rejects deletion until di
   } finally {
     release.resolve();
     await cleaning;
+    mock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('deleting an earlier cleaned task while a later item is in flight never resurrects the dirty batch record', async (t) => {
+  const f = await fixture(t);
+  const first = await f.finishTask(await f.createTask());
+  const second = await f.finishTask(await f.createTask());
+  await put(path.join(first.outputDir, 'first.txt'));
+  await put(path.join(second.outputDir, 'second.txt'));
+  const canonicalOutputDir = await realpath(second.outputDir);
+  const entered = deferred();
+  const release = deferred();
+  const original = fsPromises.readdir;
+  const mock = t.mock.method(fsPromises, 'readdir', async (directory, ...args) => {
+    if (await realpath(directory) === canonicalOutputDir) {
+      entered.resolve();
+      await release.promise;
+    }
+    return original(directory, ...args);
+  });
+  syncBuiltinESMExports();
+  const cleaning = f.service.cleanup({ categories: ['task-output'], preview: false });
+  cleaning.catch(() => {});
+  try {
+    await bounded(entered.promise);
+    assert.ok((await f.service.get(first.task.id)).outputClearedAt);
+    await bounded(f.service.deleteTask(first.task.id));
+    release.resolve();
+    const report = await cleaning;
+    assert.equal(report.files, 2);
+    const persisted = JSON.parse(await readFile(path.join(f.root, 'tasks', 'tasks.json'), 'utf8'));
+    assert.deepEqual(persisted.tasks.map((task) => task.id), [second.task.id]);
+    assert.ok(persisted.tasks[0].outputClearedAt, 'remaining batch metadata is still flushed');
+    await assert.rejects(f.service.get(first.task.id), { code: 'TASK_NOT_FOUND' });
+  } finally {
+    release.resolve();
+    await cleaning;
+    mock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('a pending cleanup batch cannot overwrite an externally replaced task store', async (t) => {
+  const f = await fixture(t, { allowStateConflict: true });
+  const first = await f.finishTask(await f.createTask());
+  const second = await f.finishTask(await f.createTask());
+  await put(path.join(first.outputDir, 'first.txt'));
+  await put(path.join(second.outputDir, 'second.txt'));
+  const canonicalOutputDir = await realpath(second.outputDir);
+  const entered = deferred();
+  const release = deferred();
+  const original = fsPromises.readdir;
+  const mock = t.mock.method(fsPromises, 'readdir', async (directory, ...args) => {
+    if (await realpath(directory) === canonicalOutputDir) {
+      entered.resolve();
+      await release.promise;
+    }
+    return original(directory, ...args);
+  });
+  syncBuiltinESMExports();
+  const cleaning = f.service.cleanup({ categories: ['task-output'], preview: false });
+  cleaning.catch(() => {});
+  try {
+    await bounded(entered.promise);
+    assert.ok((await f.service.get(first.task.id)).outputClearedAt);
+    const storePath = path.join(f.root, 'tasks', 'tasks.json');
+    const replacement = `${JSON.stringify({ version: 1, tasks: [], tombstones: [], externalCanary: true })}\n`;
+    await writeFile(storePath, replacement);
+    release.resolve();
+    await assert.rejects(cleaning, { code: 'STATE_STORE_EXTERNALLY_MODIFIED' });
+    assert.equal(await readFile(storePath, 'utf8'), replacement);
+  } finally {
+    release.resolve();
+    await cleaning.catch(() => {});
     mock.mock.restore();
     syncBuiltinESMExports();
   }

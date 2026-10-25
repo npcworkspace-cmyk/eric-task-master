@@ -299,11 +299,18 @@ test('space cleanup is authenticated, defaults to preview, and accepts only fixe
   await writeFile(path.join(cache, 'rebuildable'), 'cache');
   await writeFile(path.join(profile.userDataDir, 'Default', 'Cookies'), 'synthetic-login-canary');
 
+  assert.equal((await json(`${base}/v1/status`, { token })).body.cleanup, null);
   assert.equal((await json(`${base}/v1/cleanup`, { method: 'POST', body: { preview: false } })).status, 401);
   const before = await json(`${base}/v1/cleanup`, { token, method: 'POST', body: {} });
   assert.equal(before.status, 200);
   assert.equal(before.body.preview, true);
   assert.equal(before.body.bytes, 5);
+  assert.match(before.body.operationId, /^cleanup_[a-f0-9]{32}$/u);
+  const previewStatus = (await json(`${base}/v1/status`, { token })).body.cleanup;
+  assert.equal(previewStatus.id, before.body.operationId);
+  assert.equal(previewStatus.state, 'finished');
+  assert.equal(previewStatus.preview, true);
+  assert.equal(previewStatus.files, 1);
   assert.equal(await readFile(path.join(cache, 'rebuildable'), 'utf8'), 'cache');
   for (const body of [{ path: root }, { categories: ['cookies'], preview: false }, { preview: 'false' }, null]) {
     const invalid = await json(`${base}/v1/cleanup`, { token, method: 'POST', body });
@@ -319,6 +326,21 @@ test('space cleanup is authenticated, defaults to preview, and accepts only fixe
   assert.equal(after.preview, false);
   assert.equal(after.bytes, 5);
   assert.equal(after.files, 1);
+  const cleanupStatus = (await json(`${base}/v1/status`, { token })).body.cleanup;
+  assert.equal(cleanupStatus.id, after.operationId);
+  assert.notEqual(cleanupStatus.id, previewStatus.id);
+  assert.equal(cleanupStatus.state, 'finished');
+  assert.equal(cleanupStatus.preview, false);
+  assert.deepEqual(cleanupStatus.categories, ['browser-cache']);
+  assert.equal(cleanupStatus.phase, 'done');
+  assert.equal(cleanupStatus.current, cleanupStatus.total);
+  assert.equal(cleanupStatus.files, 1);
+  assert.equal(cleanupStatus.bytes, 5);
+  assert.equal(cleanupStatus.failed, 0);
+  assert.equal(cleanupStatus.skipped, 0);
+  assert.ok(cleanupStatus.startedAt && cleanupStatus.finishedAt);
+  assert.ok(!JSON.stringify(cleanupStatus).includes(root));
+  assert.ok(!JSON.stringify(cleanupStatus).includes(token));
   assert.equal(await readFile(path.join(profile.userDataDir, 'Default', 'Cookies'), 'utf8'), 'synthetic-login-canary');
   assert.equal(JSON.parse(await readFile(path.join(root, 'config.json'), 'utf8')).managerToken, token);
   const journal = (await readFile(path.join(root, 'logs', 'manager-events.jsonl'), 'utf8'))
