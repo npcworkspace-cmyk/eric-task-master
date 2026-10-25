@@ -130,7 +130,11 @@ const calls = {
   defaultChanges: [],
   cleanup: []
 };
-const cleanupBehavior = { failPreview: false, failExecution: false, partial: false, historicalOutputPresent: true };
+const cleanupBehavior = {
+  failPreview: false, failExecution: false, partial: false, historicalOutputPresent: true,
+  summary: undefined, busySummary: null, holdNext: null
+};
+let cleanupOperationSequence = 0;
 const cleanupSizes = { 'browser-cache': 1024 * 1024, 'temporary-files': 64 * 1024, 'task-output': 5 * 1024 * 1024 };
 
 function taskById(id) {
@@ -172,6 +176,7 @@ async function handler(request, response) {
     json(response, 200, {
       ok: true,
       version: packageJson.version,
+      ...(cleanupBehavior.summary === undefined ? {} : { cleanup: clone(cleanupBehavior.summary) }),
       defaultProfileId: profiles.find((profile) => profile.isDefault)?.id || null
     });
     return;
@@ -195,6 +200,10 @@ async function handler(request, response) {
     assert.ok(Array.isArray(body.categories) && body.categories.length > 0);
     assert.ok(body.categories.every((category) => Object.hasOwn(cleanupSizes, category)));
     if (body.preview && cleanupBehavior.failPreview) {
+      if (cleanupBehavior.busySummary) {
+        cleanupBehavior.summary = cleanupBehavior.busySummary;
+        cleanupBehavior.busySummary = null;
+      }
       cleanupBehavior.failPreview = false;
       json(response, 409, { error: { code: 'CLEANUP_BUSY', message: 'Cleanup is busy. Retry preview.' } });
       return;
@@ -204,11 +213,10 @@ async function handler(request, response) {
       json(response, 500, { error: { code: 'CLEANUP_FAILED', message: 'Fixture cleanup interrupted.' } });
       return;
     }
-    if (!body.preview && body.categories.includes('task-output')) cleanupBehavior.historicalOutputPresent = false;
     const categories = body.categories.map((id) => ({
       id, bytes: cleanupSizes[id] / (body.preview ? 1 : 2), files: body.preview ? 4 : 2
     }));
-    json(response, 200, {
+    const report = {
       ok: true, preview: body.preview,
       bytes: categories.reduce((total, category) => total + category.bytes, 0),
       files: categories.reduce((total, category) => total + category.files, 0), categories,
@@ -217,7 +225,36 @@ async function handler(request, response) {
         { kind: 'profile', id: 'profile_busy', name: 'Busy', reason: 'PROFILE_BUSY' }
       ],
       failed: cleanupBehavior.partial ? [{ kind: 'task', id: 'task_finished', name: 'Finished sample', reason: 'File is busy' }] : []
-    });
+    };
+    const held = cleanupBehavior.holdNext;
+    if (held && held.preview === body.preview) {
+      cleanupBehavior.holdNext = null;
+      const summary = {
+        id: `cleanup_fixture_${++cleanupOperationSequence}`, state: 'running', preview: body.preview,
+        categories: clone(body.categories), phase: 'profiles', current: 0, total: 3,
+        files: 0, bytes: 0, skipped: 0, failed: 0, startedAt: now(), finishedAt: null
+      };
+      cleanupBehavior.summary = summary;
+      report.operationId = summary.id;
+      if (held.disconnect) {
+        // Lose an already-started response, not the connection before headers
+        // (Chromium may transparently retry that transport-level failure).
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.flushHeaders();
+        response.write('{"ok":');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        response.destroy();
+      }
+      await held.gate;
+      Object.assign(summary, {
+        state: 'finished', phase: 'done', current: summary.total,
+        files: report.files, bytes: report.bytes, skipped: report.skipped.length,
+        failed: report.failed.length, finishedAt: now()
+      });
+      if (!body.preview && body.categories.includes('task-output')) cleanupBehavior.historicalOutputPresent = false;
+      if (held.disconnect) return;
+    } else if (!body.preview && body.categories.includes('task-output')) cleanupBehavior.historicalOutputPresent = false;
+    json(response, 200, report);
     return;
   }
 
@@ -536,6 +573,8 @@ async function checkCleanup(page, checks) {
   await page.locator('#open-cleanup').click();
   await page.locator('#cleanup-error:not(.hidden)').waitFor();
   assert.equal(await confirm.isDisabled(), true);
+  assert.match(await page.locator('#cleanup-error').textContent(), /已有清理或预览正在进行/u);
+  assert.doesNotMatch(await page.locator('#cleanup-summary').textContent(), /请至少选择一项/u);
   await page.locator('#retry-cleanup').click();
   await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
   cleanupBehavior.failExecution = true;
@@ -588,6 +627,259 @@ async function checkCleanup(page, checks) {
   await page.locator('#language-toggle').click();
   await page.setViewportSize({ width: 1440, height: 960 });
   checks.push('cleanup has translated English labels, contained keyboard focus, and a bounded scrollable mobile dialog');
+}
+
+async function checkSlowCleanup(page, checks) {
+  const confirm = page.locator('#confirm-cleanup');
+  const summary = page.locator('#cleanup-summary');
+  const errors = page.locator('#cleanup-error');
+  const requestCount = () => calls.cleanup.length;
+  const deletionCount = () => calls.cleanup.filter((entry) => !entry.preview).length;
+  const refreshStatus = async (releasePrevious) => {
+    // The modal covers this button, and a disabled HTMLElement.click() is a
+    // no-op. Dispatch through the handler so an in-flight read queues a fresh one.
+    await page.locator('#refresh-all').dispatchEvent('click');
+    releasePrevious?.();
+    await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
+  };
+  const holdNext = (preview, disconnect = false) => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    cleanupBehavior.holdNext = { preview, disconnect, gate };
+    return release;
+  };
+
+  // Advance browser time instead of making the suite wait over a minute.
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  let release = holdNext(true);
+  await page.locator('#open-cleanup').click();
+  await waitUntil(() => cleanupBehavior.summary?.state === 'running', 'slow preview starts');
+  await refreshStatus();
+  assert.match(await summary.textContent(), /正在估算.*已检查 0 \/ 3 项/u);
+  const slowPreviewRequests = requestCount();
+  await page.clock.fastForward(65_000);
+  assert.equal(await errors.isVisible(), false, 'preview must not be aborted at 60 seconds');
+  assert.equal(await confirm.isDisabled(), true);
+  assert.equal(requestCount(), slowPreviewRequests);
+  release();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+
+  release = holdNext(false);
+  let releaseReply;
+  let replyReceived = false;
+  const heldReply = new Promise((resolve) => { releaseReply = resolve; });
+  const holdReply = async (route) => {
+    const response = await route.fetch();
+    replyReceived = true;
+    await heldReply;
+    await route.fulfill({ response });
+  };
+  await page.route('**/v1/cleanup', holdReply);
+  const deletionsBefore = deletionCount();
+  await confirm.evaluate((node) => { node.click(); node.click(); });
+  await waitUntil(() => cleanupBehavior.summary?.state === 'running' && !cleanupBehavior.summary.preview, 'slow deletion starts');
+  await refreshStatus();
+  await page.clock.fastForward(65_000);
+  assert.equal(await errors.isVisible(), false, 'cleanup must not be aborted at 60 seconds');
+  assert.match(await summary.textContent(), /正在清理.*已检查 0 \/ 3 项/u);
+  assert.equal(deletionCount(), deletionsBefore + 1);
+  const runningRequests = requestCount();
+  await page.locator('#close-cleanup').click();
+  await page.locator('#open-cleanup').click();
+  assert.equal(requestCount(), runningRequests, 'reopening a running cleanup never posts another request');
+  assert.equal(await confirm.isDisabled(), true);
+  let releaseOldStatus;
+  let oldStatusCaptured = false;
+  const oldStatus = new Promise((resolve) => { releaseOldStatus = resolve; });
+  const holdOldStatus = async (route) => {
+    const response = await route.fetch();
+    oldStatusCaptured = true;
+    await oldStatus;
+    await route.fulfill({ response });
+  };
+  await page.route('**/v1/status', holdOldStatus);
+  try {
+    await page.locator('#refresh-all').dispatchEvent('click');
+    await waitUntil(() => oldStatusCaptured, 'old progress snapshot is held');
+    assert.equal(await page.locator('#refresh-all').isDisabled(), true);
+    Object.assign(cleanupBehavior.summary, { phase: 'tasks', current: 2, files: 4, bytes: 4096, skipped: 1 });
+    await refreshStatus(releaseOldStatus);
+    assert.match(await summary.textContent(), /已检查 2 \/ 3 项.*任务文件.*4 KB.*4 个文件.*已跳过 1 项/u);
+  } finally {
+    releaseOldStatus();
+    await page.unroute('**/v1/status', holdOldStatus);
+  }
+  checks.push('refresh during an in-flight older progress snapshot waits for the queued fresh read, not only the old read');
+  release();
+  await waitUntil(() => replyReceived, 'completed deletion response is held');
+  await refreshStatus();
+  assert.match(await summary.textContent(), /后台操作摘要/u);
+  assert.equal(await confirm.isDisabled(), true);
+  releaseReply();
+  await summary.getByText('已清理文件大小', { exact: true }).waitFor();
+  await page.locator('#cleanup-details').getByText(/Review open-ended feed/u).waitFor();
+  await page.unroute('**/v1/cleanup', holdReply);
+  assert.equal(await confirm.isDisabled(), true);
+  checks.push('preview and deletion survive 65 seconds of browser time; progress remains visible and reopening sends no duplicate POST');
+
+  // A busy response belongs to the existing operation, not another retry loop.
+  cleanupBehavior.busySummary = {
+    ...cleanupBehavior.summary, id: 'cleanup_external', state: 'running', phase: 'tasks',
+    preview: false, current: 1, finishedAt: null
+  };
+  // Publish the previously unknown operation atomically with the 409 response.
+  // Publishing it earlier lets polling correctly disable this preview first.
+  assert.equal(cleanupBehavior.summary.state, 'finished');
+  await refreshStatus();
+  assert.notEqual(cleanupBehavior.summary.id, 'cleanup_external');
+  assert.equal(await page.locator('#retry-cleanup').isDisabled(), false);
+  cleanupBehavior.failPreview = true;
+  await page.locator('#retry-cleanup').click();
+  await waitUntil(() => !cleanupBehavior.failPreview, 'busy preview response');
+  await refreshStatus();
+  assert.match(await summary.textContent(), /正在清理.*已检查 1 \/ 3 项/u);
+  assert.equal(await confirm.isDisabled(), true);
+  const busyRequests = requestCount();
+  await page.clock.fastForward(10_000);
+  assert.equal(requestCount(), busyRequests, 'polling a busy cleanup never retries the POST');
+  Object.assign(cleanupBehavior.summary, { state: 'finished', phase: 'done', current: 3, finishedAt: now() });
+  await refreshStatus();
+  assert.match(await summary.textContent(), /后台操作摘要/u);
+  assert.equal(await confirm.isDisabled(), true, 'a status summary is not a matching preview');
+  checks.push('CLEANUP_BUSY hands off to existing status progress; completion never authorizes deletion or retries a POST');
+
+  await page.locator('#retry-cleanup').click();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  cleanupBehavior.failPreview = true;
+  await page.locator('[name="cleanup-category"][value="task-output"]').check();
+  await errors.waitFor({ state: 'visible' });
+  assert.equal(await page.locator('[name="cleanup-category"]:checked').count(), 3);
+  assert.doesNotMatch(await summary.textContent(), /请至少选择一项/u);
+  await page.locator('#retry-cleanup').click();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  cleanupBehavior.partial = true;
+  release = holdNext(false, true);
+  const disconnectedDeletions = deletionCount();
+  await confirm.click();
+  await waitUntil(() => cleanupBehavior.summary?.state === 'running', 'disconnected cleanup starts');
+  await refreshStatus();
+  assert.match(await summary.textContent(), /正在清理/u);
+  assert.equal(await confirm.isDisabled(), true);
+  await page.clock.resume();
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await refreshStatus();
+  const reconnectRequests = requestCount();
+  await page.locator('#open-cleanup').click();
+  assert.match(await summary.textContent(), /正在清理.*历史截图、下载和结果/u);
+  assert.equal(requestCount(), reconnectRequests, 'a new page observes the live operation without replaying it');
+  assert.equal(await confirm.isDisabled(), true);
+  release();
+  await waitUntil(() => cleanupBehavior.summary?.state === 'finished', 'disconnected cleanup finishes');
+  await refreshStatus();
+  assert.match(await summary.textContent(), /已清理文件大小.*已跳过 2 项.*1 项未能清理.*部分项目未清理.*后台操作摘要/u);
+  assert.equal(deletionCount(), disconnectedDeletions + 1);
+  assert.equal(await confirm.isDisabled(), true);
+  checks.push('a lost deletion response and full page reload recover the same operation, disclose partial counts, and never replay deletion');
+  await page.locator('#close-cleanup').click();
+  cleanupBehavior.partial = false;
+  cleanupBehavior.summary = null;
+}
+
+async function checkCleanupStatusRace(page, checks) {
+  const summary = page.locator('#cleanup-summary');
+  const confirm = page.locator('#confirm-cleanup');
+  await page.locator('#open-cleanup').click();
+  const runRace = async (action, expected) => {
+    let release;
+    let captured = false;
+    const held = new Promise((resolve) => { release = resolve; });
+    cleanupBehavior.summary = {
+      id: `cleanup_stale_${calls.cleanup.length}`, state: 'running', preview: false,
+      categories: ['task-output'], phase: 'tasks', current: 9, total: 99,
+      files: 123, bytes: 123, skipped: 0, failed: 0, startedAt: now(), finishedAt: null
+    };
+    const holdStatus = async (route) => {
+      const response = await route.fetch();
+      captured = true;
+      await held;
+      await route.fulfill({ response });
+    };
+    await page.route('**/v1/status', holdStatus);
+    try {
+      await page.locator('#refresh-all').dispatchEvent('click');
+      await waitUntil(() => captured, 'old status snapshot is held');
+      cleanupBehavior.summary = null;
+      await action();
+      await summary.getByText(expected, { exact: true }).waitFor();
+      release();
+      await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
+      assert.doesNotMatch(await summary.textContent(), /9 \/ 99/u);
+      await summary.getByText(expected, { exact: true }).waitFor();
+    } finally {
+      release();
+      await page.unroute('**/v1/status', holdStatus);
+    }
+  };
+  await runRace(() => page.locator('#retry-cleanup').click(), '预计可释放');
+  assert.equal(await confirm.isDisabled(), false, 'delayed old status cannot clear a newer matching preview');
+  await runRace(() => confirm.click(), '已清理文件大小');
+  assert.equal(await confirm.isDisabled(), true);
+  await page.locator('#close-cleanup').click();
+  checks.push('a delayed old status cannot overwrite a newer preview or deletion result; a finished summary can hand off to its detailed POST response');
+}
+
+async function checkNewerCleanupStatus(page, checks) {
+  const summary = page.locator('#cleanup-summary');
+  const confirm = page.locator('#confirm-cleanup');
+  await page.locator('#open-cleanup').click();
+  await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+  for (const preview of [true, false]) {
+    let release;
+    let captured = false;
+    let delivered = false;
+    const held = new Promise((resolve) => { release = resolve; });
+    const holdResponse = async (route) => {
+      const response = await route.fetch();
+      captured = true;
+      await held;
+      await route.fulfill({ response });
+      delivered = true;
+    };
+    cleanupBehavior.holdNext = { preview, gate: Promise.resolve() };
+    await page.route('**/v1/cleanup', holdResponse);
+    try {
+      if (preview) await page.locator('[name="cleanup-category"][value="task-output"]').check();
+      else await confirm.click();
+      await waitUntil(() => captured, 'older POST response is held');
+      cleanupBehavior.summary = {
+        ...cleanupBehavior.summary, id: `cleanup_newer_${preview}`, state: 'running', preview: false,
+        categories: ['task-output'], phase: 'tasks', current: 8, total: 10, finishedAt: null
+      };
+      await page.locator('#refresh-all').dispatchEvent('click');
+      await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
+      assert.match(await summary.textContent(), /已检查 8 \/ 10 项/u);
+      release();
+      await waitUntil(() => delivered, 'older POST response is delivered');
+      assert.match(await summary.textContent(), /已检查 8 \/ 10 项/u);
+      assert.equal(await confirm.isDisabled(), true);
+      assert.equal(await page.locator('#cleanup-error').isVisible(), false);
+    } finally {
+      release();
+      await page.unroute('**/v1/cleanup', holdResponse);
+    }
+    Object.assign(cleanupBehavior.summary, { state: 'finished', phase: 'done', current: 10, finishedAt: now() });
+    await page.locator('#refresh-all').dispatchEvent('click');
+    await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
+    if (preview) {
+      cleanupBehavior.summary = null;
+      await page.locator('#retry-cleanup').click();
+      await page.waitForFunction(() => !document.querySelector('#confirm-cleanup').disabled);
+    }
+  }
+  await page.locator('#close-cleanup').click();
+  cleanupBehavior.summary = null;
+  checks.push('a newer operation observed through status survives an older preview or deletion POST response without errors or enabled deletion');
 }
 
 const server = http.createServer((request, response) => {
@@ -668,6 +960,9 @@ try {
   }
   await checkVerificationPause(page, checks);
   await checkCleanup(page, checks);
+  await checkSlowCleanup(page, checks);
+  await checkCleanupStatusRace(page, checks);
+  await checkNewerCleanupStatus(page, checks);
 
   const rejectApi = (route) => route.abort('connectionrefused');
   await page.route('**/v1/**', rejectApi);

@@ -33,6 +33,7 @@ const MAX_EVENTS = 1_000;
 const MAX_MODULE_BYTES = 16 * 1024 * 1024;
 const LEASE_TTL_MS = 45_000;
 const HEARTBEAT_TIMEOUT_MS = 35_000;
+const CLEANUP_PERSIST_BATCH = 64;
 
 function nowIso(now) {
   return new Date(now()).toISOString();
@@ -189,6 +190,7 @@ export function createTaskService({
   const pendingProgress = new Set();
   let progressTimer = null;
   let cleanupPromise = null;
+  let cleanupStatus = null;
   let mutationTail = Promise.resolve();
   let closing = false;
   let abandoningState = false;
@@ -1594,17 +1596,35 @@ export function createTaskService({
     if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
     if (cleanupPromise) throw new TaskServiceError('CLEANUP_BUSY', 'Another space cleanup is active; retry shortly', 409);
 
+    const operation = {
+      id: `cleanup_${randomUUID().replaceAll('-', '')}`, state: 'running', preview,
+      categories: [...categories], phase: categories.includes('browser-cache') ? 'profiles' : 'tasks',
+      current: 0, total: 0, files: 0, bytes: 0, skipped: 0, failed: 0,
+      startedAt: nowIso(now), finishedAt: null
+    };
+    cleanupStatus = operation;
     const attempt = (async () => {
       const result = {
-        preview, bytes: 0, files: 0, skipped: [], failed: [],
+        operationId: operation.id, preview, bytes: 0, files: 0, skipped: [], failed: [],
         categories: categories.map((id) => ({ id, bytes: 0, files: 0 }))
       };
+      let pendingMetadata = 0;
+      const flushMetadata = async () => {
+        if (!pendingMetadata) return;
+        await persist();
+        pendingMetadata = 0;
+      };
+      const publishProgress = () => Object.assign(operation, {
+        bytes: result.bytes, files: result.files,
+        skipped: result.skipped.length, failed: result.failed.length
+      });
       const clean = async (categoryId, subject, rootPath, relativePath, linkOnly = false) => {
         await checkState();
         const parent = await lstat(path.dirname(rootPath)).catch(() => null);
         if (!parent?.isDirectory() || parent.isSymbolicLink()) {
           const issue = { path: relativePath, reason: 'MANAGED_DIRECTORY_UNSAFE' };
           result.failed.push({ ...subject, ...issue });
+          publishProgress();
           return { bytes: 0, files: 0, skipped: [], failed: [issue] };
         }
         if (categoryId === 'temporary-files' && !linkOnly) {
@@ -1612,6 +1632,7 @@ export function createTaskService({
           if (staged && !staged.isFile() && !staged.isSymbolicLink()) {
             const issue = { path: relativePath, reason: 'STAGED_MODULE_NOT_FILE' };
             result.failed.push({ ...subject, ...issue });
+            publishProgress();
             return { bytes: 0, files: 0, skipped: [], failed: [issue] };
           }
         }
@@ -1628,78 +1649,113 @@ export function createTaskService({
         for (const key of ['skipped', 'failed']) {
           result[key].push(...value[key].map((item) => ({ ...subject, ...item })));
         }
+        publishProgress();
         return value;
       };
-      if (categories.includes('browser-cache')) {
-        for (const candidate of await profileStore.list()) {
-          const subject = { kind: 'profile', id: candidate.id, name: candidate.name };
-          const profile = await serialize(async () => {
-            const current = await profileStore.get(candidate.id).catch(() => null);
-            if (!current || current.state !== 'idle' || current.lease ||
-                activeProfileIds().has(candidate.id) || deletingProfiles.has(candidate.id) ||
-                profileOperations.has(candidate.id)) return null;
-            profileOperations.add(candidate.id);
-            return current;
-          });
-          if (!profile) {
-            result.skipped.push({ ...subject, reason: 'PROFILE_BUSY' });
-            continue;
-          }
-          try {
-            const usage = await profileUsageProbe(profile.userDataDir).catch(() => 'unknown');
-            if (usage !== 'inactive') {
-              result.skipped.push({ ...subject, reason: usage === 'active' ? 'BROWSER_OPEN' : 'BROWSER_USAGE_UNKNOWN' });
+      try {
+        const taskCandidates = categories.some((id) => ['temporary-files', 'task-output'].includes(id))
+          ? [...tasks.values()] : [];
+        const profileCandidates = categories.includes('browser-cache') ? await profileStore.list() : [];
+        operation.total = profileCandidates.length + taskCandidates.length;
+        if (categories.includes('browser-cache')) {
+          for (const candidate of profileCandidates) {
+            const subject = { kind: 'profile', id: candidate.id, name: candidate.name };
+            const profile = await serialize(async () => {
+              const current = await profileStore.get(candidate.id).catch(() => null);
+              if (!current || current.state !== 'idle' || current.lease ||
+                  activeProfileIds().has(candidate.id) || deletingProfiles.has(candidate.id) ||
+                  profileOperations.has(candidate.id)) return null;
+              profileOperations.add(candidate.id);
+              return current;
+            });
+            if (!profile) {
+              result.skipped.push({ ...subject, reason: 'PROFILE_BUSY' });
+              operation.current += 1;
+              publishProgress();
               continue;
             }
-            // Only disposable Chrome caches. Never sweep *Cache*, site storage,
-            // extension data, cookies, preferences, or the userDataDir itself.
-            for (const cache of ['Cache', 'Code Cache', 'GPUCache']) {
-              await clean('browser-cache', subject, profile.userDataDir, `Default/${cache}`);
+            try {
+              const usage = await profileUsageProbe(profile.userDataDir).catch(() => 'unknown');
+              if (usage !== 'inactive') {
+                result.skipped.push({ ...subject, reason: usage === 'active' ? 'BROWSER_OPEN' : 'BROWSER_USAGE_UNKNOWN' });
+                continue;
+              }
+              // Only disposable Chrome caches. Never sweep *Cache*, site storage,
+              // extension data, cookies, preferences, or the userDataDir itself.
+              for (const cache of ['Cache', 'Code Cache', 'GPUCache']) {
+                await clean('browser-cache', subject, profile.userDataDir, `Default/${cache}`);
+              }
+            } finally {
+              profileOperations.delete(profile.id);
+              operation.current += 1;
+              publishProgress();
+              background(schedule());
             }
-          } finally {
-            profileOperations.delete(profile.id);
-            background(schedule());
           }
         }
-      }
-      if (categories.includes('temporary-files') || categories.includes('task-output')) {
-        for (const candidate of [...tasks.values()]) {
-          const subject = { kind: 'task', id: candidate.id, name: candidate.label };
-          const task = await serialize(async () => {
-            const current = tasks.get(candidate.id);
-            const profile = current ? await profileStore.get(current.profileId).catch(() => null) : null;
-            if (!current || !isTerminalTask(current) || children.has(current.id) ||
-                profile?.lease?.taskId === current.id) return null;
-            cleaningTasks.add(current.id);
-            return current;
-          });
-          if (!task) {
-            result.skipped.push({ ...subject, reason: 'TASK_ACTIVE_OR_CLEANUP_UNCONFIRMED' });
-            continue;
-          }
-          try {
-            const taskRoot = taskRootPath(root, task.id);
-            if (categories.includes('temporary-files')) {
-              await clean('temporary-files', subject, taskRoot, 'task.mjs');
-              await clean('temporary-files', subject, taskRoot, 'node_modules', true);
+        if (categories.includes('temporary-files') || categories.includes('task-output')) {
+          operation.phase = 'tasks';
+          for (const candidate of taskCandidates) {
+            const subject = { kind: 'task', id: candidate.id, name: candidate.label };
+            const task = await serialize(async () => {
+              const current = tasks.get(candidate.id);
+              const profile = current ? await profileStore.get(current.profileId).catch(() => null) : null;
+              if (!current || !isTerminalTask(current) || children.has(current.id) ||
+                  profile?.lease?.taskId === current.id) return null;
+              cleaningTasks.add(current.id);
+              return current;
+            });
+            if (!task) {
+              result.skipped.push({ ...subject, reason: 'TASK_ACTIVE_OR_CLEANUP_UNCONFIRMED' });
+              operation.current += 1;
+              publishProgress();
+              continue;
             }
-            if (categories.includes('task-output')) {
-              const value = await clean('task-output', subject, taskRoot, 'output');
-              if (!preview) await serialize(async () => {
-                if (!value.failed.length && !value.skipped.length) task.outputClearedAt = nowIso(now);
-                appendEvent(task, 'task.output_cleaned', {
-                  bytes: value.bytes, files: value.files,
-                  skipped: value.skipped.length, failed: value.failed.length
+            try {
+              const taskRoot = taskRootPath(root, task.id);
+              if (categories.includes('temporary-files')) {
+                await clean('temporary-files', subject, taskRoot, 'task.mjs');
+                await clean('temporary-files', subject, taskRoot, 'node_modules', true);
+              }
+              if (categories.includes('task-output')) {
+                const value = await clean('task-output', subject, taskRoot, 'output');
+                if (!preview) await serialize(async () => {
+                  if (tasks.get(task.id) !== task) return;
+                  const cleared = !value.failed.length && !value.skipped.length;
+                  // Recheck the directory on every request, but do not rewrite the
+                  // whole history or repeat an event for unchanged empty output.
+                  if (cleared && task.outputClearedAt && !value.files && !value.bytes) return;
+                  task.outputClearedAt = cleared ? nowIso(now) : null;
+                  appendEvent(task, 'task.output_cleaned', {
+                    bytes: value.bytes, files: value.files,
+                    skipped: value.skipped.length, failed: value.failed.length
+                  });
+                  pendingMetadata += 1;
+                  if (pendingMetadata >= CLEANUP_PERSIST_BATCH) await flushMetadata();
                 });
-                await persist();
-              });
+              }
+            } finally {
+              cleaningTasks.delete(task.id);
+              operation.current += 1;
+              publishProgress();
             }
-          } finally {
-            cleaningTasks.delete(task.id);
           }
         }
+        await serialize(flushMetadata);
+        operation.phase = 'done';
+        operation.state = 'finished';
+        return result;
+      } catch (error) {
+        // Preserve completed work even if a later item fails. A fenced store
+        // rejects this flush too, so external state can never be overwritten.
+        await serialize(flushMetadata).catch(() => {});
+        operation.state = 'error';
+        operation.error = { code: normalizeError(error).code };
+        throw error;
+      } finally {
+        publishProgress();
+        operation.finishedAt = nowIso(now);
       }
-      return result;
     })();
     cleanupPromise = attempt;
     try {
@@ -1719,7 +1775,8 @@ export function createTaskService({
         running: taskList.filter((task) => ['running', 'waiting', 'stopping'].includes(task.state)).length,
         queued: taskList.filter((task) => task.state === 'queued').length
       },
-      profiles: (await listProfiles()).length
+      profiles: (await listProfiles()).length,
+      cleanup: clone(cleanupStatus)
     };
   }
 

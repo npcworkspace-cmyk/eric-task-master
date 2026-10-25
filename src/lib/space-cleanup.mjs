@@ -99,10 +99,13 @@ export async function cleanManagedPath({ root, relativePath, preview = true, lin
     return actual;
   }
 
-  async function visit(file) {
+  async function visit(file, expectedDirectory) {
     try {
       const entry = file === target ? await recheck(file, initial) : await checkedStat(file);
       if (!entry) return true;
+      if (expectedDirectory !== undefined && entry.isDirectory() !== expectedDirectory) {
+        throw Object.assign(new Error('Entry type changed during cleanup'), { code: 'PATH_CHANGED' });
+      }
       if (entry.isSymbolicLink()) {
         if (!linkOnly || file !== target) { skip(file, 'SYMLINK_OR_JUNCTION'); return false; }
         if (!preview) {
@@ -123,10 +126,21 @@ export async function cleanManagedPath({ root, relativePath, preview = true, lin
       if (!entry.isDirectory()) { skip(file, 'UNSUPPORTED_FILE_TYPE'); return false; }
       if (!await recheck(file, entry)) return true;
       parents.set(file, entry);
-      const children = await readdir(file);
+      const children = await readdir(file, { withFileTypes: true });
       if (!await recheck(file, entry)) return true;
       let empty = true;
-      for (const child of children) if (!await visit(path.join(file, child))) empty = false;
+      // Dirent types only schedule work; visit still rechecks every path before
+      // deleting it. Finish bounded leaf batches before sequential recursion so
+      // nested directories cannot multiply the concurrent filesystem work.
+      const leaves = children.filter((child) => !child.isDirectory());
+      for (let offset = 0; offset < leaves.length; offset += 4) {
+        const removed = await Promise.all(leaves.slice(offset, offset + 4)
+          .map((child) => visit(path.join(file, child.name), false)));
+        if (removed.some((value) => !value)) empty = false;
+      }
+      for (const child of children.filter((child) => child.isDirectory())) {
+        if (!await visit(path.join(file, child.name), true)) empty = false;
+      }
       if (empty && !preview && await recheck(file, entry)) await rmdir(file);
       return empty;
     } catch (error) {

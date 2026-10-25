@@ -35,12 +35,22 @@ const I18N = Object.freeze({
     'cleanup.freed': '已清理文件大小',
     'cleanup.files': '{files} 个文件',
     'cleanup.choose': '请至少选择一项，再查看预览。',
+    'cleanup.noPreview': '尚无可用预览，请重新预览所选内容。',
     'cleanup.running': '正在清理所选内容…',
+    'cleanup.busy': '已有清理或预览正在进行，正在同步进度，请勿重复提交。',
+    'cleanup.checking': '正在确认后台清理状态，请勿重复提交。',
+    'cleanup.progress': '已检查 {current} / {total} 项 · {phase}',
+    'cleanup.profiles': '浏览器缓存',
+    'cleanup.tasks': '任务文件',
+    'cleanup.done': '检查完成',
+    'cleanup.scope': '本次范围：{categories}',
+    'cleanup.summaryOnly': '这是后台操作摘要；需要再次清理时，请先重新预览。',
+    'cleanup.partialSummary': '部分项目未清理，请重新预览核对剩余内容。',
     'cleanup.skipped': '已跳过 {count} 项',
     'cleanup.failed': '{count} 项未能清理',
     'cleanup.partial': '部分项目未清理，请查看下方原因。',
     'cleanup.invalid': '清理响应与所选内容不匹配，请重新预览。',
-    'cleanup.unconfirmed': '清理结果未确认，请重新预览并核对当前空间后再试。',
+    'cleanup.unconfirmed': '清理结果未确认，正在查询后台状态。不会自动重复删除；恢复连接后请核对结果，再重新预览。',
     'cleanup.reason.PROFILE_BUSY': 'Profile 正在使用，已保留',
     'cleanup.reason.BROWSER_OPEN': '浏览器手动打开中，已保留',
     'cleanup.reason.BROWSER_USAGE_UNKNOWN': '无法确认浏览器是否闲置，已保留',
@@ -164,12 +174,22 @@ const I18N = Object.freeze({
     'cleanup.freed': 'Deleted file size',
     'cleanup.files': '{files} files',
     'cleanup.choose': 'Select at least one category to preview.',
+    'cleanup.noPreview': 'No preview is available. Preview the selected categories again.',
     'cleanup.running': 'Cleaning selected content…',
+    'cleanup.busy': 'Another cleanup or preview is running. Syncing progress; do not resubmit.',
+    'cleanup.checking': 'Checking the background cleanup state. Do not resubmit.',
+    'cleanup.progress': 'Checked {current} / {total} items · {phase}',
+    'cleanup.profiles': 'Browser caches',
+    'cleanup.tasks': 'Task files',
+    'cleanup.done': 'Checks complete',
+    'cleanup.scope': 'Operation scope: {categories}',
+    'cleanup.summaryOnly': 'This is the background operation summary. Preview again before another cleanup.',
+    'cleanup.partialSummary': 'Some items were not cleaned. Preview again to check the remaining content.',
     'cleanup.skipped': '{count} items skipped',
     'cleanup.failed': '{count} items could not be cleaned',
     'cleanup.partial': 'Some items were not cleaned. See the reasons below.',
     'cleanup.invalid': 'The cleanup response does not match your selection. Preview again.',
-    'cleanup.unconfirmed': 'The cleanup result is unconfirmed. Preview again and check the current space before retrying.',
+    'cleanup.unconfirmed': 'The cleanup result is unconfirmed. Checking the background state; deletion will not be retried automatically. Reconnect, check the result, and preview again.',
     'cleanup.reason.PROFILE_BUSY': 'Profile is in use; preserved',
     'cleanup.reason.BROWSER_OPEN': 'Browser is manually open; preserved',
     'cleanup.reason.BROWSER_USAGE_UNKNOWN': 'Cannot confirm the browser is idle; preserved',
@@ -300,7 +320,8 @@ const state = {
 
 const cleanup = {
   sequence: 0, previewRequest: null, preview: null, previewKey: '',
-  loading: false, executing: false, result: null, error: ''
+  loading: false, executing: false, result: null, error: '',
+  operation: null, ignoredOperationId: '', statusPending: false
 };
 
 const ui = {
@@ -392,7 +413,7 @@ async function request(path, { method = 'GET', body, requestTimeoutMs } = {}) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
       const response = await fetch(path, {
         method: upperMethod,
@@ -414,7 +435,7 @@ async function request(path, { method = 'GET', body, requestTimeoutMs } = {}) {
       else lastError = new HttpError(t('error.network'), 0, 'NETWORK_ERROR');
       if (attempt + 1 < attempts) await delay(READ_RETRY_DELAY_MS);
     } finally {
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
     }
   }
   throw lastError;
@@ -477,23 +498,70 @@ function cleanupResponse(payload, categories, preview) {
   return value;
 }
 
+function cleanupBusy() {
+  return cleanup.executing || cleanup.loading || cleanup.statusPending || cleanup.operation?.state === 'running';
+}
+
+function syncCleanupStatus(manager) {
+  const operation = manager?.cleanup;
+  cleanup.statusPending = false;
+  if (!operation) {
+    if (cleanup.operation?.state === 'running') {
+      cleanup.operation = null;
+      cleanup.error = t('cleanup.unconfirmed');
+    }
+    return;
+  }
+  if (operation.id === cleanup.ignoredOperationId) return;
+  if (typeof operation.id !== 'string' || !['running', 'finished', 'error'].includes(operation.state) ||
+      typeof operation.preview !== 'boolean' || !Array.isArray(operation.categories)) return;
+  cleanup.operation = operation;
+  cleanup.preview = null;
+  cleanup.previewKey = '';
+  cleanup.result = null;
+  cleanup.error = operation.state === 'error' ? `${t('cleanup.unconfirmed')} ${operation.error?.message || ''}`.trim() : '';
+}
+
 function renderCleanup() {
   const selectionKey = cleanupSelection().join(',');
   const currentPreview = cleanup.preview && cleanup.previewKey === selectionKey;
-  ui.cleanupOptions.disabled = cleanup.executing;
-  ui.closeCleanup.disabled = cleanup.executing;
-  ui.confirmCleanup.disabled = cleanup.executing || cleanup.loading || !currentPreview || !selectionKey;
-  ui.confirmCleanup.textContent = t(cleanup.executing ? 'cleanup.running' : 'cleanup.confirm');
-  ui.retryCleanup.classList.toggle('hidden', !cleanup.error && !cleanup.result);
-  ui.retryCleanup.disabled = cleanup.loading || cleanup.executing;
-  ui.cleanupSummary.setAttribute('aria-busy', String(cleanup.loading || cleanup.executing));
+  const busy = cleanupBusy();
+  ui.cleanupOptions.disabled = cleanup.executing || cleanup.statusPending || cleanup.operation?.state === 'running';
+  ui.closeCleanup.disabled = false;
+  ui.confirmCleanup.disabled = busy || !currentPreview || !selectionKey;
+  ui.confirmCleanup.textContent = t(cleanup.executing || cleanup.operation?.state === 'running' && !cleanup.operation.preview
+    ? 'cleanup.running' : 'cleanup.confirm');
+  ui.retryCleanup.classList.toggle('hidden', !cleanup.error && !cleanup.result && !cleanup.operation);
+  ui.retryCleanup.disabled = busy;
+  ui.cleanupSummary.setAttribute('aria-busy', String(busy));
   setInlineError(ui.cleanupError, cleanup.error);
   ui.cleanupSummary.replaceChildren();
   ui.cleanupDetails.replaceChildren();
+  if (cleanup.operation) {
+    const operation = cleanup.operation;
+    const phase = t(`cleanup.${operation.phase || 'tasks'}`);
+    ui.cleanupSummary.append(
+      element('p', '', t(operation.state === 'running' ? operation.preview ? 'cleanup.estimating' : 'cleanup.running'
+        : operation.preview ? 'cleanup.estimate' : 'cleanup.freed')),
+      element('small', '', t('cleanup.scope', { categories: operation.categories.map((category) => t({
+        'browser-cache': 'cleanup.cache', 'temporary-files': 'cleanup.temporary', 'task-output': 'cleanup.output'
+      }[category] || category)).join(' · ') })),
+      element('p', '', t('cleanup.progress', { current: operation.current, total: operation.total, phase })),
+      element('strong', 'npc-number', formatBytes(operation.bytes)),
+      element('small', '', t('cleanup.files', { files: operation.files })),
+      element('p', '', `${t('cleanup.skipped', { count: operation.skipped })} · ${t('cleanup.failed', { count: operation.failed })}`)
+    );
+    if (operation.state !== 'running') {
+      if (operation.failed) ui.cleanupSummary.append(element('p', '', t('cleanup.partialSummary')));
+      ui.cleanupSummary.append(element('p', '', t('cleanup.summaryOnly')));
+    }
+    return;
+  }
   const report = cleanup.result || (currentPreview ? cleanup.preview : null);
-  if (cleanup.executing || cleanup.loading || !report) {
+  if (busy || !report) {
     ui.cleanupSummary.append(element('p', '', t(cleanup.executing ? 'cleanup.running'
-      : cleanup.loading ? 'cleanup.estimating' : 'cleanup.choose')));
+      : cleanup.loading ? 'cleanup.estimating' : cleanup.statusPending ? 'cleanup.checking'
+        : selectionKey ? 'cleanup.noPreview' : 'cleanup.choose')));
   } else {
     ui.cleanupSummary.append(
       element('small', '', t(cleanup.result ? 'cleanup.freed' : 'cleanup.estimate')),
@@ -517,9 +585,11 @@ function renderCleanup() {
 }
 
 async function previewCleanup() {
-  if (cleanup.executing) return;
+  if (cleanup.executing || cleanup.statusPending || cleanup.operation?.state === 'running') return;
   const sequence = ++cleanup.sequence;
   const categories = cleanupSelection();
+  cleanup.ignoredOperationId = cleanup.operation?.id || cleanup.ignoredOperationId;
+  cleanup.operation = null;
   cleanup.preview = null;
   cleanup.previewKey = '';
   cleanup.result = null;
@@ -530,15 +600,25 @@ async function previewCleanup() {
   // Serialize previews: a rapid selection change must not race Manager's cleanup lock.
   await cleanup.previewRequest?.catch(() => {});
   if (!ui.cleanupDialog.open || sequence !== cleanup.sequence) return;
-  const operation = request('/v1/cleanup', { method: 'POST', body: { categories, preview: true } });
+  const operation = request('/v1/cleanup', { method: 'POST', body: { categories, preview: true }, requestTimeoutMs: 0 });
   cleanup.previewRequest = operation;
   try {
     const result = cleanupResponse(await operation, categories, true);
-    if (!ui.cleanupDialog.open || sequence !== cleanup.sequence) return;
+    // A superseded preview still identifies the operation the next preview
+    // was waiting for; its late status must not clear that newer selection.
+    if (cleanup.previewRequest === operation && result.operationId) cleanup.ignoredOperationId = result.operationId;
+    if (sequence !== cleanup.sequence) return;
+    if (result.operationId && cleanup.operation && cleanup.operation.id !== result.operationId) return;
     cleanup.preview = result;
     cleanup.previewKey = categories.join(',');
+    cleanup.ignoredOperationId = result.operationId || cleanup.operation?.id || cleanup.ignoredOperationId;
+    cleanup.operation = null;
   } catch (error) {
-    if (sequence === cleanup.sequence) cleanup.error = error.message || t('error.read');
+    if (sequence === cleanup.sequence) {
+      cleanup.error = error.code === 'CLEANUP_BUSY' ? t('cleanup.busy') : error.message || t('error.read');
+      cleanup.statusPending = true;
+      void refreshAll();
+    }
   } finally {
     if (cleanup.previewRequest === operation) cleanup.previewRequest = null;
     if (sequence === cleanup.sequence) {
@@ -550,27 +630,46 @@ async function previewCleanup() {
 
 function openCleanup() {
   if (ui.cleanupDialog.open) return;
-  for (const node of ui.cleanupCategories) node.checked = node.defaultChecked;
   ui.cleanupDialog.showModal();
+  if (cleanupBusy() || cleanup.operation || cleanup.result?.operationId) {
+    renderCleanup();
+    void refreshAll();
+    return;
+  }
+  for (const node of ui.cleanupCategories) node.checked = node.defaultChecked;
   void previewCleanup();
 }
 
 async function executeCleanup() {
   const categories = cleanupSelection();
-  if (cleanup.executing || cleanup.loading || !cleanup.preview || !categories.length ||
+  if (cleanupBusy() || !cleanup.preview || !categories.length ||
       cleanup.previewKey !== categories.join(',')) return;
+  const sequence = ++cleanup.sequence;
+  cleanup.ignoredOperationId = cleanup.operation?.id || cleanup.ignoredOperationId;
+  cleanup.operation = null;
   cleanup.executing = true;
   cleanup.preview = null;
   cleanup.error = '';
   renderCleanup();
   try {
-    const result = await request('/v1/cleanup', { method: 'POST', body: { categories, preview: false } });
+    const result = await request('/v1/cleanup', { method: 'POST', body: { categories, preview: false }, requestTimeoutMs: 0 });
+    if (sequence !== cleanup.sequence) return;
+    if (result.operationId && cleanup.operation && cleanup.operation.id !== result.operationId) return;
     cleanup.result = cleanupResponse(result, categories, false);
+    cleanup.ignoredOperationId = cleanup.result.operationId || cleanup.operation?.id || cleanup.ignoredOperationId;
+    cleanup.operation = null;
   } catch (error) {
-    cleanup.error = `${t('cleanup.unconfirmed')} ${error.message || t('error.operation')}`;
+    if (sequence === cleanup.sequence) {
+      cleanup.error = error.code === 'CLEANUP_BUSY' ? t('cleanup.busy')
+        : `${t('cleanup.unconfirmed')} ${error.message || t('error.operation')}`;
+      cleanup.statusPending = true;
+      void refreshAll();
+    }
   } finally {
-    cleanup.executing = false;
-    renderCleanup();
+    if (sequence === cleanup.sequence) {
+      cleanup.executing = false;
+      renderCleanup();
+    }
   }
 }
 
@@ -872,6 +971,8 @@ async function refreshAll() {
     return state.refreshPromise;
   }
   const sequence = ++state.refreshSequence;
+  const cleanupSequence = cleanup.sequence;
+  const cleanupOperationId = cleanup.ignoredOperationId;
   ui.refreshAll.disabled = true;
   ui.refreshAll.classList.add('is-loading');
   state.refreshPromise = (async () => {
@@ -884,6 +985,9 @@ async function refreshAll() {
     const [managerResult, tasksResult, profilesResult] = results;
     if (managerResult.status === 'fulfilled') {
       state.manager = statusData(managerResult.value);
+      if (cleanupSequence === cleanup.sequence && cleanupOperationId === cleanup.ignoredOperationId) {
+        syncCleanupStatus(state.manager);
+      }
       state.defaultProfileId = state.manager.defaultProfileId || state.manager.defaultProfile?.id || state.defaultProfileId;
     }
     if (tasksResult.status === 'fulfilled') {
@@ -908,6 +1012,7 @@ async function refreshAll() {
       markOffline();
     }
     renderAll();
+    renderCleanup();
   })();
   try {
     await state.refreshPromise;
@@ -924,7 +1029,7 @@ async function refreshAll() {
 
 function pollingDelay() {
   if (document.visibilityState === 'hidden') return 15_000;
-  return state.tasks.some((task) => !TERMINAL_STATES.has(normalizeTaskState(task))) ? 2_000 : 6_000;
+  return cleanupBusy() || state.tasks.some((task) => !TERMINAL_STATES.has(normalizeTaskState(task))) ? 2_000 : 6_000;
 }
 
 function scheduleRefresh() {
@@ -1101,13 +1206,10 @@ ui.closeCleanup.addEventListener('click', () => ui.cleanupDialog.close());
 ui.cleanupOptions.addEventListener('change', () => void previewCleanup());
 ui.retryCleanup.addEventListener('click', () => void previewCleanup());
 ui.confirmCleanup.addEventListener('click', () => void executeCleanup());
-ui.cleanupDialog.addEventListener('cancel', (event) => {
-  if (cleanup.executing) event.preventDefault();
-});
 ui.cleanupDialog.addEventListener('close', () => {
-  cleanup.sequence += 1;
+  if (!cleanupBusy()) cleanup.sequence += 1;
   cleanup.preview = null;
-  cleanup.loading = false;
+  cleanup.previewKey = '';
   ui.openCleanup.focus();
 });
 

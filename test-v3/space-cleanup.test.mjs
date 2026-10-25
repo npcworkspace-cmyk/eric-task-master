@@ -164,3 +164,92 @@ test('operational unlink failure is reported while other regular files can still
     syncBuiltinESMExports();
   }
 });
+
+test('cleanup uses bounded leaf concurrency without overlapping recursive directories', async (t) => {
+  const { root, outside } = await fixture(t);
+  const cache = path.join(root, 'cache');
+  await put(path.join(outside, 'canary'), 'external');
+  await put(path.join(root, 'Cookies'), 'login');
+  for (const directory of ['', 'nested', 'nested/deeper', 'sibling']) {
+    for (let index = 0; index < 9; index += 1) await put(path.join(cache, directory, `file-${index}`), 'abc');
+  }
+  await directoryLink(outside, path.join(cache, 'linked'));
+  const preview = await cleanManagedPath({ root, relativePath: 'cache' });
+  assert.equal(preview.files, 36);
+  assert.equal(await readFile(path.join(cache, 'file-0'), 'utf8'), 'abc');
+  const originalUnlink = fs.unlink;
+  const originalRmdir = fs.rmdir;
+  let active = 0;
+  let maximum = 0;
+  const activeDirectories = new Set();
+  const unlinkMock = t.mock.method(fs, 'unlink', async (file) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    activeDirectories.add(path.dirname(file));
+    try {
+      assert.equal(activeDirectories.size, 1, 'finish leaves before entering another directory');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return await originalUnlink(file);
+    } finally {
+      active -= 1;
+      if (!active) activeDirectories.clear();
+    }
+  });
+  const rmdirMock = t.mock.method(fs, 'rmdir', async (file) => {
+    assert.equal(active, 0, 'wait for every child deletion before removing its directory');
+    return originalRmdir(file);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(await cleanManagedPath({ root, relativePath: 'cache', preview: false }), preview);
+    assert.ok(maximum >= 2, 'independent leaf deletions overlap');
+    assert.ok(maximum <= 4, `leaf concurrency is bounded: ${maximum}`);
+    assert.equal(await readFile(path.join(outside, 'canary'), 'utf8'), 'external');
+    assert.equal(await readFile(path.join(root, 'Cookies'), 'utf8'), 'login');
+    assert.ok((await lstat(path.join(cache, 'linked'))).isSymbolicLink());
+    await assert.rejects(lstat(path.join(cache, 'nested')), { code: 'ENOENT' });
+    await assert.rejects(lstat(path.join(cache, 'sibling')), { code: 'ENOENT' });
+  } finally {
+    unlinkMock.mock.restore();
+    rmdirMock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('cleanup preserves entries that change between readdir classification and visit', async (t) => {
+  for (const preview of [true, false]) {
+    const { root } = await fixture(t);
+    const cache = path.join(root, 'cache');
+    const becameDirectory = path.join(cache, 'file-to-directory');
+    const becameFile = path.join(cache, 'directory-to-file');
+    await put(becameDirectory, 'old');
+    await mkdir(becameFile);
+    const original = fs.readdir;
+    let changed = false;
+    const readdirMock = t.mock.method(fs, 'readdir', async (file, options) => {
+      const children = await original(file, options);
+      if (file === cache && !changed) {
+        changed = true;
+        await fs.unlink(becameDirectory);
+        await put(path.join(becameDirectory, 'canary'), 'new directory');
+        await fs.rmdir(becameFile);
+        await writeFile(becameFile, 'new file');
+      }
+      return children;
+    });
+    syncBuiltinESMExports();
+    try {
+      const result = await cleanManagedPath({ root, relativePath: 'cache', preview });
+      assert.equal(result.files, 0);
+      assert.equal(result.bytes, 0);
+      assert.deepEqual(result.skipped, []);
+      assert.deepEqual(result.failed.map((failure) => failure.path).sort(), ['cache/directory-to-file', 'cache/file-to-directory']);
+      assert.ok(result.failed.every((failure) => failure.reason === 'PATH_CHANGED'));
+      assert.equal(await readFile(path.join(becameDirectory, 'canary'), 'utf8'), 'new directory');
+      assert.equal(await readFile(becameFile, 'utf8'), 'new file');
+    } finally {
+      readdirMock.mock.restore();
+      syncBuiltinESMExports();
+    }
+  }
+});
