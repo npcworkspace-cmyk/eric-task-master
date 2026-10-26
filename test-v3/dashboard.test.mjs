@@ -172,7 +172,10 @@ test('NPC and Media Bridge copy stay below the work area with native expanded po
   assert.match(html, /网页上能做的事，基本都可以/u);
   assert.match(source, /Use your imagination/u);
   assert.match(source, /Media Bridge · media\.npctech\.site ↗/u);
-  for (const guide of [english, chinese]) assert.ok(guide.includes('https://media.npctech.site/'));
+  for (const guide of [english, chinese]) {
+    const links = [...guide.matchAll(/\[[^\]]+\]\(([^)\s]+)\)/gu)];
+    assert.ok(links.some(([, href]) => new URL(href, 'https://github.com/').href === 'https://media.npctech.site/'));
+  }
   assert.match(chinese, /发挥你的想象力/u);
   assert.match(english, /Use your imagination/u);
   assert.ok(acceptance.includes('checkPanelBrand'));
