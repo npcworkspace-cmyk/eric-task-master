@@ -26,6 +26,7 @@ const profilesScreenshotPath = screenshotPath
 const cleanupScreenshotPaths = screenshotPath ? Object.fromEntries(['desktop', 'mobile', 'result'].map((view) => [view,
   path.join(path.dirname(screenshotPath), `${path.basename(screenshotPath, path.extname(screenshotPath))}-cleanup-${view}.png`)
 ])) : null;
+const panelBrandScreenshots = [];
 const packageJson = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'));
 
 function now() {
@@ -421,6 +422,133 @@ async function waitUntil(predicate, label, timeoutMs = 5_000) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function checkPanelBrand(page, context, checks, externalRequests) {
+  const intro = page.locator('#panel-intro');
+  const details = page.locator('#panel-possibilities');
+  const summary = page.locator('#panel-possibilities-title');
+  assert.equal(await intro.getAttribute('aria-labelledby'), 'panel-intro-title');
+  assert.equal(await details.evaluate((node) => node.open), true);
+  assert.equal(await intro.evaluate((node) =>
+    Boolean(document.querySelector('#view-profiles').compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)), true);
+  assert.equal(await intro.evaluate((node) => ['fixed', 'sticky'].includes(getComputedStyle(node).position)), false);
+  assert.match(await page.locator('#panel-intro-copy').textContent(), /甲方操盘手.*媒介桥.*任务大师/u);
+  assert.equal(await page.locator('#panel-possibilities-examples').isVisible(), true);
+  const outboundBefore = externalRequests.length;
+  assert.equal(context.pages().length, 1, 'Brand content never opens a site automatically');
+  for (const [selector, url] of [
+    ['#panel-npc-link', 'https://www.npctech.site/'],
+    ['#panel-media-link', 'https://media.npctech.site/']
+  ]) {
+    const link = page.locator(selector);
+    assert.equal(await link.getAttribute('href'), url);
+    assert.equal(await link.getAttribute('target'), '_blank');
+    assert.match(await link.getAttribute('rel'), /noopener/u);
+    assert.match(await link.getAttribute('rel'), /noreferrer/u);
+    const stub = (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<title>Brand link fixture</title>' });
+    await context.route(url, stub);
+    try {
+      const panelUrl = page.url();
+      const [popup] = await Promise.all([page.waitForEvent('popup'), link.click()]);
+      await popup.waitForLoadState('domcontentloaded');
+      assert.equal(popup.url(), url);
+      assert.equal(page.url(), panelUrl);
+      assert.equal(await popup.evaluate(() => window.opener), null);
+      const request = externalRequests.at(-1);
+      assert.equal(request.url(), url);
+      const headers = await request.allHeaders();
+      for (const key of ['authorization', 'cookie', 'referer']) assert.equal(headers[key], undefined);
+      await popup.close();
+    } finally { await context.unroute(url, stub); }
+  }
+  assert.equal(externalRequests.length, outboundBefore + 2, 'Only explicit brand clicks request external pages');
+  for (const request of externalRequests.slice(outboundBefore)) {
+    assert.equal(request.isNavigationRequest(), true);
+    assert.equal(request.method(), 'GET');
+  }
+  checks.push('NPC and Media Bridge remain below task controls; external sites open only on explicit credential-free clicks');
+
+  await summary.focus();
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => !document.querySelector('#panel-possibilities').open);
+  assert.equal(await page.locator('#panel-possibilities-examples').isVisible(), false);
+  await page.keyboard.press('Space');
+  await page.waitForFunction(() => document.querySelector('#panel-possibilities').open);
+  assert.equal(await page.locator('#panel-possibilities-examples').isVisible(), true);
+  assert.match(await page.locator('#panel-possibilities-promise').textContent(), /AI Agent.*任务大师.*本机稳定执行/u);
+  assert.notEqual(await summary.evaluate((node) => getComputedStyle(node).outlineStyle), 'none');
+  await page.locator('#refresh-all').click();
+  await page.waitForFunction(() => !document.querySelector('#refresh-all').disabled);
+  assert.equal(await details.evaluate((node) => node.open), true, 'Polling must not reset the open disclosure');
+  await page.locator('#language-toggle').click();
+  await summary.getByText('Use your imagination', { exact: true }).waitFor();
+  assert.equal(await details.evaluate((node) => node.open), true, 'Language changes retain the disclosure state');
+  assert.match(await page.locator('#panel-media-link').textContent(), /Media Bridge · media\.npctech\.site/u);
+  await summary.focus();
+  await page.keyboard.press('Space');
+  await page.waitForFunction(() => !document.querySelector('#panel-possibilities').open);
+  await page.getByRole('button', { name: 'Profiles', exact: true }).click();
+  assert.equal(await intro.isVisible(), true, 'Brand content is shared by both existing views');
+  await page.getByRole('button', { name: 'Tasks', exact: true }).click();
+  checks.push('native possibilities stay expanded by default, support Enter/Space collapse and reopening, and retain state through refresh and language changes');
+
+  for (const language of ['zh-CN', 'en']) {
+    if (await page.evaluate(() => document.documentElement.lang) !== language) await page.locator('#language-toggle').click();
+    for (const width of [320, 390, 720, 1440]) {
+      await page.setViewportSize({ width, height: 844 });
+      for (const open of [false, true]) {
+        if (await details.evaluate((node) => node.open) !== open) await summary.click();
+        await summary.scrollIntoViewIfNeeded();
+        const layout = await intro.evaluate((node) => {
+          const rect = node.getBoundingClientRect();
+          const interactive = [...node.querySelectorAll('a, summary')];
+          const normalText = [...node.querySelectorAll('p')].filter((item) => item.getClientRects().length);
+          const background = getComputedStyle(document.documentElement).getPropertyValue('--npc-paper').trim();
+          const rgb = (color) => color.startsWith('#')
+            ? color.slice(1).match(/../gu).map((part) => parseInt(part, 16) / 255)
+            : color.match(/[\d.]+/gu).slice(0, 3).map((part) => Number(part) / 255);
+          const luminance = (color) => rgb(color).map((part) => part <= .04045 ? part / 12.92 : ((part + .055) / 1.055) ** 2.4)
+            .reduce((total, part, index) => total + part * [.2126, .7152, .0722][index], 0);
+          const paper = luminance(background);
+          return {
+            viewport: innerWidth, scrollWidth: document.documentElement.scrollWidth,
+            left: rect.left, right: rect.right, overflow: node.scrollWidth > node.clientWidth,
+            shortTargets: interactive.filter((item) => item.getBoundingClientRect().height < 43.5).map((item) => item.id),
+            fontSizes: normalText.map((item) => parseFloat(getComputedStyle(item).fontSize)),
+            titleSizes: [...node.querySelectorAll('h2, summary')].map((item) => parseFloat(getComputedStyle(item).fontSize)),
+            linkSizes: [...node.querySelectorAll('a')].map((item) => parseFloat(getComputedStyle(item).fontSize)),
+            contrast: [...normalText, ...interactive].map((item) => {
+              const ink = luminance(getComputedStyle(item).color);
+              return (Math.max(ink, paper) + .05) / (Math.min(ink, paper) + .05);
+            })
+          };
+        });
+        assert.ok(layout.scrollWidth <= layout.viewport && layout.left >= 0 && layout.right <= layout.viewport,
+          `Brand content overflows ${language} ${width}px ${open ? 'expanded' : 'collapsed'}`);
+        assert.equal(layout.overflow, false);
+        assert.deepEqual(layout.shortTargets, []);
+        assert.ok(layout.fontSizes.every((size) => size >= 16));
+        assert.ok(layout.titleSizes.every((size) => size >= 18));
+        assert.ok(layout.linkSizes.every((size) => size >= 14));
+        assert.ok(layout.contrast.every((ratio) => ratio >= 4.5));
+        if (screenshotPath && (width === 390 || width === 1440)) {
+          const file = path.join(path.dirname(screenshotPath), `panel-brand-${language}-${width}-${open ? 'expanded' : 'collapsed'}.png`);
+          await mkdir(path.dirname(file), { recursive: true });
+          // Full-page captures otherwise composite a scrolled sticky header in
+          // the middle of the image rather than its normal top-of-page position.
+          await page.evaluate(() => { document.activeElement?.blur(); window.scrollTo(0, 0); });
+          await page.waitForFunction(() => scrollY === 0);
+          await page.screenshot({ path: file, fullPage: true });
+          panelBrandScreenshots.push(file);
+        }
+      }
+    }
+  }
+  if (!await details.evaluate((node) => node.open)) await summary.click();
+  if (await page.evaluate(() => document.documentElement.lang) !== 'zh-CN') await page.locator('#language-toggle').click();
+  await page.setViewportSize({ width: 1440, height: 960 });
+  checks.push('NPC brand and possibilities keep 18px titles, 16px body text, 14px links, AA contrast, 44px targets and no overflow across Chinese/English desktop and narrow screens');
 }
 
 async function checkCurrentTasks(page, checks) {
@@ -903,6 +1031,10 @@ try {
     viewport: { width: 1440, height: 960 },
     reducedMotion: 'reduce'
   });
+  const externalRequests = [];
+  context.on('request', (request) => {
+    if (new URL(request.url()).origin !== baseUrl) externalRequests.push(request);
+  });
   const page = await context.newPage();
   page.on('pageerror', (error) => pageErrors.push(error.message));
 
@@ -918,6 +1050,7 @@ try {
   assert.match(faviconResponse.headers()['content-type'], /image\/svg\+xml/u);
   checks.push('NPC vector logo and compact favicon load locally without external image dependencies');
   assert.equal(context.pages().length, 1, 'Website navigation never opens automatically');
+  assert.equal(externalRequests.length, 0, 'Panel initialization has no external marketing requests');
   await context.route('https://www.npctech.site/**', (route) => route.fulfill({
     status: 200, contentType: 'text/html', body: '<title>NPC website fixture</title>'
   }));
@@ -953,6 +1086,7 @@ try {
   assert.match(await page.locator('.task-card').filter({ hasText: 'Review open-ended feed' }).textContent(), /已处理 31/u);
   assert.equal(await page.locator('.task-card.is-targeted').count(), 1);
   checks.push('fixed Dashboard URL loads Tasks first, deep-links one task, and renders bounded and open-ended progress');
+  await checkPanelBrand(page, context, checks, externalRequests);
   await checkCurrentTasks(page, checks);
   if (activeTasksScreenshotPath) {
     await mkdir(path.dirname(activeTasksScreenshotPath), { recursive: true });
@@ -1135,6 +1269,10 @@ try {
   const unexpectedApi = calls.requests.filter((entry) => entry.pathname.startsWith('/v1/') && !allowedApi.test(entry.pathname));
   assert.deepEqual(unexpectedApi, []);
   assert.deepEqual(pageErrors, []);
+  assert.deepEqual(externalRequests.map((request) => request.url()), [
+    'https://www.npctech.site/', 'https://www.npctech.site/',
+    'https://www.npctech.site/', 'https://media.npctech.site/'
+  ], 'Marketing has no background requests or tracking');
   checks.push('Dashboard uses only status, task, Profile, and cleanup APIs and raises no page errors');
 
   const report = {
@@ -1148,7 +1286,7 @@ try {
     profileRenames: calls.profileRenames,
     profileDeletes: calls.profileDeletes,
     cleanupRequests: calls.cleanup,
-    screenshots: screenshotPath ? { tasks: screenshotPath, activeTasks: activeTasksScreenshotPath, profiles: profilesScreenshotPath, cleanup: cleanupScreenshotPaths } : null,
+    screenshots: screenshotPath ? { tasks: screenshotPath, activeTasks: activeTasksScreenshotPath, profiles: profilesScreenshotPath, cleanup: cleanupScreenshotPaths, brand: panelBrandScreenshots } : null,
     pageErrors
   };
   if (reportPath) {

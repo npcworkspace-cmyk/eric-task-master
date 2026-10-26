@@ -8,9 +8,15 @@ Codex, Claude Code, WorkBuddy, Hermes, Pi, and any other Agent that can run a lo
 
 English | [简体中文](README.zh-CN.md) | [Latest Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) | **[NPC Website ↗](https://www.npctech.site/)**
 
-Built by **NPC**. [Explore our work, services, and AI tools →](https://www.npctech.site/)
+Built by **NPC**, a global PR and brand team with client-side experience—the creators of the Media Bridge media-resource platform and Task Master AI tool.
 
-## What Agents can do with it
+[Explore NPC ↗](https://www.npctech.site/) · [Media Bridge · media.npctech.site ↗](https://media.npctech.site/)
+
+## Use your imagination
+
+Automated public-data collection and web task execution are only some possibilities. You can also organize information in bulk, compare data across sites, fill forms and update back-office records, download and archive files, manage content and e-commerce workflows, monitor pages, and test browser flows.
+
+Most work you can do on a webpage can be designed as a workflow by the AI Agent you already use, then executed reliably on your own computer with Task Master.
 
 - **Long research and data collection:** search, read, organize, and persist results across many pages without depending on one Agent turn.
 - **Unattended batch work:** keep a bounded script running in the background or overnight with its own pacing, checkpoints, and recovery logic.

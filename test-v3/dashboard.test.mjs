@@ -143,3 +143,38 @@ test('cleanup is one accessible dialog with opt-in historical output and matchin
     assert.ok(acceptance.includes(evidence), `Browser acceptance must cover ${evidence}`);
   }
 });
+
+test('NPC and Media Bridge copy stay below the work area with native expanded possibilities and aligned READMEs', async () => {
+  const [html, source, english, chinese, acceptance] = await Promise.all([
+    text('dashboard/index.html'), text('dashboard/dashboard.js'), text('README.md'),
+    text('README.zh-CN.md'), text('scripts/dashboard-acceptance.mjs')
+  ]);
+  assert.match(html, /<aside\b[^>]*id="panel-intro"[^>]*aria-labelledby="panel-intro-title"/u);
+  assert.ok(html.indexOf('id="panel-intro"') > html.indexOf('id="profiles-error"'));
+  assert.ok(html.indexOf('id="panel-intro"') < html.indexOf('id="dashboard-message"'));
+  for (const [id, url] of [
+    ['panel-npc-link', 'https://www.npctech.site/'],
+    ['panel-media-link', 'https://media.npctech.site/']
+  ]) {
+    const link = [...html.matchAll(/<a\b[^>]*>/gu)].map((match) => match[0])
+      .find((tag) => tag.includes(`id="${id}"`));
+    assert.ok(link);
+    assert.ok(link.includes(`href="${url}"`));
+    assert.match(link, /target="_blank"/u);
+    assert.match(link, /rel="(?=[^"]*noopener)(?=[^"]*noreferrer)[^"]+"/u);
+  }
+  const details = html.match(/<details\b[^>]*id="panel-possibilities"[^>]*>/u)?.[0];
+  assert.ok(details);
+  assert.match(details, /\sopen(?:\s|=|>)/u);
+  assert.match(html, /<summary\b[^>]*id="panel-possibilities-title"/u);
+  assert.match(html, /媒介桥 · media\.npctech\.site ↗/u);
+  assert.match(html, /发挥你的想象力/u);
+  assert.match(html, /网页上能做的事，基本都可以/u);
+  assert.match(source, /Use your imagination/u);
+  assert.match(source, /Media Bridge · media\.npctech\.site ↗/u);
+  for (const guide of [english, chinese]) assert.ok(guide.includes('https://media.npctech.site/'));
+  assert.match(chinese, /发挥你的想象力/u);
+  assert.match(english, /Use your imagination/u);
+  assert.ok(acceptance.includes('checkPanelBrand'));
+  assert.ok(acceptance.includes('externalRequests'));
+});

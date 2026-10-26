@@ -8,9 +8,15 @@ Codex、Claude Code、WorkBuddy、Hermes、Pi，以及任何能调用本机终�
 
 [English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md) | **[NPC 官网 ↗](https://www.npctech.site/)**
 
-由 **NPC 核子力文化科技**打造。[了解我们的作品、服务与 AI 工具 →](https://www.npctech.site/)
+**NPC 核子力文化科技**：甲方操盘手出身的全球公关与品牌团队，也是媒体资源平台「媒介桥」和 AI 工具「任务大师」的打造者。
 
-## 它能把什么交给 Agent
+[了解 NPC ↗](https://www.npctech.site/) · [媒介桥 · media.npctech.site ↗](https://media.npctech.site/)
+
+## 发挥你的想象力
+
+不限于公开数据自动化采集、网页任务执行，还可以做批量资料整理、跨站信息核对、表单填写与后台录入、文件下载归档、内容与电商运营、网页监测和流程测试……
+
+网页上能做的事，基本都可以让你手头的 AI Agent 配合任务大师来设计流程，并在本机稳定执行。
 
 - **长期调研与数据采集：**跨页面搜索、读取、整理和持续落盘，不因 Agent 一轮对话结束而中断。
 - **无人值守批量任务：**让脚本按目标、顺序、限速和检查点在后台持续工作，适合小时级或夜间任务。
