@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.11 - 2026-10-26
+
+- Add a quiet NPC and Media Bridge introduction beneath the Dashboard workspace, with explicit external links, larger readable text and a native, expanded-by-default overview of open-ended browser workflows.
+- Keep the approved Chinese copy and its English translation aligned with the bilingual README introductions. Preserve Tasks and Profiles as the only views, with no tracking, automatic external requests, new services or task-control changes.
+- Verify keyboard disclosure, language switching, responsive layouts, link safety and unchanged task/Profile/cleanup controls through the existing isolated Dashboard acceptance.
+
 ## 3.1.10 - 2026-10-25
 
 - Batch cleanup metadata snapshots instead of rewriting the full task history after every output directory; persist completed batches and the final partial batch, and avoid no-op updates while still checking for late-arriving files.
