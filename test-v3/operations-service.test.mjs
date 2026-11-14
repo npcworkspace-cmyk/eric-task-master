@@ -372,3 +372,53 @@ test('dialog acknowledgement does not abandon other pages, resources or document
   const current = await service.get(operation.id); assert.equal(current.actions.find((action) => action.actionId === 'this-context').status, 'failed');
   assert.ok(current.actions.filter((action) => action.actionId !== 'this-context').every((action) => action.status === 'unknown'));
 });
+
+async function navigationReadbackFixture(t, original, { recordKind = original.kind || original.type, requestedEffect = original.effect } = {}) {
+  const setupResult = await setup(t); const { service, input, tasks } = setupResult;
+  input.authorization.resourceIds = ['source-resource', 'destination-resource']; input.authorization.allowedActions.push('navigate', 'fill', 'site.prepare');
+  const operation = await service.start(input);
+  const definition = { actionId: 'cross-resource-navigation', ...original };
+  await service.command(operation.id, { commandId: 'navigation-command', kind: 'batch', pageId: 'same-page', pageVersion: '1:source-document:0', payload: { actions: [definition] } });
+  for (const status of ['prepared', 'initiated', 'unknown']) await service.durable(operation.taskId, 'action', {
+    commandId: 'navigation-command', actionId: definition.actionId, accountId: 'account', resourceId: 'source-resource',
+    expectedIdentity: { accountId: 'account', resourceId: 'source-resource' }, kind: recordKind, effect: requestedEffect, before: 'source-view', proposed: original.value, status
+  });
+  await service.durable(operation.taskId, 'command-result', { commandId: 'navigation-command', status: 'unknown' }); tasks.get(operation.taskId).state = 'waiting';
+  await service.command(operation.id, { commandId: 'destination-readback', kind: 'reconcile', payload: { actionIds: [definition.actionId], verify: [original.expected] } });
+  const result = { matched: true, identity: { accountId: 'account', resourceId: 'destination-resource' }, url: 'http://localhost:5555/site', verification: [original.expected] };
+  const reconcile = (override = {}) => service.durable(operation.taskId, 'reconciliation', { commandId: 'destination-readback', actionIds: [definition.actionId], result: { ...result, ...override } });
+  return { ...setupResult, operation, reconcile };
+}
+
+test('original effect-free HTTP navigation reconciles its exact authorized destination while preserving source identity', async (t) => {
+  const target = 'http://localhost:5555/site';
+  const { service, operation, reconcile } = await navigationReadbackFixture(t, { type: 'navigate', effect: false, value: target, expected: { url: target } });
+  await assert.rejects(reconcile({ url: 'http://localhost:5555/wrong-page' }), { code: 'RECONCILIATION_DESTINATION_MISMATCH' });
+  await assert.rejects(reconcile({ identity: { accountId: 'foreign-account', resourceId: 'destination-resource' } }), { code: 'ACCOUNT_MISMATCH' });
+  await assert.rejects(reconcile({ identity: { accountId: 'account', resourceId: 'unauthorized-destination' } }), { code: 'RESOURCE_NOT_AUTHORIZED' });
+  await assert.rejects(reconcile({ verification: [{ target: { selector: '#unrelated' }, text: 'anything' }] }), { code: 'RECONCILIATION_EXPECTATION_MISMATCH' });
+  assert.equal((await service.get(operation.id)).actions[0].status, 'unknown');
+  await reconcile();
+  const action = (await service.get(operation.id)).actions[0];
+  assert.equal(action.status, 'confirmed'); assert.equal(action.accountId, 'account'); assert.equal(action.resourceId, 'source-resource'); assert.equal(action.before, 'source-view'); assert.equal(action.proposed, target);
+  assert.deepEqual(action.expectedIdentity, { accountId: 'account', resourceId: 'source-resource' });
+  assert.equal(action.destinationReadback.accountId, 'account'); assert.equal(action.destinationReadback.resourceId, 'destination-resource'); assert.equal(action.destinationReadback.url, target); assert.ok(action.destinationReadback.verifiedAt);
+});
+
+test('navigation destination exception cannot be borrowed by effects, non-navigation preparation, malformed or mismatched persisted declarations', async (t) => {
+  const target = 'http://localhost:5555/site';
+  const variants = [
+    { original: { type: 'fill', kind: 'site.prepare', effect: false, value: target, expected: { url: target } } },
+    { original: { type: 'click', kind: 'navigate', effect: false, value: target, expected: { url: target } } },
+    { original: { type: 'navigate', kind: 'site.prepare', effect: false, value: target, expected: { url: target } }, recordKind: 'navigate' },
+    { original: { type: 'navigate', effect: true, value: target, expected: { url: target } }, requestedEffect: false },
+    { original: { type: 'navigate', effect: false, value: target, expected: { url: 'http://localhost:5555/different' } } },
+    { original: { type: 'navigate', effect: false, value: 'file:///unapproved', expected: { url: 'file:///unapproved' } } },
+    { original: { type: 'navigate', effect: false, value: target, expected: { url: target } }, recordKind: 'site.prepare' }
+  ];
+  for (const { original, ...options } of variants) {
+    const { service, operation, reconcile } = await navigationReadbackFixture(t, original, options);
+    await assert.rejects(reconcile(), { code: 'RECONCILIATION_RESOURCE_MISMATCH' });
+    const action = (await service.get(operation.id)).actions[0]; assert.equal(action.status, 'unknown'); assert.equal(action.resourceId, 'source-resource'); assert.equal(action.destinationReadback, undefined);
+  }
+});

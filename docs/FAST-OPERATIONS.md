@@ -70,6 +70,8 @@ Schedules store UTC instants with an explicit IANA timezone, allowed window, per
 
 Read `ops get` and pending events after any disconnect or restart. Never replay an initiated/unknown action. `ops reconcile` submits a reserved readback command with `actionIds` and positive `verify` conditions. Optional `refresh:true` performs a same-page read-only GET refresh; `url` explicitly reopens an authorized readback entry after a restarted browser. The actual account/resource must still match. Unresolved or manually conflicting values stay unresolved; changing a selector or invoking resume is not permission to overwrite them. Resume after a deliberate takeover requires current authorization, reconciled writes and a fresh observation.
 
+For an originally recorded HTTP(S) navigation explicitly marked `effect:false`, the recorded resource can describe the source page. Its recovery must read the exact original destination URL, verify the original expected URL condition, and observe the same account plus a currently authorized destination resource. The source identity remains intact and `destinationReadback` records the actual destination separately. This narrow rule cannot be claimed by a new reconcile declaration and does not relax resource matching for external writes or non-navigation preparation.
+
 Use `ops revoke OP_ID`, `ops stop OP_ID` or `ops stop-all`. The last affects operations sessions only, not unrelated script jobs. Existing task/Profile leases and process containment perform shutdown. State/evidence remain available; this does not undo already accepted external actions. Upgrading the installed runtime, replacing existing Profiles or publishing a release requires separate permission.
 
 ## Optional cursor and native-dialog acknowledgement

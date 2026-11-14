@@ -261,3 +261,22 @@ test('cursor toggles do not release takeover, change mode or invalidate page obs
   assert.equal(h.session.mode, 'operations'); assert.equal(h.state.pageVersion, version);
   await h.session.dispose();
 });
+
+test('cross-resource non-effect navigation preserves actual source identity and emits actual destination readback', async () => {
+  const h = harness({ act: async (action) => { h.state.url = action.value; } });
+  h.runtime.input.authorization.resourceIds.push('res-destination');
+  h.browser.identity = async () => ({ accountId: 'acct-1', resourceId: h.state.url.endsWith('/site') ? 'res-destination' : 'res-1' });
+  h.browser.refresh = async (url) => { h.state.url = url; };
+  await h.session.execute(h.command('observe', {}));
+  const expected = { url: 'http://fixture.test/site' };
+  const navigated = await h.session.execute(h.batch({ actions: [{ actionId: 'cross-resource-navigation', type: 'navigate', effect: false, value: expected.url, expected }], verify: [expected] }));
+  assert.equal(navigated.status, 'confirmed');
+  const prepared = h.records.find((row) => row.type === 'action' && row.payload.status === 'prepared');
+  assert.equal(prepared.payload.resourceId, 'res-1');
+  const reconciled = await h.session.execute(h.command('reconcile', { url: expected.url, actionIds: ['cross-resource-navigation'], verify: [expected] }));
+  assert.equal(reconciled.status, 'confirmed');
+  const payload = h.records.find((row) => row.type === 'reconciliation').payload;
+  assert.deepEqual(payload.result.identity, { accountId: 'acct-1', resourceId: 'res-destination' });
+  assert.equal(payload.result.url, expected.url); assert.deepEqual(payload.result.verification, [expected]);
+  await h.session.dispose();
+});

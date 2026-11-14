@@ -294,10 +294,17 @@ export async function createOperationsService({ stateDir, taskService, profileSt
         for (const id of payload.actionIds) {
           const item = data.actions.find((entry) => entry.operationId === operation.id && entry.actionId === id);
           if (!item || !['initiated', 'unknown', 'confirmed'].includes(item.status)) throw opsError('ACTION_NOT_UNCERTAIN', 'Reconciliation must identify initiated actions', 409);
-          if (item.accountId && item.accountId !== identity.accountId || item.resourceId && item.resourceId !== identity.resourceId) throw opsError('RECONCILIATION_RESOURCE_MISMATCH', 'Readback identifies a different account/resource than the original effect', 403);
           const original = data.commands.find((entry) => entry.operationId === operation.id && entry.commandId === item.commandId)?.envelope.payload?.actions?.find((entry) => entry.actionId === id);
           const expected = original?.expected || item.expected;
-          if (item.effect !== false && (!expected || !payload.result.verification.some((condition) => fingerprint(condition) === fingerprint(expected)))) throw opsError('RECONCILIATION_EXPECTATION_MISMATCH', 'Readback must verify the original effect result, not an unrelated page condition', 409);
+          let declaredReadOnlyNavigation = false;
+          if (original?.type === 'navigate' && (original.kind === undefined || original.kind === 'navigate') && item.kind === 'navigate' && original.effect === false && item.effect === false &&
+              typeof original.value === 'string' && original.value === original.expected?.url) {
+            try { declaredReadOnlyNavigation = ['http:', 'https:'].includes(new URL(original.value).protocol); } catch { /* malformed declarations receive no navigation exception */ }
+          }
+          if (item.accountId && item.accountId !== identity.accountId || !declaredReadOnlyNavigation && item.resourceId && item.resourceId !== identity.resourceId) throw opsError('RECONCILIATION_RESOURCE_MISMATCH', 'Readback identifies a different account/resource than the original effect', 403);
+          if (declaredReadOnlyNavigation && (item.accountId !== identity.accountId || payload.result.url !== original.expected.url)) throw opsError('RECONCILIATION_DESTINATION_MISMATCH', 'Read-only navigation must read back the same account at its exact originally declared destination URL', 409);
+          if ((item.effect !== false || declaredReadOnlyNavigation) && (!expected || !payload.result.verification.some((condition) => fingerprint(condition) === fingerprint(expected)))) throw opsError('RECONCILIATION_EXPECTATION_MISMATCH', 'Readback must verify the original effect result, not an unrelated page condition', 409);
+          if (declaredReadOnlyNavigation) item.destinationReadback = { accountId: identity.accountId, resourceId: identity.resourceId, url: payload.result.url, verifiedAt: timestamp(now) };
           item.status = 'confirmed'; item.verification = safeOperationsValue(payload.result); item.updatedAt = timestamp(now);
         }
         if (operation.status === 'reconcile-required' && !data.actions.some((item) => item.operationId === operation.id && ['initiated', 'unknown'].includes(item.status))) operation.status = 'running';
