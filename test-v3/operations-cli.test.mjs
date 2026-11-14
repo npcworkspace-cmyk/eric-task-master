@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,9 +37,37 @@ test('ops CLI uses protected Manager routes; Profile policy persists across rest
   });
   const compact = await runCli(['ops', 'get', 'op_compact', '--command', 'current'], stateDir, manager.address.port);
   assert.equal(compact.code, 0); assert.equal(compact.result.command.reply.result, 'compact'); assert.equal(compact.result.pauseReason.code, 'TEST_REVIEW'); assert.equal(compact.result.unresolvedActions[0].actionId, 'unresolved'); assert.equal(compact.result.actions, undefined);
+  const effectiveStateDir = manager.stateLocation.stateDirEffective;
+  assert.equal(JSON.parse(await readFile(path.join(effectiveStateDir, 'profiles.json'), 'utf8')).profiles.find((item) => item.id === profile.id).modePolicy, 'operations');
   await manager.stop();
-  const store = new ProfileStore({ filePath: path.join(stateDir, 'profiles.json'), profilesRoot: path.join(stateDir, 'profiles') }); await store.init();
+  // Manager records canonical physical Profile paths. os.tmpdir() may be a
+  // symlink/short-path alias; a raw standalone store has no Manager alias proof.
+  const store = new ProfileStore({ filePath: path.join(effectiveStateDir, 'profiles.json'), profilesRoot: path.join(effectiveStateDir, 'profiles') }); await store.init();
   assert.equal((await store.get(profile.id)).modePolicy, 'operations');
+});
+
+test('Profile policy and identity survive actual Manager restart through a state-directory alias', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-ops-cli-alias-'));
+  const physical = path.join(root, 'physical'); const logical = path.join(root, 'logical');
+  await mkdir(physical); await symlink(physical, logical, process.platform === 'win32' ? 'junction' : 'dir');
+  let manager;
+  t.after(async () => { await manager?.stop(); await removeTestTree(root); });
+  manager = await createManager({ dataDir: logical, port: 0 }); await manager.start();
+  const effective = manager.stateLocation.stateDirEffective;
+  assert.notEqual(effective, logical, 'This regression must exercise a real physical/logical path difference');
+  const profile = await manager.profileStore.create({ name: 'Alias policy retained' });
+  const changed = await runCli(['profiles', 'mode', profile.id, '--mode', 'operations'], logical, manager.address.port);
+  assert.equal(changed.code, 0); assert.equal(changed.result.profile.modePolicy, 'operations');
+  await writeFile(path.join(profile.userDataDir, 'Local State'), 'ALIAS_LOGIN_SENTINEL');
+  const persisted = JSON.parse(await readFile(path.join(effective, 'profiles.json'), 'utf8')).profiles.find((item) => item.id === profile.id);
+  assert.equal(persisted.modePolicy, 'operations'); assert.equal(persisted.userDataDir, path.join(effective, 'profiles', profile.id));
+  await manager.stop();
+  manager = await createManager({ dataDir: logical, port: 0 }); await manager.start();
+  const retained = await manager.profileStore.get(profile.id);
+  assert.equal(retained.modePolicy, 'operations'); assert.equal(retained.name, profile.name); assert.equal(retained.userDataDir, persisted.userDataDir);
+  assert.equal(await readFile(path.join(retained.userDataDir, 'Local State'), 'utf8'), 'ALIAS_LOGIN_SENTINEL');
+  const listed = await runCli(['profiles', 'list'], logical, manager.address.port);
+  assert.equal(listed.code, 0); assert.equal(listed.result.profiles.find((item) => item.id === profile.id).modePolicy, 'operations');
 });
 
 test('ops schema is usable offline without creating or contacting a Manager', async (t) => {

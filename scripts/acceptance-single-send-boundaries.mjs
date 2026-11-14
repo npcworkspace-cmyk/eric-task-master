@@ -21,11 +21,12 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); return;
   }
   if (u.pathname === '/page') {
-    const mode = cases.get(id).mode;
+    if (!cases.has(id)) { res.writeHead(400); res.end(); return; }
     res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<!doctype html><button id="save">Submit synthetic approved request</button><iframe id="child" src="/frame"></iframe><output id="state">ready</output><script>
-const endpoint='/api/save?id='+${JSON.stringify(id)}; const data={id:${JSON.stringify(id)},value:'approved'}; window.settled=false;
-async function send(extra={}) {try{return await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json',...(${JSON.stringify(mode)}==='auth'?{authorization:'synthetic-not-a-secret'}:{})},body:JSON.stringify(${JSON.stringify(mode)}==='wrong-body'?{id:data.id,value:'wrong'}:data),...extra})}catch{return null}}
-document.querySelector('#save').onclick=async()=>{const mode=${JSON.stringify(mode)};
+const id=new URL(location.href).searchParams.get('id'); const mode=id.slice('case-'.length);
+const endpoint='/api/save?id='+encodeURIComponent(id); const data={id,value:'approved'}; window.settled=false;
+async function send(extra={}) {try{return await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json',...(mode==='auth'?{authorization:'synthetic-not-a-secret'}:{})},body:JSON.stringify(mode==='wrong-body'?{id:data.id,value:'wrong'}:data),...extra})}catch{return null}}
+document.querySelector('#save').onclick=async()=>{
 if(mode==='iframe'){try{await document.querySelector('#child').contentWindow.fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)})}catch{}}
 else if(mode==='newtab'){const form=document.createElement('form');form.method='POST';form.target='_blank';form.action=endpoint;document.body.append(form);form.submit()}
 else if(mode==='double')await Promise.allSettled([send(),send()]);
