@@ -128,6 +128,22 @@ const I18N = Object.freeze({
     'profiles.open': '打开',
     'profiles.close': '关闭',
     'profiles.rename': '改名',
+    'profiles.mode': '默认执行策略',
+    'profiles.modeSaved': '默认执行策略已保存',
+    'tasks.mode': '执行模式 / 原因',
+    'mode.auto': '自动选择',
+    'mode.batch': '批量',
+    'mode.operations': '运营',
+    'modeReason.script-default': '普通脚本默认',
+    'modeReason.task-intent': '本次手动指定',
+    'modeReason.profile-policy': 'Profile 默认策略',
+    'modeReason.skill-intent': 'Skill 推荐',
+    'modeReason.operational-intent': '按任务用途选择',
+    'modeReason.explicit-resume': '手动恢复',
+    'modeReason.recovered-reconciliation': '重启后核查恢复',
+    'modeReason.manual-takeover': '人工接管',
+    'modeReason.pause': '已暂停',
+    'modeReason.takeover': '人工接管',
     'profiles.renamePrompt': '请输入新的 Profile 名称（最多 80 个字符）',
     'profiles.inUse': '任务使用中',
     'profileState.closed': '已关闭',
@@ -274,6 +290,22 @@ const I18N = Object.freeze({
     'profiles.open': 'Open',
     'profiles.close': 'Close',
     'profiles.rename': 'Rename',
+    'profiles.mode': 'Execution mode',
+    'profiles.modeSaved': 'Mode policy saved',
+    'tasks.mode': 'Mode / reason',
+    'mode.auto': 'auto',
+    'mode.batch': 'batch',
+    'mode.operations': 'operations',
+    'modeReason.script-default': 'script-default',
+    'modeReason.task-intent': 'task-intent',
+    'modeReason.profile-policy': 'profile-policy',
+    'modeReason.skill-intent': 'skill-intent',
+    'modeReason.operational-intent': 'operational-intent',
+    'modeReason.explicit-resume': 'explicit-resume',
+    'modeReason.recovered-reconciliation': 'recovered-reconciliation',
+    'modeReason.manual-takeover': 'manual-takeover',
+    'modeReason.pause': 'pause',
+    'modeReason.takeover': 'takeover',
     'profiles.renamePrompt': 'Enter a new Profile name (up to 80 characters)',
     'profiles.inUse': 'Task in progress',
     'profileState.closed': 'Closed',
@@ -825,6 +857,9 @@ function labelledValue(label, value, duration = false, taskId = '') {
   }
   return group;
 }
+function modeReasonText(reason) {
+  return I18N[state.language]?.[`modeReason.${reason}`] || String(reason);
+}
 
 function taskActionButtons(task) {
   const actions = element('div', 'task-actions');
@@ -886,6 +921,7 @@ function renderTasks() {
     const facts = element('div', 'task-facts');
     facts.append(
       labelledValue(t('tasks.profile'), taskProfileName(task)),
+      labelledValue(t('tasks.mode'), `${t(`mode.${task.mode || 'batch'}`)} · ${modeReasonText(task.modeReason || 'script-default')}`),
       labelledValue(t('tasks.elapsed'), formatDuration(taskElapsed(task)), true, task.id),
       labelledValue(t('tasks.updated'), formatClock(task.updatedAt || task.progress?.updatedAt || task.createdAt))
     );
@@ -924,6 +960,7 @@ function renderProfiles() {
     const facts = element('div', 'profile-facts');
     facts.append(
       labelledValue(t('profiles.browser'), t('profiles.chrome')),
+      labelledValue(t('profiles.mode'), t(`mode.${profile.modePolicy || 'auto'}`)),
       labelledValue(t('profiles.recent'), profileLastUsed(profile))
     );
 
@@ -931,6 +968,17 @@ function renderProfiles() {
     const rename = button(t('profiles.rename'), 'npc-btn-secondary compact-button', () => void renameProfile(profile));
     rename.disabled = pending || status === 'inUse';
     actions.append(rename);
+    const modeLabel = element('label', 'profile-mode-picker', t('profiles.mode'));
+    const modeSelect = element('select', 'compact-button');
+    modeSelect.setAttribute('aria-label', `${t('profiles.mode')} ${profile.name || profile.id}`);
+    for (const mode of ['auto', 'batch', 'operations']) {
+      const option = element('option', '', t(`mode.${mode}`)); option.value = mode; option.selected = mode === (profile.modePolicy || 'auto'); modeSelect.append(option);
+    }
+    modeSelect.disabled = pending || status === 'inUse' || status === 'open';
+    modeSelect.addEventListener('change', () => { void runMutation(`profile:${profile.id}`, 'profiles', () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
+      method: 'PATCH', body: { modePolicy: modeSelect.value }
+    }), t('profiles.modeSaved')); });
+    modeLabel.append(modeSelect); actions.append(modeLabel);
     if (!isDefaultProfile(profile)) {
       const makeDefault = button(t('profiles.setDefault'), 'npc-btn-secondary compact-button', () => void setDefaultProfile(profile));
       makeDefault.disabled = pending;

@@ -9,6 +9,29 @@ import { launchChromeProfile } from './browser-engine.mjs';
 const notWaiting = () => ({ accepted: false, waitId: null, reason: 'TASK_NOT_WAITING' });
 let externalResume = notWaiting;
 let activeCleanupAck = null;
+const durableRequests = new Map();
+const operationControlListeners = new Set();
+
+export function acknowledgeOperationDurable(message) {
+  const pending = durableRequests.get(message.requestId);
+  if (!pending) return false;
+  message.ok ? pending.resolve(message.value) : pending.reject(Object.assign(new Error(message.error?.message || 'Durable record rejected'), message.error));
+  return true;
+}
+
+function durableRecord(type, payload, { sendMessage, signal, timeoutMs = 15000 }) {
+  if (Buffer.byteLength(JSON.stringify(payload)) > 128 * 1024) return Promise.reject(Object.assign(new Error('Durable record exceeds 128 KiB'), { code: 'DURABLE_RECORD_TOO_LARGE' }));
+  return new Promise((resolve, reject) => {
+    const requestId = randomUUID();
+    const finish = (error, value) => { clearTimeout(timer); signal.removeEventListener('abort', abort); durableRequests.delete(requestId); error ? reject(error) : resolve(value); };
+    const abort = () => finish(signal.reason || new TaskStoppedError());
+    const timer = setTimeout(() => finish(Object.assign(new Error('Persistence acknowledgement missing; external result must be reconciled'), { code: 'DURABLE_ACK_TIMEOUT' })), timeoutMs);
+    durableRequests.set(requestId, { resolve: (value) => finish(null, value), reject: (error) => finish(error) });
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) return abort();
+    sendMessage({ type: 'operations-durable', requestId, recordType: type, payload });
+  });
+}
 
 class TaskStoppedError extends Error {
   constructor() {
@@ -506,10 +529,10 @@ export async function runTaskWorker(config, {
       }
     };
 
-    const sourceUrl = `${pathToFileURL(config.modulePath).href}?task=${encodeURIComponent(config.taskId)}`;
+    const sourceUrl = config.builtin === 'fast-operations' ? new URL('./fast-session.mjs', import.meta.url).href : `${pathToFileURL(config.modulePath).href}?task=${encodeURIComponent(config.taskId)}`;
     const taskModule = await abortable(() => import(sourceUrl));
     assertActive();
-    const run = typeof taskModule.run === 'function'
+    const run = config.builtin === 'fast-operations' ? taskModule.runFastSession : typeof taskModule.run === 'function'
       ? taskModule.run
       : typeof taskModule.default === 'function'
         ? taskModule.default
@@ -530,6 +553,8 @@ export async function runTaskWorker(config, {
       progress,
       emit,
       wait: waitForResume,
+      durable: (type, payload) => durableRecord(type, payload, { sendMessage, signal: controller.signal }),
+      onControl: (listener) => { operationControlListeners.add(listener); return () => operationControlListeners.delete(listener); },
       signal: controller.signal
     }));
     await abortable(() => outputBudget.assertWithinBudget());
@@ -552,6 +577,7 @@ export async function runTaskWorker(config, {
     controller.signal.removeEventListener('abort', abortWait);
     signal?.removeEventListener('abort', stop);
     externalResume = notWaiting;
+    operationControlListeners.clear();
     if (!controller.signal.aborted) controller.abort(new TaskStoppedError());
     if (context) {
       await closeAndReport(context);
@@ -596,6 +622,10 @@ if (typeof process.send === 'function') {
     }
     if (message?.type === 'stop') controller.abort(new TaskStoppedError());
     if (message?.type === 'resume') acknowledgeTaskWorkerResume(message);
+    if (message?.type === 'operations-durable-ack') acknowledgeOperationDurable(message);
+    if (message?.type === 'operations-control') {
+      for (const listener of operationControlListeners) listener(message.control);
+    }
     if (message?.type === 'cleanup_ack' && activeCleanupAck?.id === message.cleanupId) {
       activeCleanupAck.finish(true);
     }

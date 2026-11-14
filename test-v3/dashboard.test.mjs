@@ -43,6 +43,12 @@ test('v3 Dashboard is a two-page task and Profile control surface', async () => 
   assert.match(source, /if \(!name \|\| name === profile\.name\) return/u);
   assert.match(source, /'profiles\.rename': '改名'/u);
   assert.match(source, /'profiles\.rename': 'Rename'/u);
+  assert.match(source, /'profiles\.mode': '默认执行策略'/u);
+  assert.match(source, /'mode\.auto': '自动选择'/u);
+  assert.match(source, /'mode\.batch': '批量'/u);
+  assert.match(source, /'mode\.operations': '运营'/u);
+  assert.match(source, /'modeReason\.script-default': '普通脚本默认'/u);
+  assert.match(source, /option\.value = mode/u, 'Mode API values must remain unchanged despite translated display labels');
   assert.match(source, /method:\s*'DELETE'/u);
   assert.match(source, /state\.pending\.has\(key\)/u);
   assert.match(source, /credentials:\s*'same-origin'/u);

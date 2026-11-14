@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { JsonStore } from './json-store.mjs';
+import { MODES } from './operations-contracts.mjs';
 import {
   isProcessAlive as defaultProcessAlive,
   probeChromeProfileUsage as defaultProfileUsageProbe
@@ -193,6 +194,7 @@ export class ProfileStore {
             : null;
         migrated.push({
           id: candidate.id,
+          modePolicy: MODES.includes(candidate.modePolicy) ? candidate.modePolicy : 'auto',
           name,
           userDataDir: safeProfilePath(this.#profilesRoot, candidate.id),
           state: lease
@@ -257,6 +259,7 @@ export class ProfileStore {
         draft.profiles.push({
           id,
           name,
+          modePolicy: 'auto',
           userDataDir,
           state: 'error',
           lease: {
@@ -351,7 +354,8 @@ export class ProfileStore {
     return structuredClone(findProfile(data, data.defaultProfileId));
   }
 
-  async create({ name } = {}) {
+  async create({ name, modePolicy = 'auto' } = {}) {
+    if (!MODES.includes(modePolicy)) throw new ProfileStoreError('INVALID_MODE', 'Invalid Profile mode policy');
     const normalizedName = normalizeName(name);
     const id = `profile_${randomUUID().replaceAll('-', '')}`;
     const userDataDir = safeProfilePath(this.#profilesRoot, id);
@@ -366,6 +370,7 @@ export class ProfileStore {
         created = {
           id,
           name: normalizedName,
+          modePolicy,
           userDataDir,
           state: 'idle',
           lease: null,
@@ -385,7 +390,7 @@ export class ProfileStore {
   }
 
   async update(identifier, patch = {}) {
-    const allowed = new Set(['name', 'isDefault']);
+    const allowed = new Set(['name', 'isDefault', 'modePolicy']);
     const unknown = Object.keys(patch).filter((key) => !allowed.has(key));
     if (unknown.length) {
       throw new ProfileStoreError('INVALID_PROFILE_PATCH', `Unsupported fields: ${unknown.join(', ')}`);
@@ -393,6 +398,11 @@ export class ProfileStore {
     let updated;
     await this.#store.update((data) => {
       const profile = findProfile(data, identifier);
+      if (Object.hasOwn(patch, 'modePolicy')) {
+        if (!MODES.includes(patch.modePolicy)) throw new ProfileStoreError('INVALID_MODE', 'Invalid Profile mode policy');
+        if (profile.lease) throw new ProfileStoreError('PROFILE_BUSY', 'Change mode policy between tasks, not while a Profile is owned', 409);
+        profile.modePolicy = patch.modePolicy;
+      }
       if (profile.state === 'deleting') {
         throw new ProfileStoreError('PROFILE_DELETING', `Profile ${profile.name} is being deleted`, 409);
       }

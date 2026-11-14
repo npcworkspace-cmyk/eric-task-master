@@ -9,6 +9,7 @@ import { isProcessAlive } from './lib/process-tree.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import { consolidateLegacySharedState } from './lib/state-upgrade.mjs';
 import { defaultDataDirectory, startManager } from './manager.mjs';
+import { operationsSchema } from './lib/operations-schema.mjs';
 import { managerOwnershipProof, managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
 import {
   chooseDefaultState, projectStateEnvironment, readDefaultStateLocation, readStateEndpoint,
@@ -35,6 +36,15 @@ Profiles:
   taskmaster profiles create NAME
   taskmaster profiles default NAME_OR_ID
   taskmaster profiles rename NAME_OR_ID --name NEW_NAME
+  taskmaster profiles mode NAME_OR_ID --mode auto|batch|operations
+  taskmaster ops start --input JSON_OR_@FILE
+  taskmaster ops schema --json
+  taskmaster ops get OP_ID [--command COMMAND_ID]
+  taskmaster ops command OP_ID --input JSON_OR_@FILE
+  taskmaster ops events OP_ID [--after N] [--wait-ms N]
+  taskmaster ops ack|decide|reconcile|update OP_ID --input JSON_OR_@FILE
+  taskmaster ops pause|resume|takeover|revoke|stop OP_ID [--mode MODE]
+  taskmaster ops stop-all
   taskmaster profiles open|close|delete NAME_OR_ID
 
 Manager:
@@ -812,6 +822,8 @@ async function runCommand(args, options, json) {
   const body = {
     modulePath,
     ...(options.profile ? { profileId: options.profile } : {}),
+    mode: options.mode || 'batch',
+    ...(options['skill-mode'] ? { skillMode: options['skill-mode'] } : {}),
     ...(options.label ? { label: options.label } : {}),
     input: await parseJsonInput(options.input),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
@@ -894,10 +906,10 @@ async function profileCommand(action, args, options, json) {
   const identifier = args[0];
   if (!identifier) throw cliError('PROFILE_REQUIRED', `profiles ${action} requires NAME_OR_ID`);
   let result;
-  if (action === 'default' || action === 'rename') {
+  if (action === 'default' || action === 'rename' || action === 'mode') {
     const body = action === 'default'
       ? { isDefault: true }
-      : { name: options.name || args[1] };
+      : action === 'mode' ? { modePolicy: options.mode } : { name: options.name || args[1] };
     if (action === 'rename' && !body.name) throw cliError('PROFILE_NAME_REQUIRED', 'profiles rename requires --name');
     result = await requestJson(context.config, `/v1/profiles/${encodeURIComponent(identifier)}`, {
       method: 'PATCH', body, token: context.token
@@ -1138,6 +1150,30 @@ async function managerCommand(action, options, json) {
   throw cliError('UNKNOWN_COMMAND', `Unknown manager command: ${action}`);
 }
 
+async function operationsCommand(action, args, options, json) {
+  const context = await apiContext(options);
+  const identifier = args[0];
+  if (!['start', 'list', 'stop-all'].includes(action) && !identifier) throw cliError('OPERATION_REQUIRED', 'ops command requires OP_ID');
+  const base = '/v1/operations';
+  let pathname = identifier ? `${base}/${encodeURIComponent(identifier)}` : base;
+  let method = 'GET'; let body;
+  if (action === 'start') { pathname = base; method = 'POST'; body = await parseJsonInput(options.input); }
+  else if (action === 'list') pathname = base;
+  else if (action === 'stop-all') { pathname = `${base}/stop-all`; method = 'POST'; body = {}; }
+  else if (action === 'events') {
+    const after = parseIntegerOption(options.after ?? 0, { name: 'after', minimum: 0 });
+    const waitMs = parseIntegerOption(options['wait-ms'] ?? 0, { name: 'wait-ms', minimum: 0, maximum: 30000 });
+    pathname += `/events?after=${after}&waitMs=${waitMs}`;
+  } else if (action === 'command') { pathname += '/commands'; method = 'POST'; body = await parseJsonInput(options.input); }
+  else if (['ack', 'decide', 'reconcile', 'update', 'pause', 'resume', 'takeover', 'revoke', 'stop'].includes(action)) {
+    pathname += '/actions'; method = 'POST'; body = { ...(options.input ? await parseJsonInput(options.input) : {}), action, ...(options.mode ? { mode: options.mode } : {}) };
+  } else if (action === 'get' && options.command) pathname += `?commandId=${encodeURIComponent(options.command)}`;
+  else if (action !== 'get') throw cliError('UNKNOWN_COMMAND', `Unknown ops command: ${action}`);
+  const result = await requestJson(context.config, pathname, { token: context.token, method, body, timeoutMs: 45000 });
+  const value = result.operation ? { ok: result.ok, ...result.operation } : result.command ? { ok: result.ok, ...result.command } : result.result && typeof result.result === 'object' ? { ok: result.ok, ...result.result } : result;
+  emit(value, json); return value;
+}
+
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   const options = parsed.options;
@@ -1153,7 +1189,7 @@ async function main() {
     return serveCommand(await settings(options, { serving: true }), json);
   }
   if (command === 'run') {
-    assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'request-key', 'timeout']);
+    assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'request-key', 'timeout', 'mode', 'skill-mode']);
     return runCommand(args, options, json);
   }
   if (command === 'follow') {
@@ -1172,9 +1208,15 @@ async function main() {
     assertAllowedOptions(options, ['limit', 'max-bytes', 'offset', 'read']);
     return filesCommand(args[0], options, json);
   }
+  if (command === 'ops') {
+    const action = args.shift() || 'list';
+    if (action === 'schema' || action === 'help') { assertAllowedOptions(options); return emit(operationsSchema(), json); }
+    assertAllowedOptions(options, ['input', 'after', 'wait-ms', 'mode', 'command']);
+    return operationsCommand(action, args, options, json);
+  }
   if (command === 'profiles') {
     const action = args.shift() || 'list';
-    assertAllowedOptions(options, action === 'create' || action === 'rename' ? ['name'] : []);
+    assertAllowedOptions(options, action === 'create' || action === 'rename' ? ['name'] : action === 'mode' ? ['mode'] : []);
     return profileCommand(action, args, options, json);
   }
   if (command === 'manager') {

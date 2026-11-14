@@ -8,6 +8,8 @@ Codex, Claude Code, WorkBuddy, Hermes, Pi, and any other Agent that can run a lo
 
 English | [简体中文](README.zh-CN.md) | [Latest Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) | **[NPC Website ↗](https://www.npctech.site/)**
 
+For bounded persistent interaction, schedules, durable decisions and recovery, see [Fast operations](docs/FAST-OPERATIONS.md). Execution modes are `batch` and `operations`; a prompt's explicit mode overrides the Profile default only for that task. `auto` selects a mode, while human takeover pauses automation without creating another mode. Signed-in account backends retain the selected local-browser boundary; isolated simulation is not proof of real-platform compatibility.
+
 Built by **NPC**, a global PR and brand team with client-side experience—the creators of the Media Bridge media-resource platform and Task Master AI tool.
 
 [Explore NPC ↗](https://www.npctech.site/) · [Media Bridge · media.npctech.site ↗](https://media.npctech.site/)

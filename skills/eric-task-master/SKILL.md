@@ -1,11 +1,11 @@
 ---
 name: eric-task-master
-description: Run durable local Chrome automation with the installed Task Master CLI. Use when an Agent needs to create and execute a one-off browser task, follow its progress, or manage its Chrome Profile.
+description: Run durable local Chrome scripts or explicitly selected Task Master Profile operations with the installed CLI. For signed-in account administration, default to the available local-browser-admin workflow unless this task explicitly selects a Task Master Profile.
 ---
 
 # Eric Task Master
 
-Use the installed or extracted portable `taskmaster` launcher. For a normal request, do not inspect the project source or create another controller. For a new Agent or Skill update, locate the existing application as below, verify its absolute launcher with `--help`, and install/update only this Skill when the launcher works. Agents running as the same OS user share the selected Manager and Profiles; different working folders do not create new defaults. Retain the absolute launcher because an Agent host may still have an old PATH.
+Use the installed or extracted portable `taskmaster` launcher. For a normal request, do not inspect the project source or create another controller. For a new Agent or Skill update, locate the existing application as below, verify its absolute launcher with `--help`, and install/update only this Skill when the launcher works. Agents running as the same OS user share the selected Manager and Profiles; different working folders do not create new defaults. Retain the absolute launcher because an Agent host may still have an old PATH. Account backends use the user's selected signed-in local browser by default; do not silently substitute a Profile, copy credentials or attach through an unsupported connection. If browser/account/authority is unclear, offer two explicit choices and await selection.
 
 Use `--state-dir ABSOLUTE_DIRECTORY` on every command only when the user requests an isolated data project. Its Manager selects its own port unless `--port` is explicitly supplied. Normal startup, including `manager start`, reuses a compatible Manager without replacing it. Runtime upgrade is an explicit Owner action: `manager start --upgrade`; on Windows it can consolidate the complete selected legacy view once while retaining its source. Incomplete-view errors require Owner upgrade, not replacement Profiles. Native install/uninstall refuse an in-use runtime. Never stop the shared Manager to install or update an Agent Skill.
 
@@ -39,8 +39,6 @@ When no launcher is available, the Windows locator also checks `127.0.0.1:19946`
 ```js
 export async function run({ page, context, input, outputDir, progress, wait, signal }) {
   await page.goto(input.url, { waitUntil: 'domcontentloaded' });
-  // Use Playwright, page.evaluate(), CDP, HTTP, and local files as the task needs.
-  await progress({ current: 1, total: 1, message: 'Done' });
   return { processed: 1 };
 }
 ```
@@ -58,6 +56,10 @@ When the task detects a verification page, stop dispatching work and call `await
 Manager retains Chrome, Worker and heartbeat, freezes execution timeout, and requests a system notification immediately and every 30 seconds until actual resume or the 20-minute deadline. Page screenshots occur at 5/10/15/20 minutes. Before the deadline, `follow` returns screenshot `attention` and an `after` cursor. Open `attention.screenshotPath`; only if clearly recovered, run `taskmaster resume TASK_ID --probe PROBE_ID --json` with `attention.probeId`. Otherwise continue following with `--after SEQUENCE`; uncertainty means stay waiting.
 
 At 20 minutes Manager automatically pauses and stops reminders, preserving the browser and checkpoint. `follow` returns `manualResumeRequired`; the final screenshot is diagnostic only and must not trigger probe-based resume. The Dashboard Resume button or user's resume request maps to `taskmaster resume TASK_ID --json`. `stop`/`delete` cancel reminders and end the task. Keep following before automatic pause: CLI cannot wake an Agent whose turn or terminal session ended. Any later wakeup belongs to a supported, user-authorized Agent-host mechanism, not Manager; otherwise hand off the receipt without promising automatic continuation. Notification presentation follows OS settings; failures never block task control.
+
+## Fast operations and modes
+
+Only `batch` and `operations` execute work: use bounded batches for known repeated mechanical paths, and persistent operations for long follow-up with several main-Agent decisions. Prompt-selected `mode` wins for this task without rewriting Profile defaults; otherwise use Profile `modePolicy`, or `auto` with explicit `skillMode`/waiting or follow-up intent, then finite `batch`. Use `profiles mode NAME_OR_ID --mode auto|batch|operations` only to change the saved default. First read `ops schema --json` for the complete offline contract and copyable payloads; no source checkout or website is needed. `ops start --input @start.json` requires selected browser, scoped unexpired account/resource/origin/action authorization and actual account plus resource selectors. Reuse returned operation/task IDs: `ops command OP_ID --input @command.json`, then compact `ops get OP_ID --command COMMAND_ID` for that reply and safety state; reserve full `ops get OP_ID` for reconciliation. Observe fresh pageId/pageVersion before a batch with preconditions/stop conditions/positive verification. Omitted text has explicit text ranges and scoped textOffset continuation: expand required rules/context before deciding. Use `ops events OP_ID --after CURSOR --wait-ms 30000`, `ops ack` and `ops decide` for main-Agent decisions; local waits need no model polling. `ops takeover`/`pause` are page-control locks, never a third mode; explicit resume requires fresh observation. Unknown writes require identity-bound read-only `ops reconcile` against the original effects, never replay. `ops revoke`, `stop` and `stop-all` cancel scoped operations. An ended/closed host needs a real configured receipt adapter; pending events or notifications do not prove automatic wakeup. Isolated simulation does not prove real-platform support.
 
 ## Control
 

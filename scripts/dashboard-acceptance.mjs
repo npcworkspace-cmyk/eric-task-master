@@ -352,6 +352,11 @@ async function handler(request, response) {
       json(response, 200, { profile: clone(profile) });
       return;
     }
+    if (Object.hasOwn(body, 'modePolicy')) {
+      assert.ok(['auto', 'batch', 'operations'].includes(body.modePolicy));
+      profile.modePolicy = body.modePolicy; profile.updatedAt = now();
+      json(response, 200, { profile: clone(profile) }); return;
+    }
     if (body.isDefault !== true) {
       json(response, 400, { error: { code: 'INVALID_PROFILE_PATCH', message: 'Only name and isDefault are supported' } });
       return;
@@ -1159,6 +1164,15 @@ try {
   await researchCard.waitFor();
   assert.deepEqual(calls.profileCreates.at(-1), { name: 'Research' });
   assert.equal(Object.keys(calls.profileCreates.at(-1)).length, 1);
+
+  const modePicker = researchCard.getByRole('combobox', { name: '默认执行策略 Research', exact: true });
+  assert.deepEqual(await modePicker.locator('option').evaluateAll((options) => options.map((option) => option.value)), ['auto', 'batch', 'operations']);
+  assert.deepEqual(await modePicker.locator('option').allTextContents(), ['自动选择', '批量', '运营']);
+  await modePicker.selectOption('operations');
+  await waitUntil(() => profileById('profile_3')?.modePolicy === 'operations', 'Profile operations default');
+  await researchCard.getByRole('combobox').selectOption('auto');
+  await waitUntil(() => profileById('profile_3')?.modePolicy === 'auto', 'Profile auto default');
+  checks.push('Profile mode picker exposes only auto/batch/operations and persists selection through Profile PATCH');
 
   const renameButton = researchCard.getByRole('button', { name: '改名', exact: true });
   const renameRequestsBefore = calls.requests.filter((entry) => entry.method === 'PATCH').length;
