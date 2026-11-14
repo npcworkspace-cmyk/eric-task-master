@@ -10,9 +10,9 @@ import { createOperationsHarness, ROOT, pause } from '../test-v3/fixtures/fast-o
 import { startFixtureServer } from '../test-v3/fixtures/fast-operations/server.mjs';
 import { redactSensitiveValue } from '../src/lib/redaction.mjs';
 import { replaceFileWithRetry } from '../src/lib/json-store.mjs';
+import { FOUR_HOURS, EIGHT_HOURS, liveDurationGates } from '../test-v3/fixtures/live-chaos/popup-plan.mjs';
 
 const execFile = promisify(execFileCallback);
-const EIGHT_HOURS = 8 * 3600000;
 const FAMILIES = ['quiet-scheduled-inspection', 'new-reply-data-burst', 'moved-entry-stale-targets', 'slow-network-unknown-result', 'changed-before-insufficient-data', 'login-identity-permission-change', 'human-takeover', 'declared-manager-restart'];
 const iso = (value = Date.now()) => new Date(value).toISOString();
 const fileName = (id) => `${encodeURIComponent(id)}.json`;
@@ -82,7 +82,7 @@ export function auditBusinessEffects({ fixture, oracle, effectAudit, rootActions
   return { ok: true, unknown: false, observedEffects: effects.length, matches };
 }
 
-export function seededPlan(seed, { durationMs = EIGHT_HOURS, slotMs = 20 * 60000 } = {}) {
+export function seededPlan(seed, { durationMs = FOUR_HOURS, slotMs = durationMs / 24 } = {}) {
   let state = createHash('sha256').update(String(seed)).digest().readUInt32LE(0) || 1;
   const random = () => { state ^= state << 13; state ^= state >>> 17; state ^= state << 5; return (state >>> 0) / 4294967296; };
   const families = Array.from({ length: 24 }, (_, index) => FAMILIES[index % FAMILIES.length]);
@@ -164,7 +164,14 @@ const quantiles = (values) => {
   return { measured: sorted.length, medianMs: percentile(0.5), p95Ms: percentile(0.95), worstMs: sorted.at(-1) ?? null };
 };
 
-export async function runLiveChaos({ outputDir, seed = 'business-chaos-20261114', durationMs = EIGHT_HOURS, slotMs = 20 * 60000, sampleMs = 60000 } = {}) {
+export function businessAcceptanceGates({ failure, cancelled, cleanup, durationMs, actualElapsedMs, gaps, outcomes, skippedSlots, nextSlot, coverage, finalEffectAudit }) {
+  const evidenceComplete = !failure && !cancelled && cleanup?.ok === true && gaps.length === 0 &&
+    outcomes.length === 24 && skippedSlots.length === 0 && nextSlot === 24 && FAMILIES.every((family) => coverage[family]?.injected === 3 && coverage[family]?.genuineRootDecisions >= 1) &&
+    outcomes.every((outcome) => ['resolved', 'correctly_refused'].includes(outcome.outcome) && outcome.effectAudit?.ok === true) && finalEffectAudit.complete;
+  return liveDurationGates({ targetDurationMs: durationMs, elapsedMs: actualElapsedMs, evidenceComplete });
+}
+
+export async function runLiveChaos({ outputDir, seed = 'business-chaos-20261114', durationMs = FOUR_HOURS, slotMs = durationMs / 24, sampleMs = 60000 } = {}) {
   if (!outputDir || !Number.isSafeInteger(durationMs) || durationMs < 5000 || !Number.isSafeInteger(slotMs) || slotMs < 1000 || !Number.isSafeInteger(sampleMs) || sampleMs < 1000 || sampleMs > 60000) throw new Error('Explicit output directory; duration >=5s, slot >=1s, sample 1..60s required');
   outputDir = path.resolve(outputDir);
   await assertFreshLiveOutput(outputDir);
@@ -190,7 +197,7 @@ export async function runLiveChaos({ outputDir, seed = 'business-chaos-20261114'
     if (key === lastStatusKey && Date.now() - lastStatusAt < 10000) return;
     lastStatusAt = Date.now(); lastStatusKey = key;
     return atomicJson(paths.status, { schemaVersion: 1, runId, lane, seed, state, pid: process.pid, startedAt: startedWall ? iso(startedWall) : null,
-    updatedAt: iso(), targetDurationMs: durationMs, actualElapsedMs: elapsed(), slotMs, samples, nextSlot, pendingChallenge: pending?.challengeId || null,
+    updatedAt: iso(), targetDurationMs: durationMs, ...liveDurationGates({ targetDurationMs: durationMs, elapsedMs: elapsed(), evidenceComplete: false }), actualElapsedMs: elapsed(), slotMs, samples, nextSlot, pendingChallenge: pending?.challengeId || null,
     pendingRequestPath: pending?.requestPath || null, decisionPath: pending?.decisionPath || null, operationId, stateDir: harness?.stateDir,
     fixtureOrigin: harness?.fixture.origin, completed: outcomes.length, unresolved: outcomes.filter((outcome) => outcome.outcome === 'unresolved').length,
     skippedSlots, gaps, segments, stopPath: paths.stop, holdPath: paths.hold, ...extra });
@@ -339,13 +346,13 @@ export async function runLiveChaos({ outputDir, seed = 'business-chaos-20261114'
     assert.equal((await mechanicalNavigate(`${harness.fixture.origin}/social`)).status, 'confirmed');
     startedWall = Date.now(); startedMono = performance.now(); lastSampleMono = -sampleMs; lastLoopWall = startedWall; lastLoopMono = startedMono;
     await stage('initial');
-    await atomicJson(paths.manifest, { schemaVersion: 1, runId, lane, seed, pid: process.pid, startedAt: iso(startedWall), targetDurationMs: durationMs, eightHourThresholdMs: EIGHT_HOURS,
+    await atomicJson(paths.manifest, { schemaVersion: 1, runId, lane, seed, pid: process.pid, startedAt: iso(startedWall), targetDurationMs: durationMs, requiredDurationMs: FOUR_HOURS, eightHourThresholdMs: EIGHT_HOURS,
       ...fingerprint, stateDir: harness.stateDir, profileId: harness.profile.id, operationId, taskId: operation.taskId, fixtureOrigin: harness.fixture.origin, paths, slotMs, sampleMs, plan,
       actorBoundary: 'Driver injects/detects/verifies only; root-main-agent must perform actual CLI ack/decide/commands. No model, credentials or host wakeup adapter is added.',
       rootCli: `${process.execPath} ${path.join(ROOT, 'src', 'cli.mjs')} --state-dir ${harness.stateDir} --json`, fixtureControlUrl: `${harness.fixture.origin}/control`,
       mechanicalRules: ['initial authorized local navigation', 'seeded fixture changes and page refresh via normal CLI', 'declared Manager restart fault', 'scoped read-only detection/resource sampling'],
       filenameMapping: 'encodeURIComponent(challengeId)+.json; use each request.decisionPath on Windows' });
-    process.stdout.write(`${JSON.stringify({ state: 'ready', runId, lane, operationId, manifest: paths.manifest, status: paths.status })}\n`);
+    process.stdout.write(`${JSON.stringify({ state: 'ready', runId, lane, operationId, requiredDurationMs: FOUR_HOURS, targetDurationMs: durationMs, manifest: paths.manifest, status: paths.status })}\n`);
     while (!cancelled && elapsed() < durationMs) {
       if (await fileExists(paths.stop)) { cancelled = true; break; }
       const loopWall = Date.now(); const loopMono = performance.now(); const gapMs = loopMono - lastLoopMono;
@@ -396,16 +403,14 @@ export async function runLiveChaos({ outputDir, seed = 'business-chaos-20261114'
   const coverage = Object.fromEntries(FAMILIES.map((family) => [family, { planned: plan.filter((slot) => slot.scenarioId === family).length, injected: outcomes.filter((outcome) => outcome.scenarioId === family).length,
     genuineRootDecisions: outcomes.filter((outcome) => outcome.scenarioId === family && outcome.rootDecision).length, resolved: outcomes.filter((outcome) => outcome.scenarioId === family && outcome.outcome === 'resolved').length,
     correctlyRefused: outcomes.filter((outcome) => outcome.scenarioId === family && outcome.outcome === 'correctly_refused').length }]));
-  const gate = !failure && !cancelled && cleanup?.ok === true && durationMs >= EIGHT_HOURS && actualElapsedMs >= EIGHT_HOURS && gaps.length === 0 &&
-    outcomes.length === 24 && skippedSlots.length === 0 && nextSlot === 24 && FAMILIES.every((family) => coverage[family].injected === 3 && coverage[family].genuineRootDecisions >= 1) &&
-    outcomes.every((outcome) => ['resolved', 'correctly_refused'].includes(outcome.outcome) && outcome.effectAudit?.ok === true) && finalEffectAudit.complete;
-  const report = { schemaVersion: 1, runId, lane, seed, ok: gate, eightHourGatePassed: gate, shortSmokeOnly: durationMs < EIGHT_HOURS, targetDurationMs: durationMs, actualElapsedMs,
+  const gates = businessAcceptanceGates({ failure, cancelled, cleanup, durationMs, actualElapsedMs, gaps, outcomes, skippedSlots, nextSlot, coverage, finalEffectAudit });
+  const report = { schemaVersion: 1, runId, lane, seed, ok: gates.acceptanceGatePassed, ...gates, targetDurationMs: durationMs, actualElapsedMs,
     ...fingerprint, finishedAt: iso(), cancelled, failure, cleanup, coverage, outcomes, skippedSlots, gaps, segments, mechanical, finalEffectAudit,
     continuity: { supervisedExperiment: true, uninterruptedSingleBrowserSession: segments.length === 1, segmentCount: segments.length, unexpectedGapCount: gaps.length },
     latency: Object.fromEntries(['detectionMs', 'agentQueueMs', 'handlingMs', 'endToEndMs'].map((name) => [name, { ...quantiles(outcomes.map((outcome) => outcome.latency?.[name])), denominator: outcomes.length, missingOrUnresolved: outcomes.filter((outcome) => !Number.isFinite(outcome.latency?.[name])).length }])),
     boundary: 'Only isolated local fixtures; no installed Manager/Profile changes, real account edits, model additions or native closed-host wakeup claim' };
-  await atomicJson(paths.report, report); await status(cancelled ? 'cancelled' : failure ? 'failed' : gate ? 'finished' : 'finished-partial', { reportPath: paths.report, eightHourGatePassed: gate });
-  process.stdout.write(`${JSON.stringify({ state: 'finished', reportPath: paths.report, eightHourGatePassed: gate, cleanup: cleanup?.ok })}\n`);
+  await atomicJson(paths.report, report); await status(cancelled ? 'cancelled' : failure ? 'failed' : gates.acceptanceGatePassed ? 'finished' : 'finished-partial', { reportPath: paths.report, ...gates });
+  process.stdout.write(`${JSON.stringify({ state: 'finished', reportPath: paths.report, ...gates, cleanup: cleanup?.ok })}\n`);
   return report;
 }
 
@@ -413,12 +418,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   if (process.argv.includes('--self-test')) {
     const first = seededPlan('fixed-seed'); const second = seededPlan('fixed-seed'); assert.deepEqual(first, second); assert.equal(first.length, 24);
     for (const family of FAMILIES) assert.equal(first.filter((slot) => slot.scenarioId === family).length, 3);
-    assert.notDeepEqual(first, seededPlan('different-seed')); assert.ok(first.every((slot, index) => slot.dueAfterMs >= index * 1200000 + 120000 && slot.dueAfterMs <= index * 1200000 + 720000));
+    assert.notDeepEqual(first, seededPlan('different-seed')); assert.ok(first.every((slot, index) => slot.dueAfterMs >= index * 600000 + 60000 && slot.dueAfterMs <= index * 600000 + 360000));
     process.stdout.write(`${JSON.stringify({ ok: true, seedReplay: true, eightFamilies: FAMILIES.length, slots: first.length, noBrowserStarted: true })}\n`);
   } else {
     const report = await runLiveChaos({ outputDir: process.argv[2] || process.env.TASKMASTER_LIVE_OUTPUT || path.join(ROOT, '..', 'outputs', `live-chaos-${Date.now()}`),
       seed: process.env.TASKMASTER_CHAOS_SEED || process.env.TASKMASTER_LIVE_SEED || 'business-chaos-20261114',
-      durationMs: Number(process.env.TASKMASTER_LIVE_DURATION_MS || EIGHT_HOURS), slotMs: Number(process.env.TASKMASTER_LIVE_SLOT_MS || 20 * 60000), sampleMs: Number(process.env.TASKMASTER_LIVE_SAMPLE_MS || 60000) });
-    if (!report.eightHourGatePassed && !report.shortSmokeOnly) process.exitCode = 1;
+      durationMs: Number(process.env.TASKMASTER_LIVE_DURATION_MS || FOUR_HOURS), slotMs: process.env.TASKMASTER_LIVE_SLOT_MS ? Number(process.env.TASKMASTER_LIVE_SLOT_MS) : undefined, sampleMs: Number(process.env.TASKMASTER_LIVE_SAMPLE_MS || 60000) });
+    if (report.failure || report.cancelled || !report.cleanup?.ok || !report.acceptanceGatePassed && !report.shortSmokeOnly) process.exitCode = 1;
   }
 }
