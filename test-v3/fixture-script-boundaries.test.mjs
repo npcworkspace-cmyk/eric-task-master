@@ -7,7 +7,12 @@ import { startPopupFixture } from './fixtures/live-chaos/popups.mjs';
 
 const attack = '</script><script>globalThis.injected=true</script>"\'&<>';
 const post = (origin, route, body) => fetch(origin + route, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-const scripts = (html) => [...html.matchAll(/<script>([\s\S]*?)<\/script>/gu)].map((match) => match[1]);
+// Extract only our known fixture script blocks for VM execution; not an HTML sanitizer.
+const scripts = (html) => [...html.matchAll(/<script>([\s\S]*?)<\/script>/giu)].map((match) => match[1]);
+
+test('fixture script extraction recognizes mixed-case tags', () => {
+  assert.deepEqual(scripts('<ScRiPt>globalThis.example=true</sCrIpT>'), ['globalThis.example=true']);
+});
 
 test('single-send boundary page uses fixed code for all modes and rejects unknown query ids', async () => {
   const source = await readFile(new URL('../scripts/acceptance-single-send-boundaries.mjs', import.meta.url), 'utf8');
@@ -50,9 +55,11 @@ test('popup challenge id stays text/data and close action preserves the exact id
     assert.equal(scripts(html).length, 1);
     assert.ok(!html.includes(attack));
     assert.ok(!html.includes('oracle'));
+    assert.equal(await fetch(fixture.origin + '/popup?challengeId=ordinary-id').then((response) => response.text()), html);
     const button = {}, status = {}; let closed = false;
     const context = { URL, location: { href }, document: { querySelector: (id) => id === '#close-tab' ? button : status }, fetch: (route, options) => fetch(fixture.origin + route, options), window: { close() { closed = true; } } };
     vm.runInNewContext(scripts(html)[0], context);
+    assert.equal(status.textContent, `open:${attack}`);
     await button.onclick();
     assert.equal(context.injected, undefined);
     assert.equal(closed, true);

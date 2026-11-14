@@ -3,7 +3,6 @@ import { writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { POPUP_FAMILIES } from './popup-plan.mjs';
 
-const escapeHtml = (value) => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
 const pageScript = String.raw`
 let lastChallenge=null;
 const status=document.querySelector('#popup-status');
@@ -40,8 +39,7 @@ export async function startPopupFixture({ port = 0, stateFile } = {}) {
       if (request.method === 'GET' && ['/social', '/popup'].includes(url.pathname)) {
         let html;
         if (url.pathname === '/popup') {
-          const challengeId = url.searchParams.get('challengeId');
-          html = `<h1>Unexpected test window</h1>${identity}<p id="popup-status">open:${escapeHtml(challengeId)}</p><p>Review this isolated window before closing.</p><button id="close-tab">Close test window</button><script>document.querySelector('#close-tab').onclick=async()=>{const d=await fetch('/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challengeId:new URL(location.href).searchParams.get('challengeId'),action:'close-tab'})}).then(r=>r.json());document.querySelector('#popup-status').textContent=d.status;window.close()};</script>`;
+          html = `<h1>Unexpected test window</h1>${identity}<p id="popup-status"></p><p>Review this isolated window before closing.</p><button id="close-tab">Close test window</button><script>const challengeId=new URL(location.href).searchParams.get('challengeId');document.querySelector('#popup-status').textContent='open:'+challengeId;document.querySelector('#close-tab').onclick=async()=>{const d=await fetch('/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challengeId,action:'close-tab'})}).then(r=>r.json());document.querySelector('#popup-status').textContent=d.status;window.close()};</script>`;
         } else html = `<h1>Isolated unexpected-popup lane</h1>${identity}<p id="rules">No destructive, payment, ownership or credential actions are authorized.</p><p id="popup-active" data-active="false">Popup monitor</p><p id="popup-status">idle</p><div id="overlay-root"></div><script>${pageScript}</script>`;
         response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); response.end(`<!doctype html><html><head><title>Task Master popup experiment</title><style>body{font:16px Arial;padding:24px}.overlay{position:fixed;inset:12% 15%;padding:24px;background:white;border:3px solid #e77823;box-shadow:0 0 0 100vmax #0006;z-index:99}button{padding:12px;margin:8px}iframe{width:90%;height:180px}</style></head><body>${html}</body></html>`); return;
       }
