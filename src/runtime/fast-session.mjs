@@ -38,6 +38,8 @@ export function createFastSession(runtime) {
   const { context, page, input = {}, signal, outputDir, durable = async () => { throw fastError('DURABILITY_UNAVAILABLE', 'Manager persistence acknowledgement is required'); } } = runtime;
   const operationId = input.operationId;
   let mode = input.mode || 'operations';
+  let cursorExplicit = typeof input.showCursor === 'boolean';
+  let cursorEnabled = cursorExplicit ? input.showCursor : mode === 'operations';
   let humanOwned = Boolean(input.takeover);
   let freshObservation = false;
   let activeCommand = null;
@@ -62,8 +64,8 @@ export function createFastSession(runtime) {
     pendingEvents.add(promise);
     try { await promise; } finally { pendingEvents.delete(promise); }
   };
-  const browser = runtime.browserAdapter || createFastBrowser({ page, context, signal, onEvent: publish });
-  const abort = () => { terminal = true; activeCommand?.controller.abort(signal?.reason || fastError('TASK_STOPPED', 'Stopped')); abortController.abort(); };
+  const browser = runtime.browserAdapter || createFastBrowser({ page, context, signal, showCursor: cursorEnabled, onEvent: publish });
+  const abort = () => { terminal = true; activeCommand?.controller.abort(signal?.reason || fastError('TASK_STOPPED', 'Stopped')); abortController.abort(); void browser.pauseCursor?.(true); };
   if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
   const check = () => {
     if (signal?.aborted || terminal || disposed) throw signal?.reason || fastError('TASK_STOPPED', 'Session stopped');
@@ -213,16 +215,25 @@ export function createFastSession(runtime) {
     return { watchId, healthy: true, pollMs };
   };
   const control = ({ action, mode: nextMode } = {}) => {
-    if (action === 'stop') { terminal = true; activeCommand?.controller.abort(fastError('TASK_STOPPED', 'Session stopped')); abortController.abort(); }
+    if (action === 'stop') { terminal = true; activeCommand?.controller.abort(fastError('TASK_STOPPED', 'Session stopped')); abortController.abort(); void browser.pauseCursor?.(true); }
     if (action === 'takeover' || action === 'pause') {
       humanOwned = true; activeCommand?.controller.abort(fastError('MANUAL_TAKEOVER', 'Human took over or paused the page'));
+      void browser.pauseCursor?.(true);
       for (const watcher of watches.values()) watcher.controller.abort();
-    } else if (action === 'resume') { humanOwned = false; mode = nextMode || mode; }
+    } else if (action === 'resume') { humanOwned = false; mode = nextMode || mode; if (!cursorExplicit) { cursorEnabled = mode === 'operations'; void browser.setCursorEnabled?.(cursorEnabled); } void browser.pauseCursor?.(false); }
     freshObservation = false;
     browser.invalidate();
-    return { mode, automationPaused: humanOwned, requiresObservation: true };
+    return { mode, automationPaused: humanOwned, cursorEnabled, requiresObservation: true };
   };
-  const unsubscribe = runtime.onControl?.(control);
+  const handleControl = (value = {}) => {
+    if (value.action === 'cursor') {
+      if (typeof value.visible !== 'boolean') throw fastError('INVALID_COMMAND', 'Cursor visibility must be boolean');
+      cursorExplicit = true; cursorEnabled = value.visible;
+      return Promise.resolve(browser.setCursorEnabled?.(cursorEnabled)).then(() => ({ mode, automationPaused: humanOwned, cursorEnabled }));
+    }
+    return control(value);
+  };
+  const unsubscribe = runtime.onControl?.(handleControl);
   let lastSafetyIssue = null;
   let guardianUnavailableSince = null;
   const guardian = (async () => {
@@ -392,7 +403,25 @@ export function createFastSession(runtime) {
         result = browser.tabs().map(({ pageId, selected }) => ({ pageId, selected, requiresIdentityCheck: !selected }));
       }
       else if (command.kind === 'select-tab') { await refreshAuthority(command); await browser.selectTab(payload.pageId); result = (await protectedScope(command, { bootstrap: true })).state; freshObservation = false; }
-      else if (command.kind === 'control') result = control(payload);
+      else if (command.kind === 'control') {
+        if (payload.action === 'acknowledge-dialog') {
+          if (!command.pageId || !command.pageVersion || typeof payload.reason !== 'string' || !payload.reason.trim() || payload.reason.length > 2000) throw fastError('INVALID_DIALOG_ACKNOWLEDGEMENT', 'Fresh page identity/version and an explicit decision reason are required');
+          const before = await browser.meta();
+          if (before.pageId !== command.pageId || before.pageVersion !== command.pageVersion) throw fastError('STALE_OBSERVATION', 'Observe this interruption again before acknowledging it');
+          if (browser.unsafe !== 'UNEXPECTED_DIALOG') throw fastError('DIALOG_ACKNOWLEDGEMENT_NOT_APPLICABLE', 'Only the current unexpected-dialog interruption can be acknowledged');
+          const token = browser.unsafeToken;
+          const scope = await protectedScope(command);
+          const acknowledgement = await durable('dialog-acknowledgement', { operationId, commandId: command.commandId, pageId: before.pageId, pageVersion: before.pageVersion, reason: payload.reason.trim(), ...scope.identity, origin: new URL(scope.state.url).origin });
+          if (acknowledgement?.acknowledged !== true) throw fastError('DIALOG_ACKNOWLEDGEMENT_UNCONFIRMED', 'Manager did not confirm this interruption acknowledgement');
+          const after = await browser.meta();
+          if (after.pageVersion !== before.pageVersion || browser.unsafeToken !== token) throw fastError('STALE_OBSERVATION', 'Page or interruption changed while acknowledgement was being persisted');
+          if (browser.clearUnsafe(token) === false) throw fastError('DIALOG_ACKNOWLEDGEMENT_NOT_APPLICABLE', 'Interruption changed before acknowledgement');
+          if (acknowledgement.localUncertaintyCleared === true) writeUnknown = false;
+          else if (acknowledgement.remainingUnresolvedActionIds?.length) writeUnknown = true;
+          freshObservation = false;
+          result = { acknowledged: true, requiresObservation: true, automationPaused: humanOwned, pageId: before.pageId, pageVersion: after.pageVersion };
+        } else result = await handleControl(payload);
+      }
       else if (command.kind === 'screenshot') {
         await protectedScope(command);
         if (!payload.target && !payload.clip) throw fastError('SCREENSHOT_SCOPE_REQUIRED', 'Choose a region or unique target; full-page captures are not the default');
@@ -401,11 +430,12 @@ export function createFastSession(runtime) {
         if (browser.page.locator) masks.push(browser.page.locator('input[type="password"],input[type="email"],input[autocomplete="one-time-code"],[data-private]'));
         const options = { fullPage: false, timeout: 5000, mask: masks };
         let bytes;
-        if (payload.target) bytes = await (await browser.locator(payload.target)).screenshot(options);
+        const captureWithoutCursor = (capture) => browser.withoutCursor ? browser.withoutCursor(capture) : capture();
+        if (payload.target) bytes = await captureWithoutCursor(async () => (await browser.locator(payload.target)).screenshot(options));
         else {
           const { x, y, width, height } = payload.clip || {};
           if (![x, y, width, height].every(Number.isFinite) || x < 0 || y < 0 || width <= 0 || height <= 0 || width * height > 16000000) throw fastError('INVALID_COMMAND', 'Invalid screenshot region');
-          bytes = await browser.page.screenshot({ ...options, clip: { x, y, width, height } });
+          bytes = await captureWithoutCursor(() => browser.page.screenshot({ ...options, clip: { x, y, width, height } }));
         }
         if (bytes.length > 5 * 1024 * 1024) throw fastError('EVIDENCE_TOO_LARGE', 'Screenshot exceeds 5 MiB');
         await writeFile(path.join(outputDir, fileName), bytes, { flag: 'wx', mode: 0o600 });
@@ -424,7 +454,7 @@ export function createFastSession(runtime) {
         if (JSON.stringify(afterScope.identity) !== JSON.stringify(scope.identity)) throw fastError('ACCOUNT_CHANGED', 'Reconciliation identity changed during readback');
         result = { matched: true, verification: payload.verify, identity: afterScope.identity, url: afterScope.state.url, observation: await browser.observe({ scope: payload.scope }) };
         await durable('reconciliation', { operationId, commandId: command.commandId, actionIds: payload.actionIds || [], result });
-        writeUnknown = false; freshObservation = true; browser.clearUnsafe();
+        writeUnknown = false; freshObservation = true;
       }
       const meta = command.kind === 'control' ? {} : (await protectedScope(command, { bootstrap: true })).state;
       reply = { commandId: command.commandId, status: 'confirmed', ...meta, result, evidenceRef: result?.evidenceRef || null, needsDecision: false, reason: null };
@@ -448,9 +478,10 @@ export function createFastSession(runtime) {
     return safe;
   }
   const api = {
-    execute, control,
+    execute, control: handleControl,
     get mode() { return mode; },
     get automationPaused() { return humanOwned; },
+    get cursorEnabled() { return cursorEnabled; },
     get unresolved() { return writeUnknown; },
     async dispose() {
       disposed = true; activeCommand?.controller.abort(); abortController.abort();

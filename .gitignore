@@ -1,6 +1,7 @@
 node_modules/
 .taskmaster/
 artifacts/
+outputs/
 dist/
 test-results/
 playwright-report/

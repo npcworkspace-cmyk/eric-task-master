@@ -216,3 +216,48 @@ test('watcher rebinds once after a bounded navigation context failure and checks
   assert.ok(h.records.some((item) => item.type === 'authorize' && item.payload.backgroundRead));
   await h.session.dispose();
 });
+
+test('dialog acknowledgement needs fresh scene and durable ACK, preserves takeover, then requires observation', async () => {
+  const h = harness();
+  h.browser.unsafe = 'UNEXPECTED_DIALOG';
+  h.control({ action: 'takeover' });
+  await h.session.execute(h.command('observe', {}));
+  const reply = await h.session.execute(h.command('control', { action: 'acknowledge-dialog', reason: 'Reviewed benign isolated interruption; no external effect' }));
+  assert.equal(reply.status, 'confirmed');
+  assert.equal(h.browser.unsafe, null);
+  assert.equal(h.session.automationPaused, true);
+  assert.ok(h.records.some((row) => row.type === 'dialog-acknowledgement' && row.payload.resourceId === 'res-1'));
+  h.control({ action: 'resume' });
+  assert.equal((await h.session.execute(h.batch())).reason, 'OBSERVATION_REQUIRED');
+  await h.session.dispose();
+});
+
+test('stale dialog acknowledgement cannot clear unsafe or create a false persistence receipt', async () => {
+  const h = harness(); h.browser.unsafe = 'UNEXPECTED_DIALOG';
+  const reply = await h.session.execute(h.command('control', { action: 'acknowledge-dialog', reason: 'Review' }, { pageVersion: 'old' }));
+  assert.equal(reply.reason, 'STALE_OBSERVATION');
+  assert.equal(h.browser.unsafe, 'UNEXPECTED_DIALOG');
+  assert.equal(h.records.some((row) => row.type === 'dialog-acknowledgement'), false);
+  await h.session.dispose();
+});
+
+test('unknown external submit cannot be bypassed by acknowledging its dialog', async () => {
+  const h = harness({ act: async () => { h.browser.unsafe = 'UNEXPECTED_DIALOG'; }, durable: (type) => { if (type === 'dialog-acknowledgement') throw Object.assign(new Error('Reconcile actual effect first'), { code: 'RECONCILIATION_REQUIRED' }); } });
+  await h.session.execute(h.command('observe', {}));
+  assert.equal((await h.session.execute(h.batch())).status, 'unknown');
+  await h.session.execute(h.command('observe', {}));
+  const reply = await h.session.execute(h.command('control', { action: 'acknowledge-dialog', reason: 'Cannot skip a real unknown write' }));
+  assert.equal(reply.reason, 'RECONCILIATION_REQUIRED');
+  assert.equal(h.session.unresolved, true); assert.equal(h.browser.unsafe, 'UNEXPECTED_DIALOG');
+  await h.session.dispose();
+});
+
+test('cursor toggles do not release takeover, change mode or invalidate page observations', async () => {
+  const h = harness();
+  assert.equal(h.session.cursorEnabled, true);
+  h.control({ action: 'takeover' }); const version = h.state.pageVersion;
+  h.control({ action: 'cursor', visible: false });
+  assert.equal(h.session.cursorEnabled, false); assert.equal(h.session.automationPaused, true);
+  assert.equal(h.session.mode, 'operations'); assert.equal(h.state.pageVersion, version);
+  await h.session.dispose();
+});

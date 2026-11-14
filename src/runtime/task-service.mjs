@@ -664,6 +664,7 @@ export function createTaskService({
       child,
       userDataDir: profile.userDataDir,
       pendingResumes: new Map(),
+      pendingControls: new Map(),
       profileId: profile.id,
       ownerId,
       nonce,
@@ -707,6 +708,7 @@ export function createTaskService({
         pending.resolveAck({ accepted: false, reason: 'TASK_WORKER_EXITED' });
         if (entry.observedResumeWaitId !== pending.waitId) pending.resolveResumed(false);
       }
+      for (const pending of entry.pendingControls.values()) pending({ accepted: false, error: { code: 'TASK_WORKER_EXITED' } });
       if (!abandoningState) void finalizeTask(task.id, entry, code, signal).catch(() => {});
     });
 
@@ -781,6 +783,10 @@ export function createTaskService({
           await send(entry.child, { type: 'cleanup_ack', cleanupId: message.cleanupId });
         }
       }
+      return;
+    }
+    if (message?.type === 'operations-control-ack') {
+      if (children.get(taskId) === entry) entry.pendingControls.get(message.requestId)?.(message);
       return;
     }
     if (message?.type === 'operations-durable' && children.get(taskId) === entry && !entry.finalized) {
@@ -1159,7 +1165,7 @@ export function createTaskService({
         profileName: profile.name,
         mode: mode.mode,
         modeReason: body.modeReason || mode.reason,
-        ...(builtin ? { builtin: 'fast-operations' } : {}),
+        ...(builtin ? { builtin: 'fast-operations', operationId: body.input?.operationId || null, cursorEnabled: body.input?.showCursor ?? mode.mode === 'operations' } : {}),
         moduleName: staged.moduleName,
         modulePath: staged.modulePath,
         moduleSha256: staged.moduleSha256,
@@ -1942,6 +1948,25 @@ export function createTaskService({
     createOperation: (body) => create({ ...body, modulePath: fileURLToPath(new URL('./fast-session.mjs', import.meta.url)) }, { builtin: true }),
     setOperationDurableHandler: (handler) => { operationDurableHandler = handler; },
     operationControl: async (id, control) => {
+      if (control.action === 'cursor') {
+        const entry = children.get(id);
+        if (entry?.pendingControls.size) throw new TaskServiceError('CURSOR_UPDATE_PENDING', 'A cursor preference update is still awaiting Worker confirmation', 409);
+        const requestId = randomUUID(); let resolveAck;
+        const acknowledgement = new Promise((resolve) => { resolveAck = resolve; });
+        if (entry) entry.pendingControls.set(requestId, resolveAck);
+        try {
+          await serialize(async () => { const task = findTask(id); if (!task.builtin) throw new TaskServiceError('OPERATIONS_UNAVAILABLE', 'Cursor tracking is only available for controlled operations', 409);
+            task.cursorApplyState = 'pending'; task.cursorRequested = control.visible === true; await persist(); });
+          if (!entry || !await send(entry.child, { type: 'operations-control', requestId, control })) throw new TaskServiceError('CURSOR_APPLY_UNCONFIRMED', 'Worker did not receive the cursor preference; no business action was retried', 409);
+          const ack = await waitFor(acknowledgement, resumeWaitMs);
+          if (!ack || ack.accepted !== true || ack.result?.cursorEnabled !== control.visible) throw new TaskServiceError('CURSOR_APPLY_UNCONFIRMED', 'Worker did not confirm applying the cursor preference; inspect or retry only this display setting', 409);
+          await serialize(async () => { const task = findTask(id); task.cursorEnabled = control.visible; task.cursorApplyState = 'applied'; task.cursorRequested = control.visible; task.cursorApplyError = null; appendEvent(task, 'operations.cursor_applied', { visible: control.visible }); await persist(); });
+          return { applied: true, cursorEnabled: control.visible };
+        } catch (error) {
+          await serialize(async () => { const task = tasks.get(id); if (!task) return; task.cursorApplyState = 'unconfirmed'; task.cursorRequested = control.visible; task.cursorApplyError = error.code || 'CURSOR_APPLY_UNCONFIRMED'; appendEvent(task, 'operations.cursor_unconfirmed', { requested: control.visible, code: task.cursorApplyError }); await persist(); });
+          throw error;
+        } finally { entry?.pendingControls.delete(requestId); }
+      }
       await serialize(async () => {
         const task = tasks.get(id);
         if (!task?.builtin) return;

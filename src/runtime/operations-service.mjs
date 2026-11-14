@@ -16,6 +16,10 @@ function validateBudgets(value = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.values(value).some((limit) => limit !== null && (!Number.isFinite(limit) || limit < 0))) throw opsError('INVALID_BUDGET', 'Budget limits must be nonnegative finite numbers or null');
   return structuredClone(value);
 }
+function documentEpoch(pageVersion) {
+  const parts = typeof pageVersion === 'string' ? pageVersion.split(':') : [];
+  return parts.length >= 3 ? parts.slice(1, -1).join(':') : null;
+}
 
 export async function createOperationsService({ stateDir, taskService, profileStore, now = Date.now, tickMs = 500, hostDispatch = dispatchHost, storeOptions = {} }) {
   const store = await new OperationsStore({ stateDir: path.join(stateDir, 'operations'), now, ...storeOptions }).init();
@@ -60,7 +64,8 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     if (commandId) {
       const command = data.commands.find((item) => item.operationId === id && item.commandId === commandId);
       if (!command) throw opsError('COMMAND_NOT_FOUND', 'Command was not found', 404);
-      return { id, taskId: operation.taskId, goal: operation.goal, status: operation.status, mode: operation.mode, manualLock: operation.manualLock,
+      return { id, taskId: operation.taskId, goal: operation.goal, status: operation.status, mode: operation.mode, cursorEnabled: operation.cursorEnabled ?? operation.mode === 'operations',
+        cursorApplyState: operation.cursorApplyState || 'initial', cursorRequested: operation.cursorRequested ?? operation.cursorEnabled ?? operation.mode === 'operations', manualLock: operation.manualLock,
         authorizationVersion: operation.authorization.version, accountId: operation.authorization.accountId, resourceIds: operation.authorization.resourceIds,
         pending: operation.pending, pauseReason: operation.pauseReason || null, storageFailure: data.storageFailure || null,
         task: task ? { id: task.id, state: task.state, waiting: task.waiting, error: task.error } : null,
@@ -88,16 +93,18 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     const selected = selectMode({ modePolicy: profile.modePolicy || 'auto', mode: body.mode, skillMode: body.skillMode, intent: body.intent || 'waiting' });
     if (body.hostAdapter && (!path.isAbsolute(body.hostAdapter.executable || '') || !Array.isArray(body.hostAdapter.args))) throw opsError('INVALID_HOST_ADAPTER', 'Host adapter requires an explicit absolute executable and argument array');
     const budgets = validateBudgets(body.budgets);
+    if (body.showCursor !== undefined && typeof body.showCursor !== 'boolean') throw opsError('INVALID_CURSOR_PREFERENCE', 'showCursor must be a boolean');
     const operation = { id: operationId(), taskId: null, goal: String(body.goal || '').slice(0, 2000), businessKind: body.businessKind || 'general',
       browserSelection: { kind: 'profile', profileId: profile.id }, authorization, ...selected, modePolicy: profile.modePolicy || 'auto', manualLock: false,
       currentStep: null, completedActionIds: [], pending: null, nextTrigger: null, decisionSummary: '', status: 'running',
       budgets, counters: { runs: 0, hostCalls: 0, inputTokens: null, outputTokens: null, cost: null, retries: 0 },
-      identity: body.identity || null, runtimeOptions: { businessContext: body.businessContext, commandLimit: body.commandLimit, safetyConditions: body.safetyConditions },
+      cursorEnabled: body.showCursor ?? selected.mode === 'operations',
+      identity: body.identity || null, runtimeOptions: { businessContext: body.businessContext, commandLimit: body.commandLimit, safetyConditions: body.safetyConditions, ...(body.showCursor === undefined ? {} : { showCursor: body.showCursor }) },
       schedule: validateSchedule(body.schedule), hostAdapter: body.hostAdapter || null, createdAt: timestamp(now), updatedAt: timestamp(now) };
     await store.update((data) => { data.operations.push(operation); });
     try {
       const task = await taskService.createOperation({ profileId: profile.id, label: body.label || body.goal || 'Operations session',
-        input: { ...operation.runtimeOptions, operationId: operation.id, businessKind: operation.businessKind, authorization, identity: operation.identity, browserSelection: operation.browserSelection, mode: operation.mode, initialUrl: body.initialUrl },
+        input: { ...operation.runtimeOptions, showCursor: operation.cursorEnabled, operationId: operation.id, businessKind: operation.businessKind, authorization, identity: operation.identity, browserSelection: operation.browserSelection, mode: operation.mode, initialUrl: body.initialUrl },
         mode: operation.mode, modeReason: operation.reason, outputBudget: body.outputBudget || {}, timeoutMs: body.timeoutMs ?? null });
       await store.update((data) => { find(data, operation.id).taskId = task.id; });
       return get(operation.id);
@@ -119,7 +126,8 @@ export async function createOperationsService({ stateDir, taskService, profileSt
         if (previous.fingerprint !== hash) throw opsError('COMMAND_ID_CONFLICT', 'commandId is already reserved for a different payload', 409);
         return previous;
       }
-      if (operation.status !== 'running' && !(['reconcile-required', 'paused'].includes(operation.status) && READ_KINDS.has(body.kind))) throw opsError('OPERATION_NOT_RUNNING', `Operation is ${operation.status}`, 409);
+      const dialogAcknowledgement = body.kind === 'control' && body.payload?.action === 'acknowledge-dialog';
+      if (operation.status !== 'running' && !(['reconcile-required', 'paused'].includes(operation.status) && (READ_KINDS.has(body.kind) || dialogAcknowledgement))) throw opsError('OPERATION_NOT_RUNNING', `Operation is ${operation.status}`, 409);
       assertAuthorized(operation, { ...body, kind: body.kind === 'batch' ? undefined : body.kind }, now());
       if (operation.manualLock && !READ_KINDS.has(body.kind) && body.kind !== 'control') throw opsError('MANUAL_TAKEOVER', 'Human owns this page; explicitly resume before automation', 409);
       if (operation.pending) throw opsError('COMMAND_IN_PROGRESS', 'One command is already reserved; retrieve its result before issuing another', 409);
@@ -138,10 +146,10 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     const oldTask = operation.taskId ? await taskService.get(operation.taskId).catch(() => null) : null;
     if (!oldTask || ['stopped', 'error', 'finished'].includes(oldTask.state)) {
       const task = await taskService.createOperation({ profileId: operation.browserSelection.profileId, label: operation.goal || 'Recovered operations',
-        input: { ...operation.runtimeOptions, operationId: id, businessKind: operation.businessKind, authorization: operation.authorization, identity: operation.identity, mode: operation.mode,
+        input: { ...operation.runtimeOptions, showCursor: operation.cursorEnabled ?? operation.mode === 'operations', operationId: id, businessKind: operation.businessKind, authorization: operation.authorization, identity: operation.identity, mode: operation.mode,
           reconcileRequired: current.actions.some((item) => item.operationId === id && ['initiated', 'unknown'].includes(item.status)),
           completedActionIds: operation.completedActionIds }, mode: operation.mode, modeReason: 'recovered-reconciliation' });
-      await store.update((data) => { find(data, id).taskId = task.id; });
+      await store.update((data) => { const operation = find(data, id); operation.taskId = task.id; operation.cursorApplyState = 'initial'; operation.cursorRequested = operation.cursorEnabled ?? operation.mode === 'operations'; operation.cursorApplyError = null; });
     }
     await deliver(id); return result;
   }
@@ -180,13 +188,14 @@ export async function createOperationsService({ stateDir, taskService, profileSt
         catch (error) { return pausedRejection(operation, error); }
       }
       if (type === 'authorize') {
+        const readOnlyControl = payload.kind === 'control' && payload.effect === false && !payload.actionId && record?.envelope.kind === 'control' && record.envelope.payload?.action === 'acknowledge-dialog';
         const background = payload.backgroundRead === true && payload.effect === false && READ_KINDS.has(payload.kind) && ['observe', 'wait'].includes(record?.envelope.kind) && record.status === 'confirmed' && !payload.actionId && payload.proposed === undefined && payload.primitive === undefined;
         if (!record || record.status !== 'pending' && !background) throw opsError('COMMAND_NOT_RESERVED', 'Command has no active durable reservation', 409);
-        if (operation.status !== 'running' && (background || !READ_KINDS.has(payload.kind) || !['paused', 'reconcile-required'].includes(operation.status))) throw opsError('OPERATION_NOT_RUNNING', 'Operation is paused or requires reconciliation', 409);
+        if (operation.status !== 'running' && (background || !(READ_KINDS.has(payload.kind) || readOnlyControl) || !['paused', 'reconcile-required'].includes(operation.status))) throw opsError('OPERATION_NOT_RUNNING', 'Operation is paused or requires reconciliation', 409);
         const authorization = assertAuthorized(operation, payload, now());
-        if (operation.manualLock && !READ_KINDS.has(payload.kind)) throw opsError('MANUAL_TAKEOVER', 'Manual takeover prevents automated effects', 409);
-        if (!READ_KINDS.has(payload.kind) && payload.primitive !== 'navigate' && (!payload.accountId || !payload.resourceId || !payload.origin)) throw opsError('IDENTITY_EVIDENCE_REQUIRED', 'Mutation needs observed account, resource and origin', 403);
-        if (READ_KINDS.has(payload.kind)) return { authorization, mode: operation.mode, operationId: operation.id, takeover: operation.manualLock };
+        if (operation.manualLock && !(READ_KINDS.has(payload.kind) || readOnlyControl)) throw opsError('MANUAL_TAKEOVER', 'Manual takeover prevents automated effects', 409);
+        if (!(READ_KINDS.has(payload.kind) || readOnlyControl) && payload.primitive !== 'navigate' && (!payload.accountId || !payload.resourceId || !payload.origin)) throw opsError('IDENTITY_EVIDENCE_REQUIRED', 'Mutation needs observed account, resource and origin', 403);
+        if (READ_KINDS.has(payload.kind) || readOnlyControl) return { authorization, mode: operation.mode, operationId: operation.id, takeover: operation.manualLock };
         if (payload.kind === 'social.reply') {
           const original = record.envelope.payload?.actions?.find((item) => item.actionId === payload.actionId);
           const interaction = original?.interaction;
@@ -249,6 +258,30 @@ export async function createOperationsService({ stateDir, taskService, profileSt
         return action;
       }
       if (type === 'event') return addEvent(data, operation, payload);
+      if (type === 'dialog-acknowledgement') {
+        if (!record || record.status !== 'pending' || record.envelope.kind !== 'control' || record.envelope.payload?.action !== 'acknowledge-dialog' ||
+            typeof payload.reason !== 'string' || !payload.reason.trim() || record.envelope.payload.reason !== payload.reason ||
+            record.envelope.pageId !== payload.pageId || record.envelope.pageVersion !== payload.pageVersion || !payload.pageId || !payload.pageVersion) throw opsError('INVALID_DIALOG_ACKNOWLEDGEMENT', 'Explicit acknowledgement needs the reserved fresh page identity/version and decision reason', 409);
+        if (!payload.accountId || !payload.resourceId || !payload.origin) throw opsError('IDENTITY_EVIDENCE_REQUIRED', 'Dialog acknowledgement requires actual protected account/resource/origin evidence', 403);
+        assertAuthorized(operation, { ...payload, kind: 'control', authorizationVersion: record.envelope.authorizationVersion }, now());
+        const unsettled = data.actions.filter((action) => action.operationId === operation.id && ['prepared', 'initiated', 'unknown'].includes(action.status));
+        if (unsettled.some((action) => action.effect !== false && action.status !== 'prepared')) throw opsError('RECONCILIATION_REQUIRED', 'A dialog acknowledgement cannot clear unresolved external effects', 409);
+        const abandonedActionIds = [];
+        for (const action of unsettled) {
+          if (action.effect !== false) continue;
+          const originalCommand = data.commands.find((command) => command.operationId === operation.id && command.commandId === action.commandId)?.envelope;
+          if (originalCommand?.pageId !== payload.pageId || action.accountId !== payload.accountId || action.resourceId !== payload.resourceId ||
+              !documentEpoch(originalCommand.pageVersion) || documentEpoch(originalCommand.pageVersion) !== documentEpoch(payload.pageVersion)) continue;
+          action.status = 'failed'; action.updatedAt = timestamp(now); action.verification = { state: 'abandoned', reason: payload.reason, acknowledgementCommandId: record.commandId }; abandonedActionIds.push(action.actionId);
+        }
+        const remainingUnresolvedActionIds = data.actions.filter((action) => action.operationId === operation.id && ['initiated', 'unknown'].includes(action.status)).map((action) => action.actionId);
+        const acknowledgement = { acknowledged: true, operationId: operation.id, commandId: record.commandId, pageId: payload.pageId, pageVersion: payload.pageVersion,
+          accountId: payload.accountId, resourceId: payload.resourceId, origin: payload.origin, reason: payload.reason, abandonedActionIds, remainingUnresolvedActionIds,
+          localUncertaintyCleared: remainingUnresolvedActionIds.length === 0, requiresReconciliation: remainingUnresolvedActionIds.length > 0, createdAt: timestamp(now) };
+        record.dialogAcknowledgement = acknowledgement;
+        data.records.push({ kind: 'dialog-acknowledgement', status: 'confirmed', ...acknowledgement });
+        return acknowledgement;
+      }
       if (type === 'reconciliation') {
         if (!record || record.envelope.kind !== 'reconcile' || payload.result?.matched !== true || !Array.isArray(payload.actionIds) || !payload.actionIds.length || !Array.isArray(payload.result.verification) || !payload.result.verification.length) throw opsError('RECONCILIATION_EVIDENCE_REQUIRED', 'Reconciliation requires a reserved browser readback command');
         const identity = payload.result.identity;
@@ -336,7 +369,25 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     }
     if (body.action === 'reconcile') return command(id, { ...body.command, commandId: body.commandId || body.command?.commandId, kind: 'reconcile', payload: body.payload || body.command?.payload });
     if (body.action === 'update') {
-      await store.update((data) => { const operation = find(data, id); if (body.schedule !== undefined) operation.schedule = validateSchedule(body.schedule); if (body.budgets) operation.budgets = validateBudgets(body.budgets); }); return get(id);
+      if (body.showCursor !== undefined && typeof body.showCursor !== 'boolean') throw opsError('INVALID_CURSOR_PREFERENCE', 'showCursor must be a boolean');
+      let cursorTaskId;
+      await store.update((data) => { const operation = find(data, id); if (body.schedule !== undefined) operation.schedule = validateSchedule(body.schedule); if (body.budgets) operation.budgets = validateBudgets(body.budgets);
+        if (body.showCursor !== undefined) {
+          if (operation.cursorApplyState === 'pending') throw opsError('CURSOR_UPDATE_PENDING', 'A cursor preference update is awaiting Worker confirmation', 409);
+          operation.cursorApplyState = 'pending'; operation.cursorRequested = body.showCursor; cursorTaskId = operation.taskId;
+        }
+      });
+      if (body.showCursor !== undefined) {
+        try {
+          const result = await taskService.operationControl?.(cursorTaskId, { action: 'cursor', visible: body.showCursor });
+          if (result?.applied !== true || result.cursorEnabled !== body.showCursor) throw opsError('CURSOR_APPLY_UNCONFIRMED', 'Worker did not confirm applying this display preference; no business action was retried', 409);
+          await store.update((data) => { const operation = find(data, id); operation.runtimeOptions ||= {}; operation.runtimeOptions.showCursor = body.showCursor; operation.cursorEnabled = body.showCursor; operation.cursorApplyState = 'applied'; operation.cursorApplyError = null; });
+        } catch (error) {
+          await store.update((data) => { const operation = find(data, id); operation.cursorApplyState = 'unconfirmed'; operation.cursorApplyError = error.code || 'CURSOR_APPLY_UNCONFIRMED'; });
+          throw error;
+        }
+      }
+      return get(id);
     }
     if (!['pause', 'resume', 'takeover', 'revoke', 'stop'].includes(body.action)) throw opsError('INVALID_OPERATION_ACTION', 'Unknown operation action');
     let taskId; let resumedMode;
@@ -353,6 +404,7 @@ export async function createOperationsService({ stateDir, taskService, profileSt
         if (data.actions.some((item) => item.operationId === id && ['initiated', 'unknown'].includes(item.status))) throw opsError('RECONCILIATION_REQUIRED', 'Resolve uncertain effects before resuming', 409);
         const selected = selectMode({ modePolicy: operation.modePolicy, mode: body.mode || operation.mode });
         resumedMode = selected.mode;
+        operation.cursorEnabled = operation.runtimeOptions?.showCursor ?? selected.mode === 'operations';
         operation.mode = selected.mode; operation.reason = 'explicit-resume'; operation.manualLock = false; operation.status = 'running'; operation.pending = null;
       } else {
         operation.status = body.action === 'revoke' ? 'revoked' : body.action === 'stop' ? 'stopped' : 'paused';
@@ -367,6 +419,12 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     else {
       await taskService.operationControl?.(taskId, { action: body.action, ...(body.action === 'resume' ? { mode: resumedMode } : {}) });
       if (body.action === 'resume') await command(id, { commandId: operationId('resume'), kind: 'control', payload: { action: 'resume', mode: resumedMode } });
+      if (body.action === 'resume') {
+        const operation = find(await store.read(), id);
+        // A recreated Worker receives this preference in its startup config.
+        // Do not send a duplicate cursor control before its handler is ready.
+        if (operation.taskId === taskId) await taskService.operationControl?.(operation.taskId, { action: 'cursor', visible: operation.cursorEnabled });
+      }
     }
     return get(id);
   }

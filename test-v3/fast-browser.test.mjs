@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compactObservation, observationDelta, boundedInteger, delay } from '../src/runtime/fast-browser.mjs';
+import { EventEmitter } from 'node:events';
+import { createFastBrowser, compactObservation, observationDelta, boundedInteger, delay } from '../src/runtime/fast-browser.mjs';
 
 test('compact observations preserve envelope, identify omissions and never default to HTML', () => {
   const result = compactObservation({ pageId: 'p', pageVersion: 'v', total: 200, items: Array.from({ length: 200 }, (_, index) => ({ ref: `r${index}`, text: 'text '.repeat(100) })) }, { maxChars: 1000, maxItems: 4 });
@@ -42,4 +43,19 @@ test('long rules retain exact original length, omitted characters and a resumabl
   assert.ok(smaller.items[0].text.length < 2000);
   assert.equal(smaller.items[0].textContinuation.textOffset, smaller.items[0].textRange.end);
   assert.equal(smaller.omitted.textCharacters, 5000 - smaller.items[0].text.length);
+});
+
+test('tab switching cannot discard another page native-dialog interruption', async () => {
+  const makePage = () => Object.assign(new EventEmitter(), { isClosed: () => false, url: () => 'http://fixture.test/social', evaluate: async () => ({ epoch: 'doc', revision: 1, url: 'http://fixture.test/social', title: 'fixture' }) });
+  const first = makePage(), second = makePage();
+  const browser = createFastBrowser({ page: first, context: { pages: () => [first, second] } });
+  const firstId = (await browser.meta()).pageId;
+  first.emit('dialog', { message: () => 'Unexpected', dismiss: async () => {} });
+  assert.equal(browser.unsafe, 'UNEXPECTED_DIALOG');
+  const secondId = browser.tabs().find((row) => row.pageId !== firstId).pageId;
+  await browser.selectTab(secondId); assert.equal(browser.unsafe, null);
+  await browser.selectTab(firstId); assert.equal(browser.unsafe, 'UNEXPECTED_DIALOG');
+  assert.equal(browser.clearUnsafe('wrong-token'), false);
+  assert.equal(browser.unsafe, 'UNEXPECTED_DIALOG');
+  await browser.dispose();
 });

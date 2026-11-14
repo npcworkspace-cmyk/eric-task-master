@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs';
+import { createFastCursor } from './fast-cursor.mjs';
 
 export function fastError(code, message, details) {
   return Object.assign(new Error(message), { code, ...(details ? { details } : {}) });
@@ -23,23 +24,29 @@ export function delay(ms, signal) {
 }
 
 // Runs only in the page. No credentials, input values or full HTML are collected.
-function pageSnapshot({ key, scope, maxItems, offset, fields, textOffset = 0, maxTextChars = 2000 }) {
+function pageSnapshot({ key, cursorKey, scope, maxItems, offset, fields, textOffset = 0, maxTextChars = 2000 }) {
+  const owned = (node) => Boolean(window[cursorKey]?.ownedHosts.has(node));
+  const relevant = (records) => records.some((record) => {
+    if (owned(record.target)) return false;
+    if (record.type === 'childList') return [...record.addedNodes, ...record.removedNodes].some((node) => !owned(node));
+    return true;
+  });
   let state = window[key];
   if (!state || state.document !== document) {
     state?.observer?.disconnect();
     state = { document, epoch: `${Date.now()}-${Math.random()}`, revision: 0, ids: new WeakMap(), next: 0 };
-    state.observer = new MutationObserver(() => { state.revision += 1; });
+    state.observer = new MutationObserver((records) => { if (relevant(records)) state.revision += 1; });
     state.observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
     window[key] = state;
   }
   const pending = state.observer.takeRecords();
-  if (pending.length) state.revision += 1;
+  if (relevant(pending)) state.revision += 1;
   const roots = scope ? document.querySelectorAll(scope) : [document.body];
   if (roots.length !== 1 || !roots[0]) return { unsupported: true, scopeMatches: roots.length };
   const root = roots[0];
   const all = [root, ...root.querySelectorAll('a,button,input,select,textarea,[role],h1,h2,h3,p,li,[data-fast-context],[data-account-id],[data-resource-id],[data-error]')];
   const visible = all.filter((el) => {
-    if (!(el instanceof Element) || el.closest('script,style,[hidden],[aria-hidden="true"]')) return false;
+    if (!(el instanceof Element) || owned(el) || el.closest('script,style,[hidden],[aria-hidden="true"]')) return false;
     return el.getClientRects().length > 0;
   });
   const pathFor = (el) => {
@@ -121,27 +128,29 @@ export function observationDelta(previous, current) {
   };
 }
 
-export function createFastBrowser({ page: initialPage, context, signal, onEvent = async () => {} }) {
+export function createFastBrowser({ page: initialPage, context, signal, showCursor = false, onEvent = async () => {} }) {
   const key = `__etm_${randomUUID().replaceAll('-', '')}`;
   const ids = new WeakMap();
   const refs = new Map();
   const baselines = new Map();
   const attached = new Map();
+  const unsafePages = new WeakMap();
+  const cursor = createFastCursor({ enabled: showCursor });
   let page = initialPage;
   let epoch = 0;
   let disposed = false;
-  let unsafe = null;
   const id = (value) => { if (!ids.has(value)) ids.set(value, `page_${randomUUID().slice(0, 12)}`); return ids.get(value); };
   const emit = (type, summary) => { void Promise.resolve(onEvent({ type, summary, priority: 'high', dedupeKey: `${type}:${id(page)}:${epoch}` })).catch(() => {}); };
   const attach = (value) => {
     if (attached.has(value)) return;
-    const navigation = (frame) => { if (frame === value.mainFrame?.()) { epoch += 1; refs.clear(); } };
-    const dialog = (dialogValue) => { unsafe = 'UNEXPECTED_DIALOG'; epoch += 1; refs.clear(); emit('page.dialog', redactSensitiveText(dialogValue.message()).slice(0, 250)); void dialogValue.dismiss().catch(() => {}); };
+    const navigation = (frame) => { if (frame === value.mainFrame?.()) { epoch += 1; refs.clear(); void cursor.navigation(value); } };
+    const dialog = (dialogValue) => { unsafePages.set(value, { code: 'UNEXPECTED_DIALOG', token: randomUUID() }); epoch += 1; refs.clear(); emit('page.dialog', redactSensitiveText(dialogValue.message()).slice(0, 250)); void dialogValue.dismiss().catch(() => {}); };
     const close = () => { epoch += 1; emit('browser.disconnected', 'Selected page closed'); };
     value.on?.('framenavigated', navigation); value.on?.('dialog', dialog); value.on?.('close', close);
     attached.set(value, { navigation, dialog, close });
   };
   attach(page);
+  void cursor.select(page);
   const active = () => {
     if (signal?.aborted) throw signal.reason || fastError('TASK_STOPPED', 'Stopped');
     if (disposed || page.isClosed?.()) throw fastError('BROWSER_DISCONNECTED', 'Browser page unavailable');
@@ -149,7 +158,7 @@ export function createFastBrowser({ page: initialPage, context, signal, onEvent 
   const meta = async () => {
     active();
     try {
-      const value = await page.evaluate(pageSnapshot, { key, scope: null, maxItems: 0, offset: 0 });
+      const value = await page.evaluate(pageSnapshot, { key, cursorKey: cursor.key, scope: null, maxItems: 0, offset: 0 });
       return { pageId: id(page), pageVersion: `${epoch}:${value.epoch}:${value.revision}`, url: value.url, title: value.title };
     } catch (error) {
       throw fastError('OBSERVATION_UNAVAILABLE', 'Page structure is unavailable; request a scoped screenshot or inspect the current page', { cause: error.code });
@@ -195,8 +204,14 @@ export function createFastBrowser({ page: initialPage, context, signal, onEvent 
   return {
     meta, locator, condition,
     get page() { return page; },
-    get unsafe() { return unsafe; },
-    clearUnsafe() { unsafe = null; },
+    get unsafe() { return unsafePages.get(page)?.code || null; },
+    get unsafeToken() { return unsafePages.get(page)?.token || null; },
+    clearUnsafe(token) { const value = unsafePages.get(page); if (value?.code !== 'UNEXPECTED_DIALOG' || token && value.token !== token) return false; unsafePages.delete(page); return true; },
+    setCursorEnabled: (value) => cursor.setEnabled(value),
+    pauseCursor: (value) => cursor.setPaused(value),
+    get cursorState() { return { enabled: cursor.enabled, paused: cursor.paused, position: cursor.position }; },
+    withoutCursor: (capture) => cursor.without(page, capture),
+    async positionCursor(target, { click = false } = {}) { return cursor.point(page, await locator(target), { click }); },
     invalidate() { epoch += 1; refs.clear(); baselines.clear(); },
     async observe(options = {}) {
       active();
@@ -205,7 +220,7 @@ export function createFastBrowser({ page: initialPage, context, signal, onEvent 
       const textOffset = boundedInteger(options.textOffset, 0, 10000000, 'textOffset', 0);
       const maxTextChars = boundedInteger(options.maxTextChars, 2000, 8000, 'maxTextChars');
       let snapshot;
-      try { snapshot = await page.evaluate(pageSnapshot, { key, scope: options.scope || null, maxItems, offset, fields: options.fields, textOffset, maxTextChars }); }
+      try { snapshot = await page.evaluate(pageSnapshot, { key, cursorKey: cursor.key, scope: options.scope || null, maxItems, offset, fields: options.fields, textOffset, maxTextChars }); }
       catch { throw fastError('OBSERVATION_UNAVAILABLE', 'Structure unavailable; use a scoped screenshot'); }
       if (snapshot.unsupported) throw fastError('CONTEXT_INSUFFICIENT', `Observation scope matched ${snapshot.scopeMatches} elements`);
       const version = `${epoch}:${snapshot.epoch}:${snapshot.revision}`;
@@ -221,7 +236,7 @@ export function createFastBrowser({ page: initialPage, context, signal, onEvent 
       else if (options.baselineId) current = { ...current, baselineReset: true };
       baselines.set(baselineId, { value: original, scopeKey, documentEpoch: snapshot.epoch });
       while (baselines.size > 16) baselines.delete(baselines.keys().next().value);
-      return { ...current, baselineId, ...(unsafe ? { warning: unsafe } : {}) };
+      return { ...current, baselineId, ...(unsafePages.get(page) ? { warning: unsafePages.get(page).code } : {}) };
     },
     async read(target) {
       const value = await locator(target);
@@ -257,16 +272,21 @@ export function createFastBrowser({ page: initialPage, context, signal, onEvent 
     async act(action, timeoutMs = 5000) {
       active();
       if (action.type === 'navigate') {
+        await cursor.navigation(page);
         const url = new URL(action.value);
         if (!['http:', 'https:'].includes(url.protocol)) throw fastError('INVALID_TARGET', 'Navigation requires HTTP(S)');
         await page.goto(url.href, { timeout: timeoutMs, waitUntil: 'domcontentloaded' });
       } else if (action.type === 'scroll' && !action.target) {
         const delta = action.value || {};
         if (![delta.x || 0, delta.y || 0].every((n) => Number.isFinite(n) && Math.abs(n) <= 10000)) throw fastError('INVALID_TARGET', 'Scroll is bounded to 10000 pixels');
+        await cursor.point(page, null, { anchor: true });
         await page.mouse.wheel(delta.x || 0, delta.y || 0);
       } else {
-        const value = await locator(action.target);
+        let value = await locator(action.target);
         if (!await value.isVisible() || !await value.isEnabled()) throw fastError('TARGET_NOT_ACTIONABLE', 'Target is not visible and enabled');
+        await value.scrollIntoViewIfNeeded({ timeout: timeoutMs });
+        value = await locator(action.target);
+        await cursor.point(page, value, { click: action.type === 'click' });
         if (action.type === 'click') await value.click({ timeout: timeoutMs });
         else if (action.type === 'fill') await value.fill(String(action.value), { timeout: timeoutMs });
         else if (action.type === 'select') await value.selectOption(action.value, { timeout: timeoutMs });
@@ -278,15 +298,16 @@ export function createFastBrowser({ page: initialPage, context, signal, onEvent 
       refs.clear();
     },
     tabs() { return context.pages().filter((value) => !value.isClosed()).map((value) => ({ pageId: id(value), url: redactSensitiveText(value.url()), selected: value === page })); },
-    metrics() { return { pages: context.pages().filter((value) => !value.isClosed()).length, attachedPages: attached.size, targetReferences: refs.size, observationBaselines: baselines.size, selectedPageListeners: Object.fromEntries(['framenavigated', 'dialog', 'close'].map((event) => [event, page.listenerCount?.(event) ?? null])) }; },
+    metrics() { return { pages: context.pages().filter((value) => !value.isClosed()).length, attachedPages: attached.size, targetReferences: refs.size, observationBaselines: baselines.size, cursor: { enabled: cursor.enabled, paused: cursor.paused, position: cursor.position }, selectedPageListeners: Object.fromEntries(['framenavigated', 'dialog', 'close'].map((event) => [event, page.listenerCount?.(event) ?? null])) }; },
     async selectTab(pageId) {
       const next = context.pages().find((value) => id(value) === pageId && !value.isClosed());
       if (!next) throw fastError('TARGET_NOT_FOUND', 'Selected tab does not exist');
-      page = next; attach(page); epoch += 1; refs.clear(); baselines.clear(); unsafe = null;
+      await cursor.select(next); page = next; attach(page); epoch += 1; refs.clear(); baselines.clear();
       return meta();
     },
     async dispose() {
       disposed = true;
+      await cursor.dispose();
       for (const [value, handlers] of attached) {
         value.off?.('framenavigated', handlers.navigation); value.off?.('dialog', handlers.dialog); value.off?.('close', handlers.close);
         if (!value.isClosed?.()) await value.evaluate((storageKey) => { window[storageKey]?.observer?.disconnect(); delete window[storageKey]; }, key).catch(() => {});

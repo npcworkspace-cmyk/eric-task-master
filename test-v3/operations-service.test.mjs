@@ -6,6 +6,7 @@ import test from 'node:test';
 import { createOperationsService } from '../src/runtime/operations-service.mjs';
 import { operationsSchema } from '../src/lib/operations-schema.mjs';
 import { validateFastCommand } from '../src/runtime/fast-session.mjs';
+import { publicTask } from '../src/contracts.mjs';
 import { removeTestTree } from './test-fs.mjs';
 
 async function setup(t, options = {}) {
@@ -13,7 +14,7 @@ async function setup(t, options = {}) {
   const tasks = new Map(); const resumes = []; const controls = []; let sequence = 0; let clock = Date.now();
   const taskService = { createOperation: async (body) => { const task = { id: `task${++sequence}`, state: 'waiting', waiting: { reason: 'operations-command', id: `wait${sequence}` }, input: body.input }; tasks.set(task.id, task); return task; },
     get: async (id) => tasks.get(id), resume: async (id, value, envelope) => { resumes.push({ id, value, envelope }); tasks.get(id).state = 'running'; },
-    stop: async (id) => { tasks.get(id).state = 'stopped'; }, operationControl: async (id, control) => { controls.push({ id, control }); },
+    stop: async (id) => { tasks.get(id).state = 'stopped'; }, operationControl: async (id, control) => { controls.push({ id, control }); return control.action === 'cursor' ? { applied: true, cursorEnabled: control.visible } : true; },
     setOperationDurableHandler: () => {} };
   const profileStore = { get: async (id) => ({ id, modePolicy: 'auto' }) };
   const service = await createOperationsService({ stateDir, taskService, profileStore, now: () => clock, tickMs: 60000, ...options });
@@ -78,7 +79,7 @@ test('restart of an idle session permits explicit resume while uncertain effects
   const { service, stateDir, taskService, profileStore, input, tasks } = await setup(t);
   const safetyConditions = { loginExpired: { target: { selector: '#login-expired' }, state: 'visible' } };
   const businessContext = { currency: { selector: '#currency', expected: 'USD' } };
-  const idle = await service.start({ ...input, safetyConditions, businessContext, commandLimit: 2 }); tasks.get(idle.taskId).state = 'stopped';
+  const idle = await service.start({ ...input, safetyConditions, businessContext, commandLimit: 2, showCursor: false }); tasks.get(idle.taskId).state = 'stopped';
   assert.deepEqual(idle.task.input.safetyConditions, safetyConditions);
   await service.close();
   const recovered = await createOperationsService({ stateDir, taskService, profileStore, tickMs: 60000 });
@@ -88,6 +89,7 @@ test('restart of an idle session permits explicit resume while uncertain effects
   const resumed = await recovered.get(idle.id);
   assert.notEqual(resumed.taskId, idle.taskId); assert.equal(resumed.task.input.reconcileRequired, false);
   assert.deepEqual(resumed.task.input.safetyConditions, safetyConditions); assert.deepEqual(resumed.task.input.businessContext, businessContext); assert.equal(resumed.task.input.commandLimit, 2);
+  assert.equal(resumed.task.input.showCursor, false); assert.equal(resumed.cursorEnabled, false);
   assert.equal(resumed.mode, 'operations'); assert.equal(resumed.status, 'running');
   await recovered.durable(resumed.taskId, 'command-result', { commandId: resumed.pending, status: 'confirmed' });
   tasks.get(resumed.taskId).state = 'waiting';
@@ -261,4 +263,112 @@ test('budget snapshot recheck cannot overwrite a concurrent terminal stop or rev
     assert.equal((await service.get(operation.id)).status, terminal);
     if (terminal === 'revoked') assert.ok((await service.get(operation.id)).authorization.revokedAt);
   }
+});
+
+test('operation cursor defaults follow modes; explicit toggles persist without changing takeover or authority', async (t) => {
+  const { service, input, controls, tasks } = await setup(t);
+  const operations = await service.start(input); assert.equal(operations.cursorEnabled, true); assert.equal(operations.task.input.showCursor, true);
+  const batch = await service.start({ ...input, mode: 'batch' }); assert.equal(batch.cursorEnabled, false); assert.equal(batch.task.input.showCursor, false);
+  tasks.get(batch.taskId).state = 'waiting';
+  await service.action(batch.id, { action: 'resume', mode: 'operations' }); assert.equal((await service.get(batch.id)).cursorEnabled, true, 'Mode default changes only when there is no explicit cursor preference');
+  const overridden = await service.start({ ...input, mode: 'batch', showCursor: true }); assert.equal(overridden.cursorEnabled, true);
+  await assert.rejects(service.start({ ...input, showCursor: 'yes' }), { code: 'INVALID_CURSOR_PREFERENCE' });
+  await service.action(operations.id, { action: 'takeover' });
+  const before = await service.get(operations.id);
+  await service.action(operations.id, { action: 'update', showCursor: false });
+  let current = await service.get(operations.id); assert.equal(current.cursorEnabled, false); assert.equal(current.runtimeOptions.showCursor, false);
+  assert.equal(current.manualLock, true); assert.equal(current.status, 'paused'); assert.deepEqual(current.authorization, before.authorization); assert.deepEqual(current.counters, before.counters);
+  assert.deepEqual(controls.at(-1).control, { action: 'cursor', visible: false });
+  tasks.get(operations.taskId).state = 'waiting';
+  await service.action(operations.id, { action: 'resume', mode: 'batch' });
+  current = await service.get(operations.id); assert.equal(current.cursorEnabled, false); assert.equal(current.mode, 'batch');
+  const ordinary = publicTask({ id: 'free', mode: 'batch', state: 'queued', operationId: 'untrusted', cursorEnabled: true });
+  assert.equal(ordinary.operationId, undefined); assert.equal(ordinary.cursorEnabled, undefined);
+  const controlled = publicTask({ id: 'builtin', builtin: 'fast-operations', operationId: 'op', mode: 'operations', cursorEnabled: false, state: 'waiting' });
+  assert.equal(controlled.operationId, 'op'); assert.equal(controlled.cursorEnabled, false);
+});
+
+test('dialog acknowledgement abandons only effect-free preparation, keeps takeover, and rejects stale or unknown-submit cases', async (t) => {
+  const { service, input, tasks } = await setup(t);
+  const operation = await service.start(input);
+  await service.command(operation.id, { commandId: 'interrupted-preparation', kind: 'batch', pageId: 'page-current', pageVersion: '1:current-document:0', payload: { actions: [{ actionId: 'prepare', type: 'fill', effect: false, expected: { text: 'prepared' } }] } });
+  for (const status of ['prepared', 'initiated', 'unknown']) await service.durable(operation.taskId, 'action', { commandId: 'interrupted-preparation', actionId: 'prepare', kind: 'click', accountId: 'account', resourceId: 'resource', status });
+  await service.durable(operation.taskId, 'command-result', { commandId: 'interrupted-preparation', status: 'unknown' });
+  await service.action(operation.id, { action: 'takeover' }); tasks.get(operation.taskId).state = 'waiting';
+  const acknowledgement = { commandId: 'ack-dialog', kind: 'control', pageId: 'page-current', pageVersion: '2:current-document:3', payload: { action: 'acknowledge-dialog', reason: 'Root inspected a benign dismissed alert and abandons interrupted preparation' } };
+  await service.command(operation.id, acknowledgement);
+  const evidence = { commandId: acknowledgement.commandId, pageId: acknowledgement.pageId, pageVersion: acknowledgement.pageVersion, reason: acknowledgement.payload.reason, accountId: 'account', resourceId: 'resource', origin: 'http://localhost:5555' };
+  await assert.rejects(service.durable(operation.taskId, 'dialog-acknowledgement', { ...evidence, pageVersion: 'stale' }), { code: 'INVALID_DIALOG_ACKNOWLEDGEMENT' });
+  assert.equal((await service.durable(operation.taskId, 'dialog-acknowledgement', evidence)).acknowledged, true);
+  let result = await service.get(operation.id); assert.equal(result.manualLock, true); assert.equal(result.status, 'paused'); assert.equal(result.actions[0].status, 'failed'); assert.equal(result.actions[0].verification.state, 'abandoned');
+  assert.ok(result.records.some((record) => record.kind === 'dialog-acknowledgement'));
+  const external = await service.start(input);
+  await service.command(external.id, { commandId: 'unknown-submit', kind: 'batch', payload: { actions: [{ actionId: 'submit', type: 'click', expected: { text: 'saved' } }] } });
+  for (const status of ['prepared', 'initiated', 'unknown']) await service.durable(external.taskId, 'action', { commandId: 'unknown-submit', actionId: 'submit', kind: 'click', accountId: 'account', resourceId: 'resource', status });
+  await service.durable(external.taskId, 'command-result', { commandId: 'unknown-submit', status: 'unknown' }); tasks.get(external.taskId).state = 'waiting';
+  await service.command(external.id, acknowledgement);
+  await assert.rejects(service.durable(external.taskId, 'dialog-acknowledgement', evidence), { code: 'RECONCILIATION_REQUIRED' });
+  result = await service.get(external.id); assert.equal(result.actions[0].status, 'unknown');
+});
+
+test('cursor IPC failure keeps the last confirmed preference and exposes unapplied state without unlocking', async (t) => {
+  const { service, input, taskService } = await setup(t); const operation = await service.start(input);
+  await service.action(operation.id, { action: 'takeover' });
+  taskService.operationControl = async () => false;
+  await assert.rejects(service.action(operation.id, { action: 'update', showCursor: false }), { code: 'CURSOR_APPLY_UNCONFIRMED' });
+  const current = await service.get(operation.id); assert.equal(current.cursorEnabled, true); assert.equal(current.runtimeOptions.showCursor, undefined);
+  assert.equal(current.cursorApplyState, 'unconfirmed'); assert.equal(current.cursorRequested, false); assert.equal(current.manualLock, true); assert.equal(current.status, 'paused');
+});
+
+test('recreated Worker resumes with startup cursor preference without premature cursor IPC; later explicit updates still require ACK', async (t) => {
+  for (const explicit of [undefined, false]) {
+    const { service, input, taskService, tasks, controls } = await setup(t);
+    const operation = await service.start({ ...input, ...(explicit === undefined ? {} : { showCursor: explicit }) });
+    await service.store.update((data) => { data.operations.find((item) => item.id === operation.id).cursorApplyState = 'applied'; });
+    tasks.get(operation.taskId).state = 'stopped';
+    const originalCreate = taskService.createOperation;
+    taskService.createOperation = async (body) => { const task = await originalCreate(body); task.state = 'queued'; return task; };
+    const originalControl = taskService.operationControl;
+    taskService.operationControl = async (id, control) => {
+      if (control.action === 'cursor' && tasks.get(id)?.state === 'queued') throw Object.assign(new Error('Worker listener not registered during browser startup'), { code: 'CURSOR_HANDLER_UNAVAILABLE' });
+      return originalControl(id, control);
+    };
+    const resumed = await service.action(operation.id, { action: 'resume' });
+    assert.notEqual(resumed.taskId, operation.taskId); assert.equal(resumed.task.state, 'queued');
+    assert.equal(resumed.cursorApplyState, 'initial', 'Queued startup preference must not inherit the previous Worker applied ACK');
+    assert.equal(resumed.task.input.showCursor, explicit ?? true); assert.equal(resumed.cursorEnabled, explicit ?? true);
+    assert.equal(controls.filter((item) => item.id === resumed.taskId && item.control.action === 'cursor').length, 0);
+    assert.equal(resumed.commands.at(-1).delivered, false);
+    tasks.get(resumed.taskId).state = 'waiting'; await service.tick();
+    assert.equal((await service.get(operation.id)).commands.at(-1).delivered, true);
+    await service.durable(resumed.taskId, 'command-result', { commandId: resumed.pending, status: 'confirmed' });
+    const updated = await service.action(operation.id, { action: 'update', showCursor: !(explicit ?? true) });
+    assert.equal(updated.cursorApplyState, 'applied'); assert.equal(updated.cursorEnabled, !(explicit ?? true));
+    assert.equal(controls.at(-1).control.action, 'cursor');
+    taskService.operationControl = async () => false;
+    await assert.rejects(service.action(operation.id, { action: 'update', showCursor: explicit ?? true }), { code: 'CURSOR_APPLY_UNCONFIRMED' });
+  }
+});
+
+test('dialog acknowledgement does not abandon other pages, resources or document generations', async (t) => {
+  const { service, input } = await setup(t); const operation = await service.start(input);
+  await service.store.update((data) => {
+    const definitions = [
+      { id: 'this-context', pageId: 'page-current', version: '1:current-document:0', resourceId: 'resource' },
+      { id: 'other-page', pageId: 'page-other', version: '1:current-document:0', resourceId: 'resource' },
+      { id: 'other-resource', pageId: 'page-current', version: '1:current-document:0', resourceId: 'different-resource' },
+      { id: 'old-document', pageId: 'page-current', version: '1:old-document:0', resourceId: 'resource' }
+    ];
+    for (const item of definitions) {
+      data.commands.push({ operationId: operation.id, commandId: item.id, status: 'unknown', createdAt: new Date().toISOString(), envelope: { pageId: item.pageId, pageVersion: item.version, payload: { actions: [{ actionId: item.id, effect: false }] } } });
+      data.actions.push({ operationId: operation.id, commandId: item.id, actionId: item.id, effect: false, status: 'unknown', accountId: 'account', resourceId: item.resourceId });
+    }
+  });
+  const body = { commandId: 'scoped-ack', kind: 'control', pageId: 'page-current', pageVersion: '3:current-document:2', payload: { action: 'acknowledge-dialog', reason: 'Only this document and resource were inspected' } };
+  await service.command(operation.id, body);
+  const ack = await service.durable(operation.taskId, 'dialog-acknowledgement', { commandId: body.commandId, pageId: body.pageId, pageVersion: body.pageVersion, reason: body.payload.reason, accountId: 'account', resourceId: 'resource', origin: 'http://localhost:5555' });
+  assert.deepEqual(ack.abandonedActionIds, ['this-context']); assert.equal(ack.localUncertaintyCleared, false); assert.equal(ack.requiresReconciliation, true);
+  assert.deepEqual(ack.remainingUnresolvedActionIds.sort(), ['old-document', 'other-page', 'other-resource']);
+  const current = await service.get(operation.id); assert.equal(current.actions.find((action) => action.actionId === 'this-context').status, 'failed');
+  assert.ok(current.actions.filter((action) => action.actionId !== 'this-context').every((action) => action.status === 'unknown'));
 });

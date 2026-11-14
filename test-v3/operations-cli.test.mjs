@@ -47,7 +47,12 @@ test('ops schema is usable offline without creating or contacting a Manager', as
   const absentStateDir = path.join(root, 'must-remain-absent');
   const schema = await runCli(['ops', 'schema'], absentStateDir, 1);
   assert.equal(schema.code, 0); assert.deepEqual(schema.result.executionModes, ['batch', 'operations']); assert.equal(schema.result.selectionPolicy, 'auto');
-  for (const name of ['start', 'observe', 'bootstrap', 'batch', 'ack', 'decision', 'reconcile', 'hostAdapter', 'hostInput', 'hostReceipt']) assert.ok(schema.result.examples[name]);
+  for (const name of ['start', 'observe', 'bootstrap', 'batch', 'ack', 'decision', 'reconcile', 'dialogAcknowledgement', 'hostAdapter', 'hostInput', 'hostReceipt']) assert.ok(schema.result.examples[name]);
+  assert.ok(schema.result.commandKinds.includes('control'));
+  const acknowledgement = schema.result.examples.dialogAcknowledgement;
+  assert.equal(acknowledgement.kind, 'control'); assert.equal(acknowledgement.pageId, 'COPY_FRESH_PAGE_ID'); assert.equal(acknowledgement.pageVersion, 'COPY_FRESH_PAGE_VERSION');
+  assert.equal(acknowledgement.payload.action, 'acknowledge-dialog'); assert.ok(acknowledgement.payload.reason.trim());
+  assert.match(schema.result.examples.dialogAcknowledgementBoundary, /Unknown external effects still require actual same-resource reconciliation/u);
   await assert.rejects(access(absentStateDir), { code: 'ENOENT' });
 });
 test('legacy Profile records migrate to auto without touching browser contents', async (t) => {

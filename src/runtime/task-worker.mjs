@@ -12,6 +12,21 @@ let activeCleanupAck = null;
 const durableRequests = new Map();
 const operationControlListeners = new Set();
 
+export async function acknowledgeOperationControl(message, { listeners = operationControlListeners, sendMessage = send } = {}) {
+  try {
+    if (!listeners.size && message.control?.action === 'cursor') throw Object.assign(new Error('Operations cursor handler is not ready'), { code: 'CURSOR_HANDLER_UNAVAILABLE' });
+    const results = await Promise.all([...listeners].map((listener) => listener(message.control)));
+    const result = results.find((value) => typeof value?.cursorEnabled === 'boolean') || results[0] || null;
+    if (message.control?.action === 'cursor' && result?.cursorEnabled !== message.control.visible) throw Object.assign(new Error('Worker did not confirm the requested cursor preference'), { code: 'CURSOR_APPLY_UNCONFIRMED' });
+    if (message.requestId) sendMessage({ type: 'operations-control-ack', requestId: message.requestId, accepted: true, result });
+    return { accepted: true, result };
+  } catch (error) {
+    const failure = { code: error.code || 'CURSOR_APPLY_FAILED', message: redactSensitiveText(error.message || 'Control was not applied') };
+    if (message.requestId) sendMessage({ type: 'operations-control-ack', requestId: message.requestId, accepted: false, error: failure });
+    return { accepted: false, error: failure };
+  }
+}
+
 export function acknowledgeOperationDurable(message) {
   const pending = durableRequests.get(message.requestId);
   if (!pending) return false;
@@ -624,7 +639,7 @@ if (typeof process.send === 'function') {
     if (message?.type === 'resume') acknowledgeTaskWorkerResume(message);
     if (message?.type === 'operations-durable-ack') acknowledgeOperationDurable(message);
     if (message?.type === 'operations-control') {
-      for (const listener of operationControlListeners) listener(message.control);
+      void acknowledgeOperationControl(message);
     }
     if (message?.type === 'cleanup_ack' && activeCleanupAck?.id === message.cleanupId) {
       activeCleanupAck.finish(true);

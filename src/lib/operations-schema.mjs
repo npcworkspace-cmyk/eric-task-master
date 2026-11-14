@@ -9,6 +9,7 @@ export function operationsSchema({ now = Date.now() } = {}) {
       'This Profile example is for an explicitly selected isolated/local test Profile, not permission to use an existing account.',
       'Observe first; use returned pageId/pageVersion. Batches require current identity, unique targets, preconditions, positive verification and stable action IDs.',
       'Unknown/initiated effects require readback; never change action IDs to retry. Takeover is a separate pause lock, not a mode.',
+      'control acknowledge-dialog requires a fresh pageId/pageVersion and main-Agent reason. It only acknowledges an already safely dismissed UNEXPECTED_DIALOG; it cannot accept a confirmation, release takeover/pause, clear another unsafe reason, or replace same-resource reconcile for unknown external effects.',
       'No native session-ended/app-closed host wake-up is claimed without a configured and verified adapter.'
     ],
     workflow: [
@@ -21,11 +22,11 @@ export function operationsSchema({ now = Date.now() } = {}) {
       'ops pause|takeover OP_ID prevents automation. Resume is explicit and requires fresh observation; revoked/expired permission cannot resume.',
       'ops stop-all stops operations only. Original finite script run/follow commands remain supported.'
     ],
-    commandKinds: ['observe', 'batch', 'wait', 'screenshot', 'tabs', 'select-tab', 'reconcile'],
+    commandKinds: ['observe', 'batch', 'wait', 'screenshot', 'tabs', 'select-tab', 'reconcile', 'control'],
     envelope: { commandId: 'stable-unique-id', kind: 'observe', pageId: 'COPY_FRESH_PAGE_ID', pageVersion: 'COPY_FRESH_PAGE_VERSION', payload: {} },
     bounds: { commandBytes: 131072, maxBatchActions: 16, maxActionGroupTimeoutMs: 60000, eventLongPollMaxMs: 30000, readOnlyParallelScopes: 4 },
     examples: {
-      start: { goal: 'Verify a local test configuration', businessKind: 'site', mode: 'operations', skillMode: 'operations',
+      start: { goal: 'Verify a local test configuration', businessKind: 'site', mode: 'operations', skillMode: 'operations', showCursor: true,
         browserSelection: { kind: 'profile', profileId: 'REPLACE_WITH_EXPLICIT_PROFILE_ID' },
         authorization: { accountId: 'account-1', resourceIds: ['config-1'], origins: ['http://127.0.0.1:8800'], allowedActions: ['navigate', 'site.prepare', 'site.configure'], expiresAt: new Date(now + 86400000).toISOString() },
         identity: { account: { selector: '[data-account-id]', attribute: 'data-account-id' }, resource: { selector: '[data-resource-id]', attribute: 'data-resource-id' } },
@@ -41,7 +42,12 @@ export function operationsSchema({ now = Date.now() } = {}) {
       ack: { eventId: 'COPY_EVENT_ID' },
       decision: { eventId: 'COPY_RECEIVED_EVENT_ID', authorizationVersion: 1, summary: 'Main Agent reviewed the exact account/resource and approves this bounded change', command: { commandId: 'inspect-after-decision-1', kind: 'observe', payload: { scope: '#current-value' } } },
       reconcile: { commandId: 'readback-save-config-1', kind: 'reconcile', payload: { url: 'http://127.0.0.1:8800/site', actionIds: ['save-config-1:fill', 'save-config-1:save'], verify: [expected] } },
+      dialogAcknowledgement: { commandId: 'acknowledge-dialog-1', kind: 'control', pageId: 'COPY_FRESH_PAGE_ID', pageVersion: 'COPY_FRESH_PAGE_VERSION',
+        payload: { action: 'acknowledge-dialog', reason: 'Main Agent inspected the safely dismissed dialog and current protected page; explicitly abandon only this context effect-free preparation, then observe again' } },
+      dialogAcknowledgementBoundary: 'Unknown external effects still require actual same-resource reconciliation before acknowledgement. Other pages/resources/documents remain unresolved; acknowledgement never replays the interrupted group or grants permission to accept an unknown charge, delete resources or enter credentials.',
       hostAdapter: { executable: process.execPath, args: ['ABSOLUTE_PATH_TO_EXPLICITLY_CONFIGURED_HOST_ADAPTER.mjs'] },
+      cursorUpdate: { showCursor: false },
+      cursorBoundary: 'Omitted showCursor follows mode: operations on, controlled batch off. ops update --input toggles only this operation, never account/permission/pause. Free-form scripts do not claim full action tracking.',
       hostInput: { schemaVersion: 1, event: { id: 'event_example', operationId: 'op_example', type: 'decision', summary: 'Main Agent review required' } },
       hostReceipt: { accepted: true, eventId: 'event_example', deliveryId: 'host_delivery_example', received: true },
       decisionVersusReceipt: 'Receipt establishes delivery/reception only. Explicit ops decide is required to handle the event and continue.'

@@ -81,6 +81,7 @@ function taskFixture(id, values = {}) {
 const tasks = new Map([
   ['task_running', taskFixture('task_running', {
     title: 'Collect 20 pages',
+    operationId: 'op_dashboard_cursor', cursorEnabled: true,
     progress: { current: 7, total: 20, message: 'Reading page 8' }
   })],
   ['task_waiting', taskFixture('task_waiting', {
@@ -123,6 +124,7 @@ let profiles = [
 const calls = {
   requests: [],
   taskActions: [],
+  cursorChanges: [],
   taskDeletes: [],
   profileActions: [],
   profileDeletes: [],
@@ -135,6 +137,7 @@ const cleanupBehavior = {
   failPreview: false, failExecution: false, partial: false, historicalOutputPresent: true,
   summary: undefined, busySummary: null, holdNext: null
 };
+let rejectCursorUpdate = false;
 let cleanupOperationSequence = 0;
 const cleanupSizes = { 'browser-cache': 1024 * 1024, 'temporary-files': 64 * 1024, 'task-output': 5 * 1024 * 1024 };
 
@@ -267,6 +270,16 @@ async function handler(request, response) {
     return;
   }
 
+  if (request.method === 'POST' && pathname === '/v1/operations/op_dashboard_cursor/actions') {
+    const body = await bodyFrom(request);
+    assert.deepEqual(Object.keys(body).sort(), ['action', 'showCursor']); assert.equal(body.action, 'update'); assert.equal(typeof body.showCursor, 'boolean');
+    if (rejectCursorUpdate) {
+      tasks.get('task_running').cursorApplyState = 'unconfirmed'; tasks.get('task_running').cursorRequested = body.showCursor;
+      json(response, 409, { error: { code: 'CURSOR_APPLY_UNCONFIRMED', message: '操作光标应用未确认，请仅重试显示设置' } }); return;
+    }
+    tasks.get('task_running').cursorEnabled = body.showCursor; calls.cursorChanges.push(body.showCursor);
+    json(response, 200, { ok: true, result: { id: 'op_dashboard_cursor', cursorEnabled: body.showCursor } }); return;
+  }
   const taskActionMatch = pathname.match(/^\/v1\/tasks\/([^/]+)\/actions$/u);
   if (request.method === 'POST' && taskActionMatch) {
     const task = taskById(taskActionMatch[1]);
@@ -423,7 +436,7 @@ async function closeServer(server) {
 async function waitUntil(predicate, label, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`Timed out waiting for ${label}`);
@@ -1127,6 +1140,28 @@ try {
   checks.push('a temporary Manager outage keeps the last task state and recovers in place');
 
   const runningCard = page.locator('.task-card').filter({ hasText: 'Collect 20 pages' });
+  const cursorToggle = runningCard.getByRole('checkbox', { name: '显示操作光标 Collect 20 pages', exact: true });
+  assert.equal(await cursorToggle.isChecked(), true);
+  await cursorToggle.uncheck(); await waitUntil(() => tasks.get('task_running').cursorEnabled === false, 'operation cursor hidden');
+  await cursorToggle.check(); await waitUntil(() => tasks.get('task_running').cursorEnabled === true, 'operation cursor shown');
+  assert.deepEqual(calls.cursorChanges, [false, true]);
+  rejectCursorUpdate = true;
+  const cursorRequestsBeforeRejection = calls.requests.filter((request) => request.method === 'POST' && request.pathname === '/v1/operations/op_dashboard_cursor/actions').length;
+  // Rejection intentionally restores checked=true. uncheck() would retry to
+  // enforce a state the product correctly refuses, manufacturing a test loop.
+  await cursorToggle.click();
+  await waitUntil(async () => await cursorToggle.isChecked() && await cursorToggle.isEnabled() &&
+    (await runningCard.textContent()).includes('应用未确认') && (await page.locator('#dashboard-message').textContent()).includes('未确认'),
+  'unconfirmed cursor update restores last confirmed checkbox state and renders its failure');
+  assert.equal(tasks.get('task_running').cursorEnabled, true);
+  assert.match(await runningCard.textContent(), /应用未确认/u);
+  assert.match(await page.locator('#dashboard-message').textContent(), /未确认/u);
+  assert.deepEqual(calls.cursorChanges, [false, true], 'Failed application cannot be counted as a successful preference change');
+  assert.equal(calls.requests.filter((request) => request.method === 'POST' && request.pathname === '/v1/operations/op_dashboard_cursor/actions').length - cursorRequestsBeforeRejection, 1, 'The deliberately rejected change must send exactly one request, not a setChecked retry loop');
+  rejectCursorUpdate = false; tasks.get('task_running').cursorApplyState = 'applied'; tasks.get('task_running').cursorRequested = true;
+  await page.locator('#refresh-all').click();
+  assert.equal(await page.locator('.task-card[data-task-id="task_waiting"]').getByRole('checkbox').count(), 0, 'Free-form script task has no cursor tracking switch');
+  checks.push('Controlled operation cursor checkbox uses existing update; an unconfirmed Worker application retains last confirmed state and displays failure without success');
   await runningCard.getByRole('button', { name: '停止', exact: true }).evaluate((node) => {
     node.click();
     node.click();
@@ -1279,7 +1314,7 @@ try {
     await page.screenshot({ path: screenshotPath, fullPage: true });
   }
 
-  const allowedApi = /^\/v1\/(?:status|cleanup|tasks(?:\/[^/]+(?:\/actions)?)?|profiles(?:\/[^/]+(?:\/actions)?)?)$/u;
+  const allowedApi = /^\/v1\/(?:status|cleanup|tasks(?:\/[^/]+(?:\/actions)?)?|profiles(?:\/[^/]+(?:\/actions)?)?|operations\/op_dashboard_cursor\/actions)$/u;
   const unexpectedApi = calls.requests.filter((entry) => entry.pathname.startsWith('/v1/') && !allowedApi.test(entry.pathname));
   assert.deepEqual(unexpectedApi, []);
   assert.deepEqual(pageErrors, []);
@@ -1287,7 +1322,7 @@ try {
     'https://www.npctech.site/', 'https://www.npctech.site/',
     'https://www.npctech.site/', 'https://media.npctech.site/'
   ], 'Marketing has no background requests or tracking');
-  checks.push('Dashboard uses only status, task, Profile, and cleanup APIs and raises no page errors');
+  checks.push('Dashboard uses only status, task, Profile, cleanup and the approved operation cursor update APIs and raises no page errors');
 
   const report = {
     ok: true,
@@ -1295,6 +1330,7 @@ try {
     browser: 'playwright-chromium',
     checks,
     taskActions: calls.taskActions,
+    cursorChanges: calls.cursorChanges,
     taskDeletes: calls.taskDeletes,
     profileActions: calls.profileActions,
     profileRenames: calls.profileRenames,

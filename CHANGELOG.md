@@ -5,6 +5,7 @@
 - Add persistent operations sessions through the CLI and the existing Manager/Worker lifecycle, with bounded action groups, scoped and differential observations, local condition waits and explicit decision events. Keep ordinary script tasks compatible and add no model or production dependency.
 - Add durable authorization, pre-effect action acknowledgements, business records, uncertain-result reconciliation, schedules and a bounded event outbox with an explicitly configured host delivery adapter. A delivery receipt is not an Agent decision or proof of native closed-session wake-up.
 - Support exactly two execution modes, batch and operations. Profile settings choose a fixed default or auto policy; an explicit task mode overrides only that task. Human takeover is a separate pause lock, never a third execution mode.
+- Add an optional NPC-orange operation cursor with click-through, observation/screenshot isolation and an existing Tasks visibility control, plus fresh-scene durable acknowledgement of safely cancelled native dialogs without replay or fake action reconciliation.
 - Add isolated social, advertising and website workflow fixtures, concentrated browser acceptance and real-time soak tooling. Real account operations, native host integration and public release remain separate validation and authorization scopes.
 
 ## 3.1.11 - 2026-10-26

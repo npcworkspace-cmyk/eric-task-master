@@ -76,6 +76,8 @@ export function publicTask(task) {
     profileName: task.profileName ?? null,
     mode: task.mode || 'batch',
     modeReason: task.modeReason || 'script-default',
+    ...(task.builtin === 'fast-operations' ? { operationId: task.operationId || null, cursorEnabled: task.cursorEnabled ?? task.mode === 'operations',
+      cursorApplyState: task.cursorApplyState || 'initial', cursorRequested: task.cursorRequested ?? task.cursorEnabled ?? task.mode === 'operations', cursorApplyError: task.cursorApplyError || null } : {}),
     moduleName: task.moduleName ?? null,
     outputBudget: task.outputBudget && typeof task.outputBudget === 'object'
       ? redactSensitiveValue(task.outputBudget)
