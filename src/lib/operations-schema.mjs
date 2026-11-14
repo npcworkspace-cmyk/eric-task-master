@@ -9,6 +9,7 @@ export function operationsSchema({ now = Date.now() } = {}) {
       'This Profile example is for an explicitly selected isolated/local test Profile, not permission to use an existing account.',
       'Observe first; use returned pageId/pageVersion. Batches require current identity, unique targets, preconditions, positive verification and stable action IDs.',
       'Unknown/initiated effects require readback; never change action IDs to retry. Takeover is a separate pause lock, not a mode.',
+      'singleSendTransport is an immutable explicit operation opt-in (default false) for owned Profiles, same-origin small non-sensitive JSON POST only. Every effect action requires an exact transport guard. SW, iframe/new-tab writes, uploads, HTTP authorization and redirects are unsupported. Failures stay unknown; no fallback/replay. A URL/method/body digest can be consumed only once per context. This is not universal exactly-once delivery.',
       'control acknowledge-dialog requires a fresh pageId/pageVersion and main-Agent reason. It only acknowledges an already safely dismissed UNEXPECTED_DIALOG; it cannot accept a confirmation, release takeover/pause, clear another unsafe reason, or replace same-resource reconcile for unknown external effects.',
       'No native session-ended/app-closed host wake-up is claimed without a configured and verified adapter.'
     ],
@@ -47,6 +48,7 @@ export function operationsSchema({ now = Date.now() } = {}) {
       dialogAcknowledgementBoundary: 'Unknown external effects still require actual same-resource reconciliation before acknowledgement. Other pages/resources/documents remain unresolved; acknowledgement never replays the interrupted group or grants permission to accept an unknown charge, delete resources or enter credentials.',
       hostAdapter: { executable: process.execPath, args: ['ABSOLUTE_PATH_TO_EXPLICITLY_CONFIGURED_HOST_ADAPTER.mjs'] },
       cursorUpdate: { showCursor: false },
+      singleSendTransport: { operationStart: { singleSendTransport: true }, action: { transport: { url: 'http://127.0.0.1:8800/api/config', method: 'POST', bodySha256: 'REPLACE_WITH_SHA256_OF_EXACT_JSON_UTF8_BODY', maxBodyBytes: 65536 } }, boundary: 'Guard matches the existing UI request, never creates a second submission. An initiated durable ACK and a fresh scoped transport-forward ACK precede its sole fetch(maxRetries:0,maxRedirects:0). Stop can abort in-flight transport but cannot withdraw an effect already accepted by the server. Use current-resource readback; never retry an unknown submission.' },
       cursorBoundary: 'Omitted showCursor follows mode: operations on, controlled batch off. ops update --input toggles only this operation, never account/permission/pause. Free-form scripts do not claim full action tracking.',
       hostInput: { schemaVersion: 1, event: { id: 'event_example', operationId: 'op_example', type: 'decision', summary: 'Main Agent review required' } },
       hostReceipt: { accepted: true, eventId: 'event_example', deliveryId: 'host_delivery_example', received: true },

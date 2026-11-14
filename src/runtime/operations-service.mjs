@@ -3,6 +3,7 @@ import { OperationsStore, operationId, safeOperationsValue } from '../lib/operat
 import { assertAuthorized, fingerprint, opsError, selectMode, validateAuthorization } from '../lib/operations-contracts.mjs';
 import { scheduleDue, validateSchedule } from '../lib/operations-scheduler.mjs';
 import { dispatchHost } from '../lib/host-dispatch.mjs';
+import { validateTransport } from './single-send-transport.mjs';
 
 const READ_KINDS = new Set(['observe', 'wait', 'screenshot', 'tabs', 'select-tab', 'reconcile']);
 const find = (data, id) => {
@@ -94,12 +95,13 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     if (body.hostAdapter && (!path.isAbsolute(body.hostAdapter.executable || '') || !Array.isArray(body.hostAdapter.args))) throw opsError('INVALID_HOST_ADAPTER', 'Host adapter requires an explicit absolute executable and argument array');
     const budgets = validateBudgets(body.budgets);
     if (body.showCursor !== undefined && typeof body.showCursor !== 'boolean') throw opsError('INVALID_CURSOR_PREFERENCE', 'showCursor must be a boolean');
+    if (body.singleSendTransport !== undefined && typeof body.singleSendTransport !== 'boolean') throw opsError('INVALID_TRANSPORT_POLICY', 'singleSendTransport must be an explicit boolean');
     const operation = { id: operationId(), taskId: null, goal: String(body.goal || '').slice(0, 2000), businessKind: body.businessKind || 'general',
       browserSelection: { kind: 'profile', profileId: profile.id }, authorization, ...selected, modePolicy: profile.modePolicy || 'auto', manualLock: false,
       currentStep: null, completedActionIds: [], pending: null, nextTrigger: null, decisionSummary: '', status: 'running',
       budgets, counters: { runs: 0, hostCalls: 0, inputTokens: null, outputTokens: null, cost: null, retries: 0 },
-      cursorEnabled: body.showCursor ?? selected.mode === 'operations',
-      identity: body.identity || null, runtimeOptions: { businessContext: body.businessContext, commandLimit: body.commandLimit, safetyConditions: body.safetyConditions, ...(body.showCursor === undefined ? {} : { showCursor: body.showCursor }) },
+      cursorEnabled: body.showCursor ?? selected.mode === 'operations', singleSendTransport: body.singleSendTransport === true,
+      identity: body.identity || null, runtimeOptions: { singleSendTransport: body.singleSendTransport === true, businessContext: body.businessContext, commandLimit: body.commandLimit, safetyConditions: body.safetyConditions, ...(body.showCursor === undefined ? {} : { showCursor: body.showCursor }) },
       schedule: validateSchedule(body.schedule), hostAdapter: body.hostAdapter || null, createdAt: timestamp(now), updatedAt: timestamp(now) };
     await store.update((data) => { data.operations.push(operation); });
     try {
@@ -120,6 +122,14 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     if (body.kind === 'batch' && (!Array.isArray(body.payload?.actions) || !body.payload.actions.length || body.payload.actions.length > 32)) throw opsError('INVALID_BATCH', 'Batch must contain 1-32 actions');
     const result = await store.update((data) => {
       const operation = find(data, id);
+      if (body.kind === 'batch') for (const action of body.payload.actions) {
+        const writes = !['read', 'locate', 'wait'].includes(action.type) && action.effect !== false;
+        if (action.transport && !operation.singleSendTransport) throw opsError('TRANSPORT_NOT_ENABLED', 'Explicit singleSendTransport is required for transport guards');
+        if (operation.singleSendTransport && writes) {
+          if (!['click', 'fill', 'select', 'key'].includes(action.type)) throw opsError('TRANSPORT_ACTION_UNSUPPORTED', 'Explicitly mark non-effect navigation/scroll; only known JSON UI submissions can be guarded');
+          validateTransport(action.transport, { origins: operation.authorization.origins });
+        } else if (action.transport) throw opsError('INVALID_TRANSPORT_GUARD', 'Transport guards belong only to external-effect actions');
+      }
       const previous = data.commands.find((item) => item.operationId === id && item.commandId === body.commandId);
       const hash = fingerprint(body);
       if (previous) {
@@ -146,7 +156,7 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     const oldTask = operation.taskId ? await taskService.get(operation.taskId).catch(() => null) : null;
     if (!oldTask || ['stopped', 'error', 'finished'].includes(oldTask.state)) {
       const task = await taskService.createOperation({ profileId: operation.browserSelection.profileId, label: operation.goal || 'Recovered operations',
-        input: { ...operation.runtimeOptions, showCursor: operation.cursorEnabled ?? operation.mode === 'operations', operationId: id, businessKind: operation.businessKind, authorization: operation.authorization, identity: operation.identity, mode: operation.mode,
+        input: { ...operation.runtimeOptions, browserSelection: operation.browserSelection, showCursor: operation.cursorEnabled ?? operation.mode === 'operations', operationId: id, businessKind: operation.businessKind, authorization: operation.authorization, identity: operation.identity, mode: operation.mode,
           reconcileRequired: current.actions.some((item) => item.operationId === id && ['initiated', 'unknown'].includes(item.status)),
           completedActionIds: operation.completedActionIds }, mode: operation.mode, modeReason: 'recovered-reconciliation' });
       await store.update((data) => { const operation = find(data, id); operation.taskId = task.id; operation.cursorApplyState = 'initial'; operation.cursorRequested = operation.cursorEnabled ?? operation.mode === 'operations'; operation.cursorApplyError = null; });
@@ -236,7 +246,7 @@ export async function createOperationsService({ stateDir, taskService, profileSt
           if (payload.status !== 'prepared') throw opsError('INVALID_ACTION_TRANSITION', 'Action must be prepared before initiation', 409);
           const original = record.envelope.payload?.actions?.find((item) => item.actionId === payload.actionId);
           if (!original) throw opsError('ACTION_NOT_RESERVED', 'Action must belong to the original reserved group', 409);
-          action = { ...safeOperationsValue(payload), expected: original.expected || null, effect: original.effect !== false, interaction: original.interaction || null,
+          action = { ...safeOperationsValue(payload), expected: original.expected || null, effect: original.effect !== false, interaction: original.interaction || null, transport: original.transport || null,
             operationId: operation.id, authorizationVersion: operation.authorization.version, createdAt: timestamp(now) };
           if (action.kind === 'social.reply') action.socialInteractionKey = socialKey(action.accountId, action.resourceId, original.interaction, original.expected.text);
           data.actions.push(action);
@@ -249,7 +259,8 @@ export async function createOperationsService({ stateDir, taskService, profileSt
             if (action.socialInteractionKey && data.actions.some((item) => item !== action && item.socialInteractionKey === action.socialInteractionKey && ['initiated', 'confirmed', 'unknown'].includes(item.status))) throw opsError('SOCIAL_INTERACTION_DUPLICATE', 'The same reply target and content were already initiated', 409);
           }
           Object.assign(action, safeOperationsValue(payload), { operationId: operation.id, expected: action.expected, interaction: action.interaction, effect: action.effect, socialInteractionKey: action.socialInteractionKey,
-            kind: action.kind, accountId: action.accountId, resourceId: action.resourceId, proposed: action.proposed, before: action.before, businessKey: action.businessKey });
+            kind: action.kind, accountId: action.accountId, resourceId: action.resourceId, proposed: action.proposed, before: action.before, businessKey: action.businessKey, transport: action.transport, transportForward: action.transportForward,
+            ...(action.transport ? { pageId: action.pageId, pageVersion: action.pageVersion } : {}) });
         }
         action.updatedAt = timestamp(now);
         if (action.status === 'initiated') action.startedAt = timestamp(now);
@@ -258,6 +269,20 @@ export async function createOperationsService({ stateDir, taskService, profileSt
         return action;
       }
       if (type === 'event') return addEvent(data, operation, payload);
+      if (type === 'transport-forward') {
+        if (!operation.singleSendTransport || operation.browserSelection?.kind !== 'profile' || operation.status !== 'running' || operation.manualLock || !record || record.status !== 'pending') throw opsError('TRANSPORT_NOT_AUTHORIZED', 'Single-send forwarding requires the live explicitly opted-in owned operation', 409);
+        checkBudget(operation);
+        const original = record.envelope.payload?.actions?.find((item) => item.actionId === payload.actionId);
+        const action = data.actions.find((item) => item.operationId === operation.id && item.actionId === payload.actionId && item.commandId === payload.commandId);
+        if (!original || original.effect === false || !action || action.status !== 'initiated' || action.transportForward) throw opsError('TRANSPORT_FORWARD_ALREADY_CONSUMED', 'Forwarding requires the original durably initiated action and an unused budget', 409);
+        const guard = validateTransport(original.transport, { origins: operation.authorization.origins });
+        assertAuthorized(operation, { ...payload, kind: action.kind }, now());
+        if (payload.accountId !== action.accountId || payload.resourceId !== action.resourceId || payload.pageId !== action.pageId || payload.pageId !== record.envelope.pageId || action.kind !== (original.kind || original.type) ||
+            !documentEpoch(action.pageVersion) || documentEpoch(action.pageVersion) !== documentEpoch(record.envelope.pageVersion) || documentEpoch(action.pageVersion) !== documentEpoch(payload.pageVersion) ||
+            payload.url !== guard.url || payload.origin !== new URL(guard.url).origin || payload.method !== 'POST' || payload.bodySha256 !== guard.bodySha256 || !Number.isSafeInteger(payload.bodyBytes) || payload.bodyBytes < 2 || payload.bodyBytes > guard.maxBodyBytes || action.authorizationVersion !== operation.authorization.version) throw opsError('TRANSPORT_BINDING_MISMATCH', 'Forward metadata does not match original page/account/resource/body authorization', 403);
+        action.transportForward = { at: timestamp(now), url: guard.url, method: 'POST', bodySha256: payload.bodySha256, bodyBytes: payload.bodyBytes, pageId: payload.pageId, pageVersion: payload.pageVersion, authorizationVersion: operation.authorization.version };
+        return { acknowledged: true, authorization: operation.authorization, transportForward: action.transportForward };
+      }
       if (type === 'dialog-acknowledgement') {
         if (!record || record.status !== 'pending' || record.envelope.kind !== 'control' || record.envelope.payload?.action !== 'acknowledge-dialog' ||
             typeof payload.reason !== 'string' || !payload.reason.trim() || record.envelope.payload.reason !== payload.reason ||
@@ -376,6 +401,7 @@ export async function createOperationsService({ stateDir, taskService, profileSt
     }
     if (body.action === 'reconcile') return command(id, { ...body.command, commandId: body.commandId || body.command?.commandId, kind: 'reconcile', payload: body.payload || body.command?.payload });
     if (body.action === 'update') {
+      if (body.singleSendTransport !== undefined) throw opsError('TRANSPORT_POLICY_IMMUTABLE', 'Transport context policy is selected at operation start, not changed on a running browser');
       if (body.showCursor !== undefined && typeof body.showCursor !== 'boolean') throw opsError('INVALID_CURSOR_PREFERENCE', 'showCursor must be a boolean');
       let cursorTaskId;
       await store.update((data) => { const operation = find(data, id); if (body.schedule !== undefined) operation.schedule = validateSchedule(body.schedule); if (body.budgets) operation.budgets = validateBudgets(body.budgets);

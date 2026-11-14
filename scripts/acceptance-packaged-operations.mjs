@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { CLI, ROOT, createOperationsHarness } from '../test-v3/fixtures/fast-operations/harness.mjs';
 import { SIMULATED_SELECTORS, websiteBatch } from '../src/runtime/operations-workflows.mjs';
+import { jsonTransport } from '../src/runtime/single-send-transport.mjs';
 
 const execute = promisify(execFileCallback);
 const samePath = (left, right) => process.platform === 'win32' ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase() : path.resolve(left) === path.resolve(right);
@@ -49,7 +50,7 @@ export async function runPackagedOperations({ bundleRoot, outputDir } = {}) {
     assert.equal(manager.version, manifest.version); assert.equal(manager.scope, 'project'); assert.ok(samePath(manager.stateDirEffective, harness.stateDir));
     record('portable Node/CLI starts the expected package version in fresh isolated project state', { version: manager.version, managerPid: manager.pid, stateDir: harness.stateDir });
 
-    const operation = await harness.start('site', { mode: 'operations' });
+    const operation = await harness.start('site', { mode: 'operations', singleSendTransport: true });
     assert.equal(operation.mode, 'operations'); assert.equal(operation.cursorEnabled, true); assert.equal(operation.task.cursorEnabled, true); assert.equal(operation.task.operationId, operation.id);
     assert.equal((await harness.navigate(operation.id, `${harness.fixture.origin}/site`)).status, 'confirmed');
     const observation = await harness.observe(operation.id, { scope: 'body', maxChars: 5000 });
@@ -67,11 +68,13 @@ export async function runPackagedOperations({ bundleRoot, outputDir } = {}) {
     const before = (await harness.state()).config; const next = 'packaged-smoke-approved-value';
     const fresh = await harness.observe(operation.id, { scope: 'body' });
     const batch = websiteBatch({ decision: { approved: true, id: 'packaged-local-save', reason: 'Explicit infrastructure smoke against the isolated local fixture only' },
-      selectors: SIMULATED_SELECTORS.site, record: { accountId: 'account-1', domain: 'example.test', resourceId: 'config-1', before, rollback: `Restore ${before}` }, nextValue: next });
+      selectors: SIMULATED_SELECTORS.site, record: { accountId: 'account-1', domain: 'example.test', resourceId: 'config-1', before, rollback: `Restore ${before}` }, nextValue: next,
+      transport: jsonTransport(`${harness.fixture.origin}/api/config`, { value: next }) });
     const result = await harness.command(operation.id, 'batch', batch, { pageId: fresh.pageId, pageVersion: fresh.pageVersion });
     assert.equal(result.status, 'confirmed'); assert.equal((await harness.state()).config, next); assert.equal((await harness.state()).effects.length, 1);
     const saved = await harness.cli(['ops', 'get', operation.id]);
     assert.equal(saved.taskId, operation.taskId); assert.ok(saved.actions.some((action) => action.kind === 'site.configure' && action.status === 'confirmed' && action.verification?.matched === true));
+    assert.equal(saved.actions.find((action) => action.kind === 'site.configure').transportForward?.bodySha256, batch.actions.at(-1).transport.bodySha256);
     const readback = await harness.observe(operation.id, { scope: '#current-value' }); assert.equal(readback.status, 'confirmed'); assert.ok(readback.result.items.some((item) => item.text === next));
     record('portable Worker executes one bounded local configuration save and confirms independent fixture plus browser readback', { externalEffects: 1, finalValue: next, sameTaskId: saved.taskId });
     await harness.stop(operation.id);

@@ -3,6 +3,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createFastBrowser, fastError, boundedInteger, delay } from './fast-browser.mjs';
 import { redactSensitiveValue } from '../lib/redaction.mjs';
+import { createSingleSendTransport, validateTransport } from './single-send-transport.mjs';
 
 const leases = new WeakMap();
 const KINDS = new Set(['observe', 'batch', 'wait', 'screenshot', 'tabs', 'select-tab', 'reconcile', 'control']);
@@ -65,7 +66,21 @@ export function createFastSession(runtime) {
     try { await promise; } finally { pendingEvents.delete(promise); }
   };
   const browser = runtime.browserAdapter || createFastBrowser({ page, context, signal, showCursor: cursorEnabled, onEvent: publish });
-  const abort = () => { terminal = true; activeCommand?.controller.abort(signal?.reason || fastError('TASK_STOPPED', 'Stopped')); abortController.abort(); void browser.pauseCursor?.(true); };
+  let transport = null;
+  const transportReady = input.singleSendTransport === true ? Promise.resolve().then(async () => {
+    if (!runtime.singleSendPolicyReady || input.browserSelection?.kind !== 'profile') throw fastError('TRANSPORT_CONTEXT_UNSUPPORTED', 'Single-send transport requires the explicitly selected owned context with service workers blocked');
+    transport = await createSingleSendTransport({ context, signal, onBlocked: publish, authorizeForward: async (binding, metadata) => {
+      check();
+      if (activeCommand?.command.commandId !== binding.commandId || humanOwned) throw fastError('TRANSPORT_STOPPED', 'Original action no longer owns the page');
+      const scope = await protectedScope(binding.command);
+      const ack = await durable('transport-forward', { operationId, commandId: binding.commandId, actionId: binding.actionId, authorizationVersion: binding.command.authorizationVersion,
+        ...scope.identity, origin: new URL(scope.state.url).origin, pageId: scope.state.pageId, pageVersion: scope.state.pageVersion, ...metadata });
+      check();
+      if (!ack?.acknowledged || humanOwned) throw fastError('TRANSPORT_STOPPED', 'Current forwarding authorization was not confirmed');
+    } });
+  }) : Promise.resolve();
+  transportReady.catch(() => {});
+  const abort = () => { terminal = true; activeCommand?.controller.abort(signal?.reason || fastError('TASK_STOPPED', 'Stopped')); abortController.abort(); transport?.pause(true); void browser.pauseCursor?.(true); };
   if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
   const check = () => {
     if (signal?.aborted || terminal || disposed) throw signal?.reason || fastError('TASK_STOPPED', 'Session stopped');
@@ -215,12 +230,13 @@ export function createFastSession(runtime) {
     return { watchId, healthy: true, pollMs };
   };
   const control = ({ action, mode: nextMode } = {}) => {
-    if (action === 'stop') { terminal = true; activeCommand?.controller.abort(fastError('TASK_STOPPED', 'Session stopped')); abortController.abort(); void browser.pauseCursor?.(true); }
+    if (action === 'stop') { terminal = true; activeCommand?.controller.abort(fastError('TASK_STOPPED', 'Session stopped')); abortController.abort(); transport?.pause(true); void browser.pauseCursor?.(true); }
     if (action === 'takeover' || action === 'pause') {
       humanOwned = true; activeCommand?.controller.abort(fastError('MANUAL_TAKEOVER', 'Human took over or paused the page'));
+      transport?.pause(true);
       void browser.pauseCursor?.(true);
       for (const watcher of watches.values()) watcher.controller.abort();
-    } else if (action === 'resume') { humanOwned = false; mode = nextMode || mode; if (!cursorExplicit) { cursorEnabled = mode === 'operations'; void browser.setCursorEnabled?.(cursorEnabled); } void browser.pauseCursor?.(false); }
+    } else if (action === 'resume') { humanOwned = false; transport?.pause(false); mode = nextMode || mode; if (!cursorExplicit) { cursorEnabled = mode === 'operations'; void browser.setCursorEnabled?.(cursorEnabled); } void browser.pauseCursor?.(false); }
     freshObservation = false;
     browser.invalidate();
     return { mode, automationPaused: humanOwned, cursorEnabled, requiresObservation: true };
@@ -314,11 +330,19 @@ export function createFastSession(runtime) {
       }
       const beforeAction = await browser.meta();
       if (beforeAction.pageVersion !== state.pageVersion) throw fastError('STALE_OBSERVATION', 'Page changed during safety checks; observe again');
+      if (action.transport && !transport) throw fastError('TRANSPORT_NOT_ENABLED', 'This operation did not explicitly enable single-send transport');
+      const guarded = transport && action.effect !== false;
+      if (guarded) {
+        if (!['click', 'fill', 'select', 'key'].includes(action.type)) throw fastError('TRANSPORT_ACTION_UNSUPPORTED', 'Only known JSON UI submissions can use a forward guard');
+        validateTransport(action.transport, { pageUrl: state.url, origins: authority.origins });
+      }
       await authorize(command, action, identity, state.url);
       const record = {
         actionId: action.actionId, commandId: command.commandId, operationId,
         authorizationVersion: command.authorizationVersion, accountId: identity?.accountId || authority.accountId,
+        pageId: beforeAction.pageId, pageVersion: beforeAction.pageVersion,
         resourceId: identity?.resourceId || null, businessKey: action.businessKey,
+        transport: action.transport || null,
         expected: action.expected || null, expectedIdentity: identity, beforeTarget: action.beforeTarget || null, interaction: action.interaction ? { ...action.interaction, observedReplyToId: action.observedReplyToId } : null,
         kind: action.kind || action.type, before: action.before ?? null,
         proposed: action.proposed ?? (action.type === 'fill' ? '[input omitted]' : action.value) ?? null,
@@ -333,7 +357,9 @@ export function createFastSession(runtime) {
       pending.push(record);
       try {
         check();
+        if (guarded) await transport.arm({ page: browser.page, pageId: beforeAction.pageId, url: state.url, command, commandId: command.commandId, actionId: action.actionId, guard: action.transport });
         await browser.act(action, Math.min(10000, Math.max(1, timeoutMs - (Date.now() - started))));
+        if (guarded) record.transportResult = await transport.finish(action.actionId, Math.min(10000, Math.max(1, timeoutMs - (Date.now() - started))));
         check();
         if (browser.unsafe) throw fastError(browser.unsafe, 'Unexpected dialog interrupted the action group');
         const after = await browser.meta();
@@ -348,6 +374,7 @@ export function createFastSession(runtime) {
         }
         results.push({ actionId: action.actionId, status: 'initiated' });
       } catch (error) {
+        transport?.disarm(action.actionId);
         writeUnknown = true;
         throw fastError('WRITE_RESULT_UNKNOWN', 'Action may have taken effect; inspect and reconcile before retrying', { actionId: action.actionId, cause: error.code || 'ACTION_FAILED' });
       }
@@ -377,6 +404,7 @@ export function createFastSession(runtime) {
     activeCommand = { command, controller: new AbortController() };
     let reply;
     try {
+      await transportReady;
       check();
       let result;
       const payload = command.payload || {};
@@ -479,12 +507,14 @@ export function createFastSession(runtime) {
   }
   const api = {
     execute, control: handleControl,
+    ready: () => transportReady,
     get mode() { return mode; },
     get automationPaused() { return humanOwned; },
     get cursorEnabled() { return cursorEnabled; },
     get unresolved() { return writeUnknown; },
     async dispose() {
       disposed = true; activeCommand?.controller.abort(); abortController.abort();
+      await transportReady.catch(() => {}); await transport?.dispose();
       for (const watcher of watches.values()) watcher.controller.abort();
       await Promise.allSettled([...watches.values()].map((watcher) => watcher.done));
       await guardian.catch(() => {});
@@ -502,6 +532,7 @@ export async function runFastSession(runtime) {
   const session = createFastSession(runtime);
   let completedBatches = 0;
   try {
+    await session.ready();
     await runtime.durable('event', { operationId: runtime.input.operationId, type: 'session.ready', dedupeKey: `ready:${runtime.input.operationId}`, summary: 'Persistent browser session ready', priority: 'normal' });
     while (!runtime.signal.aborted) {
       const command = await runtime.wait({ reason: 'operations-command', data: { operationId: runtime.input.operationId, mode: session.mode, requiresReconciliation: session.unresolved } });

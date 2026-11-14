@@ -407,7 +407,7 @@ export async function runTaskWorker(config, {
     sendMessage({ type: 'heartbeat', at: new Date().toISOString() });
     const playwright = await abortable(loadPlaywright);
     context = await abortable(() => {
-      launchPromise = launchChromeProfile(playwright, config.profile);
+      launchPromise = launchChromeProfile(playwright, config.profile, config.builtin === 'fast-operations' && config.input?.singleSendTransport === true ? { serviceWorkers: 'block' } : {});
       return launchPromise;
     });
     assertActive();
@@ -570,6 +570,7 @@ export async function runTaskWorker(config, {
       wait: waitForResume,
       durable: (type, payload) => durableRecord(type, payload, { sendMessage, signal: controller.signal }),
       onControl: (listener) => { operationControlListeners.add(listener); return () => operationControlListeners.delete(listener); },
+      singleSendPolicyReady: config.builtin === 'fast-operations' && config.input?.singleSendTransport === true,
       signal: controller.signal
     }));
     await abortable(() => outputBudget.assertWithinBudget());

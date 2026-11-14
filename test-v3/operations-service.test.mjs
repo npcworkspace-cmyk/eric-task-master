@@ -8,6 +8,7 @@ import { operationsSchema } from '../src/lib/operations-schema.mjs';
 import { validateFastCommand } from '../src/runtime/fast-session.mjs';
 import { publicTask } from '../src/contracts.mjs';
 import { removeTestTree } from './test-fs.mjs';
+import { jsonTransport } from '../src/runtime/single-send-transport.mjs';
 
 async function setup(t, options = {}) {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-ops-service-'));
@@ -23,6 +24,44 @@ async function setup(t, options = {}) {
     authorization: { accountId: 'account', resourceIds: ['resource'], origins: ['http://localhost:5555'], allowedActions: ['click', 'ads.adjust'], expiresAt: new Date(clock + 3600000).toISOString() } };
   return { service, stateDir, taskService, profileStore, tasks, resumes, controls, input, advance: (milliseconds) => { clock += milliseconds; } };
 }
+
+test('single-send admission and durable forward bind original action, identity, page and current authority', async (t) => {
+  const { service, input } = await setup(t);
+  const guard = jsonTransport('http://localhost:5555/api/config', { value: 'approved' });
+  const raw = { commandId: 'transport-batch', kind: 'batch', pageId: 'page1', pageVersion: '1:doc1:1', payload: { actions: [{ actionId: 'save', type: 'click', kind: 'click', transport: guard }] } };
+  const legacy = await service.start(input);
+  await assert.rejects(service.command(legacy.id, raw), { code: 'TRANSPORT_NOT_ENABLED' });
+  const operation = await service.start({ ...input, singleSendTransport: true });
+  assert.equal(operation.task.input.singleSendTransport, true); assert.equal(operation.task.input.browserSelection.kind, 'profile');
+  await assert.rejects(service.command(operation.id, { ...raw, payload: { actions: [{ actionId: 'missing', type: 'click' }] } }), { code: 'INVALID_TRANSPORT_GUARD' });
+  await service.command(operation.id, raw);
+  const action = { commandId: raw.commandId, actionId: 'save', kind: 'click', accountId: 'account', resourceId: 'resource', authorizationVersion: 1, origin: 'http://localhost:5555', pageId: 'page1', pageVersion: '1:doc1:1' };
+  const forward = { ...action, ...guard, bodyBytes: 20 };
+  await service.durable(operation.taskId, 'action', { ...action, status: 'prepared' });
+  await assert.rejects(service.durable(operation.taskId, 'transport-forward', forward), { code: 'TRANSPORT_FORWARD_ALREADY_CONSUMED' });
+  await service.durable(operation.taskId, 'action', { ...action, status: 'initiated' });
+  for (const changed of [{ resourceId: 'other' }, { accountId: 'other' }, { pageId: 'other' }, { pageVersion: 'other:1' }, { url: `${guard.url}?wrong=1` }, { bodySha256: 'a'.repeat(64) }]) await assert.rejects(service.durable(operation.taskId, 'transport-forward', { ...forward, ...changed }));
+  assert.equal((await service.durable(operation.taskId, 'transport-forward', forward)).acknowledged, true);
+  await assert.rejects(service.durable(operation.taskId, 'transport-forward', forward), { code: 'TRANSPORT_FORWARD_ALREADY_CONSUMED' });
+  assert.equal((await service.get(operation.id)).actions[0].transportForward.bodySha256, guard.bodySha256);
+  await assert.rejects(service.action(operation.id, { action: 'update', singleSendTransport: false }), { code: 'TRANSPORT_POLICY_IMMUTABLE' });
+});
+
+test('single-send fresh authorization rejects takeover/revoke and restart retains policy without unknown replay', async (t) => {
+  const { service, input, tasks } = await setup(t);
+  const guard = jsonTransport('http://localhost:5555/api/config', { value: 'approved' });
+  for (const lock of ['takeover', 'revoke']) {
+    const op = await service.start({ ...input, singleSendTransport: true });
+    await service.command(op.id, { commandId: `guard-${lock}`, kind: 'batch', payload: { actions: [{ actionId: `save-${lock}`, type: 'click', transport: guard }] } });
+    const action = { commandId: `guard-${lock}`, actionId: `save-${lock}`, kind: 'click', accountId: 'account', resourceId: 'resource', authorizationVersion: 1, origin: 'http://localhost:5555', pageId: 'p', pageVersion: 'doc:1' };
+    await service.durable(op.taskId, 'action', { ...action, status: 'prepared' }); await service.durable(op.taskId, 'action', { ...action, status: 'initiated' });
+    await service.action(op.id, { action: lock });
+    await assert.rejects(service.durable(op.taskId, 'transport-forward', { ...action, ...guard, bodyBytes: 20 }));
+  }
+  const op = await service.start({ ...input, singleSendTransport: true }); tasks.get(op.taskId).state = 'stopped';
+  await service.action(op.id, { action: 'resume' }); const recreated = await service.get(op.id);
+  assert.notEqual(recreated.taskId, op.taskId); assert.equal(recreated.task.input.singleSendTransport, true); assert.deepEqual(recreated.task.input.browserSelection, op.browserSelection);
+});
 
 test('operation rejects implicit Profile fallback, persists commands, dispatches same worker once', async (t) => {
   const { service, input, resumes } = await setup(t);
