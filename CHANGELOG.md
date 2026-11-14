@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.2.0 - 2026-11-15
+
+- Add persistent operations sessions through the CLI and the existing Manager/Worker lifecycle, with bounded action groups, scoped and differential observations, local condition waits and explicit decision events. Keep ordinary script tasks compatible and add no model or production dependency.
+- Add durable authorization, pre-effect action acknowledgements, business records, uncertain-result reconciliation, schedules and a bounded event outbox with an explicitly configured host delivery adapter. A delivery receipt is not an Agent decision or proof of native closed-session wake-up.
+- Add opt-in single-send transport for explicitly selected owned Profiles and known small same-origin JSON POST effects, with exact request guards, a durable one-send allowance, late/repeated-request blocking and readback after uncertainty. Native unguarded browser/site retries and unsupported platform transports remain outside this policy; this is not universal exactly-once delivery.
+- Recover uncertain read-only navigation by verifying its exact original destination and currently authorized identity while retaining the original source resource record; external writes retain same-resource reconciliation.
+- Support exactly two execution modes, batch and operations. Profile settings choose a fixed default or auto policy; an explicit task mode overrides only that task. Human takeover is a separate pause lock, never a third execution mode.
+- Add an optional NPC-orange operation cursor with click-through, observation/screenshot isolation and an existing Tasks visibility control, plus fresh-scene durable acknowledgement of safely cancelled native dialogs without replay or fake action reconciliation.
+- Add isolated social, advertising and website workflow fixtures, concentrated browser acceptance and real-time soak tooling. Real account operations, native host integration and public release remain separate validation and authorization scopes.
+
 ## 3.1.11 - 2026-10-26
 
 - Add a quiet NPC and Media Bridge introduction beneath the Dashboard workspace, with explicit external links, larger readable text and a native, expanded-by-default overview of open-ended browser workflows.

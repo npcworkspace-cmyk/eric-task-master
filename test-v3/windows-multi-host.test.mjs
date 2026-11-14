@@ -39,7 +39,7 @@ test('real Windows legacy union view is preserved by one explicit Owner upgrade 
     const setup = path.join(root, 'setup.mjs');
     await mkdir(home);
     await writeFile(setup, [
-      "import { mkdir, writeFile } from 'node:fs/promises';",
+      "import { mkdir, writeFile, realpath } from 'node:fs/promises';",
       "import path from 'node:path';",
       "const root = process.env.OWNER_TEST_LEGACY; const id = process.env.OWNER_TEST_PROFILE;",
       "await mkdir(root, { recursive: true });",
@@ -51,8 +51,11 @@ test('real Windows legacy union view is preserved by one explicit Owner upgrade 
       "  await writeFile(path.join(root, 'config.json'), JSON.stringify({ version: 3, managerToken: 'fixture-owner-token-'.repeat(3), stateInstanceId: 'fixture-owner-instance-0001' }));",
       "  await writeFile(path.join(root, 'profiles.json'), JSON.stringify({ version: 1, defaultProfileId: id, deletions: [], profiles: [{ id, name: 'Legacy lower-layer Profile', userDataDir: path.join(root, 'profiles', id), state: 'idle', lease: null }] }));",
       "}",
-      "process.stdout.write(JSON.stringify({ ok: true }));"
+      "const result = { ok: true };",
+      "if (process.argv[2] !== 'base') result.configPhysicalPath = await realpath(path.join(root, 'config.json'));",
+      "process.stdout.write(JSON.stringify(result));"
     ].join('\n'));
+    await execute(process.execPath, ['--check', setup], { windowsHide: true, timeout: 5_000 });
     const call = async (arguments_, breakaway = false, script = cli) => {
       const output = path.join(root, randomUUID() + '.json');
       const payload = Buffer.from(JSON.stringify({ node: process.execPath, cli: script, cwd: ROOT,
@@ -64,20 +67,28 @@ test('real Windows legacy union view is preserved by one explicit Owner upgrade 
     };
     const normal = await call(['help']);
     if (!normal.packaged) { await removeTestTree(root); t.skip('requires an actual MSIX Agent host'); return; }
-    assert.equal(normal.hostConsoleWindow, 0, 'the packaged fixture must run without an allocated console');
-    const overlay = await call(['packaged'], false, setup);
-    assert.equal(overlay.exitCode, 0, overlay.stderr);
-    const base = await call(['base'], true, setup);
-    assert.equal(base.packaged, false);
-    assert.equal(base.hostConsoleWindow, 0, 'the breakaway fixture must run without an allocated console');
-    assert.equal(base.exitCode, 0, base.stderr);
-    const physical = path.dirname(await import('node:fs/promises').then(({ realpath }) => realpath(path.join(legacy, 'config.json'))));
-    await assert.rejects(readFile(path.join(physical, 'profiles', profileId, 'Local State')), { code: 'ENOENT' });
     t.after(async () => {
       const stopped = await call(['manager', 'stop', '--if-idle', '--json'], true);
       assert.equal(stopped.exitCode, 0, stopped.stderr);
       await removeTestTree(root);
+      // Physical AppData fixtures are retained: never guess which host owns a redirected tree.
     });
+    assert.equal(normal.hostConsoleWindow, 0, 'the packaged fixture must run without an allocated console');
+    const overlay = await call(['packaged'], false, setup);
+    assert.equal(overlay.exitCode, 0, overlay.stderr);
+    assert.equal(overlay.packaged, true, 'the configuration must really be created by the packaged host');
+    const configPhysicalPath = JSON.parse(overlay.stdout).configPhysicalPath;
+    assert.ok(path.isAbsolute(configPhysicalPath), 'the packaged creator must resolve its own physical configuration');
+    assert.equal(path.basename(configPhysicalPath), 'config.json');
+    const base = await call(['base'], true, setup);
+    assert.equal(base.packaged, false);
+    assert.equal(base.hostConsoleWindow, 0, 'the breakaway fixture must run without an allocated console');
+    assert.equal(base.exitCode, 0, base.stderr);
+    // The test runner may be unpackaged even when the explicit helper is packaged.
+    // Resolve through the creator's real filesystem view, not the parent's lexical view.
+    const physical = path.dirname(configPhysicalPath);
+    assert.equal(JSON.parse(await readFile(configPhysicalPath, 'utf8')).stateInstanceId, 'fixture-owner-instance-0001');
+    await assert.rejects(readFile(path.join(physical, 'profiles', profileId, 'Local State')), { code: 'ENOENT' });
     const ordinary = await call(['manager', 'start', '--json']);
     assert.equal(ordinary.exitCode, 1);
     assert.equal(JSON.parse(ordinary.stderr.trim().split(/\r?\n/u).at(-1)).error.details.managerCode,

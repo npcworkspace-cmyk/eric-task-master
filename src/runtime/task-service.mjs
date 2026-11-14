@@ -23,6 +23,7 @@ import { redactSensitiveText, redactSensitiveValue } from '../lib/redaction.mjs'
 import { ProfileStoreError } from '../lib/profile-store.mjs';
 import { createProfileRuntime } from './profile-runtime.mjs';
 import { TaskServiceError } from './task-service-error.mjs';
+import { selectMode } from '../lib/operations-contracts.mjs';
 
 export { TaskServiceError } from './task-service-error.mjs';
 
@@ -199,6 +200,7 @@ export function createTaskService({
   const activeOperations = new Set();
   let closePromise = null;
   let reaper = null;
+  let operationDurableHandler = null;
   let readyResolve;
   let readyReject;
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
@@ -662,6 +664,7 @@ export function createTaskService({
       child,
       userDataDir: profile.userDataDir,
       pendingResumes: new Map(),
+      pendingControls: new Map(),
       profileId: profile.id,
       ownerId,
       nonce,
@@ -705,6 +708,7 @@ export function createTaskService({
         pending.resolveAck({ accepted: false, reason: 'TASK_WORKER_EXITED' });
         if (entry.observedResumeWaitId !== pending.waitId) pending.resolveResumed(false);
       }
+      for (const pending of entry.pendingControls.values()) pending({ accepted: false, error: { code: 'TASK_WORKER_EXITED' } });
       if (!abandoningState) void finalizeTask(task.id, entry, code, signal).catch(() => {});
     });
 
@@ -734,6 +738,7 @@ export function createTaskService({
           taskId: task.id,
           profile: leased,
           modulePath: task.modulePath,
+          builtin: task.builtin,
           input: clone(task.input),
           outputDir: task.outputDir,
           outputBudget: task.outputBudget,
@@ -777,6 +782,20 @@ export function createTaskService({
         if (typeof message.cleanupId === 'string') {
           await send(entry.child, { type: 'cleanup_ack', cleanupId: message.cleanupId });
         }
+      }
+      return;
+    }
+    if (message?.type === 'operations-control-ack') {
+      if (children.get(taskId) === entry) entry.pendingControls.get(message.requestId)?.(message);
+      return;
+    }
+    if (message?.type === 'operations-durable' && children.get(taskId) === entry && !entry.finalized) {
+      try {
+        if (!tasks.get(taskId)?.builtin || !operationDurableHandler) throw new TaskServiceError('OPERATIONS_UNAVAILABLE', 'Durable operations handler is unavailable', 409);
+        const value = await operationDurableHandler(taskId, message.recordType, message.payload);
+        await send(entry.child, { type: 'operations-durable-ack', requestId: message.requestId, ok: true, value });
+      } catch (error) {
+        await send(entry.child, { type: 'operations-durable-ack', requestId: message.requestId, ok: false, error: normalizeError(error) });
       }
       return;
     }
@@ -1045,13 +1064,13 @@ export function createTaskService({
     }
   }
 
-  async function create(body = {}) {
+  async function create(body = {}, { builtin = false } = {}) {
     await ready;
     if (closing) throw new TaskServiceError('MANAGER_STOPPING', 'Manager is stopping', 503);
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       throw new TaskServiceError('INVALID_TASK', 'Task request must be an object');
     }
-    const allowed = new Set(['modulePath', 'profileId', 'label', 'input', 'timeoutMs', 'outputBudget', 'requestKey']);
+    const allowed = new Set(['modulePath', 'profileId', 'label', 'input', 'timeoutMs', 'outputBudget', 'requestKey', 'mode', 'skillMode', 'modeReason']);
     const unknown = Object.keys(body).filter((key) => !allowed.has(key));
     if (unknown.length) throw new TaskServiceError('INVALID_TASK', `Unsupported fields: ${unknown.join(', ')}`);
     if (typeof body.modulePath !== 'string' || !body.modulePath) {
@@ -1087,7 +1106,7 @@ export function createTaskService({
         requestFingerprint = createHash('sha256').update(canonicalJson(jsonClone({
           moduleSha256, profileId: body.profileId ?? null, input: body.input ?? {},
           label: normalizeLabel(body.label, body.modulePath), timeoutMs: body.timeoutMs ?? null,
-          outputBudget: body.outputBudget ?? {}
+          outputBudget: body.outputBudget ?? {}, mode: body.mode ?? null, skillMode: body.skillMode ?? null
         }))).digest('hex');
         const previous = [...tasks.values()].find((task) => task.requestKeyHash === requestKeyHash);
         if (previous) {
@@ -1108,6 +1127,8 @@ export function createTaskService({
           409
         );
       }
+      const mode = selectMode({ modePolicy: profile.modePolicy || 'auto', mode: body.mode ?? (builtin ? undefined : 'batch'), skillMode: body.skillMode });
+      if (!builtin && mode.mode !== 'batch') throw new TaskServiceError('MODE_REQUIRES_OPERATIONS', 'Use ops start for operations mode; ordinary scripts run in batch mode', 409);
       if (deletingProfiles.has(profile.id)) {
         throw new TaskServiceError('PROFILE_DELETING', 'Profile is being deleted', 409);
       }
@@ -1142,6 +1163,9 @@ export function createTaskService({
         label: normalizeLabel(body.label, body.modulePath),
         profileId: profile.id,
         profileName: profile.name,
+        mode: mode.mode,
+        modeReason: body.modeReason || mode.reason,
+        ...(builtin ? { builtin: 'fast-operations', operationId: body.input?.operationId || null, cursorEnabled: body.input?.showCursor ?? mode.mode === 'operations' } : {}),
         moduleName: staged.moduleName,
         modulePath: staged.modulePath,
         moduleSha256: staged.moduleSha256,
@@ -1921,6 +1945,39 @@ export function createTaskService({
   }
 
   const service = {
+    createOperation: (body) => create({ ...body, modulePath: fileURLToPath(new URL('./fast-session.mjs', import.meta.url)) }, { builtin: true }),
+    setOperationDurableHandler: (handler) => { operationDurableHandler = handler; },
+    operationControl: async (id, control) => {
+      if (control.action === 'cursor') {
+        const entry = children.get(id);
+        if (entry?.pendingControls.size) throw new TaskServiceError('CURSOR_UPDATE_PENDING', 'A cursor preference update is still awaiting Worker confirmation', 409);
+        const requestId = randomUUID(); let resolveAck;
+        const acknowledgement = new Promise((resolve) => { resolveAck = resolve; });
+        if (entry) entry.pendingControls.set(requestId, resolveAck);
+        try {
+          await serialize(async () => { const task = findTask(id); if (!task.builtin) throw new TaskServiceError('OPERATIONS_UNAVAILABLE', 'Cursor tracking is only available for controlled operations', 409);
+            task.cursorApplyState = 'pending'; task.cursorRequested = control.visible === true; await persist(); });
+          if (!entry || !await send(entry.child, { type: 'operations-control', requestId, control })) throw new TaskServiceError('CURSOR_APPLY_UNCONFIRMED', 'Worker did not receive the cursor preference; no business action was retried', 409);
+          const ack = await waitFor(acknowledgement, resumeWaitMs);
+          if (!ack || ack.accepted !== true || ack.result?.cursorEnabled !== control.visible) throw new TaskServiceError('CURSOR_APPLY_UNCONFIRMED', 'Worker did not confirm applying the cursor preference; inspect or retry only this display setting', 409);
+          await serialize(async () => { const task = findTask(id); task.cursorEnabled = control.visible; task.cursorApplyState = 'applied'; task.cursorRequested = control.visible; task.cursorApplyError = null; appendEvent(task, 'operations.cursor_applied', { visible: control.visible }); await persist(); });
+          return { applied: true, cursorEnabled: control.visible };
+        } catch (error) {
+          await serialize(async () => { const task = tasks.get(id); if (!task) return; task.cursorApplyState = 'unconfirmed'; task.cursorRequested = control.visible; task.cursorApplyError = error.code || 'CURSOR_APPLY_UNCONFIRMED'; appendEvent(task, 'operations.cursor_unconfirmed', { requested: control.visible, code: task.cursorApplyError }); await persist(); });
+          throw error;
+        } finally { entry?.pendingControls.delete(requestId); }
+      }
+      await serialize(async () => {
+        const task = tasks.get(id);
+        if (!task?.builtin) return;
+        task.mode = control.mode || task.mode;
+        task.modeReason = control.action === 'takeover' ? 'manual-takeover' : control.action === 'resume' ? 'explicit-resume' : control.action;
+        appendEvent(task, 'operations.control', control); await persist();
+      });
+      const entry = children.get(id);
+      if (!entry) return false;
+      return send(entry.child, { type: 'operations-control', control });
+    },
     status,
     list,
     get,

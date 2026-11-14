@@ -111,6 +111,33 @@ class CleanupFailingWorker extends FakeWorker {
   }
 }
 
+test('TaskService cursor state changes only after Worker ACK and remains unconfirmed on IPC failure or lost ACK', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cursor-control-ack-')); const alive = new Set();
+  const profileStore = new ProfileStore({ filePath: path.join(root, 'profiles.json'), profilesRoot: path.join(root, 'profiles'), processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive' });
+  await profileStore.init(); const profile = await profileStore.create({ name: 'Cursor ACK fixture' });
+  const workers = [];
+  const workerFactory = () => { const worker = new FakeWorker(98760 + workers.length, alive); workers.push(worker); return worker; };
+  const service = createTaskService({ stateDir: path.join(root, 'tasks'), profileStore, workerFactory, profileWorkerFactory: workerFactory,
+    processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive', resumeWaitMs: 100 });
+  t.after(async () => { await service.close(); await removeTestTree(root); });
+  const task = await service.createOperation({ profileId: profile.id, mode: 'operations', input: { operationId: 'op_cursor_test', showCursor: true } });
+  await until(() => workers[0]?.config); const worker = workers[0];
+  const changing = service.operationControl(task.id, { action: 'cursor', visible: false });
+  await until(() => worker.messages.some((message) => message.type === 'operations-control' && message.requestId));
+  const request = worker.messages.find((message) => message.type === 'operations-control');
+  let state = await service.get(task.id); assert.equal(state.cursorEnabled, true); assert.equal(state.cursorApplyState, 'pending');
+  worker.emit('message', { type: 'operations-control-ack', requestId: request.requestId, accepted: true, result: { cursorEnabled: false } });
+  assert.deepEqual(await changing, { applied: true, cursorEnabled: false });
+  state = await service.get(task.id); assert.equal(state.cursorEnabled, false); assert.equal(state.cursorApplyState, 'applied');
+  const originalSend = worker.send.bind(worker);
+  worker.send = (message, handle, options, callback) => { if (message.type === 'operations-control') { callback?.(new Error('IPC unavailable')); return; } return originalSend(message, handle, options, callback); };
+  await assert.rejects(service.operationControl(task.id, { action: 'cursor', visible: true }), { code: 'CURSOR_APPLY_UNCONFIRMED' });
+  state = await service.get(task.id); assert.equal(state.cursorEnabled, false); assert.equal(state.cursorApplyState, 'unconfirmed'); assert.equal(state.cursorRequested, true);
+  worker.send = originalSend;
+  await assert.rejects(service.operationControl(task.id, { action: 'cursor', visible: true }), { code: 'CURSOR_APPLY_UNCONFIRMED' });
+  state = await service.get(task.id); assert.equal(state.cursorEnabled, false); assert.equal(state.cursorApplyState, 'unconfirmed');
+});
+
 test('TaskService queues one writer, preserves partial output, and deletes atomically', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-service-'));
   const alive = new Set();

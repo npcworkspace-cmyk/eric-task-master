@@ -102,6 +102,11 @@ async function staticChecks() {
     'portable Skill exposes a removed v2 concept');
   invariant(cli.includes("if (command === 'run')") && cli.includes("if (command === 'panel')"),
     'CLI fast path is missing');
+  invariant(cli.includes("if (command === 'ops')") && manager.includes("pathname === '/v1/operations'"), 'User-approved operations entry points are missing');
+  invariant(worker.includes("operations-durable-ack") && worker.includes("config.builtin === 'fast-operations'"), 'Operations must use existing worker with durable acknowledgement');
+  for (const relative of ['src/lib/operations-contracts.mjs', 'src/lib/operations-store.mjs', 'src/lib/operations-scheduler.mjs', 'src/lib/host-dispatch.mjs', 'src/runtime/operations-service.mjs', 'src/runtime/fast-session.mjs']) {
+    invariant(await exists(relative), `Approved operations contract is missing: ${relative}`);
+  }
   invariant(!/connect|register-mcp|modelcontextprotocol/iu.test(cli), 'CLI contains a removed connection path');
   invariant(manager.includes("pathname === '/v1/tasks'") && manager.includes("pathname === '/v1/profiles'"),
     'minimal Manager API is missing');

@@ -15,6 +15,7 @@ import { ProfileStore, ProfileStoreError } from './lib/profile-store.mjs';
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 import { createTaskService, TaskServiceError } from './runtime/task-service.mjs';
 import { createVerificationNotifier } from './lib/desktop-notifications.mjs';
+import { createOperationsService } from './runtime/operations-service.mjs';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -61,7 +62,7 @@ function dashboardSameOrigin(request, origin) {
 
 function errorPayload(error, requestId) {
   const known = error instanceof HttpError || error instanceof TaskServiceError ||
-    error instanceof ProfileStoreError || error instanceof JsonStoreConflictError;
+    error instanceof ProfileStoreError || error instanceof JsonStoreConflictError || (typeof error?.code === 'string' && Number.isInteger(error?.statusCode));
   const statusCode = known ? error.statusCode ?? 400 : 500;
   const code = known ? error.code : 'INTERNAL_ERROR';
   const message = known ? error.message : 'Internal Manager error';
@@ -125,6 +126,7 @@ export async function createManager({
 
   let server;
   let taskService;
+  let operationsService;
   let stopped = false;
   let stopping = false;
   let stopPromise;
@@ -192,10 +194,12 @@ export async function createManager({
       verificationNotifier,
       ...taskServiceOptions
     });
+    operationsService = await createOperationsService({ stateDir: effectiveDataDir, taskService, profileStore });
 
     function markStateConflict() {
       stateConflict = true;
       taskService.beginStateRecovery?.();
+      operationsService.fence();
     }
 
     async function readCurrentConfig({ requireSameInstance = true } = {}) {
@@ -218,6 +222,7 @@ export async function createManager({
       const current = await readCurrentConfig();
       try {
         await taskService.assertStateUnchanged?.();
+        await operationsService.assertUnchanged();
       } catch (error) {
         if (!(error instanceof JsonStoreConflictError)) throw error;
         markStateConflict();
@@ -250,7 +255,7 @@ export async function createManager({
             version: VERSION,
             apiVersion: API_VERSION,
             capabilities: ['task.request-key', 'manager.idle-stop', 'manager.state-recovery',
-              'manager.state-location', 'manager.owner-proof', 'verification.notifications'],
+              'manager.state-location', 'manager.owner-proof', 'verification.notifications', 'operations.durable', 'operations.modes'],
             state: stopping ? 'stopping' : 'ready',
             ...stateLocation,
             stateChanged,
@@ -329,6 +334,23 @@ export async function createManager({
         if (request.method === 'GET' && pathname === '/v1/status') {
           sendJson(response, 200, { ok: true, ...(await taskService.status()) });
           return;
+        }
+        if (pathname === '/v1/operations' && request.method === 'GET') {
+          sendJson(response, 200, { ok: true, operations: await operationsService.list() }); return;
+        }
+        if (pathname === '/v1/operations' && request.method === 'POST') {
+          sendJson(response, 201, { ok: true, operation: await operationsService.start(await readJson(request)) }); return;
+        }
+        if (pathname === '/v1/operations/stop-all' && request.method === 'POST') {
+          sendJson(response, 200, { ok: true, ...(await operationsService.stopAll()) }); return;
+        }
+        const operationsMatch = /^\/v1\/operations\/([^/]+)(?:\/(commands|events|actions))?$/u.exec(pathname);
+        if (operationsMatch) {
+          const id = decodeURIComponent(operationsMatch[1]); const section = operationsMatch[2];
+          if (!section && request.method === 'GET') { sendJson(response, 200, { ok: true, operation: await operationsService.get(id, { commandId: url.searchParams.get('commandId') || null }) }); return; }
+          if (section === 'commands' && request.method === 'POST') { sendJson(response, 202, { ok: true, command: await operationsService.command(id, await readJson(request)) }); return; }
+          if (section === 'actions' && request.method === 'POST') { sendJson(response, 200, { ok: true, result: await operationsService.action(id, await readJson(request)) }); return; }
+          if (section === 'events' && request.method === 'GET') { sendJson(response, 200, { ok: true, ...(await operationsService.events(id, { after: integerParam(url.searchParams.get('after'), 0), waitMs: integerParam(url.searchParams.get('waitMs'), 0, { maximum: 30000 }) })) }); return; }
         }
         if (request.method === 'POST' && pathname === '/v1/cleanup') {
           const result = await taskService.cleanup(await readJson(request));
@@ -518,6 +540,7 @@ export async function createManager({
       if (stopPromise) return stopPromise;
       const attempt = (async () => {
         stopping = true;
+        await operationsService.close();
         await taskService.close({ abandonState });
         verificationNotifier.close();
         if (address) {
@@ -549,9 +572,11 @@ export async function createManager({
       get stopped() { return stopped; },
       taskService,
       profileStore,
-      stateLocation
+      stateLocation,
+      operationsService
     });
   } catch (error) {
+    await operationsService?.close?.().catch(() => {});
     verificationNotifier.close();
     await taskService?.close?.().catch(() => {});
     await managerLock.release().catch(() => {});

@@ -8,6 +8,8 @@ Codex、Claude Code、WorkBuddy、Hermes、Pi，以及任何能调用本机终�
 
 [English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md) | **[NPC 官网 ↗](https://www.npctech.site/)**
 
+常驻快速交互、定时事件、持久决策与恢复见 [Fast operations 说明](docs/FAST-OPERATIONS.md)。执行模式只有 `batch` 和 `operations`；prompt 明确指定时仅覆盖本次任务，不改写 Profile 默认值。`auto` 负责选择模式，人工接管只是暂停自动操作的控制状态。登录后台仍遵守用户选择的本机浏览器边界，隔离模拟测试不代表真实平台兼容性已经验证。
+
 **NPC 核子力文化科技**：甲方操盘手出身的全球公关与品牌团队，也是媒体资源平台「媒介桥」和 AI 工具「任务大师」的打造者。
 
 [了解 NPC ↗](https://www.npctech.site/) · [媒介桥 · media.npctech.site ↗](https://media.npctech.site/)
