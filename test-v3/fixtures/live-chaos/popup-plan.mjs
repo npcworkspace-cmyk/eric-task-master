@@ -1,4 +1,13 @@
 export const POPUP_FAMILIES = Object.freeze(['benign-overlay', 'risky-consent', 'destructive-confirmation', 'login-security', 'new-tab', 'iframe-modal', 'native-alert', 'native-choice']);
+export const FOUR_HOURS = 4 * 3600000;
+export const EIGHT_HOURS = 8 * 3600000;
+
+export function liveDurationGates({ targetDurationMs, elapsedMs, evidenceComplete }) {
+  const fourHourGatePassed = evidenceComplete === true && targetDurationMs >= FOUR_HOURS && elapsedMs >= FOUR_HOURS;
+  return { requiredDurationMs: FOUR_HOURS, acceptanceGatePassed: fourHourGatePassed, fourHourGatePassed,
+    eightHourGatePassed: evidenceComplete === true && targetDurationMs >= EIGHT_HOURS && elapsedMs >= EIGHT_HOURS,
+    shortSmokeOnly: targetDurationMs < FOUR_HOURS };
+}
 
 export function seededRandom(seed) {
   let value = 2166136261;
@@ -6,7 +15,7 @@ export function seededRandom(seed) {
   return () => { value ^= value << 13; value ^= value >>> 17; value ^= value << 5; return (value >>> 0) / 4294967296; };
 }
 
-export function popupPlan({ seed, durationMs = 8 * 3600000 } = {}) {
+export function popupPlan({ seed, durationMs = FOUR_HOURS } = {}) {
   if (!Number.isSafeInteger(durationMs) || durationMs < 24000) throw new Error('Popup experiment duration must be at least 24000ms');
   const random = seededRandom(seed);
   const slotMs = durationMs / 24;

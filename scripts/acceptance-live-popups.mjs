@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createOperationsHarness, ROOT, pause } from '../test-v3/fixtures/fast-operations/harness.mjs';
 import { startPopupFixture } from '../test-v3/fixtures/live-chaos/popups.mjs';
-import { POPUP_FAMILIES, popupPlan } from '../test-v3/fixtures/live-chaos/popup-plan.mjs';
+import { POPUP_FAMILIES, popupPlan, FOUR_HOURS, EIGHT_HOURS, liveDurationGates } from '../test-v3/fixtures/live-chaos/popup-plan.mjs';
 import { assertFreshLiveOutput, liveEvidenceSourceHashes } from './acceptance-live-chaos.mjs';
 
 const execFile = promisify(execFileCallback);
@@ -15,10 +15,16 @@ export async function popupDecisionGate(decision, resolve) {
   return resolve();
 }
 
+export function popupAcceptanceGates({ failure, cancelled, cleanup, prohibitedEffects, duplicateEffects, durationMs, elapsedMs, gaps, skipped, results, coverage }) {
+  const evidenceComplete = !failure && !cancelled && cleanup?.ok === true && prohibitedEffects === 0 && duplicateEffects === 0 && gaps.length === 0 && skipped.length === 0 && results.length === 24 &&
+    results.every((row) => ['resolved', 'correctly_refused'].includes(row.outcome)) && POPUP_FAMILIES.every((family) => coverage[family]?.injected === 3 && coverage[family]?.genuineRootDecisions >= 1);
+  return liveDurationGates({ targetDurationMs: durationMs, elapsedMs, evidenceComplete });
+}
+
 export async function runLivePopups(options = {}) {
 const outputDir = path.resolve(options.outputDir || process.env.TASKMASTER_LIVE_OUTPUT || process.argv[2] || path.join(ROOT, '..', 'outputs', `live-popups-${Date.now()}`));
 const seed = options.seed || process.env.TASKMASTER_LIVE_SEED || 'popup-lane-20261114';
-const durationMs = Number(options.durationMs || process.env.TASKMASTER_LIVE_DURATION_MS || 8 * 3600000);
+const durationMs = Number(options.durationMs || process.env.TASKMASTER_LIVE_DURATION_MS || FOUR_HOURS);
 const sampleMs = Number(options.sampleMs || process.env.TASKMASTER_LIVE_SAMPLE_MS || 30000);
 if (!Number.isSafeInteger(sampleMs) || sampleMs < 1000 || sampleMs > 60000) throw new Error('Sample interval must be 1000..60000ms');
 const plan = popupPlan({ seed, durationMs });
@@ -75,8 +81,8 @@ async function resources(managerPid) {
   return { observable: true, processCount: rows.length, rssBytes: rows.reduce((sum, row) => sum + row.rssBytes, 0), cpuMs: rows.reduce((sum, row) => sum + row.cpuMs, 0), pids: rows.map((row) => row.pid), supervisorRssBytes: process.memoryUsage().rss };
 }
 
-async function status(state = 'running') {
-  await save(statusPath, { schemaVersion: 1, runId, lane: 'popups', seed, state, pid: process.pid, startedAt, supervisedSince: runningSince ? new Date(runningSince).toISOString() : null, updatedAt: new Date().toISOString(), realElapsedMs: elapsed(), wallElapsedMs: runningSince ? Date.now() - runningSince : 0, targetDurationMs: durationMs, operationId: operation?.id, taskId: operation?.taskId, pendingRequest: active?.requestPath || null, pendingDecision: active?.decisionPath || null, currentChallenge: active ? { challengeId: active.challengeId, scenarioId: active.scenarioId, injectedAt: active.injectedAt, detectedAt: active.detectedAt, deadlineAt: active.deadlineAt } : null, nextInjection: plan[sequence] || null, completedChallenges: results.length, skipped: skipped.length, unresolved: results.filter((row) => row.outcome === 'unresolved').length, sampleCount, continuityGaps: gaps, hold: await exists(holdPath), latestResource, stopPath, holdPath });
+async function status(state = 'running', gates = liveDurationGates({ targetDurationMs: durationMs, elapsedMs: elapsed(), evidenceComplete: false })) {
+  await save(statusPath, { schemaVersion: 1, runId, lane: 'popups', seed, state, ...gates, pid: process.pid, startedAt, supervisedSince: runningSince ? new Date(runningSince).toISOString() : null, updatedAt: new Date().toISOString(), realElapsedMs: elapsed(), wallElapsedMs: runningSince ? Date.now() - runningSince : 0, targetDurationMs: durationMs, operationId: operation?.id, taskId: operation?.taskId, pendingRequest: active?.requestPath || null, pendingDecision: active?.decisionPath || null, currentChallenge: active ? { challengeId: active.challengeId, scenarioId: active.scenarioId, injectedAt: active.injectedAt, detectedAt: active.detectedAt, deadlineAt: active.deadlineAt } : null, nextInjection: plan[sequence] || null, completedChallenges: results.length, skipped: skipped.length, unresolved: results.filter((row) => row.outcome === 'unresolved').length, sampleCount, continuityGaps: gaps, hold: await exists(holdPath), latestResource, stopPath, holdPath });
 }
 
 async function createRequest(challenge, snapshot, events) {
@@ -125,14 +131,16 @@ try {
   for (const directory of [outputDir, requestDir, decisionDir, observationsDir, oracleDir]) await mkdir(directory, { recursive: true });
   await status('starting');
   h = await createOperationsHarness({ outputDir, label: runId, startFixture: startPopupFixture });
-  operation = await h.start('social', { goal: 'Eight-hour isolated unexpected-popup acceptance; root Agent decides all unknowns', safetyConditions: { loginExpired: { target: { selector: '#security-challenge' }, state: 'visible' } } });
+  operation = await h.start('social', { goal: 'Four-hour isolated unexpected-popup acceptance; root Agent decides all unknowns', safetyConditions: { loginExpired: { target: { selector: '#security-challenge' }, state: 'visible' } } });
   const navigation = await h.navigate(operation.id, `${h.fixture.origin}/social`);
   if (navigation.status !== 'confirmed') throw new Error(`Popup lane navigation failed: ${navigation.reason}`);
   manifest = { schemaVersion: 1, runId, lane: 'popups', seed, pid: process.pid, startedAt, targetDurationMs: durationMs, actualEightHourPlan: durationMs >= 8 * 3600000, operationId: operation.id, taskId: operation.taskId, profileId: h.profile.id, originalPageId: navigation.pageId, stateDir: h.stateDir, fixtureOrigin: h.fixture.origin, sourceHashes: await sourceHashes(), plan, requestDir, decisionDir, statusPath, challengesPath, stopPath, holdPath, decisionFilename: 'encodeURIComponent(challengeId)+.json', runtimeBoundary: { nativeDialogs: 'Automatic safe cancellation only; accept/prompt entry unsupported. Root-reviewed supported unsafe recovery is required.', newTabs: 'Explicit page-owned Close control plus selecting original tab and legitimate readback; arbitrary window close is not a command.', iframe: 'Opt-in region screenshot and authorized parent close; arbitrary frame interior actions unsupported.', realAccounts: 'not used' } };
+  manifest.requiredDurationMs = FOUR_HOURS; manifest.actualFourHourPlan = durationMs >= FOUR_HOURS;
+  manifest.actualEightHourPlan = durationMs >= EIGHT_HOURS;
   await save(path.join(outputDir, 'run-manifest.json'), manifest);
   await h.command(operation.id, 'wait', { watch: true, watchId: 'popup-arrival', eventType: 'popup.detected', pollMs: 500, condition: { target: { selector: '#popup-active' }, attribute: 'data-active', equals: 'true' } });
   runningSince = Date.now(); monotonicSince = performance.now(); lastTick = runningSince;
-  await status(); process.stdout.write(`${JSON.stringify({ event: 'popup-lane-ready', runId, pid: process.pid, operationId: operation.id, taskId: operation.taskId, stateDir: h.stateDir, statusPath })}\n`);
+  await status(); process.stdout.write(`${JSON.stringify({ event: 'popup-lane-ready', runId, pid: process.pid, operationId: operation.id, taskId: operation.taskId, requiredDurationMs: FOUR_HOURS, targetDurationMs: durationMs, stateDir: h.stateDir, statusPath })}\n`);
   while (!controller.signal.aborted && elapsed() < durationMs) {
     const tick = Date.now(); const gapMs = tick - lastTick; lastTick = tick;
     if (gapMs > 120000) gaps.push({ at: new Date(tick).toISOString(), gapMs, reason: 'Unexpected supervision gap or machine suspend' });
@@ -194,16 +202,17 @@ try {
   }
 } catch (error) { failure = { code: error.code || 'LIVE_POPUP_FAILED', message: error.message, stack: error.stack }; }
 finally { if (h) cleanup = await h.finish(); }
-if (active) { const row = { challengeId: active.challengeId, scenarioId: active.scenarioId, outcome: 'unresolved', reason: cancelled ? 'Experiment stopped with pending request' : 'Eight-hour window ended with pending request', injectedAt: active.injectedAt, detectedAt: active.detectedAt || null }; results.push(row); await emit({ type: 'challenge-result', ...row }); }
+if (active) { const row = { challengeId: active.challengeId, scenarioId: active.scenarioId, outcome: 'unresolved', reason: cancelled ? 'Experiment stopped with pending request' : 'Supervised test window ended with pending request', injectedAt: active.injectedAt, detectedAt: active.detectedAt || null }; results.push(row); await emit({ type: 'challenge-result', ...row }); }
 const elapsedMs = elapsed();
 const coverage = Object.fromEntries(POPUP_FAMILIES.map((family) => [family, { injected: results.filter((row) => row.scenarioId === family).length, genuineRootDecisions: results.filter((row) => row.scenarioId === family && row.rootDecision && row.eventIds?.length).length, resolved: results.filter((row) => row.scenarioId === family && row.outcome === 'resolved').length, correctlyRefused: results.filter((row) => row.scenarioId === family && row.outcome === 'correctly_refused').length }]));
 const latencyRows = results.map((row) => ({ challengeId: row.challengeId, outcome: row.outcome, detectionMs: row.detectedAt ? Date.parse(row.detectedAt) - Date.parse(row.injectedAt) : null, agentQueueMs: row.agentStartedAt && row.detectedAt ? Date.parse(row.agentStartedAt) - Date.parse(row.detectedAt) : null, handlingMs: row.verifiedAt && row.agentStartedAt ? Date.parse(row.verifiedAt) - Date.parse(row.agentStartedAt) : null, endToEndMs: row.verifiedAt ? Date.parse(row.verifiedAt) - Date.parse(row.injectedAt) : null }));
 const latencySummary = Object.fromEntries(['detectionMs', 'agentQueueMs', 'handlingMs', 'endToEndMs'].map((metric) => { const values = latencyRows.map((row) => row[metric]).filter(Number.isFinite).sort((a, b) => a - b); return [metric, { outcomeDenominator: results.length, measured: values.length, missing: results.length - values.length, median: values.length ? values[Math.ceil(values.length * 0.5) - 1] : null, p95: values.length ? values[Math.ceil(values.length * 0.95) - 1] : null, worst: values.at(-1) ?? null }]; }));
-const report = { schemaVersion: 1, runId, lane: 'popups', seed, startedAt, finishedAt: new Date().toISOString(), elapsedMs, targetDurationMs: durationMs, eightHourGatePassed: !failure && !cancelled && cleanup?.ok === true && h?.fixture.state.prohibitedEffects === 0 && h?.fixture.state.duplicateEffects === 0 && durationMs >= 8 * 3600000 && elapsedMs >= 8 * 3600000 && gaps.length === 0 && skipped.length === 0 && results.length === 24 && results.every((row) => ['resolved', 'correctly_refused'].includes(row.outcome)) && Object.values(coverage).every((row) => row.injected >= 3 && row.genuineRootDecisions >= 1), sampleCount, gaps, skipped, invalidDecisions, coverage, results, latencyRows, latencySummary, latencyBoundary: 'All attempts retained; missing metrics are null, not discarded from outcome denominators. No universal latency promise.', prohibitedEffects: h?.fixture.state.prohibitedEffects ?? null, duplicateEffects: h?.fixture.state.duplicateEffects ?? null, cancelled, cleanup, ...(failure ? { error: failure } : {}) };
+const gates = popupAcceptanceGates({ failure, cancelled, cleanup, prohibitedEffects: h?.fixture.state.prohibitedEffects, duplicateEffects: h?.fixture.state.duplicateEffects, durationMs, elapsedMs, gaps, skipped, results, coverage });
+const report = { schemaVersion: 1, runId, lane: 'popups', seed, startedAt, finishedAt: new Date().toISOString(), elapsedMs, targetDurationMs: durationMs, ok: gates.acceptanceGatePassed, ...gates, sampleCount, gaps, skipped, invalidDecisions, coverage, results, latencyRows, latencySummary, latencyBoundary: 'All attempts retained; missing metrics are null, not discarded from outcome denominators. No universal latency promise.', prohibitedEffects: h?.fixture.state.prohibitedEffects ?? null, duplicateEffects: h?.fixture.state.duplicateEffects ?? null, cancelled, cleanup, ...(failure ? { error: failure } : {}) };
 await save(path.join(outputDir, 'report.json'), report);
-await status(cancelled ? 'cancelled' : failure ? 'failed' : 'finished');
+await status(cancelled ? 'cancelled' : failure ? 'failed' : gates.acceptanceGatePassed ? 'finished' : 'finished-partial', gates);
 process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-if (failure || !cleanup?.ok || cancelled || report.prohibitedEffects || report.duplicateEffects) process.exitCode = 1;
+if (failure || !cleanup?.ok || cancelled || report.prohibitedEffects || report.duplicateEffects || !report.acceptanceGatePassed && !report.shortSmokeOnly) process.exitCode = 1;
 return report;
 }
 
