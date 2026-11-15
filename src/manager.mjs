@@ -60,6 +60,14 @@ function dashboardSameOrigin(request, origin) {
   return request.method === 'GET' && request.headers['sec-fetch-site'] === 'same-origin';
 }
 
+function requireCurrentClient(request) {
+  if (request.headers['x-taskmaster-runtime-version'] === VERSION) return;
+  const error = new HttpError(409, 'CLIENT_VERSION_MISMATCH',
+    `This Task Master client does not match Manager ${VERSION}; refresh the Agent Skill or Dashboard and use the current launcher.`);
+  error.nextAction = `The request was not executed. Read ${path.resolve(MODULE_DIR, '..', 'skills', 'eric-task-master', 'SKILL.md')} in full, use its locator to find the current launcher, then retry.`;
+  throw error;
+}
+
 function errorPayload(error, requestId) {
   const known = error instanceof HttpError || error instanceof TaskServiceError ||
     error instanceof ProfileStoreError || error instanceof JsonStoreConflictError || (typeof error?.code === 'string' && Number.isInteger(error?.statusCode));
@@ -339,6 +347,7 @@ export async function createManager({
           sendJson(response, 200, { ok: true, operations: await operationsService.list() }); return;
         }
         if (pathname === '/v1/operations' && request.method === 'POST') {
+          requireCurrentClient(request);
           sendJson(response, 201, { ok: true, operation: await operationsService.start(await readJson(request)) }); return;
         }
         if (pathname === '/v1/operations/stop-all' && request.method === 'POST') {
@@ -348,11 +357,16 @@ export async function createManager({
         if (operationsMatch) {
           const id = decodeURIComponent(operationsMatch[1]); const section = operationsMatch[2];
           if (!section && request.method === 'GET') { sendJson(response, 200, { ok: true, operation: await operationsService.get(id, { commandId: url.searchParams.get('commandId') || null }) }); return; }
-          if (section === 'commands' && request.method === 'POST') { sendJson(response, 202, { ok: true, command: await operationsService.command(id, await readJson(request)) }); return; }
-          if (section === 'actions' && request.method === 'POST') { sendJson(response, 200, { ok: true, result: await operationsService.action(id, await readJson(request)) }); return; }
+          if (section === 'commands' && request.method === 'POST') { requireCurrentClient(request); sendJson(response, 202, { ok: true, command: await operationsService.command(id, await readJson(request)) }); return; }
+          if (section === 'actions' && request.method === 'POST') {
+            const body = await readJson(request);
+            if (!['stop', 'pause', 'takeover', 'revoke', 'ack'].includes(body.action)) requireCurrentClient(request);
+            sendJson(response, 200, { ok: true, result: await operationsService.action(id, body) }); return;
+          }
           if (section === 'events' && request.method === 'GET') { sendJson(response, 200, { ok: true, ...(await operationsService.events(id, { after: integerParam(url.searchParams.get('after'), 0), waitMs: integerParam(url.searchParams.get('waitMs'), 0, { maximum: 30000 }) })) }); return; }
         }
         if (request.method === 'POST' && pathname === '/v1/cleanup') {
+          requireCurrentClient(request);
           const result = await taskService.cleanup(await readJson(request));
           if (!result.preview) await journal.append({
             level: 'info', event: 'space.cleaned',
@@ -366,6 +380,7 @@ export async function createManager({
           return;
         }
         if (request.method === 'POST' && pathname === '/v1/tasks') {
+          requireCurrentClient(request);
           sendJson(response, 201, { ok: true, task: await taskService.create(await readJson(request, { maxBytes: 8 * 1024 * 1024 })) });
           return;
         }
@@ -374,6 +389,7 @@ export async function createManager({
           return;
         }
         if (request.method === 'POST' && pathname === '/v1/profiles') {
+          requireCurrentClient(request);
           sendJson(response, 201, { ok: true, profile: await taskService.createProfile(await readJson(request)) });
           return;
         }
@@ -405,6 +421,7 @@ export async function createManager({
           return;
         }
         if (taskMatch && request.method === 'DELETE') {
+          requireCurrentClient(request);
           sendJson(response, 200, { ok: true, ...(await taskService.deleteTask(decodeURIComponent(taskMatch[1]))) });
           return;
         }
@@ -416,6 +433,7 @@ export async function createManager({
             return;
           }
           if (body.action === 'resume') {
+            requireCurrentClient(request);
             sendJson(response, 200, {
               ok: true,
               task: await taskService.resume(taskId, body.value ?? null, {
@@ -466,6 +484,7 @@ export async function createManager({
           return;
         }
         if (profileMatch && request.method === 'PATCH') {
+          requireCurrentClient(request);
           sendJson(response, 200, {
             ok: true,
             profile: await taskService.updateProfile(
@@ -476,6 +495,7 @@ export async function createManager({
           return;
         }
         if (profileMatch && request.method === 'DELETE') {
+          requireCurrentClient(request);
           sendJson(response, 200, {
             ok: true,
             ...(await taskService.deleteProfile(decodeURIComponent(profileMatch[1])))
@@ -486,6 +506,7 @@ export async function createManager({
           const identifier = decodeURIComponent(profileActions[1]);
           const body = await readJson(request);
           if (body.action === 'open') {
+            requireCurrentClient(request);
             sendJson(response, 200, { ok: true, ...(await taskService.openProfile(identifier)) });
             return;
           }

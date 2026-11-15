@@ -47,7 +47,7 @@ Space cleanup persists output metadata in batches of at most 64 task changes, in
 
 Frequent progress updates coalesce to the latest value once per second; state transitions flush pending progress first. Heartbeats renew the lease without rewriting task history. Output-budget scans share in-flight work and a five-second cache on progress; startup, periodic checks, diagnostics, and completion still enforce the budget directly.
 
-An optional `run --request-key KEY` makes submission retries return the existing task. A key is bound to the frozen module bytes and canonical request parameters; conflicting reuse is rejected. Different keys permit intentional repeats. `follow` drains retained terminal events and returns a cursor; `--wait-ms` optionally bounds one call. A compatible Manager is reused without maintenance on normal commands. Explicit idle maintenance is serialized with task creation and Profile operations.
+An optional `run --request-key KEY` makes submission retries return the existing task. A key is bound to the frozen module bytes and canonical request parameters; conflicting reuse is rejected. Different keys permit intentional repeats. `follow` drains retained terminal events and returns a cursor; `--wait-ms` optionally bounds one call. The Manager rejects old clients before new work, and each recognized Agent must reload and acknowledge the matching selected Skill. Safe stop and read controls remain available across version mismatches; stopping active work for an upgrade requires the Owner's explicit choice.
 
 ## Profiles and concurrency
 

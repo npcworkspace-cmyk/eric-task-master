@@ -6,14 +6,16 @@ import path from 'node:path';
 import test from 'node:test';
 import { removeTestTree } from './test-fs.mjs';
 import { createManager } from '../src/manager.mjs';
+import { VERSION } from '../src/contracts.mjs';
 import { managerRecoveryProof } from '../src/lib/manager-state.mjs';
 import { TaskServiceError } from '../src/runtime/task-service.mjs';
 
-async function json(url, { token, method = 'GET', body } = {}) {
+async function json(url, { token, method = 'GET', body, clientVersion = VERSION } = {}) {
   const response = await fetch(url, {
     method,
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(clientVersion === null ? {} : { 'x-taskmaster-runtime-version': clientVersion }),
       ...(body === undefined ? {} : { 'content-type': 'application/json' })
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) })
@@ -46,12 +48,13 @@ test('Manager exposes the minimal v3 loopback API and passes through errors', as
   const task = { id: 'task_1', title: 'demo', state: 'waiting', canResume: true };
   const profile = { id: 'profile_1', name: 'Default', state: 'idle', isDefault: true };
   const resumes = [];
+  let created = 0;
   const service = {
     status: async () => ({ state: 'ready', tasks: { total: 1, running: 1, queued: 0 }, profiles: 1 }),
     list: async () => [task],
     get: async () => task,
     events: async () => ({ task, events: [], truncated: false, nextAfter: 0 }),
-    create: async () => task,
+    create: async () => { created += 1; return task; },
     stop: async () => ({ ...task, state: 'stopped' }),
     resume: async (...args) => {
       resumes.push(args);
@@ -90,6 +93,24 @@ test('Manager exposes the minimal v3 loopback API and passes through errors', as
   assert.equal((await json(`${base}/v1/tasks`)).status, 401);
   assert.deepEqual((await json(`${base}/v1/tasks`, { token })).body.tasks, [task]);
   assert.equal((await json(`${base}/v1/tasks`, { token, method: 'POST', body: { modulePath: 'job.mjs' } })).status, 201);
+  for (const clientVersion of ['4.0.1', null]) {
+    const stale = await json(`${base}/v1/tasks`, { token, clientVersion, method: 'POST', body: { modulePath: 'job.mjs' } });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.error.code, 'CLIENT_VERSION_MISMATCH');
+    assert.match(stale.body.nextAction, /not executed/u);
+  }
+  assert.equal(created, 1, 'stale Agents must not submit a task');
+  const oldOps = await json(`${base}/v1/operations`, { token, clientVersion: '4.0.1', method: 'POST', body: {} });
+  assert.equal(oldOps.status, 409);
+  assert.equal(oldOps.body.error.code, 'CLIENT_VERSION_MISMATCH');
+  const oldResume = await json(`${base}/v1/tasks/task_1/actions`, {
+    token, clientVersion: '4.0.1', method: 'POST', body: { action: 'resume' }
+  });
+  assert.equal(oldResume.body.error.code, 'CLIENT_VERSION_MISMATCH');
+  const safeStop = await json(`${base}/v1/tasks/task_1/actions`, {
+    token, clientVersion: '4.0.1', method: 'POST', body: { action: 'stop' }
+  });
+  assert.equal(safeStop.body.task.state, 'stopped', 'old clients retain safe stop control');
   assert.equal((await json(`${base}/v1/tasks/task_1/events`, { token })).status, 200);
   assert.deepEqual((await json(`${base}/v1/tasks/task_1/artifacts?offset=0&limit=5`, { token })).body, {
     ok: true, artifacts: [], offset: 0, count: 0, truncated: false, nextOffset: null
@@ -318,7 +339,7 @@ test('space cleanup is authenticated, defaults to preview, and accepts only fixe
     assert.equal(invalid.body.error.code, body === null ? 'INVALID_JSON_BODY' : 'INVALID_CLEANUP_OPTIONS');
   }
   const response = await fetch(`${base}/v1/cleanup`, {
-    method: 'POST', headers: { origin: base, 'content-type': 'application/json' },
+    method: 'POST', headers: { origin: base, 'content-type': 'application/json', 'x-taskmaster-runtime-version': VERSION },
     body: JSON.stringify({ categories: ['browser-cache'], preview: false })
   });
   const after = await response.json();
