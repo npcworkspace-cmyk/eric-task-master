@@ -6,11 +6,11 @@ Let your Agent plan the work. Let Task Master keep the browser, task state, prog
 
 Eric Task Master runs on your own computer. It gives terminal-capable Agents one CLI for finite browser jobs and persistent operations: submit a script, keep a selected Chrome Profile alive, wait for a condition or scheduled event, hand control to a person, and continue from recorded state. The Agent supplies judgment and business logic; Task Master supplies execution and lifecycle control. It is not a general-purpose autonomous Agent.
 
-English | [简体中文](README.zh-CN.md) | [Download latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [4.0.0 release notes](docs/releases/4.0.0.md) | [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) | **[NPC Website ↗](https://www.npctech.site/)**
+English | [简体中文](README.zh-CN.md) | [Download latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [4.0.1 release notes](docs/releases/4.0.1.md) | [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) | **[NPC Website ↗](https://www.npctech.site/)**
 
 Built by **NPC**, a global PR and brand team with client-side experience—the creators of the Media Bridge media-resource platform and Task Master AI tool.
 
-[Explore NPC ↗](https://www.npctech.site/) · [Media Bridge · media.npctech.site ↗](https://media.npctech.site/)
+[Explore NPC ↗](https://www.npctech.site/) · [Media Bridge · npcpressbridge.com ↗](https://npcpressbridge.com/)
 
 ## Use your imagination
 
@@ -77,7 +77,7 @@ The Manager owns process lifetime, Profile leases, task state, progress, results
 
 Submitted work can continue after an Agent turn ends **while the local computer and runtime remain running**. This does not promise execution through sleep, shutdown or a closed Agent host, nor automatic recovery of every browser session after a restart.
 
-## Install 4.0.0
+## Install 4.0.1
 
 ### 1. Locate an existing installation first
 
@@ -91,17 +91,17 @@ Agents running as the same OS user share one selected Manager and Profile pool b
 
 ### 2. Download the matching runtime and Skill
 
-For a new installation, install stable Google Chrome and choose files from the [latest release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) or the [versioned 4.0.0 release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/tag/v4.0.0).
+For a new installation, install stable Google Chrome and choose files from the [latest release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) or the [versioned 4.0.1 release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/tag/v4.0.1).
 
 | Platform | Native installer | Portable ZIP |
 | --- | --- | --- |
-| Windows 10/11 x64 | `eric-task-master-v4.0.0-windows-x64-setup.exe` | `eric-task-master-v4.0.0-windows-x64-portable.zip` |
-| macOS Apple silicon | `eric-task-master-v4.0.0-macos-arm64.pkg` | `eric-task-master-v4.0.0-macos-arm64-portable.zip` |
-| macOS Intel | `eric-task-master-v4.0.0-macos-x64.pkg` | `eric-task-master-v4.0.0-macos-x64-portable.zip` |
-| Debian/Ubuntu x64 | `eric-task-master-v4.0.0-linux-x64.deb` | `eric-task-master-v4.0.0-linux-x64-portable.zip` |
-| Debian/Ubuntu arm64 | `eric-task-master-v4.0.0-linux-arm64.deb` | `eric-task-master-v4.0.0-linux-arm64-portable.zip` |
+| Windows 10/11 x64 | `eric-task-master-v4.0.1-windows-x64-setup.exe` | `eric-task-master-v4.0.1-windows-x64-portable.zip` |
+| macOS Apple silicon | `eric-task-master-v4.0.1-macos-arm64.pkg` | `eric-task-master-v4.0.1-macos-arm64-portable.zip` |
+| macOS Intel | `eric-task-master-v4.0.1-macos-x64.pkg` | `eric-task-master-v4.0.1-macos-x64-portable.zip` |
+| Debian/Ubuntu x64 | `eric-task-master-v4.0.1-linux-x64.deb` | `eric-task-master-v4.0.1-linux-x64-portable.zip` |
+| Debian/Ubuntu arm64 | `eric-task-master-v4.0.1-linux-arm64.deb` | `eric-task-master-v4.0.1-linux-arm64-portable.zip` |
 
-Also download **`eric-task-master-skill-v4.0.0.zip`**, `SHA256SUMS` and `UNSIGNED-BUILD.txt` from the same release. Verify checksums before installation. Windows and macOS packages are unsigned; portable ZIPs do not bypass SmartScreen or Gatekeeper.
+Also download **`eric-task-master-skill-v4.0.1.zip`**, `SHA256SUMS` and `UNSIGNED-BUILD.txt` from the same release. Verify checksums before installation. Windows and macOS packages are unsigned; portable ZIPs do not bypass SmartScreen or Gatekeeper.
 
 The runtime includes Node.js, Playwright, the CLI, Dashboard, background Manager, same-version driving Skill and optional online Codex adapter. It uses your installed stable Chrome rather than bundling Chromium. A portable package needs no system Node.js or administrator installation; extract it to a permanent directory and use its launcher:
 
@@ -121,7 +121,7 @@ Open `taskmaster panel`. For ordinary script work, retain an existing Profile or
 
 **Signed-in account administration defaults to the user's explicitly selected real local browser through a supported browser-use adapter.** A supported local-browser adapter is not bundled. If unavailable, choose explicitly between connecting that selected browser through a supported adapter and authorizing a Task Master-owned Profile for this task. Never silently switch identity, attach an arbitrary browser or substitute another Profile.
 
-Import the runtime's `app/skills/eric-task-master/` or `eric-task-master-skill-v4.0.0.zip` in the Agent's Skill manager. For folder-based installation, confirm `SKILL.md` is at the Skill root. Agents without a Skill manager can read [the driving Skill](skills/eric-task-master/SKILL.md) directly. Before declaring deployment complete, read back version 4.0.0 from Skill metadata, the absolute launcher's `--help`, and the running `manager status --json`.
+Import the runtime's `app/skills/eric-task-master/` or `eric-task-master-skill-v4.0.1.zip` in the Agent's Skill manager. For folder-based installation, confirm `SKILL.md` is at the Skill root. Agents without a Skill manager can read [the driving Skill](skills/eric-task-master/SKILL.md) directly. Before declaring deployment complete, read back version 4.0.1 from Skill metadata, the absolute launcher's `--help`, and the running `manager status --json`.
 
 ## First batch task
 

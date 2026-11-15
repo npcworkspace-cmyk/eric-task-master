@@ -6,11 +6,11 @@ Agent 负责计划和判断，任务大师负责保留浏览器、任务状态�
 
 Eric Task Master 运行在你自己的电脑上，为能调用终端的 Agent 提供统一 CLI，既能执行一次性批量任务，也能维持常驻操作：提交脚本、保留选定的 Chrome Profile、等待条件或定时事件、交给人工接管，再根据已记录的状态继续。业务逻辑和决策来自 Agent，任务大师负责执行与生命周期管理；它不是一个通用全自主 Agent。
 
-[English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [4.0.0 发布说明](docs/releases/4.0.0.md) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md) | **[NPC 官网 ↗](https://www.npctech.site/)**
+[English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [4.0.1 发布说明](docs/releases/4.0.1.md) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md) | **[NPC 官网 ↗](https://www.npctech.site/)**
 
 **NPC 核子力文化科技**：甲方操盘手出身的全球公关与品牌团队，也是媒体资源平台「媒介桥」和 AI 工具「任务大师」的打造者。
 
-[了解 NPC ↗](https://www.npctech.site/) · [媒介桥 · media.npctech.site ↗](https://media.npctech.site/)
+[了解 NPC ↗](https://www.npctech.site/) · [媒介桥 · npcpressbridge.com ↗](https://npcpressbridge.com/)
 
 ## 发挥你的想象力
 
@@ -77,7 +77,7 @@ Manager 管进程、Profile 租约、任务状态、进度、结果和清理；�
 
 Agent 一轮对话结束后，已提交任务可以继续运行，**前提是本机电脑和运行时仍在运行**。这不代表休眠、关机或 Agent 宿主关闭后仍能执行，也不承诺所有浏览器现场都能在重启后自动恢复。
 
-## 安装 4.0.0
+## 安装 4.0.1
 
 ### 1. 先定位已有安装
 
@@ -91,17 +91,17 @@ Windows 使用 Skill 的[只读启动器定位脚本](skills/eric-task-master/sc
 
 ### 2. 下载对应系统的运行时与 Skill
 
-全新安装先准备稳定版 Google Chrome，再从[最新 Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)或[固定版本 4.0.0](https://github.com/npcworkspace-cmyk/eric-task-master/releases/tag/v4.0.0)选择文件。
+全新安装先准备稳定版 Google Chrome，再从[最新 Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)或[固定版本 4.0.1](https://github.com/npcworkspace-cmyk/eric-task-master/releases/tag/v4.0.1)选择文件。
 
 | 平台 | 原生安装包 | 便携 ZIP |
 | --- | --- | --- |
-| Windows 10/11 x64 | `eric-task-master-v4.0.0-windows-x64-setup.exe` | `eric-task-master-v4.0.0-windows-x64-portable.zip` |
-| macOS Apple silicon | `eric-task-master-v4.0.0-macos-arm64.pkg` | `eric-task-master-v4.0.0-macos-arm64-portable.zip` |
-| macOS Intel | `eric-task-master-v4.0.0-macos-x64.pkg` | `eric-task-master-v4.0.0-macos-x64-portable.zip` |
-| Debian/Ubuntu x64 | `eric-task-master-v4.0.0-linux-x64.deb` | `eric-task-master-v4.0.0-linux-x64-portable.zip` |
-| Debian/Ubuntu arm64 | `eric-task-master-v4.0.0-linux-arm64.deb` | `eric-task-master-v4.0.0-linux-arm64-portable.zip` |
+| Windows 10/11 x64 | `eric-task-master-v4.0.1-windows-x64-setup.exe` | `eric-task-master-v4.0.1-windows-x64-portable.zip` |
+| macOS Apple silicon | `eric-task-master-v4.0.1-macos-arm64.pkg` | `eric-task-master-v4.0.1-macos-arm64-portable.zip` |
+| macOS Intel | `eric-task-master-v4.0.1-macos-x64.pkg` | `eric-task-master-v4.0.1-macos-x64-portable.zip` |
+| Debian/Ubuntu x64 | `eric-task-master-v4.0.1-linux-x64.deb` | `eric-task-master-v4.0.1-linux-x64-portable.zip` |
+| Debian/Ubuntu arm64 | `eric-task-master-v4.0.1-linux-arm64.deb` | `eric-task-master-v4.0.1-linux-arm64-portable.zip` |
 
-同时下载该 Release 下的 **`eric-task-master-skill-v4.0.0.zip`**、`SHA256SUMS` 和 `UNSIGNED-BUILD.txt`，安装前核对校验和。Windows 和 macOS 包尚未签名；使用便携 ZIP 也不能绕过 SmartScreen 或 Gatekeeper。
+同时下载该 Release 下的 **`eric-task-master-skill-v4.0.1.zip`**、`SHA256SUMS` 和 `UNSIGNED-BUILD.txt`，安装前核对校验和。Windows 和 macOS 包尚未签名；使用便携 ZIP 也不能绕过 SmartScreen 或 Gatekeeper。
 
 运行时包含 Node.js、Playwright、CLI、Dashboard 和后台 Manager，使用本机稳定版 Chrome，不另行捆绑 Chromium。便携包不要求系统安装 Node.js 或管理员安装；解压到固定目录后调用启动器：
 
@@ -121,7 +121,7 @@ Windows 使用 Skill 的[只读启动器定位脚本](skills/eric-task-master/sc
 
 **已登录账号后台默认使用用户明确选定的本机真实浏览器，经受支持的 browser-use 适配器操作。** 当前未捆绑此类 local-browser 适配器。缺少支持时，需要明确选择：连接选定的本机浏览器，或授权本次任务使用任务大师自有 Profile。不能静默切换身份、连接任意浏览器或替换成另一个 Profile。
 
-通过 Agent 的 Skill 管理器导入运行时自带的 `app/skills/eric-task-master/` 或 `eric-task-master-skill-v4.0.0.zip`。采用目录安装时，确认 `SKILL.md` 位于 Skill 根目录；没有 Skill 管理器的 Agent 可以直接读取[驱动 Skill](skills/eric-task-master/SKILL.md)。宣布部署完成前，分别读回 Skill 元数据、绝对路径启动器的 `--help` 和运行中 `manager status --json`，三处均应为 4.0.0。
+通过 Agent 的 Skill 管理器导入运行时自带的 `app/skills/eric-task-master/` 或 `eric-task-master-skill-v4.0.1.zip`。采用目录安装时，确认 `SKILL.md` 位于 Skill 根目录；没有 Skill 管理器的 Agent 可以直接读取[驱动 Skill](skills/eric-task-master/SKILL.md)。宣布部署完成前，分别读回 Skill 元数据、绝对路径启动器的 `--help` 和运行中 `manager status --json`，三处均应为 4.0.1。
 
 ## 第一个批量任务
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.0.1 - 2026-11-15
+
+- Correct the Media Bridge / 媒介桥 link in the bilingual READMEs, Dashboard and current release documentation to `https://npcpressbridge.com/`; retain the approved product name and all runtime behavior.
+- Publish matching 4.0.1 runtime packages and driving Skill so new Agent and user deployments have a consistent versioned entry. Existing installations are not silently upgraded.
+
 ## 4.0.0 - 2026-11-15
 
 Major release: combine the persistent operations introduced in 3.2.0 with an optional real online Agent handoff and complete same-version runtime/Skill distribution. Ordinary `.mjs` jobs remain supported; the runtime does not become a general-purpose autonomous Agent. See the [4.0.0 release notes](docs/releases/4.0.0.md) for deployment and evidence boundaries.

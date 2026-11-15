@@ -160,7 +160,7 @@ test('NPC and Media Bridge copy stay below the work area with native expanded po
   assert.ok(html.indexOf('id="panel-intro"') < html.indexOf('id="dashboard-message"'));
   for (const [id, url] of [
     ['panel-npc-link', 'https://www.npctech.site/'],
-    ['panel-media-link', 'https://media.npctech.site/']
+    ['panel-media-link', 'https://npcpressbridge.com/']
   ]) {
     const link = [...html.matchAll(/<a\b[^>]*>/gu)].map((match) => match[0])
       .find((tag) => tag.includes(`id="${id}"`));
@@ -173,14 +173,14 @@ test('NPC and Media Bridge copy stay below the work area with native expanded po
   assert.ok(details);
   assert.match(details, /\sopen(?:\s|=|>)/u);
   assert.match(html, /<summary\b[^>]*id="panel-possibilities-title"/u);
-  assert.match(html, /媒介桥 · media\.npctech\.site ↗/u);
+  assert.match(html, /媒介桥 · npcpressbridge\.com ↗/u);
   assert.match(html, /发挥你的想象力/u);
   assert.match(html, /网页上能做的事，基本都可以/u);
   assert.match(source, /Use your imagination/u);
-  assert.match(source, /Media Bridge · media\.npctech\.site ↗/u);
+  assert.match(source, /Media Bridge · npcpressbridge\.com ↗/u);
   for (const guide of [english, chinese]) {
     const links = [...guide.matchAll(/\[[^\]]+\]\(([^)\s]+)\)/gu)];
-    assert.ok(links.some(([, href]) => new URL(href, 'https://github.com/').href === 'https://media.npctech.site/'));
+    assert.ok(links.some(([, href]) => new URL(href, 'https://github.com/').href === 'https://npcpressbridge.com/'));
   }
   assert.match(chinese, /发挥你的想象力/u);
   assert.match(english, /Use your imagination/u);
