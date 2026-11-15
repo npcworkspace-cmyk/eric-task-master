@@ -219,3 +219,6 @@ Remove-Item Env:NODE_OPTIONS,Env:NODE_PATH -ErrorAction SilentlyContinue
   if ($null -eq $originalTaskMasterPort) { Remove-Item Env:ERIC_TASK_MASTER_PORT -ErrorAction SilentlyContinue } else { $env:ERIC_TASK_MASTER_PORT = $originalTaskMasterPort }
   Remove-Item -LiteralPath (Join-Path $staleLauncherDir 'taskmaster.cmd') -Force -ErrorAction SilentlyContinue
 }
+# The missing-current legacy launcher intentionally returned a nonzero exit
+# code above. Do not leak that expected result to the CI shell after success.
+$global:LASTEXITCODE = 0
