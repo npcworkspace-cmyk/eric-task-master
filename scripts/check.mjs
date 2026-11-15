@@ -66,7 +66,8 @@ async function staticChecks() {
 
   invariant(packageJson.version === VERSION, 'package.json and runtime versions differ');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock version differs');
-  invariant(/^3\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(VERSION), 'v3 release must use a stable semantic version');
+  invariant(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(VERSION), 'release must use a stable semantic version');
+  invariant(skill.includes(`version: "${VERSION}"`), 'portable Skill version differs from the runtime');
   invariant(packageJson.bin?.taskmaster === './src/cli.mjs', 'CLI binary contract changed');
   invariant(JSON.stringify(Object.keys(packageJson.dependencies || {})) === JSON.stringify(['playwright']),
     'Playwright must be the only production dependency');

@@ -1,5 +1,7 @@
 # Fast operations: bounded implementation contract
 
+Historical design snapshot. Its initial source-only scope, no-independent-Agent restriction and proposed long-test gates below were superseded by explicit later approvals. Current supported behavior and evidence are in [Fast operations](FAST-OPERATIONS.md), the [online adapter guide](CODEX-HOST-ADAPTER.md) and [4.0.0 release notes](releases/4.0.0.md). Do not use this historical plan as a deployment instruction or current release gate.
+
 Date: 2026-11-14. Source: workspace-root `TASKMASTER_TODO.md`, original 55 requirements plus six user-requested mode/Skill requirements (61 total). Baseline: `53094a406a2439dede9198b1670eb6b9b0d62edc`, 3.1.11. This document adds no authorization for real accounts, installed Manager/Profile replacement or release. Current delivery is isolated/local only. The user's latest explicit instruction replaces the earlier 24-hour gate with TWO concurrent 8-hour real-time lanes: dynamic business chaos and unexpected popups, with the root main Agent making actual recovery decisions.
 
 ## Product boundary and minimal architecture

@@ -1,8 +1,8 @@
 # Fast operations
 
-The new operations path keeps one existing Task Master task, worker and Chrome context alive across commands. The main Agent decides strategy and text; bounded local commands handle mechanical actions, scoped observation and condition waiting. No second model is installed or called.
+The operations path keeps one existing Task Master task, worker and Chrome context alive across commands. The authorized Agent decides strategy and text; bounded local commands handle mechanical actions, scoped observation and condition waiting. The Manager contains no model. In 4.0.0, an optional, explicitly configured [online Codex CLI host adapter](CODEX-HOST-ADAPTER.md) can start an independent decision Agent using a separately installed and signed-in CLI.
 
-This source delivery supports isolated, explicitly selected Task Master Profiles. Signed-in account administration still defaults to the user's real local browser. A supported browser-use host adapter is not bundled: selecting `local-browser` fails with `BROWSER_ADAPTER_UNAVAILABLE` and offers connecting the selected local browser through a supported adapter or explicitly choosing a Task Master Profile. It never silently launches a replacement or attaches arbitrary CDP.
+This delivery supports explicitly selected Task Master Profiles; its acceptance evidence uses isolated Profiles. Signed-in account administration still defaults to the user's real local browser. A supported browser-use host adapter is not bundled: selecting `local-browser` fails with `BROWSER_ADAPTER_UNAVAILABLE` and offers connecting the selected local browser through a supported adapter or explicitly choosing a Task Master Profile. It never silently launches a replacement or attaches arbitrary CDP. The new Codex decision adapter is not a browser-use adapter and does not remove this boundary.
 
 ## Modes and page ownership
 
@@ -72,7 +72,7 @@ Advertising actions preserve before/after, currency, daily/lifetime basis, field
 
 Screenshots are opt-in: supply a unique target or validated clip. They are private bounded artifacts, not default model input. Password/email/OTP and `data-private` regions are masked, but other visible data can remain; review before sharing. Observations omit credential-input values, private regions and executable page contents; stored structured data uses the existing redactor. Task-written arbitrary files remain subject to review.
 
-Event lifecycle is pending → delivered → received → handled. A receipt is not a decision. An explicitly configured absolute executable plus argument array can consume bounded JSON on stdin and return an identified accepted delivery receipt. Failed dispatch retains the same pending event for bounded retry. The fixture adapter demonstrates process plumbing only; it does not prove that a closed or ended Codex session can wake up. With no supported adapter, events remain available for a live Agent's bounded CLI long poll. Actual host token/cost usage that is unavailable is reported unobservable; character length is not substituted for tokens.
+Event lifecycle is pending → delivered → received → handled. A receipt is not a decision. An explicitly configured absolute executable plus argument array can consume bounded JSON on stdin and return an identified accepted delivery receipt. Failed dispatch retains the same pending event for bounded retry. The fixture adapter demonstrates process plumbing only. The optional bundled Codex CLI adapter has separate actual online observe/stop evidence; it does not wake the original desktop conversation or recover an offline host. With no configured supported adapter, events remain available for a live Agent's bounded CLI long poll. Actual host token/cost usage that is unavailable is reported unobservable; character length is not substituted for tokens.
 
 Schedules store UTC instants with an explicit IANA timezone, allowed window, per-window cap, expiry and `once`/`skip` misfire policy. Resume coalesces missed work instead of bursting a backlog. Run/duration/host-call limits are enforced; token/cost enforcement requiring unavailable measurements pauses rather than pretending to enforce spend.
 
@@ -115,9 +115,15 @@ node scripts/soak-fast-operations.mjs ABSOLUTE_OUTPUT_DIRECTORY
 
 The legacy `soak-fast-operations.mjs` defaults to 24 actual hours and retains its original `preliminary24HourGatePassed` field for compatibility; it is no longer this round's acceptance gate. It can still exercise deterministic fault coverage with `TASKMASTER_SOAK_DURATION_MS=180000` and `TASKMASTER_SOAK_SAMPLE_MS=5000`. Its short script-driven success is not a live main-Agent decision or a substitute for the user-revised test below.
 
-## Current gate: two real four-hour live lanes
+## 4.0.0 online-host acceptance
 
-On 2026-11-15 the user explicitly replaced the previous eight-hour target with two concurrent, separately isolated four-hour experiments and added a bounded 500-credit budget. Keep the same 24 cases per lane, scenario coverage, real main-Agent decisions and safety checks. Earlier stopped eight-hour runs remain historical incomplete evidence and contribute no duration to the new runs. Do not report either lane complete before its actual result exists:
+One isolated Windows online-host run completed 14,401,755.9 ms with 238 samples and a maximum 61.01-second sample gap. A previously verified scheduled-entry event was reused against unchanged adapter/core hashes, not re-run and not added to the new duration. Two new actual Codex CLI decisions covered a pending event across one failed delivery/reconnection and safe refusal of an unapproved publication request near the end. Both events were handled once; adapter idle model calls and simulator writes were zero. The final minutes observed the safely stopped task, followed by verified isolated cleanup. See the [4.0.0 release record](releases/4.0.0.md) and [adapter guide](CODEX-HOST-ADAPTER.md).
+
+This is bounded read-only online-host evidence, not real-platform writing, original desktop-thread wakeup, all-day stability or universal autonomous completion. Existing unmodified business/safety checks were reused. Ordinary deployment does not need to rerun these engineering experiments.
+
+## Historical optional experiments: two four-hour live lanes
+
+An earlier 2026-11-15 plan proposed two concurrent, separately isolated four-hour experiments. That plan was superseded by critical-risk release acceptance and the single online-host validation above. These scripts remain available for explicitly requested engineering work; they are not the 4.0.0 release gate. Their cancelled or short runs remain incomplete and contribute no duration to the completed online-host run. A future dual-lane claim still requires its own complete reports:
 
 ```text
 node scripts/acceptance-live-chaos.mjs ABSOLUTE_BUSINESS_LANE_OUTPUT
