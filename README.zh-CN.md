@@ -1,14 +1,12 @@
-# Eric Task Master · 任务大师
+# Eric Task Master 4.0 · 任务大师
 
-**让 Agent 离开对话框以后，任务仍然继续。**
+**让 AI Agent 的浏览器任务，在本机持续执行。**
 
-Eric Task Master 是运行在本机的全时浏览器任务底座。Agent 负责理解目标和生成最小脚本；Task Master 负责让真实 Chrome、登录态、任务进程、进度和结果跨越单次对话持续运行。它不替代 Agent，也不把工作锁进固定流程，而是把临时浏览器操作变成可并行、可恢复、可复用的自动化能力。
+Agent 负责计划和判断，任务大师负责保留浏览器、任务状态、进度与结果，让工作不止于一轮对话。
 
-Codex、Claude Code、WorkBuddy、Hermes、Pi，以及任何能调用本机终端并读取 JSON 的 Agent，都可以通过同一套 CLI 使用它。
+Eric Task Master 运行在你自己的电脑上，为能调用终端的 Agent 提供统一 CLI，既能执行一次性批量任务，也能维持常驻操作：提交脚本、保留选定的 Chrome Profile、等待条件或定时事件、交给人工接管，再根据已记录的状态继续。业务逻辑和决策来自 Agent，任务大师负责执行与生命周期管理；它不是一个通用全自主 Agent。
 
-[English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md) | **[NPC 官网 ↗](https://www.npctech.site/)**
-
-常驻快速交互、定时事件、持久决策与恢复见 [Fast operations 说明](docs/FAST-OPERATIONS.md)。执行模式只有 `batch` 和 `operations`；prompt 明确指定时仅覆盖本次任务，不改写 Profile 默认值。`auto` 负责选择模式，人工接管只是暂停自动操作的控制状态。登录后台仍遵守用户选择的本机浏览器边界，隔离模拟测试不代表真实平台兼容性已经验证。
+[English](README.md) | 简体中文 | [下载最新版](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [4.0.0 发布说明](docs/releases/4.0.0.md) | [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md) | **[NPC 官网 ↗](https://www.npctech.site/)**
 
 **NPC 核子力文化科技**：甲方操盘手出身的全球公关与品牌团队，也是媒体资源平台「媒介桥」和 AI 工具「任务大师」的打造者。
 
@@ -16,224 +14,181 @@ Codex、Claude Code、WorkBuddy、Hermes、Pi，以及任何能调用本机终�
 
 ## 发挥你的想象力
 
-不限于公开数据自动化采集、网页任务执行，还可以做批量资料整理、跨站信息核对、表单填写与后台录入、文件下载归档、内容与电商运营、网页监测和流程测试……
+任务明确、需要真实浏览器、执行时间较长，又不能丢掉身份和结果的工作，都适合从一个小脚本开始：
 
-网页上能做的事，基本都可以让你手头的 AI Agent 配合任务大师来设计流程，并在本机稳定执行。
+- 长时间调研与公开数据采集，边做边保存有效结果。
+- 重复网页任务，由脚本负责限速、检查点和结果核验。
+- 网页监测，在本机等待条件变化，需要判断时再产生事件。
+- 经过授权的内容、广告或网站流程，限定操作范围并读回确认。
+- 浏览器质量检查、文件下载归档，以及可复用的专业 Skill。
 
-- **长期调研与数据采集：**跨页面搜索、读取、整理和持续落盘，不因 Agent 一轮对话结束而中断。
-- **无人值守批量任务：**让脚本按目标、顺序、限速和检查点在后台持续工作，适合小时级或夜间任务。
-- **多账号与多工作空间：**每个 Chrome Profile 独立保存登录态；不同 Profile 可以被不同 Agent 同时使用，互不抢窗口。
-- **网页运营与重复操作：**后台录入、表单处理、内容流程、商品与账号工作，都可以由专用脚本或 Skill 定义。
-- **监测、巡检与质量检查：**持续观察页面变化、检查流程结果、记录异常，并把中间结果逐步交付出来。
-- **可复用的专业能力：**把验证有效的任务脚本、业务规则和结果检查方法沉淀为 Skill，交给更多 Agent 和电脑复用。
+这些是可构建的工作流方向，不代表所有网站都已兼容。具体站点怎么操作、怎样确认结果，仍由脚本或 Skill 定义，并需要在相应平台和授权范围内验证。
 
-它适合承载“任务明确、需要真实 Chrome、执行时间较长、结果必须保留”的网页工作。一次性需求可以立即运行；成熟流程可以继续升级为专业 Skill。
+Codex、Claude Code、WorkBuddy、Hermes、Pi，以及其他能运行本机 CLI、读取 JSON 的 Agent，都可以使用同一接口。核心运行时不需要逐个宿主安装插件、注册 MCP 或安装浏览器扩展。
 
-## 为什么不只用 Agent 内置浏览器
+## 两种执行模式
 
-Agent 内置浏览器适合即时交互，却很难承载长时间、可恢复、带登录态的任务。直接启动 Playwright 虽然自由，但每个 Agent 都要重新处理进程、Profile、进度、结果和清理。
+| 模式 | 适合什么 | 何时结束 |
+| --- | --- | --- |
+| `batch` | 有限动作组、一次性任务 | 本次限定工作完成后结束 |
+| `operations` | 持续观察、分批指令、条件等待和定时决策 | 保留任务与 Chrome 上下文，直到停止或达到限制 |
 
-Task Master 补上的是中间这一层：
+任务 prompt 明确指定模式时，只覆盖本次任务，不修改 Profile 的默认值。否则按 Profile 策略选择；`auto` 参考 Skill 声明或等待、后续跟进意图，最后回退到 batch。`auto` 是选择策略，不是第三种执行引擎。
 
-- **Agent 退出，任务不退出：**本机 Manager 和 Worker 继续运行。
-- **登录一次，后续复用：**命名 Profile 使用本机稳定版 Chrome，并长期保留浏览器状态。
-- **多个 Agent，各做各的：**不同 Profile 可并行运行；同一 Profile 始终只有一个写入者。
-- **边做边交付：**进度和文件在运行中就可读取；任务提前停止也不否定已经落盘的结果。
-- **遇到人工验证不丢现场：**保留浏览器、通知用户并支持暂停后恢复。
-- **结束以后自动收尾：**停止或删除任务时终止所属进程、释放 Profile，并在确认旧进程已停止后回收失效租约。
+**人工接管是暂停锁，不是执行模式。** 接管时保留浏览器，阻止自动修改；自动化不能自行解除。恢复需要明确操作，旧目标引用失效，未确认的外部结果必须先核对。切换模式不会切换身份，也不会扩大权限。
 
-## 一个基座，三种使用深度
+## 4.0 带来的变化
 
-### 1. Manager：稳定执行层
+### 常驻操作
 
-Manager 负责浏览器进程、Profile 租约、任务状态、进度、输出文件、停止、恢复和清理。人可以在本机面板查看当前工作，Agent 通过 CLI 使用同一套状态。
+同一个任务、Worker 和 Chrome 上下文可以承接多批有限指令：观察指定区域、使用当前页面的有效目标、执行小批动作、确认结果，再等待下一步。本机条件观察器负责安静等待，不必每次轮询都请求模型判断。
 
-### 2. `.mjs`：最快的自由任务
+普通 `.mjs` 任务继续保留。脚本仍可直接使用内置 Playwright、CDP、HTTP、Node.js 工具、自定义重试和检查点；Manager 不要求注册网站专属任务类型或脚本资产。
 
-Agent 收到新需求后，只写一份最小 JavaScript 文件就能运行。脚本可以直接使用 Playwright、`page.evaluate()`、CDP、HTTP、本地文件、自定义并发、限速、重试和检查点；Manager 不强迫它套用额外动作框架。
+### 定时事件与明确决策
 
-### 3. Skill：可复用的专业能力
+定时计划记录时间、时区、允许执行窗口、有效期和次数限制。错过的工作按有限补偿策略处理，不会无上限补跑。事件区分 **pending、delivered、received、handled**：送达不等于 Agent 已判断，更不等于业务动作成功。
 
-当一套流程被反复验证后，可以把操作方法、执行脚本、业务约束和结果检查沉淀成 Skill。Task Master 保持通用，垂直能力在 Skill 层独立迭代，避免一个核心项目塞入所有网站和业务逻辑。
+在线 Agent 可以通过 CLI 长轮询接收事件；明确配置的宿主适配器也可以把事件交给另一个进程。可选的 [在线 Codex CLI 适配器](docs/CODEX-HOST-ADAPTER.md) 使用独立安装、已有登录的 Codex CLI，只在事件到来时调用，并持久记录模型调用额度。目前它只接受白名单范围的**只读观察或安全停止**，不负责发布、发消息或修改业务记录。
 
-这三层既可以单独使用，也可以组合：临时需求直接跑小脚本，稳定需求调用专业 Skill，所有任务共用同一个长期运行基座。
+### 授权、读回和恢复
 
-## 平台价值
+常驻操作把权限绑定到选定的浏览器与账号、资源、域名、允许动作和有效期。Manager 在执行前记录动作，在外部效果发生前持久确认启动，再通过读回判断预期结果是已确认还是未知。
 
-Task Master 的目标不只是“控制一个浏览器”，而是成为多个 Agent 共用的本机任务执行平台：
+结果不明的写入不会自动重试。必须回到同一授权资源，核对原始预期结果后再决定下一步。可选的单次发送传输策略，为明确选定的任务大师 Profile、已知的小型同源 JSON POST 增加有限保护；它和动作记录都不等于外部系统的通用“恰好一次”保证。
 
-- **统一入口：**不同 Agent 都使用同一条 CLI 路径，不依赖专属插件或宿主协议。
-- **任务与 Agent 解耦：**任务由 Manager 持有，不依赖发起它的对话窗口继续存在。
-- **能力与基座解耦：**业务变化只更新脚本或 Skill，不需要不断修改 Manager。
-- **数据由任务掌握：**输出是普通文件，可继续分析、审计、转换和交付，不被锁进面板。
-- **减少重复成本：**复用登录态、任务状态和专业 Skill，减少 Agent 反复观察页面、重建上下文和重写控制器带来的时间与 Token 消耗。
-- **从一次性到规模化：**先用最小脚本验证，再把高价值流程沉淀为 Skill，逐步形成个人或团队的自动化能力库。
+具体配置、命令、传输限制与恢复规则见 [Fast operations](docs/FAST-OPERATIONS.md)。
 
-因此，同一套基座可以用于网页调研、数据采集、内容和账号流程、电商后台、线索开发、页面监控、浏览器 QA，以及 Agent 能用 JavaScript 描述的其他任务。
-
-## 工作方式
+## 小核心，可复用的工作流
 
 ```text
-专业 Skill ─┐
-临时 .mjs ──┼─> Agent ─> taskmaster CLI ─> 本机 Manager ─> Worker ─> Chrome Profile
-自然语言任务 ┘                              │
-                                             └─> 进度、事件、结果文件
+Agent + 可选 Skill
+        │ 计划、脚本、决策
+        ▼
+taskmaster CLI → 本机 Manager → Worker → 选定的 Chrome Profile
+                      │
+                      ├─ 任务状态、进度与结果文件
+                      └─ 常驻操作、计划与持久事件
 
-人 ───────────────────────────────> 本机面板：任务控制与 Profile 管理
+用户 → 本机 Dashboard → 任务控制、Profiles 与人工接管
 ```
 
-Agent 与 Manager 的通信是本机 CLI + 机器可读 JSON：
+Manager 管进程、Profile 租约、任务状态、进度、结果和清理；脚本与 Skill 管站点行为和业务逻辑。不同 Profile 可以并行，同一个 Profile 同时只有一个写入者。Dashboard 只保留 Tasks 和 Profiles 两个工作视图。
 
-1. `run --detach` 提交脚本和输入，立即返回任务 ID；
-2. `follow` 持续读取进度、状态和事件游标；
-3. `files` 列出任务产物，`files --read` 读取指定结果文件；
-4. `stop`、`resume`、`delete` 控制任务生命周期。
+Agent 一轮对话结束后，已提交任务可以继续运行，**前提是本机电脑和运行时仍在运行**。这不代表休眠、关机或 Agent 宿主关闭后仍能执行，也不承诺所有浏览器现场都能在重启后自动恢复。
 
-Manager 只监听 `127.0.0.1`。不需要 MCP 注册、浏览器插件、配对码或为每个 Agent 单独部署控制器。
+## 安装 4.0.0
 
-## 三步部署
+### 1. 先定位已有安装
 
-### 第一步：先检查 Manager，缺少时才安装
+新 Agent 部署时，**先检查 Manager，缺少时才安装**。所需版本已部署时，**只给新 Agent 安装或更新 Skill**。发现旧版则安排明确授权的空闲升级，不另建第二套 Manager 或替换已有 Profile 池。
 
-在 Windows 部署时，先使用 Skill 自带的[只读启动器定位工具](skills/eric-task-master/scripts/find-launcher.ps1)，即使旧 PATH 中已经有启动器也一样。它优先确认正在运行的 Manager，再读取已选共享位置和系统安装登记；macOS/Linux 使用已安装或已知便携目录中的启动器。用返回的绝对路径执行 `--help`，本次会话始终沿用它。启动器可用，就保留现有 Profile，只给新 Agent 安装或更新 Skill。定位不确定或状态位置报错时，应报告证据，不能重装、合并数据或重建 Profile。结果含义见[部署文档](docs/INSTALLERS.md)。
+Windows 使用 Skill 的[只读启动器定位脚本](skills/eric-task-master/scripts/find-launcher.ps1)；macOS/Linux 使用已安装或已知便携目录中的启动器。用 `--help` 确认绝对路径，本次会话继续使用该路径。定位不明确或状态目录报错，不等于可以重新安装、合并数据或重建 Profile。
 
-同一系统用户的多个 Agent 默认共用已选 Manager 和 Profile 池，切换工作目录不会另建默认库。需要独立数据项目时，在每条命令显式传入 `--state-dir 绝对目录`；未指定 `--port` 时自动发现自己的端口。普通启动只复用 Manager，不替换版本；运行时升级由 Owner 显式执行 `manager start --upgrade`，且必须空闲。原生安装、卸载会拒绝使用中的运行时；更新 Skill 不会停止共享 Manager。
+同一系统用户下的 Agent 默认共用一个选定的 Manager 和 Profile 池。独立项目需要在每条命令中明确传入 `--state-dir ABSOLUTE_DIRECTORY`。常规启动会复用兼容的运行中 Manager，不会静默替换版本。
 
-无论是否已有 Manager，电脑都需要稳定版 Google Chrome。确认没有 Manager 后，才从[最新 GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)下载两个文件：
+**Manager 与 Agent Skill 是两份独立安装。** 更新 Skill 不会升级运行时。旧安装要使用 4.0 能力，应由 Owner 明确安排空闲升级；原生安装和卸载会拒绝占用中的运行时。保留已有 Profile、任务记录与输出，详见[安装说明](docs/INSTALLERS.md)和[状态恢复](docs/STATE-BACKUP-RECOVERY.md)。
 
-1. 对应系统和 CPU 的 Manager **安装包或便携 ZIP**；
-2. `eric-task-master-skill-v<VERSION>.zip`。
+### 2. 下载对应系统的运行时与 Skill
 
-| 系统 | 安装包 | 便携包 |
+全新安装先准备稳定版 Google Chrome，再从[最新 Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)或[固定版本 4.0.0](https://github.com/npcworkspace-cmyk/eric-task-master/releases/tag/v4.0.0)选择文件。
+
+| 平台 | 原生安装包 | 便携 ZIP |
 | --- | --- | --- |
-| Windows 10/11 x64 | `eric-task-master-v<VERSION>-windows-x64-setup.exe` | `eric-task-master-v<VERSION>-windows-x64-portable.zip` |
-| macOS Apple silicon | `eric-task-master-v<VERSION>-macos-arm64.pkg` | `eric-task-master-v<VERSION>-macos-arm64-portable.zip` |
-| macOS Intel | `eric-task-master-v<VERSION>-macos-x64.pkg` | `eric-task-master-v<VERSION>-macos-x64-portable.zip` |
-| Debian/Ubuntu x64 | `eric-task-master-v<VERSION>-linux-x64.deb` | `eric-task-master-v<VERSION>-linux-x64-portable.zip` |
-| Debian/Ubuntu arm64 | `eric-task-master-v<VERSION>-linux-arm64.deb` | `eric-task-master-v<VERSION>-linux-arm64-portable.zip` |
+| Windows 10/11 x64 | `eric-task-master-v4.0.0-windows-x64-setup.exe` | `eric-task-master-v4.0.0-windows-x64-portable.zip` |
+| macOS Apple silicon | `eric-task-master-v4.0.0-macos-arm64.pkg` | `eric-task-master-v4.0.0-macos-arm64-portable.zip` |
+| macOS Intel | `eric-task-master-v4.0.0-macos-x64.pkg` | `eric-task-master-v4.0.0-macos-x64-portable.zip` |
+| Debian/Ubuntu x64 | `eric-task-master-v4.0.0-linux-x64.deb` | `eric-task-master-v4.0.0-linux-x64-portable.zip` |
+| Debian/Ubuntu arm64 | `eric-task-master-v4.0.0-linux-arm64.deb` | `eric-task-master-v4.0.0-linux-arm64-portable.zip` |
 
-安装包自带 Node.js、Playwright、CLI、本机面板和按需启动的后台 Manager；用户不需要再配置 Node.js 或下载 Chromium。
+同时下载该 Release 下的 **`eric-task-master-skill-v4.0.0.zip`**、`SHA256SUMS` 和 `UNSIGNED-BUILD.txt`，安装前核对校验和。Windows 和 macOS 包尚未签名；使用便携 ZIP 也不能绕过 SmartScreen 或 Gatekeeper。
 
-安装器不可用时，下载 `eric-task-master-v<VERSION>-<target>-portable.zip` 和同一 Release 的 `SHA256SUMS`，校验后解压到长期保留的目录：
+运行时包含 Node.js、Playwright、CLI、Dashboard 和后台 Manager，使用本机稳定版 Chrome，不另行捆绑 Chromium。便携包不要求系统安装 Node.js 或管理员安装；解压到固定目录后调用启动器：
 
 ```powershell
-# Windows
+# Windows 便携版示例
 & 'C:\Tools\eric-task-master\bin\taskmaster.cmd' panel
 ```
 
 ```bash
-# macOS / Linux
+# macOS / Linux 便携版示例
 '/absolute/path/eric-task-master/bin/taskmaster' panel
 ```
 
-便携包不要求管理员权限，也不依赖系统 Node.js。当前 Windows 和 macOS 安装包尚未签名，系统可能要求用户确认；便携 ZIP 不会绕过 SmartScreen 或 Gatekeeper。完整的平台选择、升级和兼容范围见[部署文档](docs/INSTALLERS.md)。
+### 3. 选定浏览器，把 Skill 交给 Agent
 
-### 第二步：准备默认 Profile
+运行 `taskmaster panel`。普通脚本工作应保留已有 Profile，或创建命名 Profile、打开原生 Chrome 窗口、按需登录，关闭手动窗口后选定默认 Profile。不要因为启动器定位出错就替换原有 Profile。
 
-运行：
+**已登录账号后台默认使用用户明确选定的本机真实浏览器，经受支持的 browser-use 适配器操作。** 当前未捆绑此类 local-browser 适配器。缺少支持时，需要明确选择：连接选定的本机浏览器，或授权本次任务使用任务大师自有 Profile。不能静默切换身份、连接任意浏览器或替换成另一个 Profile。
 
-```bash
-taskmaster panel
-```
+通过 Agent 的 Skill 管理器导入运行时自带的 `app/skills/eric-task-master/` 或 `eric-task-master-skill-v4.0.0.zip`。采用目录安装时，确认 `SKILL.md` 位于 Skill 根目录；没有 Skill 管理器的 Agent 可以直接读取[驱动 Skill](skills/eric-task-master/SKILL.md)。宣布部署完成前，分别读回 Skill 元数据、绝对路径启动器的 `--help` 和运行中 `manager status --json`，三处均应为 4.0.0。
 
-如果已有默认 Profile，继续使用即可。否则在面板创建 Profile，打开它的原生 Chrome 窗口并完成登录；关闭窗口后，把该 Profile 设为默认。自动化任务会复用同一份登录状态。网站仍可能在之后要求重新验证。
+## 第一个批量任务
 
-重装 Manager 会保留独立用户状态目录中的 Profile。如果登记文件丢失、但 v3 Profile 目录仍在，Manager 3.1.5 及后续版本会将它们以 `Recovered profile_<id>` 的名称重新列出，不改动浏览器文件；请在面板重新指定正确的默认 Profile。范围和安全边界见[状态恢复说明](docs/STATE-BACKUP-RECOVERY.md)。
-
-### 第三步：把 Skill 给 Agent
-
-通过 Agent 的 Skill 管理界面导入 `eric-task-master-skill-v<VERSION>.zip`；如果使用目录式安装，先解压，再确认 Skill 根目录直接包含 `SKILL.md`。Agent 不支持 Skill 时，也可以直接把本仓库链接交给它，让它阅读 `skills/eric-task-master/SKILL.md`。
-
-之后只需要告诉 Agent 具体任务。它会沿固定路径写最小 `.mjs`、运行一次、返回面板地址并持续跟进结果。
-
-## Agent 固定路径
-
-```bash
-taskmaster run ./job.mjs --input '@./input.json' --detach --json
-taskmaster panel --json
-taskmaster follow TASK_ID --wait-ms 60000 --json
-taskmaster files TASK_ID --json
-```
-
-第一次 `follow` 不需要游标；后续调用使用返回的 `after` 值继续读取：`taskmaster follow TASK_ID --after AFTER --wait-ms 60000 --json`。不指定 `--profile` 时使用面板中的默认 Profile。Manager 未启动时，`run` 会自动在后台启动。所有命令都支持 `--json`，便于不同 Agent 稳定解析。
-
-`panel --json` 只返回固定面板地址，不打开浏览器。多个任务复用同一链接；明确需要打开面板时才执行 `taskmaster panel`。任务使用的浏览器窗口在任务结束后关闭，手动打开的管理面板保留。
-
-最小任务：
+保存可信的最小 `job.mjs`：
 
 ```js
 export async function run({ page, input, outputDir, progress, signal }) {
   await page.goto(input.url, { waitUntil: 'domcontentloaded' });
   const title = await page.title();
-  await progress({ current: 1, total: 1, message: '已读取标题' });
+  await progress({ current: 1, total: 1, message: 'Collected title' });
   return { title, outputDir, aborted: signal.aborted };
 }
 ```
 
-提交时只冻结入口 `.mjs`。请保持单文件自包含：可以使用 Node.js 内置模块、裸导入 `playwright`、任务 `input`、绝对路径和 `outputDir`；入口旁边的相对导入或资源不会被自动复制。
-
-## 核心命令
+然后使用已确认的启动器：
 
 ```bash
-taskmaster status --json
-taskmaster profiles list --json
-taskmaster profiles create NAME --json
-taskmaster profiles default NAME_OR_ID --json
-taskmaster run ./job.mjs --input '@./input.json' --detach --json
+taskmaster run ./job.mjs --input '{"url":"https://example.com"}' --detach --json
+taskmaster panel --json
 taskmaster follow TASK_ID --wait-ms 60000 --json
 taskmaster files TASK_ID --json
-taskmaster files TASK_ID --read RELATIVE_PATH --json
-taskmaster stop TASK_ID --json
-taskmaster resume TASK_ID --json
-taskmaster delete TASK_ID --json
-taskmaster panel
 ```
 
-## 长任务、验证和结果
+`run` 按需启动 Manager 并返回任务 ID。后续 `follow` 带上上次返回的 `after` 游标继续读取。`panel --json` 只返回 Dashboard 地址，不会反复打开窗口。普通脚本省略 `--profile` 时使用选定的默认 Profile。
 
-- 任务脚本应把有价值的数据持续写入 `outputDir`，不要等到最后才一次保存。
-- `progress()` 用于报告当前动作和已处理数量；`follow` 可在 Agent 重连后从事件游标继续读取。
-- 脚本检测到验证页面时可以调用 `wait({ reason: 'verification' })`。Manager 保留 Chrome 和 Worker，通知用户、保存诊断截图，并在限定时间后保留现场自动暂停。
-- 任务可以由 Agent 或人在面板恢复；截图探测期间，Agent 按 `follow` 返回的当前 `probeId` 恢复。Task Master 不自动识别或破解验证码。
-- 面板只显示排队、运行、等待和停止中的当前任务。任务结束后卡片自动消失，但记录和结果仍可通过 CLI 读取或显式清理。
-- 面板的「清理空间」可删除闲置 Profile 缓存和已结束任务的临时脚本；历史结果需要单独选择，登录态、扩展数据和正在使用的任务不会被清理。
+只有提交的 `.mjs` 入口会被冻结，旁边的文件不会自动复制；保持脚本自包含，或使用明确的绝对资源路径。重要数据应逐步写入 `outputDir`，不要只在任务结束时保存。
 
-## 为什么容易维护和扩展
+## 开始一个常驻操作
 
-- **核心很薄：**Manager 只维护任务、进程、Profile、进度和结果，不内置站点规则。
-- **升级边界清楚：**应用程序与用户 Profile、登录态、任务记录分开存放，升级 Manager 不需要重建业务能力。
-- **运行环境内置：**Agent 使用 Manager 已验证的浏览器自动化依赖，不需要自行安装或选择 Playwright 版本。
-- **脚本无需注册：**新任务不进入资产库，不用维护 Task Type；一次性脚本提交后即可运行。
-- **Skill 独立演进：**网站适配、行业知识和结果验收在各自 Skill 中维护，可以单独发布、替换和复用。
-- **跨平台一致：**Windows、macOS 和 Linux 使用同一 CLI 合约与同一种任务文件。
+先按[操作指南](docs/FAST-OPERATIONS.md)准备范围明确的 `start.json`，包含用户选定的浏览器、账号与资源证据、允许动作和有效期。配置示例本身不构成真实账号操作授权。
 
-## Task Master Skills 社区
+```bash
+taskmaster ops start --input '@start.json' --json
+taskmaster ops command OP_ID --input '@observe.json' --json
+taskmaster ops get OP_ID --json
+taskmaster ops events OP_ID --after CURSOR --wait-ms 30000 --json
+taskmaster ops takeover OP_ID --json
+taskmaster ops stop OP_ID --json
+```
 
-想先用现成工作流，可以到 [Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/README.zh-CN.md)寻找红人开发、社群调研等能力。配套 Skill 提供具体工作的操作说明、执行脚本和结果检查方法；Skill 按需安装，也可以继续直接运行自己的脚本。
+命令返回持久受理记录，实际完成情况要读取对应回复。保留操作 ID 和事件游标；断线后先检查当前状态与未决动作，再继续。`ops stop-all` 只停止常驻操作，不影响无关脚本任务，也不能撤销服务端已经接受的动作。
 
-有一套已经帮你节省时间的工作流？欢迎把有用部分整理成 Skill。可以先[提交想法](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/issues/new?template=skill-proposal.md)，改进已有 Skill，或者按照[贡献指南](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md)提交 PR。审核通过后，它就能成为其他人可以下载、安装和使用的版本。
+## 人工验证与结果保留
 
-我们希望一个人和自己的 Agent 也能组织大批量、有结果的工作。每一个共享工作流、经过验证的修复和更清楚的说明，都在帮助下一个人多自动化一部分工作，让个人与小团队的规模化自动化逐步成为可能。
+- 脚本可以进入 `wait({ reason: 'verification' })`：保留 Chrome、请求桌面通知并拍摄有限的诊断截图；20 分钟后暂停，要求人工恢复。
+- 页面是否可以继续，由 Agent 或用户判断；任务大师不会自动破解验证码，也不会猜测验证已经解除。
+- 结束的任务卡片会离开 Dashboard，但记录和输出仍可通过 CLI 读取，直到明确删除。
+- **清理空间**保留登录态、扩展数据和活动任务；历史输出是需要单独勾选的删除类别。
 
-**两个项目的分工：**
+## 已经验证到哪里
 
-- [Eric Task Master 任务大师](https://github.com/npcworkspace-cmyk/eric-task-master)：安装在本机的长期任务执行基座。
-- [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill)：寻找、开发和分享可复用的专业工作流。
+可选在线 Codex CLI 适配器于 2026-11-15 完成 Windows 隔离环境下的一次四小时验收：**14,401,755.9 毫秒**、**238 次采样**、最大采样间隔 **61.01 秒**。两次新的真实 CLI Agent 调用分别完成中断投递后的只读观察，以及拒绝未授权发布并安全停止。适配器空闲模型调用为零，模拟业务写入为零，隔离环境清理通过。定时进入断言复用了此前证据，适配器与核心哈希保持不变，没有复用此前运行时长。
 
-## 信任模型
+这是源码环境、宿主在线条件下的证据，**不证明**原桌面聊天会被唤醒、电脑休眠或宿主关闭后的恢复、真实平台业务写入，或各平台安装包已经通过。原生安装包、便携包和公开下载文件各自有独立发布验证，详见 [4.0.0 发布说明](docs/releases/4.0.0.md)及[适配器证据与边界](docs/CODEX-HOST-ADAPTER.md)。
 
-任务脚本以当前操作系统用户权限运行，属于可信本地代码。Task Master 不假装为脚本提供安全沙箱；只运行你信任的 Agent、Skill 和脚本。
+## 信任与安全边界
 
-Manager 控制面只监听本机 `127.0.0.1`，对自己的诊断信息进行凭据脱敏，不会自动重放整份失败脚本，也不会让两个浏览器同时写入同一个 Profile。任务脚本本身拥有网络和文件能力，其实际行为由脚本作者负责。
+任务脚本是以当前系统用户权限运行的可信本机代码，不是安全沙箱；可以访问网络与文件系统，只运行你信任的 Agent、Skill 和脚本。常驻操作的安全约束不会把任意脚本变成受限代码。
 
-## 项目第一原则
+Manager 仅监听 `127.0.0.1`，对自身诊断做敏感信息脱敏，不自动重放整个失败脚本。分享前仍应检查任务生成的文件与截图。模式、计划、页面指令或适配器回执都不能授予新权限；无法测量的 token 或费用，不能宣称已实现支出控制。
 
-> **领任务 → 写最小自由脚本 → 一条 CLI 运行 → 边跑边输出结果。**
+## 一起构建和分享 Skill
 
-如果一个功能不能让任务更快启动、更稳定运行或更容易收尾，却让 Agent 在第一次浏览器操作前多走一步，它就不应该进入 Manager。
+[Task Master Skills 社区库](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill)用于分享可复用的流程说明、脚本和结果核验。Skill 不是必需品：先用小脚本把工作做通，再沉淀确实有效的部分。
 
-## License
+欢迎提交[工作流想法](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/issues/new?template=skill-proposal.md)，或按[贡献指南](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md)参与。运行时保持通用，专业工作流独立演进。
+
+## 许可证
 
 MIT
-
-关键词：AI Agent 浏览器自动化、AI 自动化平台、Playwright、Chrome 自动化、长期任务、无人值守自动化、多 Agent、浏览器 Profile、CLI 自动化、RPA、网页调研、数据采集、工作流 Skill、跨平台 Agent 工具。

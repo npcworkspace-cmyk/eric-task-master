@@ -1,7 +1,7 @@
 {
   "name": "eric-task-master",
-  "version": "3.2.0",
-  "description": "A local, durable Chrome task runner for AI agents: write one script, run one command, stream results.",
+  "version": "4.0.0",
+  "description": "Durable local Chrome execution for AI agents: batch jobs, persistent operations, scoped decisions, recovery, and online Agent handoff.",
   "license": "MIT",
   "type": "module",
   "private": true,

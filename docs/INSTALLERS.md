@@ -1,16 +1,20 @@
 # Self-contained installers
 
-Eric Task Master `v3.2.0` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, and local Dashboard. Users do not install Node.js, npm, Playwright, or a Playwright browser.
+Eric Task Master `v4.0.0` is distributed as a CLI-first Manager. Each platform package contains its own pinned Node.js runtime, the production dependency tree, the Manager, CLI, local Dashboard, matching driving Skill and optional online Codex CLI host adapter. Users do not install Node.js, npm, Playwright, or a Playwright browser. The optional decision adapter separately requires a supported installed and signed-in Codex CLI; that CLI and its account are not bundled.
 
 Google Chrome is intentionally not redistributed. The Manager uses a locally installed stable Chrome channel and reports a direct installation instruction if Chrome cannot be found.
 
 ## Before deploying to another Agent
 
-One Manager installation and its Profile state are shared by Agents running as the same operating-system user. Check `taskmaster --help` before downloading another Manager. A working launcher means the Manager is already deployed: leave the application and state directory in place, and import only the Skill ZIP into the new Agent. An already-running Agent host can retain a PATH from before installation; retain and use the discovered absolute launcher path rather than requiring a host restart.
+A working launcher means the Manager is already deployed, but not necessarily at version 4.0.0. Reuse a matching installation; upgrade an older one only through the explicit idle-only process, never by creating a second Manager or new Profile pool.
+
+One Manager installation and its Profile state are shared by Agents running as the same operating-system user. For a requested 4.0.0 deployment, read the actual version from `taskmaster --help` and `taskmaster manager status --json`: Skill version, launcher version and live Manager version are separate. A working older runtime is not a completed 4.0.0 deployment. Preserve its state and arrange the explicit idle-only Owner upgrade below; do not silently stop it or reinstall just to import a Skill. An already-running Agent host can retain an old PATH; retain and use the discovered absolute launcher rather than assuming a PATH update has taken effect.
+
+For this release select [v4.0.0](https://github.com/npcworkspace-cmyk/eric-task-master/releases/tag/v4.0.0), or confirm that [Latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) resolves to that tag before claiming a 4.0.0 deployment. Download only matching `v4.0.0` assets and their `SHA256SUMS`; verify the digest before execution. Import `eric-task-master-skill-v4.0.0.zip`, or the identical `app/skills/eric-task-master/` inside a native/portable runtime. Do not point a deployment to an old local archive or substitute a different version without saying so.
 
 For new-Agent or Skill deployment on Windows, or when the assumed launcher fails, run `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '<SKILL_ROOT>/scripts/find-launcher.ps1'`. This read-only helper prefers a live Manager's verified embedded runtime, then the selected shared launcher, then the exact HKCU/HKLM uninstall record's `InstallLocation`, PATH and known portable extractions. The shared locator supplies the port when it is not the default. An unlocatable live Manager or damaged selected location remains `unresolved`; an older launcher is not a fallback. `%LOCALAPPDATA%\Programs\Eric Task Master` is only a fallback. Supply a known extraction with `-PortableRoot 'ABSOLUTE_DIRECTORY'`. The helper never executes a launcher, starts/stops Manager, or writes installation/state data. This is deployment discovery, not a mandatory preflight before ordinary tasks.
 
-- `found`: execute the returned `launcher` with `--help`. If it succeeds, use that absolute path and install only the Agent Skill.
+- `found`: execute the returned `launcher` with `--help` and read the live Manager version. If both are the requested 4.0.0, use that absolute path and import the matching Skill. If older, preserve the installation and complete the explicitly authorized upgrade before reporting deployment complete.
 - `unresolved`: existing registration/files/Manager or an uncertain query prevents confirming absence. Report the locator result; no deployment repair is authorized by this status. The helper exits with code 1 and `canFreshInstall: false`.
 - `absent`: no registration, launcher, application directory, or reachable Manager was found and queries completed. A fresh install is appropriate only for a user-requested deployment; retained user-state data must still be preserved.
 
@@ -26,21 +30,21 @@ On macOS/Linux check `/usr/local/bin/taskmaster` or `/usr/bin/taskmaster`, known
 | Debian/Ubuntu Linux x64 | `linux-x64.deb`, portable ZIP and tarball | system installer or per-user extraction |
 | Debian/Ubuntu Linux arm64 | `linux-arm64.deb`, portable ZIP and tarball | system installer or per-user extraction |
 
-The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v3.2.0` target. Windows arm64 is not a native `v3.2.0` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
+The Linux binaries use the official glibc Node.js builds and require glibc 2.28 or newer. Alpine/musl is not a supported `v4.0.0` target. Windows arm64 is not a native `v4.0.0` target. The two macOS packages are deliberately separate because Node.js publishes architecture-specific runtimes; they are not described as a universal binary.
 
 ## Install
 
 Install stable Google Chrome first. Then use the package matching the operating system and CPU:
 
 - Windows x64: open the `setup.exe`. Start a new terminal after installation and run `taskmaster panel`. The portable ZIP needs no installer; extract it and run `bin\\taskmaster.cmd`.
-- macOS: run `sudo installer -pkg eric-task-master-v3.2.0-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
-- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v3.2.0-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
+- macOS: run `sudo installer -pkg eric-task-master-v4.0.0-macos-<arch>.pkg -target /`, then run `taskmaster panel`. Because this release is unsigned, macOS may require explicit Owner approval.
+- Debian/Ubuntu: run `sudo apt install ./eric-task-master-v4.0.0-linux-<arch>.deb`, then run `taskmaster panel`. The portable tarball can be extracted anywhere and started through `bin/taskmaster`.
 
-`taskmaster --help` is the installation check. User data is created only when the Manager or another command starts.
+Read `Eric Task Master 4.0.0` from the installed absolute launcher's `--help`. After authorized start, confirm `taskmaster manager status --json` reports version `4.0.0`; a compatible old Manager may otherwise still be running. Confirm the imported Skill metadata is also `4.0.0`. User data is created only when the Manager or another command starts.
 
 ## Portable ZIP fallback
 
-Every target has `eric-task-master-v3.2.0-<target>-portable.zip`. Choose `windows-x64`, `macos-arm64` (Apple silicon), `macos-x64` (Intel), `linux-arm64`, or `linux-x64`. This is a complete Manager runtime, not the separate `eric-task-master-skill-v3.2.0.zip` instructions archive.
+Every target has `eric-task-master-v4.0.0-<target>-portable.zip`. Choose `windows-x64`, `macos-arm64` (Apple silicon), `macos-x64` (Intel), `linux-arm64`, or `linux-x64`. This is a complete Manager runtime, not the separate `eric-task-master-skill-v4.0.0.zip` instructions archive.
 
 1. Download the matching ZIP and `SHA256SUMS` from the same Release. Compare SHA-256 using `Get-FileHash` on Windows, `shasum -a 256` on macOS, or `sha256sum` on Linux.
 2. Extract into a permanent, user-writable folder. Preserve the entire `eric-task-master/` tree, including `runtime/` and `app/`. On macOS/Linux, `unzip PACKAGE.zip -d DESTINATION` preserves the launcher's executable permissions.
@@ -58,11 +62,11 @@ Use that same absolute launcher for `run`, `follow`, and other commands. No admi
 
 Before replacing or moving a portable runtime, finish tasks, close Profile windows and explicitly stop its idle Manager with `manager stop --if-idle --json`. Extract updates into a fresh application folder rather than merging files. Keep user Profiles and task data outside the application directory. Installing or updating an Agent Skill requires none of these runtime changes.
 
-## Upgrading from 2.x
+## Upgrading existing 2.x or 3.x installations
 
-Run the v3 native installer only after the Owner has explicitly stopped the idle Manager. The installer checks whether its embedded runtime is still in use and refuses rather than stopping any Agent. Failed process inspection also aborts. Once unused, it replaces only the managed application payload so removed v2 files cannot remain. User state is never part of installer cleanup. Do not run an uncoordinated runtime update while Agents can start new work.
+Run the 4.0.0 native installer only after the Owner has explicitly stopped the idle Manager. The installer checks whether its embedded runtime is still in use and refuses rather than stopping any Agent. Failed process inspection also aborts. Once unused, it replaces only the managed application payload so removed files cannot remain. User state is never part of installer cleanup. Do not run an uncoordinated runtime update while Agents can start new work. Existing paths may retain a historical `v3` folder name; the actual launcher/manifest/live Manager version is authoritative, not the folder label.
 
-Portable ZIP and tar users must replace the entire extracted `eric-task-master` directory rather than merge v3 files into an older directory. Keep the separate user-state directory unchanged.
+Portable ZIP and tar users must extract the complete 4.0.0 tree into a fresh permanent application directory rather than merge files into an older directory. Keep the separate user-state directory unchanged. Use its absolute launcher for the explicitly authorized `manager start --upgrade --json`, then read back the running version; never use a new empty Profile or copied credentials to hide an upgrade error.
 
 ## Runtime behavior
 
@@ -120,9 +124,9 @@ Local Windows acceptance proves the Windows package on the maintainer's machine.
 
 After native uninstall, each target also extracts its portable ZIP into a path containing spaces, verifies its payload hash and executable permissions, and invokes the extracted launcher with an isolated state directory. A real stable Chrome task must pass using bundled Node and Playwright, followed by verified Worker, Manager, Profile, and temporary-directory cleanup. This is separate evidence for the installer-free route.
 
-## Unsigned `v3.2.0` boundary
+## Unsigned `v4.0.0` boundary
 
-The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v3.2.0` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
+The repository currently has no Apple Developer ID or Windows Authenticode signing secrets. Therefore `v4.0.0` packages produced by this workflow are explicitly marked `signed: false` in their manifests:
 
 - Windows may display Microsoft Defender SmartScreen guidance.
 - macOS may require the Owner to approve an unidentified developer package.

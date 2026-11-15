@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.0 - 2026-11-15
+
+Major release: combine the persistent operations introduced in 3.2.0 with an optional real online Agent handoff and complete same-version runtime/Skill distribution. Ordinary `.mjs` jobs remain supported; the runtime does not become a general-purpose autonomous Agent. See the [4.0.0 release notes](docs/releases/4.0.0.md) for deployment and evidence boundaries.
+
+- Add the optional online Codex CLI host adapter with explicit configuration, persistent event claims and model-call slots, bounded child-process lifetime, verified handled receipts, and only allowlisted read-only observation or safe stop decisions. It does not wake the original desktop chat or authorize business writes.
+- Record completed isolated Windows online-adapter acceptance: 14,401,755.9 ms, 238 samples, maximum 61.01-second sample gap, two new actual CLI Agent decisions, zero idle adapter calls, interrupted-delivery recovery, refusal of unauthorized publication, no simulator business writes and successful cleanup. Reuse only the earlier scheduled-entry assertion with unchanged adapter/core hashes, not elapsed time. Source-tree evidence remains separate from native package and public-asset verification.
+- Include the adapter, its guide and the version-matched driving Skill in every native/portable runtime, while retaining the standalone Skill ZIP. Verify packaged adapter imports and Skill/runtime version agreement.
+- Rewrite the bilingual product overview and 4.0.0 deployment path around batch/operations, explicit browser selection, human takeover, authorization, readback and recovery. Preserve NPC branding, the CLI-first core and separate runtime/Skill upgrades.
+
 ## 3.2.0 - 2026-11-15
 
 - Add persistent operations sessions through the CLI and the existing Manager/Worker lifecycle, with bounded action groups, scoped and differential observations, local condition waits and explicit decision events. Keep ordinary script tasks compatible and add no model or production dependency.
@@ -9,7 +18,6 @@
 - Support exactly two execution modes, batch and operations. Profile settings choose a fixed default or auto policy; an explicit task mode overrides only that task. Human takeover is a separate pause lock, never a third execution mode.
 - Add an optional NPC-orange operation cursor with click-through, observation/screenshot isolation and an existing Tasks visibility control, plus fresh-scene durable acknowledgement of safely cancelled native dialogs without replay or fake action reconciliation.
 - Add isolated social, advertising and website workflow fixtures, concentrated browser acceptance and real-time soak tooling. Real account operations, native host integration and public release remain separate validation and authorization scopes.
-
 ## 3.1.11 - 2026-10-26
 
 - Add a quiet NPC and Media Bridge introduction beneath the Dashboard workspace, with explicit external links, larger readable text and a native, expanded-by-default overview of open-ended browser workflows.

@@ -25,6 +25,10 @@ for (const forbidden of [
 }
 for (const required of [
   join(bundleRoot, 'app', 'src', 'cli.mjs'),
+  join(bundleRoot, 'app', 'scripts', 'codex-host-adapter.mjs'),
+  join(bundleRoot, 'app', 'docs', 'CODEX-HOST-ADAPTER.md'),
+  join(bundleRoot, 'app', 'skills', 'eric-task-master', 'SKILL.md'),
+  join(bundleRoot, 'app', 'skills', 'eric-task-master', 'scripts', 'find-launcher.ps1'),
   join(bundleRoot, 'app', 'node_modules', 'playwright', 'package.json'),
   join(bundleRoot, 'runtime', manifest.platform === 'win32' ? 'node.exe' : 'node'),
   join(bundleRoot, 'runtime', 'NODE-LICENSE'),
@@ -40,6 +44,11 @@ if (tree.files !== manifest.tree.files || tree.sha256 !== manifest.tree.sha256) 
 }
 
 const nodeBinary = join(bundleRoot, 'runtime', manifest.platform === 'win32' ? 'node.exe' : 'node');
+const bundledSkill = await readFile(join(bundleRoot, 'app', 'skills', 'eric-task-master', 'SKILL.md'), 'utf8');
+if (!bundledSkill.includes(`version: "${manifest.version}"`)) throw new Error('Bundled Skill version differs from the runtime');
+await execFileAsync(nodeBinary, ['--input-type=module', '-e',
+  "const adapter = await import('./scripts/codex-host-adapter.mjs'); if (typeof adapter.receiveEvent !== 'function' || typeof adapter.validateConfig !== 'function') throw new Error('Bundled host adapter is unavailable');"],
+  { cwd: join(bundleRoot, 'app'), windowsHide: true, timeout: 30000 });
 const nodeVersion = (await execFileAsync(nodeBinary, ['--version'], { windowsHide: true })).stdout.trim();
 if (nodeVersion !== `v${manifest.node.version}`) throw new Error(`Bundled Node version is ${nodeVersion}`);
 await execFileAsync(nodeBinary, [join(bundleRoot, 'app', 'src', 'cli.mjs'), '--help'], {
