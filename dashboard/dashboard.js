@@ -1,3 +1,4 @@
+const DASHBOARD_RUNTIME_VERSION = '4.0.2';
 const READ_REQUEST_TIMEOUT_MS = 10_000;
 const MUTATION_REQUEST_TIMEOUT_MS = 60_000;
 const PROFILE_OPEN_REQUEST_TIMEOUT_MS = 100_000;
@@ -470,7 +471,7 @@ async function request(path, { method = 'GET', body, requestTimeoutMs } = {}) {
       const response = await fetch(path, {
         method: upperMethod,
         credentials: 'same-origin',
-        headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+        headers: { 'x-taskmaster-runtime-version': DASHBOARD_RUNTIME_VERSION, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal
       });

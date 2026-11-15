@@ -1,6 +1,6 @@
 {
   "name": "eric-task-master",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "description": "Durable local Chrome execution for AI agents: batch jobs, persistent operations, scoped decisions, recovery, and online Agent handoff.",
   "license": "MIT",
   "type": "module",

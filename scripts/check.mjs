@@ -62,12 +62,17 @@ async function staticChecks() {
   const worker = await readFile(path.join(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8');
   const browser = await readFile(path.join(ROOT, 'src', 'runtime', 'browser-engine.mjs'), 'utf8');
   const skill = await readFile(path.join(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8');
+  const dashboard = await readFile(path.join(ROOT, 'dashboard', 'dashboard.js'), 'utf8');
+  const dashboardHtml = await readFile(path.join(ROOT, 'dashboard', 'index.html'), 'utf8');
   const workflow = await readFile(path.join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
 
   invariant(packageJson.version === VERSION, 'package.json and runtime versions differ');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock version differs');
   invariant(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(VERSION), 'release must use a stable semantic version');
   invariant(skill.includes(`version: "${VERSION}"`), 'portable Skill version differs from the runtime');
+  invariant(skill.includes(`ERIC_TASK_MASTER_AGENT_SKILL_VERSION=${VERSION}`), 'Agent Skill acknowledgement version differs from the runtime');
+  invariant(dashboard.includes(`const DASHBOARD_RUNTIME_VERSION = '${VERSION}';`) &&
+    dashboardHtml.includes(`/dashboard/dashboard.js?v=${VERSION}`), 'Dashboard version differs from the runtime');
   invariant(packageJson.bin?.taskmaster === './src/cli.mjs', 'CLI binary contract changed');
   invariant(JSON.stringify(Object.keys(packageJson.dependencies || {})) === JSON.stringify(['playwright']),
     'Playwright must be the only production dependency');

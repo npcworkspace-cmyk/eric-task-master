@@ -8,8 +8,9 @@ import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, PROFILE_ACTION_TIMEOUT_MS, TER
 import { isProcessAlive } from './lib/process-tree.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import { consolidateLegacySharedState } from './lib/state-upgrade.mjs';
-import { defaultDataDirectory, startManager } from './manager.mjs';
+import { createManager, defaultDataDirectory } from './manager.mjs';
 import { operationsSchema } from './lib/operations-schema.mjs';
+import { assertAgentSkillLoaded, assertSelectedSkillVersion, planSkillUpgrade, replaceSelectedSkill } from './lib/skill-sync.mjs';
 import { managerOwnershipProof, managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
 import {
   chooseDefaultState, projectStateEnvironment, readDefaultStateLocation, readStateEndpoint,
@@ -54,7 +55,7 @@ Manager:
 
 All commands accept --json. Manager starts automatically when needed.
 panel opens the Dashboard; panel --json returns its URL without opening a browser.
-Compatible running Managers are reused, including manager start. --upgrade is explicit and idle-only.
+Matching running Managers are reused. --upgrade is explicit and idle-only, and synchronizes an installed driving Skill.
 Data is independent of the application and Agent host. Defaults share one selected state.
 --state-dir DIR isolates a project and discovers its own port unless --port is supplied.
 follow --wait-ms returns current state and an after cursor when the wait expires.`;
@@ -203,6 +204,7 @@ async function requestJson(config, pathname, { method = 'GET', body, token, time
     response = await fetch(new URL(pathname, config.baseUrl), {
       method,
       headers: {
+        'x-taskmaster-runtime-version': VERSION,
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' })
       },
@@ -468,7 +470,8 @@ async function spawnBackgroundManager(config, {
   cliPath = CLI_PATH
 } = {}) {
   const cleanEnvironment = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => key.toUpperCase() !== 'NODE_OPTIONS')
+    Object.entries(process.env).filter(([key]) => !['NODE_OPTIONS', 'CODEX_THREAD_ID', 'ERIC_TASK_MASTER_AGENT_ID',
+      'ERIC_TASK_MASTER_AGENT_SKILL_VERSION'].includes(key.toUpperCase()))
   );
   cleanEnvironment.NODE_OPTIONS = '';
   const startupDirectory = path.join(config.stateDir, 'logs');
@@ -491,6 +494,7 @@ async function spawnBackgroundManager(config, {
       ...(config.shared ? ['--shared'] : []),
       ...(config.stateDirAliases?.[0] ? ['--state-alias', config.stateDirAliases[0]] : []),
       ...(config.projectEnvironment ? ['--state-request', config.requestedStateDir] : []),
+      ...(config.activateSkill ? ['--activate-skill'] : []),
       '--json'
     ], {
       detached: true,
@@ -614,7 +618,7 @@ export async function ensureManager(config, { startManager = startBackgroundMana
   } catch (error) {
     if (error.code === 'MANAGER_UNREACHABLE') {
       await prepareStateForStart(config, { upgrade: maintainVersion });
-      const started = await startManager(config);
+      const started = await startManager(maintainVersion ? { ...config, activateSkill: true } : config);
       await rememberSharedState(config, started);
       return started;
     }
@@ -651,31 +655,31 @@ export async function ensureManager(config, { startManager = startBackgroundMana
     throw cliError(
       'MANAGER_CAPABILITY_UNAVAILABLE',
       `Manager ${current.version || 'unknown'} cannot guard an idle version replacement`,
-      'Keep using the compatible running Manager. To update, finish the existing work, close its Profiles, explicitly run taskmaster manager stop, then taskmaster manager start.'
+      'Ask the Owner whether to wait or explicitly stop this Manager and its work, then retry the upgrade. Do not choose or stop automatically.'
     );
   }
 
   const token = await readToken(config);
   const status = await requestJson(config, '/v1/status', { token });
-  const activeTasks = Number(status.tasks?.running || 0) + Number(status.tasks?.queued || 0);
-  if (activeTasks > 0) {
-    throw cliError(
-      'MANAGER_VERSION_MISMATCH',
-      `Manager ${current.version || 'unknown'} has ${activeTasks} active task(s) and cannot be replaced by CLI ${VERSION}`,
-      'Let the active tasks finish or stop them, then run taskmaster manager start --upgrade.'
-    );
+  const { running, queued } = status.tasks || {};
+  if (!Number.isSafeInteger(running) || !Number.isSafeInteger(queued) || running < 0 || queued < 0) {
+    throw cliError('INVALID_MANAGER_RESPONSE', 'Manager did not return valid task counts for upgrade');
   }
   const { profiles } = await requestJson(config, '/v1/profiles', { token });
   if (!Array.isArray(profiles)) {
     throw cliError('INVALID_MANAGER_RESPONSE', 'Manager did not return its Profiles for version maintenance');
   }
   const occupiedProfiles = profiles.filter((profile) => profile.lease || ['opening', 'open', 'closing'].includes(profile.state));
-  if (occupiedProfiles.length) {
-    throw cliError(
-      'MANAGER_VERSION_MISMATCH',
-      `Manager ${current.version || 'unknown'} has ${occupiedProfiles.length} occupied Profile(s) and cannot be replaced by CLI ${VERSION}`,
-      'Close the occupied Profiles, then run taskmaster manager start --upgrade. Existing task and Profile controls remain available.'
+  if (running + queued > 0 || occupiedProfiles.length) {
+    const error = cliError(
+      'MANAGER_UPGRADE_DECISION_REQUIRED',
+      `Manager ${current.version || 'unknown'} has ${running + queued} active task(s) and ${occupiedProfiles.length} occupied Profile(s)`,
+      'Ask the Owner to choose: wait for the work to finish, or explicitly stop this Manager and its tasks/Profile windows and replace it. Stopped work may have unconfirmed external effects; inspect them before retrying. Never choose automatically.'
     );
+    error.details = { managerVersion: current.version || null, managerPid: current.pid || null,
+      stateId: current.stateId || null, running, queued, occupiedProfiles: occupiedProfiles.length,
+      choices: ['wait', 'stop_selected_manager_and_replace'] };
+    throw error;
   }
   await requestJson(config, '/v1/manager/stop', { method: 'POST', body: { onlyIfIdle: true }, token });
   if (!(await waitForManagerStop(config, 20_000, current.pid))) {
@@ -686,7 +690,7 @@ export async function ensureManager(config, { startManager = startBackgroundMana
     );
   }
   await prepareStateForStart(config, { upgrade: maintainVersion });
-  const started = await startManager(config);
+  const started = await startManager(maintainVersion ? { ...config, activateSkill: true } : config);
   await rememberSharedState(config, started);
   return started;
 }
@@ -695,6 +699,40 @@ async function apiContext(options) {
   const config = await settings(options);
   const manager = await ensureManager(config);
   return { config, token: await readToken(config), manager };
+}
+
+function requireCurrentManager(manager) {
+  if (manager?.version !== VERSION) {
+    throw cliError('MANAGER_VERSION_MISMATCH',
+      `Running Manager ${manager?.version || 'unknown'} does not match CLI ${VERSION}`,
+      'Finish active work with its existing controls, then run taskmaster manager start --upgrade with the current launcher.');
+  }
+}
+
+async function currentWorkContext(options) {
+  const context = await apiContext(options);
+  requireCurrentManager(context.manager);
+  let skill;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      try { skill = await assertSelectedSkillVersion(VERSION); }
+      catch (error) {
+        if (error.code !== 'SKILL_VERSION_MISMATCH') throw error;
+        await replaceSelectedSkill(VERSION);
+        skill = await assertSelectedSkillVersion(VERSION);
+      }
+      break;
+    } catch (error) {
+      if (error.code !== 'SKILL_UPGRADE_BUSY' || attempt === 7) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 75));
+    }
+  }
+  if (skill?.state === 'not-installed' && (process.env.CODEX_THREAD_ID || process.env.ERIC_TASK_MASTER_AGENT_ID)) {
+    throw cliError('SKILL_NOT_INSTALLED', 'This Agent has no selected Task Master Skill',
+      'Import the Skill bundled with the current application, read its SKILL.md, then retry. No work was submitted.');
+  }
+  assertAgentSkillLoaded(VERSION);
+  return context;
 }
 
 async function parseJsonInput(value, field = 'input') {
@@ -830,7 +868,7 @@ async function runCommand(args, options, json) {
     ...(outputBudget === undefined ? {} : { outputBudget }),
     ...(requestKey === undefined ? {} : { requestKey })
   };
-  const context = await apiContext(options);
+  const context = await currentWorkContext(options);
   if (requestKey !== undefined && !context.manager.capabilities?.includes('task.request-key')) {
     throw cliError(
       'MANAGER_CAPABILITY_UNAVAILABLE',
@@ -888,7 +926,8 @@ async function statusCommand(taskId, options, json) {
 }
 
 async function profileCommand(action, args, options, json) {
-  const context = await apiContext(options);
+  const createsOrChangesProfile = ['create', 'default', 'rename', 'mode', 'delete', 'open'].includes(action);
+  const context = createsOrChangesProfile ? await currentWorkContext(options) : await apiContext(options);
   if (action === 'list') {
     const result = await requestJson(context.config, '/v1/profiles', { token: context.token });
     emit(result, json);
@@ -987,13 +1026,15 @@ function openUrl(url) {
   child.unref();
 }
 
-async function serveCommand(config, json, { onReady = async () => {} } = {}) {
-  const manager = await startManager({
+async function serveCommand(config, json, { onReady = async () => {}, activateSkill = false } = {}) {
+  const manager = await createManager({
     host: config.host, port: config.port, dataDir: config.stateDir,
     identityDir: config.stateDirAliases[0] || config.identityDir,
     scope: config.shared ? 'shared' : 'project', stateDirAliases: config.stateDirAliases
   });
   try {
+    if (activateSkill) await replaceSelectedSkill(VERSION);
+    await manager.start();
     await writeStateEndpoint(manager.stateLocation.stateDirEffective, {
       pid: process.pid, version: VERSION, baseUrl: manager.baseUrl
     });
@@ -1033,6 +1074,7 @@ async function managerCommand(action, options, json) {
   if (action === 'foreground') {
     try {
       const current = await health(config);
+      requireCurrentManager(current);
       emit({ ok: true, manager: current, reused: true }, json);
       return;
     } catch (error) { if (error.code !== 'MANAGER_UNREACHABLE') throw error; }
@@ -1056,8 +1098,15 @@ async function managerCommand(action, options, json) {
     return serveCommand(config, json);
   }
   if (action === 'start') {
+    const skillPlan = options.upgrade === true ? await planSkillUpgrade(VERSION) : null;
     const current = await ensureManager(config, { maintainVersion: options.upgrade === true });
-    emit({ ok: true, manager: current }, json);
+    requireCurrentManager(current);
+    let skill;
+    if (skillPlan) {
+      skill = await replaceSelectedSkill(VERSION);
+      if (skill.state !== 'not-installed') await assertSelectedSkillVersion(VERSION);
+    }
+    emit({ ok: true, manager: current, ...(skill ? { skill } : {}) }, json);
     return;
   }
   if (action === 'status') {
@@ -1151,7 +1200,8 @@ async function managerCommand(action, options, json) {
 }
 
 async function operationsCommand(action, args, options, json) {
-  const context = await apiContext(options);
+  const startsOrChangesWork = ['start', 'command', 'resume', 'update', 'decide'].includes(action);
+  const context = startsOrChangesWork ? await currentWorkContext(options) : await apiContext(options);
   const identifier = args[0];
   if (!['start', 'list', 'stop-all'].includes(action) && !identifier) throw cliError('OPERATION_REQUIRED', 'ops command requires OP_ID');
   const base = '/v1/operations';
@@ -1185,8 +1235,8 @@ async function main() {
     return emit(HELP);
   }
   if (command === 'serve') {
-    assertAllowedOptions(options, ['shared', 'state-alias', 'state-request']);
-    return serveCommand(await settings(options, { serving: true }), json);
+    assertAllowedOptions(options, ['shared', 'state-alias', 'state-request', 'activate-skill']);
+    return serveCommand(await settings(options, { serving: true }), json, { activateSkill: options['activate-skill'] === true });
   }
   if (command === 'run') {
     assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'request-key', 'timeout', 'mode', 'skill-mode']);

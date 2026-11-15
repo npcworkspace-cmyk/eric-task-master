@@ -19,7 +19,7 @@ function occurrences(value, fragment) {
   return value.split(fragment).length - 1;
 }
 
-test('Windows upgrade and uninstall refuse an occupied runtime without stopping any Agent', async () => {
+test('Windows upgrade requires an explicit interactive choice before stopping occupied work', async () => {
   const installer = await source('scripts/install/windows/installer.iss');
   for (const payload of ['app', 'bin', 'runtime']) {
     assert.match(installer, new RegExp(`Name: "\\{app\\}\\\\${payload}"; Check: IsManagedUpgradeRoot`, 'u'));
@@ -30,7 +30,10 @@ test('Windows upgrade and uninstall refuse an occupied runtime without stopping 
   assert.match(installer, /CheckRuntimeIdle/u);
   assert.match(installer, /function InitializeUninstall\(\): Boolean;/u);
   assert.match(installer, /CloseApplications=no/u);
-  assert.doesNotMatch(installer, /manager stop|\[UninstallRun\]|StopStarted|Sleep\(1000\)/u);
+  assert.match(installer, /StopSelectedManager\(True\)/u);
+  assert.match(installer, /if WizardSilent then[\s\S]*no force stop was performed/u);
+  assert.match(installer, /MB_YESNO or MB_DEFBUTTON2\) = IDYES[\s\S]*StopSelectedManager\(False\)/u);
+  assert.doesNotMatch(installer, /taskkill|Stop-Process|\[UninstallRun\]|StopStarted|Sleep\(1000\)/u);
   assert.doesNotMatch(installer, /ERIC_TASK_MASTER_HOME|\\eric-task-master(?:\\|')/u);
 });
 
@@ -109,6 +112,31 @@ test('Windows runtime guard rejects a real live process and permits its exit', {
   await check();
 });
 
+test('Windows runtime guard also protects a live process from the previous v3 application directory', { skip: process.platform !== 'win32' }, async (t) => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-legacy-guard-'));
+  const root = path.join(parent, 'Eric Task Master');
+  const legacyRuntime = path.join(`${root} v3`, 'runtime');
+  await mkdir(legacyRuntime, { recursive: true });
+  const node = path.join(legacyRuntime, 'node.exe');
+  await copyFile(process.execPath, node);
+  const guard = path.join(ROOT, 'src/lib/assert-runtime-idle.ps1');
+  const check = () => execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', guard, '-AppRoot', root], { windowsHide: true, timeout: 20_000 });
+  const child = spawn(node, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true, stdio: 'ignore' });
+  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  t.after(async () => { if (child.exitCode === null) child.kill(); await exited; await removeTestTree(parent); });
+  await assert.rejects(check(), (error) => {
+    assert.equal(error.code, 10);
+    assert.match(error.stderr, /runtime is still in use/u);
+    return true;
+  });
+  assert.equal(child.exitCode, null, 'legacy guard must not terminate another Agent process');
+  child.kill();
+  await exited;
+  await check();
+});
+
 test('native installer smoke tests simulate stale v2 payload while preserving external state', async () => {
   const [windows, mac, linux] = await Promise.all([
     source('scripts/install/smoke-windows.ps1'),
@@ -124,7 +152,10 @@ test('native installer smoke tests simulate stale v2 payload while preserving ex
     assert.match(smoke, /staleV2PayloadRemoved/u);
     assert.match(smoke, /userStatePreserved/u);
   }
-  assert.ok(occurrences(windows, 'Start-Process -FilePath $installerPath') >= 2);
+  assert.ok(occurrences(windows, 'Invoke-InstallerProcess -FilePath $installerPath') >= 2);
+  assert.match(windows, /\$process\.WaitForExit\(120000\)/u);
+  assert.doesNotMatch(windows, /-WindowStyle Hidden -Wait -PassThru/u);
+  assert.match(windows, /\$legacyExitCode = \$LASTEXITCODE[\s\S]*if \(\$legacyExitCode -eq 0\) \{ throw[\s\S]*\$global:LASTEXITCODE = 0\s*$/u);
   assert.match(windows, /windows-installer-first-install\.log/u);
   assert.match(windows, /windows-installer-upgrade\.log/u);
   assert.ok(occurrences(mac, 'installer -pkg "${package}" -target /') >= 2);
