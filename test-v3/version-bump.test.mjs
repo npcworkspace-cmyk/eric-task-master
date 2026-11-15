@@ -41,6 +41,12 @@ test('version bump keeps runtime, Dashboard, Skill and current deployment docs i
   }
 });
 
+test('driving Skill follows a newer Latest only after replacing Manager and refuses a downgrade', async () => {
+  const skill = await readFile(path.join(ROOT, 'skills/eric-task-master/SKILL.md'), 'utf8');
+  assert.match(skill, /If it is newer than [0-9.]+, consult that release's deployment guide[\s\S]*replace and activate Manager[\s\S]*then load the matching Skill/u);
+  assert.match(skill, /If Latest is older than [0-9.]+[\s\S]*stop and report rather than downgrade/u);
+});
+
 test('version bump validates all components before writing any file', async (t) => {
   const directory = await fixture(t);
   const broken = path.join(directory, 'dashboard/index.html');
