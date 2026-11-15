@@ -4,6 +4,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Invoke-InstallerProcess([string]$FilePath, [string[]]$Arguments) {
+  # Start-Process -Wait waits for the whole process tree, including the new
+  # long-lived Manager. Wait for this installer process only.
+  $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle Hidden -PassThru
+  if (-not $process.WaitForExit(120000)) {
+    $process.Kill()
+    throw "Installer process timed out: $FilePath"
+  }
+  $process.Refresh()
+  return $process
+}
 $installerPath = [System.IO.Path]::GetFullPath($Installer)
 $root = [System.IO.Path]::GetFullPath($InstallRoot)
 $runnerTemp = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP)
@@ -47,9 +58,9 @@ Set-Content -LiteralPath (Join-Path $staleLauncherDir 'taskmaster.cmd') -Value '
 try {
 Remove-Item -LiteralPath $root,$state -Recurse -Force -ErrorAction SilentlyContinue
 
-$install = Start-Process -FilePath $installerPath -ArgumentList @(
+$install = Invoke-InstallerProcess -FilePath $installerPath -Arguments @(
   '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$installLog`""
-) -WindowStyle Hidden -Wait -PassThru
+)
 if ($install.ExitCode -ne 0) { throw "Installer exited with $($install.ExitCode)" }
 
 $cli = Join-Path $root 'bin\taskmaster.cmd'
@@ -106,9 +117,9 @@ $preUpgradeManagerProcessId = (Get-Content -LiteralPath $managerFile -Raw | Conv
 & $cli profiles open $upgradeProfileId --json | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Could not create an occupied Profile for the upgrade-choice test' }
 
-$blockedUpgrade = Start-Process -FilePath $installerPath -ArgumentList @(
+$blockedUpgrade = Invoke-InstallerProcess -FilePath $installerPath -Arguments @(
   '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$upgradeLog.blocked`""
-) -WindowStyle Hidden -Wait -PassThru
+)
 if ($blockedUpgrade.ExitCode -eq 0) { throw 'Upgrade must refuse a live shared runtime' }
 if (-not (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue)) { throw 'Refused upgrade stopped another Agent Manager' }
 if (-not (Test-Path -LiteralPath $staleMcp)) { throw 'Refused upgrade changed application files' }
@@ -116,9 +127,9 @@ if (-not (Test-Path -LiteralPath $staleMcp)) { throw 'Refused upgrade changed ap
 if ($LASTEXITCODE -ne 0) { throw 'Could not close the occupied Profile after the refused upgrade' }
 
 Set-Content -LiteralPath (Join-Path $testSkill 'SKILL.md') -Value 'unrecognized fixture Skill' -Encoding Ascii
-$failedActivation = Start-Process -FilePath $installerPath -ArgumentList @(
+$failedActivation = Invoke-InstallerProcess -FilePath $installerPath -Arguments @(
   '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$upgradeLog.activation-failed`""
-) -WindowStyle Hidden -Wait -PassThru
+)
 if ($failedActivation.ExitCode -ne 20) { throw "Incomplete activation must return exit 20, got $($failedActivation.ExitCode)" }
 if (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue) { throw 'Idle Manager was not stopped automatically before replacement' }
 if (-not (Test-Path -LiteralPath $cli)) { throw 'Incomplete activation rolled back the installed application' }
@@ -127,9 +138,9 @@ if ((Get-Content -LiteralPath (Join-Path $testSkill 'SKILL.md') -Raw).Trim() -ne
 }
 Copy-Item -LiteralPath (Join-Path $root 'app/skills/eric-task-master/SKILL.md') -Destination (Join-Path $testSkill 'SKILL.md') -Force
 
-$upgrade = Start-Process -FilePath $installerPath -ArgumentList @(
+$upgrade = Invoke-InstallerProcess -FilePath $installerPath -Arguments @(
   '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$root`"", "/LOG=`"$upgradeLog`""
-) -WindowStyle Hidden -Wait -PassThru
+)
 if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer exited with $($upgrade.ExitCode)" }
 $deadline = [DateTime]::UtcNow.AddSeconds(20)
 while ([DateTime]::UtcNow -lt $deadline -and (Get-Process -Id $preUpgradeManagerProcessId -ErrorAction SilentlyContinue)) {
@@ -163,13 +174,13 @@ $managerProcessId = (Get-Content -LiteralPath $managerFile -Raw | ConvertFrom-Js
 
 $uninstaller = Join-Path $root 'unins000.exe'
 if (-not (Test-Path -LiteralPath $uninstaller)) { throw 'Uninstaller is missing' }
-$blockedUninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
+$blockedUninstall = Invoke-InstallerProcess -FilePath $uninstaller -Arguments @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
 if ($blockedUninstall.ExitCode -eq 0) { throw 'Uninstall must refuse a live shared runtime' }
 if (-not (Get-Process -Id $managerProcessId -ErrorAction SilentlyContinue)) { throw 'Refused uninstall stopped another Agent Manager' }
 if (-not (Test-Path -LiteralPath $cli)) { throw 'Refused uninstall removed application files' }
 & $cli manager stop --if-idle --json | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Explicit idle-only stop before uninstall failed' }
-$uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
+$uninstall = Invoke-InstallerProcess -FilePath $uninstaller -Arguments @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
 if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with $($uninstall.ExitCode)" }
 if (Test-Path -LiteralPath (Join-Path $root 'bin\taskmaster.cmd')) { throw 'Application files remain after uninstall' }
 $previousPreference = $ErrorActionPreference

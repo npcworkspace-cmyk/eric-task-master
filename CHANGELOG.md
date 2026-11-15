@@ -7,6 +7,7 @@
 - If an old Manager is busy, offer the Owner a choice to wait or explicitly stop its work for replacement. Silent upgrades never select force automatically, and safe task stop/read controls remain available.
 - On Windows, recognize the previous managed `v3` sibling installation, retain its files in a recovery backup and replace its old launcher path with a forwarder to the current application. Unknown directories and unsafe replacements fail closed.
 - The Windows replacement installer attempts Manager and Skill activation automatically and returns exit code 20 if activation is incomplete, leaving the installed files in place for an explicit retry.
+- Do not rewrite an unchanged healthy Profile registry during a routine lease-recovery check; retain the existing state-drift guard and recovery behavior.
 - Clarify that installing a package alone is not completed activation; describe the default Codex Skill location, explicitly selected alternative location, portable replacement and limits for older downloads and other Agent hosts.
 
 ## 4.0.1 - 2026-11-15

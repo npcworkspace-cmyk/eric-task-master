@@ -1,10 +1,25 @@
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { removeTestTree } from './test-fs.mjs';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
+
+test('healthy Profile recovery does not rewrite the store on a no-op reaper tick', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-reaper-'));
+  t.after(() => removeTestTree(root));
+  const filePath = path.join(root, 'profiles.json');
+  const store = new ProfileStore({ filePath, profilesRoot: path.join(root, 'profiles'), processAlive: () => true });
+  await store.init();
+  const profile = await store.create({ name: 'Active' });
+  await store.acquireLease(profile.id, { ownerId: 'task:active', kind: 'task', pid: process.pid, nonce: 'active-nonce' });
+  const before = await stat(filePath, { bigint: true });
+  assert.deepEqual(await store.recoverExpiredLeases(), []);
+  const after = await stat(filePath, { bigint: true });
+  assert.deepEqual([after.dev, after.ino, after.size, after.mtimeNs, after.ctimeNs],
+    [before.dev, before.ino, before.size, before.mtimeNs, before.ctimeNs]);
+});
 
 test('reinstall keeps registered Profiles and adopts retained directories without changing login data', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-profile-reinstall-'));

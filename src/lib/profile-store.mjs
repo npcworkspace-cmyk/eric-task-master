@@ -583,6 +583,15 @@ export class ProfileStore {
       }
     }
     const recoveredIds = [];
+    // Do not rewrite a healthy Profile store on every reaper tick. Besides
+    // avoiding unnecessary I/O, this keeps a no-op check from racing an
+    // independently replaced state file before the drift guard observes it.
+    const needsWrite = data.profiles.some((profile) => {
+      const lease = profile.lease;
+      return lease && (recoverable.has(profile.id) || lease.identityUntrusted === true ||
+        (!lease.cleanupConfirmedAt && !this.#processAlive(lease.pid)));
+    });
+    if (!needsWrite) return recoveredIds;
     await this.#store.update((draft) => {
       for (const profile of draft.profiles) {
         if (!profile.lease) continue;

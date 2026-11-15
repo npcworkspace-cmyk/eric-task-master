@@ -152,7 +152,9 @@ test('native installer smoke tests simulate stale v2 payload while preserving ex
     assert.match(smoke, /staleV2PayloadRemoved/u);
     assert.match(smoke, /userStatePreserved/u);
   }
-  assert.ok(occurrences(windows, 'Start-Process -FilePath $installerPath') >= 2);
+  assert.ok(occurrences(windows, 'Invoke-InstallerProcess -FilePath $installerPath') >= 2);
+  assert.match(windows, /\$process\.WaitForExit\(120000\)/u);
+  assert.doesNotMatch(windows, /-WindowStyle Hidden -Wait -PassThru/u);
   assert.match(windows, /windows-installer-first-install\.log/u);
   assert.match(windows, /windows-installer-upgrade\.log/u);
   assert.ok(occurrences(mac, 'installer -pkg "${package}" -target /') >= 2);
