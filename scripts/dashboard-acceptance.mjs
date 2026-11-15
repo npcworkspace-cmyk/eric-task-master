@@ -457,7 +457,7 @@ async function checkPanelBrand(page, context, checks, externalRequests) {
   assert.equal(context.pages().length, 1, 'Brand content never opens a site automatically');
   for (const [selector, url] of [
     ['#panel-npc-link', 'https://www.npctech.site/'],
-    ['#panel-media-link', 'https://media.npctech.site/']
+    ['#panel-media-link', 'https://npcpressbridge.com/']
   ]) {
     const link = page.locator(selector);
     assert.equal(await link.getAttribute('href'), url);
@@ -502,7 +502,7 @@ async function checkPanelBrand(page, context, checks, externalRequests) {
   await page.locator('#language-toggle').click();
   await summary.getByText('Use your imagination', { exact: true }).waitFor();
   assert.equal(await details.evaluate((node) => node.open), true, 'Language changes retain the disclosure state');
-  assert.match(await page.locator('#panel-media-link').textContent(), /Media Bridge · media\.npctech\.site/u);
+  assert.match(await page.locator('#panel-media-link').textContent(), /Media Bridge · npcpressbridge\.com/u);
   await summary.focus();
   await page.keyboard.press('Space');
   await page.waitForFunction(() => !document.querySelector('#panel-possibilities').open);
@@ -1320,7 +1320,7 @@ try {
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(externalRequests.map((request) => request.url()), [
     'https://www.npctech.site/', 'https://www.npctech.site/',
-    'https://www.npctech.site/', 'https://media.npctech.site/'
+    'https://www.npctech.site/', 'https://npcpressbridge.com/'
   ], 'Marketing has no background requests or tracking');
   checks.push('Dashboard uses only status, task, Profile, cleanup and the approved operation cursor update APIs and raises no page errors');
 

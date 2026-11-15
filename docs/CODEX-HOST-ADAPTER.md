@@ -1,6 +1,6 @@
 # Explicit online Codex CLI host adapter
 
-This optional adapter connects the existing `hostAdapter` stdin contract to an independently installed Codex CLI Agent. Every 4.0.0 native/portable runtime includes it at `app/scripts/codex-host-adapter.mjs` and this guide at `app/docs/CODEX-HOST-ADAPTER.md`. Use the package's `runtime/node[.exe]` as the host executable and `app/src/cli.mjs` as `taskmasterCli`; a source checkout is not required. The computer, Task Master Manager and CLI must remain online. It does not wake the original desktop chat, recover a sleeping/offline computer, or claim closed-host continuation. No credentials are read or copied by the adapter; the CLI uses its existing sign-in.
+This optional adapter connects the existing `hostAdapter` stdin contract to an independently installed Codex CLI Agent. Every 4.0.x native/portable runtime includes it at `app/scripts/codex-host-adapter.mjs` and this guide at `app/docs/CODEX-HOST-ADAPTER.md`. Use the package's `runtime/node[.exe]` as the host executable and `app/src/cli.mjs` as `taskmasterCli`; a source checkout is not required. The computer, Task Master Manager and CLI must remain online. It does not wake the original desktop chat, recover a sleeping/offline computer, or claim closed-host continuation. No credentials are read or copied by the adapter; the CLI uses its existing sign-in.
 
 Configure absolute paths in a separate explicit JSON file (not global Codex configuration):
 
