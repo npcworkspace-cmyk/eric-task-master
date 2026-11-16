@@ -13,7 +13,7 @@ function harness(options = {}) {
     page, unsafe: null,
     meta: async () => ({ ...state }),
     observe: async () => ({ ...state, items: [], total: 0 }),
-    condition: async (condition) => condition.pass !== false,
+    condition: async (condition) => condition.text !== 'fail',
     identity: async () => ({ accountId: 'acct-1', resourceId: 'res-1' }),
     act: async (action) => { effects.push(action.actionId); state.pageVersion = `v${effects.length + 1}`; await options.act?.(action); },
     read: async () => 'fixture text', invalidate: () => { state.pageVersion += '-invalidate'; },
@@ -33,12 +33,71 @@ function harness(options = {}) {
   };
   const session = createFastSession(runtime);
   const command = (kind, payload, extra = {}) => ({ schemaVersion: 1, commandId: `cmd-${records.length}-${kind}`, operationId: 'op-1', authorizationVersion: 1, ...state, kind, payload, ...extra });
-  const batch = (extra = {}) => command('batch', { preconditions: [{ pass: true }], stopConditions: [], actions: [{ actionId: 'a1', type: 'click', target: { selector: '#save' } }], verify: [{ pass: true }], ...extra });
+  const batch = (extra = {}) => command('batch', { preconditions: [{ target: { selector: '#proof' }, text: 'pass' }], stopConditions: [], actions: [{ actionId: 'a1', type: 'click', target: { selector: '#save' } }], verify: [{ target: { selector: '#proof' }, text: 'pass' }], ...extra });
   return { session, records, effects, browser, state, runtime, command, batch, control: (value) => onControl(value) };
 }
 
 test('versioned commands reject oversized groups and missing safety conditions', () => {
   assert.throws(() => validateFastCommand({ schemaVersion: 1, commandId: 'c', kind: 'batch', payload: { actions: [] } }), { code: 'INVALID_COMMAND' });
+});
+
+test('every declared condition is validated before any batch action can run', async (t) => {
+  const h = harness(); t.after(() => h.session.dispose());
+  await h.session.execute(h.command('observe', {}));
+  const malformed = { target: { selector: '#checkbox' }, cheked: true };
+  const cases = [
+    { preconditions: [malformed] }, { stopConditions: [malformed] }, { verify: [malformed] },
+    ...['preconditions', 'guard', 'expected'].map(field => ({ actions: [
+      { actionId: 'first', type: 'click', target: { selector: '#save' } },
+      { actionId: 'later', type: 'click', target: { selector: '#save' }, [field]: field === 'preconditions' ? [malformed] : malformed }
+    ] })),
+    { actions: [{ actionId: 'first', type: 'click', target: { selector: '#save' } }, { actionId: 'wait', type: 'wait', value: { condition: malformed } }] }
+  ];
+  for (const payload of cases) await assert.rejects(h.session.execute(h.batch(payload)), { code: 'INVALID_CONDITION' });
+  assert.equal(h.effects.length, 0);
+  assert.equal(h.records.some(record => record.type === 'action'), false);
+});
+
+for (const type of ['read', 'locate', 'wait']) {
+  test(`${type} does not skip its declared expected condition`, async (t) => {
+    const h = harness(); t.after(() => h.session.dispose());
+    await h.session.execute(h.command('observe', {}));
+    const action = { actionId: `checked-${type}`, type, target: { selector: '#proof' },
+      ...(type === 'wait' ? { value: { condition: { target: { selector: '#ready' }, text: 'pass' } } } : {}),
+      expected: { target: { selector: '#proof' }, text: 'fail' } };
+    const result = await h.session.execute(h.batch({ actions: [action], verify: [], timeoutMs: 35 }));
+    assert.equal(result.status, 'stopped'); assert.equal(result.reason, 'CONDITION_TIMEOUT');
+    assert.equal(h.effects.length, 0);
+    assert.equal(h.session.unresolved, false);
+  });
+}
+
+test('actual action expected readback is recorded without inventing unchecked group proof', async (t) => {
+  const h = harness(); t.after(() => h.session.dispose());
+  await h.session.execute(h.command('observe', {}));
+  const reply = await h.session.execute(h.batch({ verify: [], actions: [
+    { actionId: 'verified-save', type: 'click', target: { selector: '#save' }, expected: { target: { selector: '#proof' }, text: 'pass' } }
+  ] }));
+  assert.equal(reply.status, 'confirmed'); assert.equal(reply.result.actions[0].expectedMatched, true);
+  assert.equal(reply.result.verification.actionExpectedMatched, 1);
+  assert.equal(reply.result.verification.businessResultVerified, true);
+  assert.equal(reply.result.verification.groupMatched, undefined);
+  const saved = h.records.filter(record => record.type === 'action' && record.payload.status === 'confirmed').at(-1).payload;
+  assert.equal(saved.verification.expectedMatched, true); assert.equal(saved.verification.method, 'readback');
+});
+
+test('one checked effect does not claim readback verification for another unchecked effect', async (t) => {
+  const h = harness(); t.after(() => h.session.dispose());
+  await h.session.execute(h.command('observe', {}));
+  const reply = await h.session.execute(h.batch({ verify: [], actions: [
+    { actionId: 'checked', type: 'click', target: { selector: '#save' }, expected: { target: { selector: '#proof' }, text: 'pass' } },
+    { actionId: 'unchecked', type: 'click', target: { selector: '#other' } }
+  ] }));
+  assert.equal(reply.status, 'confirmed'); assert.equal(reply.result.verification.matched, true);
+  assert.equal(reply.result.verification.businessResultVerified, false);
+  const saved = h.records.filter(record => record.type === 'action' && record.payload.status === 'confirmed').map(record => record.payload);
+  assert.equal(saved[0].verification.businessResultVerified, true);
+  assert.equal(saved[1].verification.businessResultVerified, false);
 });
 
 test('persistent commands reuse one browser and durable initiated ACK precedes the effect', async () => {
@@ -68,11 +127,11 @@ test('no observation, stale references and changed authorization cannot mutate',
 test('failed final verification becomes unknown and blocks retry until reconciliation', async () => {
   const h = harness();
   await h.session.execute(h.command('observe', {}));
-  assert.equal((await h.session.execute(h.batch({ verify: [{ pass: false }] }))).status, 'unknown');
+  assert.equal((await h.session.execute(h.batch({ verify: [{ target: { selector: '#proof' }, text: 'fail' }] }))).status, 'unknown');
   await h.session.execute(h.command('observe', {}));
   assert.equal((await h.session.execute(h.batch())).reason, 'RECONCILE_REQUIRED');
   assert.equal(h.effects.length, 1);
-  assert.equal((await h.session.execute(h.command('reconcile', { actionIds: ['a1'], verify: [{ pass: true }] }))).status, 'confirmed');
+  assert.equal((await h.session.execute(h.command('reconcile', { actionIds: ['a1'], verify: [{ target: { selector: '#proof' }, text: 'pass' }] }))).status, 'confirmed');
   assert.equal((await h.session.execute(h.batch())).reason, 'ACTION_ALREADY_ATTEMPTED');
   await h.session.dispose();
 });
@@ -89,7 +148,7 @@ test('second-step precondition failure preserves the first initiated action as u
   let checks = 0;
   const h = harness({ browser: { condition: async () => ++checks < 2 } });
   await h.session.execute(h.command('observe', {}));
-  const result = await h.session.execute(h.batch({ actions: [{ actionId: 'a1', type: 'click', target: {} }, { actionId: 'a2', type: 'click', target: {} }] }));
+  const result = await h.session.execute(h.batch({ actions: [{ actionId: 'a1', type: 'click', target: {} }, { actionId: 'a2', type: 'click', target: {}, preconditions: [{ target: { selector: '#proof' }, text: 'pass' }] }] }));
   assert.equal(result.status, 'unknown');
   assert.deepEqual(h.effects, ['a1']);
   assert.equal(h.records.filter((r) => r.type === 'action').at(-1).payload.status, 'unknown');
@@ -120,9 +179,9 @@ test('one page cannot accept concurrent commands', async () => {
 
 test('local wait times out and quiet watchers produce no main-Agent event', async () => {
   const h = harness({ browser: { condition: async () => false } });
-  assert.equal((await h.session.execute(h.command('wait', { condition: {}, timeoutMs: 30, pollMs: 25 }))).reason, 'CONDITION_TIMEOUT');
+  assert.equal((await h.session.execute(h.command('wait', { condition: { target: { selector: '#ready' }, state: 'visible' }, timeoutMs: 30, pollMs: 25 }))).reason, 'CONDITION_TIMEOUT');
   const priorEvents = h.records.filter((r) => r.type === 'event').length;
-  await h.session.execute(h.command('wait', { watch: true, watchId: 'quiet', condition: {}, pollMs: 100 }));
+  await h.session.execute(h.command('wait', { watch: true, watchId: 'quiet', condition: { target: { selector: '#ready' }, state: 'visible' }, pollMs: 100 }));
   await new Promise((resolve) => setTimeout(resolve, 130));
   assert.equal(h.records.filter((r) => r.type === 'event').length, priorEvents);
   await h.session.dispose();
@@ -137,19 +196,32 @@ test('run loop resumes commands on the same runtime without re-launching', async
   assert.ok(h.records.some((r) => r.type === 'command-result'));
 });
 
-for (const mismatch of ['origin', 'account', 'resource', 'missing-resource']) {
+for (const mismatch of ['origin']) {
   test(`protected reads and non-refresh reconciliation refuse ${mismatch} without returning page contents`, async () => {
     let contentReads = 0;
     const h = harness({ browser: { observe: async () => { contentReads += 1; return { text: 'must-not-leak' }; }, identity: async () => ({ accountId: mismatch === 'account' ? 'foreign' : 'acct-1', resourceId: mismatch === 'missing-resource' ? null : mismatch === 'resource' ? 'foreign' : 'res-1' }) } });
     if (mismatch === 'origin') h.state.url = 'http://foreign.test/private';
     for (const kind of ['observe', 'wait', 'screenshot', 'reconcile']) {
-      const reply = await h.session.execute(h.command(kind, { health: true, verify: [{ pass: true }], actionIds: ['a1'] }));
+      const reply = await h.session.execute(h.command(kind, { health: true, verify: [{ target: { selector: '#proof' }, text: 'pass' }], actionIds: ['a1'] }));
       assert.equal(reply.status, 'stopped');
       assert.equal(reply.url, undefined); assert.equal(reply.title, undefined);
       assert.ok(!JSON.stringify(reply).includes('must-not-leak'));
     }
     assert.equal(contentReads, 0);
     assert.equal(h.records.some((item) => item.type === 'reconciliation'), false);
+    await h.session.dispose();
+  });
+}
+
+for (const mismatch of ['account', 'resource', 'missing-resource']) {
+  test(`strict ${mismatch} guards effects and reconciliation but leaves a diagnostic page readable`, async () => {
+    const h = harness({ browser: { identity: async () => ({ accountId: mismatch === 'account' ? 'foreign' : 'acct-1', resourceId: mismatch === 'missing-resource' ? null : mismatch === 'resource' ? 'foreign' : 'res-1' }) } });
+    const observation = await h.session.execute(h.command('observe', {}));
+    assert.equal(observation.status, 'confirmed'); assert.equal(observation.identityStatus.verified, false);
+    assert.equal((await h.session.execute(h.command('wait', { health: true }))).status, 'confirmed');
+    assert.equal((await h.session.execute(h.command('reconcile', { actionIds: ['a1'], verify: [{ target: { selector: '#proof' }, text: 'pass' }] }))).status, 'stopped');
+    assert.equal((await h.session.execute(h.batch())).status, 'stopped');
+    assert.equal(h.effects.length, 0); assert.equal(h.records.some((item) => item.type === 'reconciliation'), false);
     await h.session.dispose();
   });
 }
@@ -166,12 +238,14 @@ test('resource assertion cannot substitute for missing actual page resource evid
   await h.session.dispose();
 });
 
-test('explicit login-expired condition emits a distinct durable event and prevents protected reads or writes', async () => {
+test('explicit login-expired condition preserves diagnostic reading and still prevents protected effects', async () => {
   let contentReads = 0;
   const h = harness({ browser: { condition: async () => true, observe: async () => { contentReads += 1; return {}; } } });
   h.runtime.input.safetyConditions = { loginExpired: { target: { selector: '#login-expired' }, state: 'visible' } };
-  assert.equal((await h.session.execute(h.command('observe', {}))).reason, 'LOGIN_EXPIRED');
-  assert.equal(contentReads, 0);
+  const observation = await h.session.execute(h.command('observe', {}));
+  assert.equal(observation.status, 'confirmed'); assert.equal(observation.identityStatus.warning, 'LOGIN_EXPIRED');
+  assert.ok(contentReads > 0);
+  assert.equal((await h.session.execute(h.batch())).reason, 'LOGIN_EXPIRED');
   assert.equal(h.effects.length, 0);
   assert.ok(h.records.some((item) => item.type === 'event' && item.payload.type === 'login.expired'));
   await h.session.dispose();
@@ -195,7 +269,7 @@ test('empty initial page returns only bootstrap metadata and can navigate withou
 
 test('reconciliation always emits actual identity and observed URL for Manager provenance checks', async () => {
   const h = harness();
-  const reply = await h.session.execute(h.command('reconcile', { actionIds: ['old'], verify: [{ pass: true }] }));
+  const reply = await h.session.execute(h.command('reconcile', { actionIds: ['old'], verify: [{ target: { selector: '#proof' }, text: 'pass' }] }));
   assert.equal(reply.status, 'confirmed');
   const result = h.records.find((item) => item.type === 'reconciliation').payload.result;
   assert.deepEqual(result.identity, { accountId: 'acct-1', resourceId: 'res-1' });
@@ -207,7 +281,7 @@ test('reconciliation always emits actual identity and observed URL for Manager p
 test('watcher rebinds once after a bounded navigation context failure and checks live read authority', async () => {
   let conditionCalls = 0;
   const h = harness({ browser: { condition: async () => { conditionCalls += 1; if (conditionCalls === 1) throw Object.assign(new Error('Execution context was destroyed during navigation'), { code: 'OBSERVATION_UNAVAILABLE' }); return true; } } });
-  const reply = await h.session.execute(h.command('wait', { watch: true, once: true, watchId: 'rebind', condition: {}, pollMs: 100 }));
+  const reply = await h.session.execute(h.command('wait', { watch: true, once: true, watchId: 'rebind', condition: { target: { selector: '#ready' }, state: 'visible' }, pollMs: 100 }));
   assert.equal(reply.status, 'confirmed');
   await new Promise((resolve) => setTimeout(resolve, 350));
   assert.ok(conditionCalls >= 2, 'the injected context failure must really be retried');
@@ -271,8 +345,9 @@ test('cross-resource non-effect navigation preserves actual source identity and 
   const expected = { url: 'http://fixture.test/site' };
   const navigated = await h.session.execute(h.batch({ actions: [{ actionId: 'cross-resource-navigation', type: 'navigate', effect: false, value: expected.url, expected }], verify: [expected] }));
   assert.equal(navigated.status, 'confirmed');
-  const prepared = h.records.find((row) => row.type === 'action' && row.payload.status === 'prepared');
-  assert.equal(prepared.payload.resourceId, 'res-1');
+  const local = h.records.find((row) => row.type === 'command-result' && row.payload.localActions?.length).payload.localActions[0];
+  assert.equal(local.resourceId, 'res-1');
+  assert.equal(local.after.resourceId, 'res-destination');
   const reconciled = await h.session.execute(h.command('reconcile', { url: expected.url, actionIds: ['cross-resource-navigation'], verify: [expected] }));
   assert.equal(reconciled.status, 'confirmed');
   const payload = h.records.find((row) => row.type === 'reconciliation').payload;

@@ -1,5 +1,39 @@
 # Changelog
 
+## 4.2.1 - 2026-11-16
+
+- Further separate healthy model-facing success replies from complete stored receipts, omitting repeated route IDs, ID-only successful action detail, routine timings and empty defaults. Preserve explicit warnings, unknown effects, command/page identity and positive readback evidence. Document explicit baseline reuse without silently changing command envelopes.
+- Validate every declared condition before any action; AND together URL, DOM and value predicates instead of accepting the first match. Verify actual checked states and complete multi-select collections, and reject unsupported conditions rather than treating them as visibility checks.
+- Execute and record declared expectations for read/locate/wait as well as writes; distinguish action checks, checked final groups and unchecked effects.
+- Bind reference actions to the originally observed node through native selector resolution, retain same-document post-fill readback, reject replacement/detachment and recheck cancellation/control state at dispatch. Preserve native typing/dragging and cleanup interrupted new-tab creation.
+- Correct wrapped-label accessible names and conservatively reset partial observation baselines instead of reporting unobserved refs as removed.
+- Carry the pre-acknowledgement page/document/control binding through the final native dispatch boundary. Reject navigation during authorization or persistence rather than retargeting a same-named control on the replacement page.
+- Apply one monotonic action-group deadline to waits, checks and dispatch, including time spent awaiting authorization and persistence. Preserve uncertain-effect reconciliation and already committed completion evidence.
+- Refresh reference-cache recency on observation and retain the current scene's references when enforcing the existing bounded cache.
+- Include the output, persistence and stream contracts in every native/portable runtime, with missing-document rejection during bundle verification.
+- Refresh the bilingual project homepage and reusable banner, and make Latest the default new-deployment entry. Runtime, Skill and running Manager versions must still be checked separately; this changelog alone is not installation or publication evidence.
+
+## 4.2.0 - 2026-11-16
+
+- Default operations output to a bounded decision view, with semantic references, safe current values/states, explicit omissions and directly replayable continuation. Preserve exact stored receipts, selectors and full audits through explicit full detail; fresh expanded captures remain separate reads.
+- Remove repeated ancestor text before the capture budget and keep private selector paths out of routine wire output. Keep meaningful warnings, operation/Profile identity, unknown-effect bindings and post-execution formatting fallback receipts.
+- Separate large terminal replies into durable immutable content-addressed evidence. Preserve active safety state, logical storage limits, hash-checked recovery, strict v1/v2 migration and fail-closed missing evidence. Reuse transaction-local immutable canonical serialization instead of repeatedly generating the same JSON.
+- Finish narrow current-command/ready/scheduler/event projections and single-reply hydration; retain live authorization, one durable dispatch fence, per-line Manager ownership checks and uncertain-effect replay protection.
+- Retain bounded command-stage timing evidence on failures without capturing page/input content or adding action retries. Distinguish native action, verification, authority, observation and result-persistence boundaries.
+- This source version requires separate release and installation verification; local tests do not establish publication or upgrade an existing Manager.
+
+## 4.1.0 - 2026-11-15
+
+- Make ordinary operations as direct as batch scripts: use the selected/saved default Task Master Profile without website identity-selector or permission-table setup. Keep legacy explicit identity/resource envelopes as optional guards; remove host-specific local-browser routing from the product and shipped guide.
+- Reuse one operation/Profile across tabs, return titles and URLs, select a unique tab by title/URL/page ID, support cross-tab action groups and concurrent independent tab reads. Keep unfinished operations and browser scenes alive.
+- Return actual command replies and the next compact observation in one CLI call, generate omitted command/action IDs and use document/element identity rather than unrelated DOM noise for action freshness. Metadata checks no longer scan/layout the entire page.
+- Include contenteditable controls in observation and support their text/value readback. Publish one shared action catalog including targeted/global keys, sequential typing, hover/drag, tab/history control, authorized uploads, completed download artifacts and viewport screenshots.
+- Preserve original failure phase/cause/target. Non-effect navigation failures no longer create unknown-write locks; strict identity failures remain diagnosable, same-URL readback does not repeatedly reload, and uncertain actual effects still require reconciliation before new effects.
+- Add a quiet local `ops listen` path: no model requests or empty model-facing heartbeat output while waiting. Keep host wake-up support distinct from a listener process, and retain the generic executable/stdin event contract.
+- Decouple non-Codex Agent calls from an unrelated Codex Skill installation and document one UTF-8 JSON/CLI contract across hosts. Keep stop, takeover, revocation, explicit limits, redaction and external-effect replay protection.
+- Support JSON stdin, UTF-8 BOM input and small schema sections for host output limits; document Hermes's native terminal/completion-notification path without a provider-specific browser integration.
+- Allow explained task-specific readback of general browser actions, including actual audit/result pages and definite non-application, while binding the outcome/evidence to the Agent decision and retaining strict legacy guards when explicitly configured.
+
 ## 4.0.2 - 2026-11-15
 
 - Treat an Owner-authorized upgrade as replacement and activation: the new Manager synchronizes the selected installed driving Skill with its bundled version before reporting ready, retaining the previous Skill outside active discovery.

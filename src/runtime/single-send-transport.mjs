@@ -11,7 +11,7 @@ export function validateTransport(value, { pageUrl, origins } = {}) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash || url.href !== value.url ||
       [...url.searchParams.keys()].some((key) => isSensitiveKey(key)) || value.method !== 'POST' ||
       !/^[a-f0-9]{64}$/u.test(value.bodySha256 || '') || !Number.isSafeInteger(value.maxBodyBytes) || value.maxBodyBytes < 2 || value.maxBodyBytes > SINGLE_SEND_MAX_BYTES) throw error('INVALID_TRANSPORT_GUARD', 'Only bounded known JSON POST guards without URL credentials are supported');
-  if (pageUrl && new URL(pageUrl).origin !== url.origin || origins && !origins.includes(url.origin)) throw error('TRANSPORT_ORIGIN_MISMATCH', 'Transport must use the same currently authorized page origin');
+  if (pageUrl && new URL(pageUrl).origin !== url.origin || origins && !origins.includes('*') && !origins.includes(url.origin)) throw error('TRANSPORT_ORIGIN_MISMATCH', 'Transport must use the same currently authorized page origin');
   return { url: value.url, method: 'POST', bodySha256: value.bodySha256, maxBodyBytes: value.maxBodyBytes };
 }
 

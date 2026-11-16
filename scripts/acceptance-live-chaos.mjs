@@ -42,6 +42,29 @@ export function businessRefusalAllowed(scenarioId) {
   return ['changed-before-insufficient-data', 'login-identity-permission-change', 'human-takeover'].includes(scenarioId);
 }
 
+// The Manager owns the materialized journal. Read through its existing CLI;
+// opening a second store here could mutate crash-recovery evidence beside it.
+export async function readLiveOperationLedger(cli, operationId) {
+  const operation = await cli(['ops', 'get', operationId]);
+  if (operation?.error || operation?.id !== operationId || !Array.isArray(operation.actions) || !Array.isArray(operation.commands)) {
+    throw new Error('Current operation ledger snapshot is unavailable');
+  }
+  const events = [];
+  let after = 0;
+  for (let pages = 0; pages < 100; pages++) {
+    const page = await cli(['ops', 'events', operationId, '--after', String(after)]);
+    if (page?.error || !Array.isArray(page?.events) || !Number.isSafeInteger(page.nextCursor) || page.nextCursor < after) throw new Error('Operation event page is unavailable or invalid');
+    if (!page.events.length) return { operations: [operation], actions: operation.actions, commands: operation.commands, events };
+    for (const event of page.events) {
+      if (event.operationId !== operationId || !Number.isSafeInteger(event.sequence) || event.sequence <= after) throw new Error('Operation event pagination changed scope or failed to advance');
+      after = event.sequence;
+      events.push(event);
+    }
+    if (page.nextCursor !== after) throw new Error('Operation event cursor does not match the returned page');
+  }
+  throw new Error('Operation event history exceeds the bounded complete-read limit');
+}
+
 export function businessContinuationEvidence({ scenarioId, current, previousTaskId, requestTaskId, probe, commands }) {
   if (probe?.status !== 'confirmed' || current?.status !== 'running' || current.manualLock || current.pending || current.task?.state !== 'waiting' || current.task.waiting?.reason !== 'operations-command') return { ok: false, reason: 'A confirmed read-only continuation probe and healthy waiting operation are required' };
   if (scenarioId === 'declared-manager-restart') {
@@ -189,7 +212,7 @@ export async function runLiveChaos({ outputDir, seed = 'business-chaos-20261114'
   process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
   const elapsed = () => startedMono === undefined ? 0 : performance.now() - startedMono;
   const appendChallenge = async (value) => appendFile(paths.challenges, `${JSON.stringify(redactSensitiveValue(value, { maxDepth: 24, maxItems: 10000 }))}\n`, { mode: 0o600 });
-  const localLedger = async () => JSON.parse(await readFile(path.join(harness.stateDir, 'operations', 'operations.json'), 'utf8'));
+  const localLedger = async () => readLiveOperationLedger(harness.cli, operationId);
   const currentOperation = (ledger) => ledger.operations.find((operation) => operation.id === operationId);
   const fileExists = async (target) => readFile(target, 'utf8').then(() => true, (error) => { if (error.code === 'ENOENT') return false; throw error; });
   const status = async (state, extra = {}) => {

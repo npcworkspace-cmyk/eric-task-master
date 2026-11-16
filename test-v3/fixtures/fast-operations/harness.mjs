@@ -30,8 +30,11 @@ export async function createOperationsHarness({ outputDir, label = 'fast-accepta
   let sequence = 0;
   const cli = async (args, { expectedFailure = false, timeout = 90000 } = {}) => {
     const started = performance.now();
+    // This harness audits durable histories. Normal command replies remain
+    // compact; a historical audit explicitly asks for its full evidence.
+    const commandArgs = args[0] === 'ops' && args[1] === 'get' && !args.includes('--detail') ? [...args, '--detail', 'full'] : args;
     let result;
-    try { result = await executeFile(process.execPath, [CLI, ...args, '--state-dir', stateDir, '--json'], { cwd: ROOT, env, windowsHide: true, timeout, maxBuffer: 12 * 1024 * 1024 }); }
+    try { result = await executeFile(process.execPath, [CLI, ...commandArgs, '--state-dir', stateDir, '--json'], { cwd: ROOT, env, windowsHide: true, timeout, maxBuffer: 12 * 1024 * 1024 }); }
     catch (error) { if (!expectedFailure) throw Object.assign(new Error(`${args.slice(0, 2).join(' ')}: ${error.stdout || error.message}`), { code: error.code }); result = error; }
     const rows = String(result.stdout || result.stderr || '').split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
     const value = rows.at(-1);

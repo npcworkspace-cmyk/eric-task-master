@@ -13,6 +13,11 @@ function failure(code, message, nextAction) {
 
 export function selectedSkillDirectory({ environment = process.env, home = os.homedir() } = {}) {
   const requested = environment.ERIC_TASK_MASTER_SKILL_DIR;
+  if (!requested && (environment.ERIC_TASK_MASTER_AGENT_ID || !environment.CODEX_THREAD_ID && !environment.CODEX_HOME)) {
+    // Other Agent hosts can read the bundled guide directly. Their CLI calls
+    // must not depend on, replace, or validate an unrelated Codex installation.
+    return { directory: path.resolve(bundledSkill), required: true };
+  }
   const codexRoot = environment.CODEX_HOME || path.join(home, '.codex');
   if (requested && (!path.isAbsolute(requested) || path.basename(requested).toLowerCase() !== 'eric-task-master')) {
     throw failure('SKILL_LOCATION_INVALID', 'ERIC_TASK_MASTER_SKILL_DIR must be an absolute eric-task-master Skill directory');

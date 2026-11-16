@@ -13,10 +13,10 @@ test('operations persist domain permissions but redact secrets before disk; reco
   await store.update((data) => {
     data.operations.push({ id: 'op1', status: 'running', authorization: { accountId: 'account', version: 1, diagnostics: { authorization: 'Basic NESTED_PERMISSION_BASIC_SENTINEL' } }, password: 'SECRET_SENTINEL', verificationCode: 'OTP_SENTINEL',
       diagnostics: { request: { authorization: 'Basic HTTP_BASIC_SENTINEL' }, headers: { Authorization: 'Basic HEADER_BASIC_SENTINEL' }, other: { Authorization: 'Basic MIXED_CASE_BASIC_SENTINEL' } } });
-    data.actions.push({ actionId: 'write1', status: 'initiated', createdAt: new Date().toISOString() });
+    data.actions.push({ operationId: 'op1', actionId: 'write1', status: 'initiated', createdAt: new Date().toISOString() });
     data.commands.push({ commandId: 'cmd1', status: 'pending' });
   });
-  const source = await readFile(path.join(stateDir, 'operations.json'), 'utf8');
+  const source = (await Promise.all([store.store.filePath, store.store.journalPath].map((file) => readFile(file, 'utf8')))).join('\n');
   assert.equal(source.includes('SECRET_SENTINEL'), false);
   assert.equal(source.includes('OTP_SENTINEL'), false);
   for (const sentinel of ['HTTP_BASIC_SENTINEL', 'HEADER_BASIC_SENTINEL', 'MIXED_CASE_BASIC_SENTINEL', 'NESTED_PERMISSION_BASIC_SENTINEL']) assert.equal(source.includes(sentinel), false);

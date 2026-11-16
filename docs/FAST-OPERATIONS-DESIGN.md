@@ -2,6 +2,8 @@
 
 Historical design snapshot. Its initial source-only scope, no-independent-Agent restriction and proposed long-test gates below were superseded by explicit later approvals. Current supported behavior and evidence are in [Fast operations](FAST-OPERATIONS.md), the [online adapter guide](CODEX-HOST-ADAPTER.md) and [4.0.0 release notes](releases/4.0.0.md). Do not use this historical plan as a deployment instruction or current release gate.
 
+Correction, 2026-11-15: the local-browser routing amendment below was an implementation mistake, not a Task Master product requirement. All Task Master work uses its own selected/default Profile. The current general-ops path has batch-like Profile access, optional website identity guards, multi-tab work, direct command replies and local event listening. Historical requirements that made every observation depend on website identity or every navigation uncertainty block the task are superseded. Preserve real external-effect reconciliation and human stop/takeover.
+
 Date: 2026-11-14. Source: workspace-root `TASKMASTER_TODO.md`, original 55 requirements plus six user-requested mode/Skill requirements (61 total). Baseline: `53094a406a2439dede9198b1670eb6b9b0d62edc`, 3.1.11. This document adds no authorization for real accounts, installed Manager/Profile replacement or release. Current delivery is isolated/local only. The user's latest explicit instruction replaces the earlier 24-hour gate with TWO concurrent 8-hour real-time lanes: dynamic business chaos and unexpected popups, with the root main Agent making actual recovery decisions.
 
 ## Product boundary and minimal architecture

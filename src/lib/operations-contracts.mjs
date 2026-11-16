@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 export const MODES = Object.freeze(['auto', 'batch', 'operations']);
+export const scopeIncludes = (values, value) => Array.isArray(values) && (values.includes(value) || values.includes('*'));
 export function opsError(code, message, statusCode = 400) {
   return Object.assign(new Error(message), { code, statusCode });
 }
@@ -21,13 +22,15 @@ export function selectMode({ modePolicy = 'auto', mode, skillMode, intent, manua
   return { mode: requested, reason: skillMode && skillMode !== 'auto' ? 'skill-intent' : intent ? 'operational-intent' : 'script-default', ...(manualLock ? { automationPaused: true } : {}) };
 }
 export function validateAuthorization(value, now = Date.now()) {
+  const requiresExpiry = value?.scope !== 'profile' || value?.expiresAt != null;
   if (!value || typeof value !== 'object' || !value.accountId || !Array.isArray(value.resourceIds) ||
       !value.resourceIds.length || !Array.isArray(value.origins) || !value.origins.length ||
       !Array.isArray(value.allowedActions) || !value.allowedActions.length ||
-      !Number.isFinite(Date.parse(value.expiresAt)) || Date.parse(value.expiresAt) <= now) {
-    throw opsError('INVALID_AUTHORIZATION', 'Explicit account, resources, origins, actions and future expiry are required');
+      requiresExpiry && (!Number.isFinite(Date.parse(value.expiresAt)) || Date.parse(value.expiresAt) <= now)) {
+    throw opsError('INVALID_AUTHORIZATION', 'Invalid account/resource/origin/action scope or expiry; strict identity requires a future expiry');
   }
   for (const origin of value.origins) {
+    if (origin === '*' && value.scope === 'profile') continue;
     let valid = false; try { valid = new URL(origin).origin === origin && ['http:', 'https:'].includes(new URL(origin).protocol); } catch { /* invalid explicit origin */ }
     if (!valid) throw opsError('INVALID_AUTHORIZATION', 'Authorization origins must be exact HTTP URL origins');
   }
@@ -38,14 +41,22 @@ export function validateAuthorization(value, now = Date.now()) {
   }
   return structuredClone(value);
 }
+export function operationAuthorization(value, profileId, now = Date.now()) {
+  if (value != null && (typeof value !== 'object' || Array.isArray(value))) throw opsError('INVALID_AUTHORIZATION', 'Optional authorization must be a JSON object');
+  if (value?.scope === 'identity' || value?.accountId && value.scope !== 'profile') return validateAuthorization({ ...value, scope: 'identity' }, now);
+  return validateAuthorization({
+    scope: 'profile', accountId: `profile:${profileId}`, resourceIds: ['*'], origins: ['*'], allowedActions: ['*'],
+    expiresAt: null, ...value, scope: 'profile', accountId: `profile:${profileId}`
+  }, now);
+}
 export function assertAuthorized(operation, request = {}, now = Date.now()) {
   const auth = operation.authorization;
   if (auth.revokedAt || Date.parse(auth.expiresAt) <= now) throw opsError('AUTHORIZATION_INACTIVE', 'Authorization expired or was revoked', 403);
   if (request.authorizationVersion !== undefined && request.authorizationVersion !== auth.version) throw opsError('AUTHORIZATION_CHANGED', 'Refresh authorization before continuing', 409);
   if (request.accountId && request.accountId !== auth.accountId) throw opsError('ACCOUNT_MISMATCH', 'Account is outside authorization', 403);
-  if (request.resourceId && !auth.resourceIds.includes(request.resourceId)) throw opsError('RESOURCE_NOT_AUTHORIZED', 'Resource is outside authorization', 403);
-  if (request.origin && !auth.origins.includes(request.origin)) throw opsError('ORIGIN_NOT_AUTHORIZED', 'Origin is outside authorization', 403);
+  if (request.resourceId && !scopeIncludes(auth.resourceIds, request.resourceId)) throw opsError('RESOURCE_NOT_AUTHORIZED', 'Resource is outside authorization', 403);
+  if (request.origin && !scopeIncludes(auth.origins, request.origin)) throw opsError('ORIGIN_NOT_AUTHORIZED', 'Origin is outside authorization', 403);
   if (request.kind && !['observe', 'wait', 'tabs', 'select-tab', 'screenshot', 'reconcile', 'control'].includes(request.kind) &&
-      !auth.allowedActions.includes(request.kind)) throw opsError('ACTION_NOT_AUTHORIZED', `Action ${request.kind} is outside authorization`, 403);
+      !scopeIncludes(auth.allowedActions, request.kind)) throw opsError('ACTION_NOT_AUTHORIZED', `Action ${request.kind} is outside authorization`, 403);
   return auth;
 }

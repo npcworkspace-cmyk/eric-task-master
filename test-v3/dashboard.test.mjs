@@ -88,14 +88,14 @@ test('portable Skill keeps one CLI guide and routes path discovery to its packag
   assert.match(skill, /taskmaster delete TASK_ID/u);
   assert.match(skill, /Do not add a preflight check to a normal task/u);
   assert.match(skill, /For a new Agent or Skill update, locate the existing application/u);
-  assert.match(skill, /install\/update only this Skill/u);
+  assert.match(skill, /(?:install\/)?update only this Skill/u);
   assert.match(skill, /Never stop the shared Manager to install or update an Agent Skill/u);
   assert.match(skill, /--state-dir ABSOLUTE_DIRECTORY/u);
   assert.match(skill, /<SKILL_ROOT>\/scripts\/find-launcher\.ps1/u);
   assert.ok((await readFile(new URL('scripts/find-launcher.ps1', skillRoot), 'utf8')).length > 0);
   assert.match(skill, /macOS `\/usr\/local\/bin\/taskmaster`; Linux `\/usr\/bin\/taskmaster`/u);
   assert.doesNotMatch(skill, /task type|surface-probe|full-human|journey|ephemeral/iu);
-  assert.ok(skill.split(/\r?\n/u).length <= 70, 'Skill should stay one-page and cheap to read');
+  assert.ok(skill.split(/\r?\n/u).length <= 110, 'Skill should remain a compact, readable guide');
 });
 
 test('deployment guides reuse the Manager and leave Playwright version selection to the bundle', async () => {

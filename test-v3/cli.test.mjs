@@ -56,6 +56,17 @@ function lastJson(source) {
   return JSON.parse(lines.at(-1));
 }
 
+test('lightweight CLI requests do not load the Manager service graph', async () => {
+  const hook = `export async function resolve(specifier, context, nextResolve) {
+    if (specifier.endsWith('/manager.mjs')) throw new Error('EAGER_MANAGER_IMPORT');
+    return nextResolve(specifier, context);
+  }`;
+  const preload = `import { register } from 'node:module'; register(${JSON.stringify(`data:text/javascript,${encodeURIComponent(hook)}`)}, import.meta.url);`;
+  const result = await runCli(['--help'], { nodeArgs: ['--import', `data:text/javascript,${encodeURIComponent(preload)}`] });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Eric Task Master/u);
+});
+
 async function reservePort() {
   const server = http.createServer();
   await new Promise((resolve, reject) => {
@@ -919,6 +930,11 @@ test('explicit Manager maintenance waits for process exit and never interrupts a
 
 test('different-version Managers retain task controls but refuse new work until the upgrade', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-compatible-'));
+  const skillEnvironment = {
+    ERIC_TASK_MASTER_AGENT_ID: 'cli-version-compatibility-test',
+    ERIC_TASK_MASTER_AGENT_SKILL_VERSION: VERSION,
+    ERIC_TASK_MASTER_SKILL_DIR: path.join(ROOT, 'skills', 'eric-task-master')
+  };
   t.after(() => removeTestTree(root));
   await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'c'.repeat(48) }));
   const requests = [];
@@ -970,7 +986,7 @@ test('different-version Managers retain task controls but refuse new work until 
   assert.equal(lastJson(profileMismatch.stderr).error.code, 'MANAGER_VERSION_MISMATCH');
   assert.equal(requests.some((request) => request.includes('/v1/profiles')), false, 'a mismatched Manager never opens a new Profile');
   managerVersion = VERSION;
-  const unsupported = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', '--detach', ...common]);
+  const unsupported = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', '--detach', ...common], { env: skillEnvironment });
   assert.equal(unsupported.code, 1);
   assert.equal(lastJson(unsupported.stderr).error.code, 'MANAGER_CAPABILITY_UNAVAILABLE');
   assert.match(lastJson(unsupported.stderr).nextAction, /controls remain available/u);
@@ -978,11 +994,11 @@ test('different-version Managers retain task controls but refuse new work until 
 
   capabilities = ['task.request-key'];
   requests.length = 0;
-  const accepted = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', ...common]);
+  const accepted = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', ...common], { env: skillEnvironment });
   assert.equal(accepted.code, 0, accepted.stderr);
   assert.equal(submissions.at(-1).requestKey, 'logical-submit');
   assert.equal(requests.filter((request) => request.includes('/v1/health')).length, 1, 'run reuses its connection for follow');
-  const invalid = await runCli(['run', 'job.mjs', '--request-key', ...common]);
+  const invalid = await runCli(['run', 'job.mjs', '--request-key', ...common], { env: skillEnvironment });
   assert.equal(invalid.code, 1);
   assert.equal(lastJson(invalid.stderr).error.code, 'INVALID_REQUEST_KEY');
 });

@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createOperationsService } from '../src/runtime/operations-service.mjs';
+import { OperationsStore } from '../src/lib/operations-store.mjs';
 import { operationsSchema } from '../src/lib/operations-schema.mjs';
 import { validateFastCommand } from '../src/runtime/fast-session.mjs';
 import { publicTask } from '../src/contracts.mjs';
@@ -17,7 +18,7 @@ async function setup(t, options = {}) {
     get: async (id) => tasks.get(id), resume: async (id, value, envelope) => { resumes.push({ id, value, envelope }); tasks.get(id).state = 'running'; },
     stop: async (id) => { tasks.get(id).state = 'stopped'; }, operationControl: async (id, control) => { controls.push({ id, control }); return control.action === 'cursor' ? { applied: true, cursorEnabled: control.visible } : true; },
     setOperationDurableHandler: () => {} };
-  const profileStore = { get: async (id) => ({ id, modePolicy: 'auto' }) };
+  const profileStore = { get: async (id) => ({ id, modePolicy: 'auto' }), getDefault: async () => ({ id: 'saved-default', modePolicy: 'auto' }) };
   const service = await createOperationsService({ stateDir, taskService, profileStore, now: () => clock, tickMs: 60000, ...options });
   t.after(async () => { await service.close(); await removeTestTree(stateDir); });
   const input = { goal: 'Local test', mode: 'operations', browserSelection: { kind: 'profile', profileId: 'explicit-test' },
@@ -63,9 +64,11 @@ test('single-send fresh authorization rejects takeover/revoke and restart retain
   assert.notEqual(recreated.taskId, op.taskId); assert.equal(recreated.task.input.singleSendTransport, true); assert.deepEqual(recreated.task.input.browserSelection, op.browserSelection);
 });
 
-test('operation rejects implicit Profile fallback, persists commands, dispatches same worker once', async (t) => {
+test('operation reuses its own saved default Profile, persists commands and dispatches the same worker once', async (t) => {
   const { service, input, resumes } = await setup(t);
-  await assert.rejects(service.start({ ...input, browserSelection: undefined }), { code: 'BROWSER_ADAPTER_UNAVAILABLE' });
+  const defaultOperation = await service.start({ ...input, browserSelection: undefined });
+  assert.equal(defaultOperation.browserSelection.profileId, 'saved-default');
+  await assert.rejects(service.start({ ...input, browserSelection: { kind: 'local-browser' } }), { code: 'INVALID_BROWSER_SELECTION' });
   const operation = await service.start(input);
   const command = { commandId: 'observe1', kind: 'observe', payload: {} };
   const first = await service.command(operation.id, command); assert.equal(first.status, 'pending'); assert.equal(resumes[0].id, operation.taskId);
@@ -74,6 +77,25 @@ test('operation rejects implicit Profile fallback, persists commands, dispatches
   await service.durable(operation.taskId, 'command-result', { commandId: 'observe1', status: 'confirmed', result: { text: 'summary' } });
   assert.equal((await service.get(operation.id)).pending, null);
 });
+
+for (const outcome of ['applied', 'not-applied']) {
+  test(`general browser action without a preset expected result can be reconciled as ${outcome} using explained actual evidence`, async (t) => {
+    const { service, tasks } = await setup(t);
+    const op = await service.start({ goal: 'General authorized browser work', mode: 'operations' });
+    const identity = { accountId: op.authorization.accountId, resourceId: 'http://localhost:5555/page' };
+    await service.command(op.id, { commandId: 'browser-action', kind: 'batch', payload: { actions: [{ actionId: 'click', type: 'click', target: { selector: '#submit' } }] } });
+    for (const status of ['prepared', 'initiated', 'unknown']) await service.durable(op.taskId, 'action', { commandId: 'browser-action', actionId: 'click', kind: 'click', ...identity, status });
+    await service.durable(op.taskId, 'command-result', { commandId: 'browser-action', status: 'unknown' }); tasks.get(op.taskId).state = 'waiting';
+    const verification = [{ target: { selector: '#application-status' }, text: outcome === 'applied' ? 'Accepted with reference 123' : 'Rejected before sending' }];
+    const reason = 'Agent reviewed the actual application status and audit evidence for this action';
+    await service.command(op.id, { commandId: 'readback', kind: 'reconcile', payload: { actionIds: ['click'], verify: verification, outcome, reason } });
+    const resultIdentity = { ...identity, resourceId: 'http://localhost:5555/application-audit' };
+    const result = { matched: true, outcome, verification, identity: resultIdentity, url: resultIdentity.resourceId };
+    await assert.rejects(service.durable(op.taskId, 'reconciliation', { commandId: 'readback', actionIds: ['click'], result }), { code: 'RECONCILIATION_DECISION_MISMATCH' });
+    await service.durable(op.taskId, 'reconciliation', { commandId: 'readback', actionIds: ['click'], result: { ...result, reason } });
+    assert.equal((await service.get(op.id)).actions[0].status, outcome === 'applied' ? 'confirmed' : 'failed');
+  });
+}
 
 test('durable initiated state precedes write, unknown blocks mutations and takeover retains mode', async (t) => {
   const { service, input, controls } = await setup(t); const operation = await service.start(input);
@@ -123,7 +145,7 @@ test('restart of an idle session permits explicit resume while uncertain effects
   await service.close();
   const recovered = await createOperationsService({ stateDir, taskService, profileStore, tickMs: 60000 });
   t.after(() => recovered.close());
-  assert.equal((await recovered.get(idle.id)).status, 'reconcile-required');
+  assert.equal((await recovered.get(idle.id)).status, 'running');
   await recovered.action(idle.id, { action: 'resume' });
   const resumed = await recovered.get(idle.id);
   assert.notEqual(resumed.taskId, idle.taskId); assert.equal(resumed.task.input.reconcileRequired, false);
@@ -267,15 +289,19 @@ test('twenty successful quiet authorizations rewrite nothing, while budget rejec
   await service.durable(operation.taskId, 'command-result', { commandId: 'quiet-observer', status: 'confirmed' });
   const ledgerPath = service.store.store.filePath;
   const before = await stat(ledgerPath, { bigint: true }); const sourceBefore = await readFile(ledgerPath, 'utf8');
+  const journalPath = service.store.store.journalPath;
+  const journalBefore = await stat(journalPath, { bigint: true }); const journalSourceBefore = await readFile(journalPath, 'utf8');
   const originalUpdate = service.store.store.update.bind(service.store.store); let writes = 0;
   service.store.store.update = async (...args) => { writes += 1; return originalUpdate(...args); };
   const request = { commandId: 'quiet-observer', kind: 'observe', effect: false, backgroundRead: true, accountId: 'account', resourceId: 'resource', origin: 'http://localhost:5555' };
   for (let count = 0; count < 20; count += 1) assert.equal((await service.durable(operation.taskId, 'authorize', request)).authorization.version, 1);
   const after = await stat(ledgerPath, { bigint: true });
   assert.equal(writes, 0); assert.equal(before.mtimeNs, after.mtimeNs); assert.equal(await readFile(ledgerPath, 'utf8'), sourceBefore);
+  assert.equal(journalBefore.mtimeNs, (await stat(journalPath, { bigint: true })).mtimeNs); assert.equal(await readFile(journalPath, 'utf8'), journalSourceBefore);
   advance(10001);
   await assert.rejects(service.durable(operation.taskId, 'authorize', request), { code: 'OPERATION_BUDGET_EXCEEDED' });
-  assert.equal(writes, 1); assert.equal(JSON.parse(await readFile(ledgerPath, 'utf8')).operations[0].status, 'paused'); assert.equal(controls.at(-1).control.action, 'pause');
+  const reopened = await new OperationsStore({ stateDir: path.dirname(ledgerPath) }).init();
+  assert.equal(writes, 1); assert.equal((await reopened.read()).operations[0].status, 'paused'); assert.equal(controls.at(-1).control.action, 'pause');
   t.diagnostic(JSON.stringify({ quietAuthorizations: 20, quietLedgerWrites: 0, budgetPauseLedgerWrites: writes, pausePersisted: true }));
 });
 
@@ -285,9 +311,9 @@ test('budget snapshot recheck cannot overwrite a concurrent terminal stop or rev
     const operation = await service.start({ ...input, budgets: { maxDurationMs: 1000 } });
     await service.command(operation.id, { commandId: 'terminal-race', kind: 'observe' });
     advance(1001);
-    const originalRead = service.store.read.bind(service.store); let inject = true;
-    service.store.read = async () => {
-      const snapshot = await originalRead();
+    const originalRead = service.store.readAuthorizationContext.bind(service.store); let inject = true;
+    service.store.readAuthorizationContext = async (...args) => {
+      const snapshot = await originalRead(...args);
       if (inject) {
         inject = false;
         await service.store.update((data) => {
