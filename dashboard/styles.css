@@ -31,8 +31,6 @@
   --npc-ease: cubic-bezier(.2, .8, .2, 1);
   --npc-focus-ring: 0 0 0 4px rgba(255, 75, 35, .24);
 }
-.profile-mode-picker { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
-.profile-mode-picker select { max-width: 125px; color: inherit; background: var(--npc-paper-bright); border: 1px solid currentColor; border-radius: 8px; padding: 6px; }
 
 * { box-sizing: border-box; }
 

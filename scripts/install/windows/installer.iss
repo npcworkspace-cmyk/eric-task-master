@@ -37,7 +37,6 @@ Type: files; Name: "{app}\THIRD_PARTY_NOTICES.txt"; Check: IsManagedUpgradeRoot
 
 [Files]
 Source: "{#SourceRoot}\app\src\lib\assert-runtime-idle.ps1"; Flags: dontcopy
-Source: "{#SourceRoot}\app\src\lib\replace-legacy-launcher.ps1"; Flags: dontcopy
 Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -52,10 +51,6 @@ Type: files; Name: "{userprograms}\Eric Task Master\Eric Task Master Notificatio
 [Code]
 const
   UserEnvironmentKey = 'Environment';
-
-var
-  ActivateUpgrade: Boolean;
-  ActivationFailed: Boolean;
 
 function NormalizedPath(Value: string): string;
 begin
@@ -76,91 +71,24 @@ begin
     (NormalizedPath(PreviousRoot) = NormalizedPath(ExpandConstant('{app}')));
 end;
 
-function RuntimeInspectionStatus(GuardPath: string): Integer;
+function CheckRuntimeIdle(GuardPath: string): Boolean;
 var
   ResultCode: Integer;
 begin
-  Result := 11;
-  if FileExists(GuardPath) and Exec(
+  Result := FileExists(GuardPath) and Exec(
     ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + GuardPath +
       '" -AppRoot "' + ExpandConstant('{app}') + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode
-  ) then Result := ResultCode;
-end;
-
-function CheckRuntimeIdle(GuardPath: string): Boolean;
-begin
-  Result := RuntimeInspectionStatus(GuardPath) = 0;
-end;
-
-function StopSelectedManager(OnlyIfIdle: Boolean): Boolean;
-var
-  LauncherPath: string;
-  Parameters: string;
-  ResultCode: Integer;
-begin
-  LauncherPath := ExpandConstant('{app}\bin\taskmaster.cmd');
-  if not FileExists(LauncherPath) then LauncherPath := ExpandConstant('{app} v3\bin\taskmaster.cmd');
-  if not FileExists(LauncherPath) then begin Result := False; Exit; end;
-  Parameters := '/D /S /C ""' + LauncherPath + '" manager stop';
-  if OnlyIfIdle then Parameters := Parameters + ' --if-idle';
-  Parameters := Parameters + ' --json"';
-  Result := Exec(ExpandConstant('{cmd}'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
-end;
-
-function CheckLegacyLauncher(Mode: string): Boolean;
-var
-  ResultCode: Integer;
-begin
-  Result := Exec(
-    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\replace-legacy-launcher.ps1') +
-      '" -AppRoot "' + ExpandConstant('{app}') + '" -NewVersion "{#ProductVersion}" -Mode ' + Mode,
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode
   ) and (ResultCode = 0);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  Inspection: Integer;
 begin
   Result := '';
-  ActivateUpgrade := IsManagedUpgradeRoot() or
-    FileExists(ExpandConstant('{app}\release-manifest.json')) or
-    FileExists(ExpandConstant('{app} v3\release-manifest.json')) or
-    FileExists(ExpandConstant('{app} v3\.taskmaster-legacy.json'));
   ExtractTemporaryFile('assert-runtime-idle.ps1');
-  ExtractTemporaryFile('replace-legacy-launcher.ps1');
-  if not CheckLegacyLauncher('Validate') then
-    Result := 'Existing Task Master installations could not be safely replaced or are newer. No legacy files were moved; inspect the installation before retrying.'
-  else
-  begin
-    Inspection := RuntimeInspectionStatus(ExpandConstant('{tmp}\assert-runtime-idle.ps1'));
-    if Inspection = 10 then
-    begin
-      if StopSelectedManager(True) then
-        Inspection := RuntimeInspectionStatus(ExpandConstant('{tmp}\assert-runtime-idle.ps1'));
-      if Inspection = 10 then
-      begin
-        if WizardSilent then
-          Result := 'Task Master is busy. Ask the Owner to wait or explicitly stop the selected Manager and its work; no force stop was performed.'
-        else if MsgBox('Task Master is still working. Stop the selected Manager and its tasks and Profile windows now to install the new version? Unconfirmed external actions may have an unknown result and must be checked before retrying. Choose No to leave the work running and cancel this upgrade.', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-        begin
-          if StopSelectedManager(False) then
-            Inspection := RuntimeInspectionStatus(ExpandConstant('{tmp}\assert-runtime-idle.ps1'))
-          else
-            Result := 'The selected Manager could not be stopped safely. Installation was not started.';
-        end
-        else
-          Result := 'Upgrade cancelled. Existing work was not force-stopped.';
-      end;
-    end;
-    if (Result = '') and (Inspection <> 0) then
-      Result := 'Task Master runtime remains in use or could not be inspected. Installation was not started; retain existing work and data.';
-    if (Result = '') and not CheckLegacyLauncher('Apply') then
-      Result := 'The legacy Task Master launcher could not be safely replaced. Installation was not started; preserve user data and inspect the old path.';
-  end;
+  if not CheckRuntimeIdle(ExpandConstant('{tmp}\assert-runtime-idle.ps1')) then
+    Result := 'Eric Task Master runtime is still in use or could not be inspected. No Agent was stopped. Finish tasks, close Profiles, explicitly stop the idle Manager, then retry.';
 end;
 
 function InitializeUninstall(): Boolean;
@@ -225,33 +153,8 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
-var
-  ResultCode: Integer;
 begin
-  if CurStep = ssPostInstall then
-  begin
-    AddUserPath(ExpandConstant('{app}\bin'));
-    if ActivateUpgrade then
-    begin
-      ActivationFailed := not Exec(
-        ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-        '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\app\src\lib\activate-upgrade.ps1') +
-          '" -AppRoot "' + ExpandConstant('{app}') + '" -ExpectedVersion "{#ProductVersion}"',
-        '', SW_HIDE, ewWaitUntilTerminated, ResultCode
-      ) or (ResultCode <> 0);
-      if ActivationFailed then
-      begin
-        Log('Application files were installed but Manager/Skill activation failed. The upgrade is incomplete.');
-        if not WizardSilent then
-          MsgBox('Task Master files were installed, but Manager and Skill activation did not complete. Keep existing data and run the new launcher with manager start --upgrade --json after resolving the condition.', mbError, MB_OK);
-      end;
-    end;
-  end;
-end;
-
-function GetCustomSetupExitCode(): Integer;
-begin
-  if ActivationFailed then Result := 20 else Result := 0;
+  if CurStep = ssPostInstall then AddUserPath(ExpandConstant('{app}\bin'));
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

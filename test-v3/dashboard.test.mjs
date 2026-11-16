@@ -43,12 +43,6 @@ test('v3 Dashboard is a two-page task and Profile control surface', async () => 
   assert.match(source, /if \(!name \|\| name === profile\.name\) return/u);
   assert.match(source, /'profiles\.rename': '改名'/u);
   assert.match(source, /'profiles\.rename': 'Rename'/u);
-  assert.match(source, /'profiles\.mode': '默认执行策略'/u);
-  assert.match(source, /'mode\.auto': '自动选择'/u);
-  assert.match(source, /'mode\.batch': '批量'/u);
-  assert.match(source, /'mode\.operations': '运营'/u);
-  assert.match(source, /'modeReason\.script-default': '普通脚本默认'/u);
-  assert.match(source, /option\.value = mode/u, 'Mode API values must remain unchanged despite translated display labels');
   assert.match(source, /method:\s*'DELETE'/u);
   assert.match(source, /state\.pending\.has\(key\)/u);
   assert.match(source, /credentials:\s*'same-origin'/u);
@@ -88,14 +82,14 @@ test('portable Skill keeps one CLI guide and routes path discovery to its packag
   assert.match(skill, /taskmaster delete TASK_ID/u);
   assert.match(skill, /Do not add a preflight check to a normal task/u);
   assert.match(skill, /For a new Agent or Skill update, locate the existing application/u);
-  assert.match(skill, /(?:install\/)?update only this Skill/u);
+  assert.match(skill, /install\/update only this Skill/u);
   assert.match(skill, /Never stop the shared Manager to install or update an Agent Skill/u);
   assert.match(skill, /--state-dir ABSOLUTE_DIRECTORY/u);
   assert.match(skill, /<SKILL_ROOT>\/scripts\/find-launcher\.ps1/u);
   assert.ok((await readFile(new URL('scripts/find-launcher.ps1', skillRoot), 'utf8')).length > 0);
   assert.match(skill, /macOS `\/usr\/local\/bin\/taskmaster`; Linux `\/usr\/bin\/taskmaster`/u);
   assert.doesNotMatch(skill, /task type|surface-probe|full-human|journey|ephemeral/iu);
-  assert.ok(skill.split(/\r?\n/u).length <= 110, 'Skill should remain a compact, readable guide');
+  assert.ok(skill.split(/\r?\n/u).length <= 70, 'Skill should stay one-page and cheap to read');
 });
 
 test('deployment guides reuse the Manager and leave Playwright version selection to the bundle', async () => {
@@ -160,7 +154,7 @@ test('NPC and Media Bridge copy stay below the work area with native expanded po
   assert.ok(html.indexOf('id="panel-intro"') < html.indexOf('id="dashboard-message"'));
   for (const [id, url] of [
     ['panel-npc-link', 'https://www.npctech.site/'],
-    ['panel-media-link', 'https://npcpressbridge.com/']
+    ['panel-media-link', 'https://media.npctech.site/']
   ]) {
     const link = [...html.matchAll(/<a\b[^>]*>/gu)].map((match) => match[0])
       .find((tag) => tag.includes(`id="${id}"`));
@@ -173,14 +167,14 @@ test('NPC and Media Bridge copy stay below the work area with native expanded po
   assert.ok(details);
   assert.match(details, /\sopen(?:\s|=|>)/u);
   assert.match(html, /<summary\b[^>]*id="panel-possibilities-title"/u);
-  assert.match(html, /媒介桥 · npcpressbridge\.com ↗/u);
+  assert.match(html, /媒介桥 · media\.npctech\.site ↗/u);
   assert.match(html, /发挥你的想象力/u);
   assert.match(html, /网页上能做的事，基本都可以/u);
   assert.match(source, /Use your imagination/u);
-  assert.match(source, /Media Bridge · npcpressbridge\.com ↗/u);
+  assert.match(source, /Media Bridge · media\.npctech\.site ↗/u);
   for (const guide of [english, chinese]) {
     const links = [...guide.matchAll(/\[[^\]]+\]\(([^)\s]+)\)/gu)];
-    assert.ok(links.some(([, href]) => new URL(href, 'https://github.com/').href === 'https://npcpressbridge.com/'));
+    assert.ok(links.some(([, href]) => new URL(href, 'https://github.com/').href === 'https://media.npctech.site/'));
   }
   assert.match(chinese, /发挥你的想象力/u);
   assert.match(english, /Use your imagination/u);

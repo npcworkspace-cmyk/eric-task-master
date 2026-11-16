@@ -8,8 +8,7 @@ import { API_VERSION, DEFAULT_HOST, DEFAULT_PORT, PROFILE_ACTION_TIMEOUT_MS, TER
 import { isProcessAlive } from './lib/process-tree.mjs';
 import { ManagerLock } from './lib/manager-lock.mjs';
 import { consolidateLegacySharedState } from './lib/state-upgrade.mjs';
-import { operationsSchema } from './lib/operations-schema.mjs';
-import { assertAgentSkillLoaded, assertSelectedSkillVersion, planSkillUpgrade, replaceSelectedSkill } from './lib/skill-sync.mjs';
+import { defaultDataDirectory, startManager } from './manager.mjs';
 import { managerOwnershipProof, managerRecoveryProof, managerStateId, readManagerConfig } from './lib/manager-state.mjs';
 import {
   chooseDefaultState, projectStateEnvironment, readDefaultStateLocation, readStateEndpoint,
@@ -36,17 +35,6 @@ Profiles:
   taskmaster profiles create NAME
   taskmaster profiles default NAME_OR_ID
   taskmaster profiles rename NAME_OR_ID --name NEW_NAME
-  taskmaster profiles mode NAME_OR_ID --mode auto|batch|operations
-  taskmaster ops start [--profile NAME_OR_ID] [--goal TEXT] [--input JSON_OR_@FILE]
-  taskmaster ops schema [--section start|actions|recovery|compatibility|all] --json
-  taskmaster ops get OP_ID [--command COMMAND_ID] [--detail compact|full]
-  taskmaster ops command OP_ID --input JSON_OR_@FILE [--wait-ms 0..30000] [--detail compact|full]
-  taskmaster ops stream OP_ID [--wait-ms 0..30000] [--detail compact|full] --json
-  taskmaster ops events OP_ID [--after N] [--wait-ms N]
-  taskmaster ops listen OP_ID [--after N] [--timeout MILLISECONDS]
-  taskmaster ops ack|decide|reconcile|update OP_ID --input JSON_OR_@FILE
-  taskmaster ops pause|resume|takeover|revoke|stop OP_ID [--mode MODE]
-  taskmaster ops stop-all
   taskmaster profiles open|close|delete NAME_OR_ID
 
 Manager:
@@ -56,7 +44,7 @@ Manager:
 
 All commands accept --json. Manager starts automatically when needed.
 panel opens the Dashboard; panel --json returns its URL without opening a browser.
-Matching running Managers are reused. --upgrade is explicit and idle-only, and synchronizes an installed driving Skill.
+Compatible running Managers are reused, including manager start. --upgrade is explicit and idle-only.
 Data is independent of the application and Agent host. Defaults share one selected state.
 --state-dir DIR isolates a project and discovers its own port unless --port is supplied.
 follow --wait-ms returns current state and an after cursor when the wait expires.`;
@@ -163,11 +151,11 @@ async function settings(options = {}, { serving = false } = {}) {
   const environment = stateEnvironment();
   const location = !explicitState ? await readDefaultStateLocation(environment) : null;
   const requestedStateDir = path.resolve(options['state-request'] || options['state-dir'] ||
-    process.env.ERIC_TASK_MASTER_HOME || location?.stateDir || environment.sharedRoot);
+    process.env.ERIC_TASK_MASTER_HOME || location?.stateDir || defaultDataDirectory());
   const projectEnvironment = !shared ? projectStateEnvironment(requestedStateDir, environment) : null;
   const projectLocation = projectEnvironment ? await readDefaultStateLocation(projectEnvironment) : null;
   const stateDir = projectLocation?.stateDir || path.resolve(options['state-dir'] ||
-    process.env.ERIC_TASK_MASTER_HOME || location?.stateDir || environment.sharedRoot);
+    process.env.ERIC_TASK_MASTER_HOME || location?.stateDir || defaultDataDirectory());
   const explicitPort = options.port !== undefined || process.env.ERIC_TASK_MASTER_PORT !== undefined;
   const autoPort = !shared && !explicitPort && !serving;
   let port = autoPort ? 0 : parseIntegerOption(
@@ -205,7 +193,6 @@ async function requestJson(config, pathname, { method = 'GET', body, token, time
     response = await fetch(new URL(pathname, config.baseUrl), {
       method,
       headers: {
-        'x-taskmaster-runtime-version': VERSION,
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' })
       },
@@ -471,8 +458,7 @@ async function spawnBackgroundManager(config, {
   cliPath = CLI_PATH
 } = {}) {
   const cleanEnvironment = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => !['NODE_OPTIONS', 'CODEX_THREAD_ID', 'ERIC_TASK_MASTER_AGENT_ID',
-      'ERIC_TASK_MASTER_AGENT_SKILL_VERSION'].includes(key.toUpperCase()))
+    Object.entries(process.env).filter(([key]) => key.toUpperCase() !== 'NODE_OPTIONS')
   );
   cleanEnvironment.NODE_OPTIONS = '';
   const startupDirectory = path.join(config.stateDir, 'logs');
@@ -495,7 +481,6 @@ async function spawnBackgroundManager(config, {
       ...(config.shared ? ['--shared'] : []),
       ...(config.stateDirAliases?.[0] ? ['--state-alias', config.stateDirAliases[0]] : []),
       ...(config.projectEnvironment ? ['--state-request', config.requestedStateDir] : []),
-      ...(config.activateSkill ? ['--activate-skill'] : []),
       '--json'
     ], {
       detached: true,
@@ -619,7 +604,7 @@ export async function ensureManager(config, { startManager = startBackgroundMana
   } catch (error) {
     if (error.code === 'MANAGER_UNREACHABLE') {
       await prepareStateForStart(config, { upgrade: maintainVersion });
-      const started = await startManager(maintainVersion ? { ...config, activateSkill: true } : config);
+      const started = await startManager(config);
       await rememberSharedState(config, started);
       return started;
     }
@@ -656,31 +641,31 @@ export async function ensureManager(config, { startManager = startBackgroundMana
     throw cliError(
       'MANAGER_CAPABILITY_UNAVAILABLE',
       `Manager ${current.version || 'unknown'} cannot guard an idle version replacement`,
-      'Ask the Owner whether to wait or explicitly stop this Manager and its work, then retry the upgrade. Do not choose or stop automatically.'
+      'Keep using the compatible running Manager. To update, finish the existing work, close its Profiles, explicitly run taskmaster manager stop, then taskmaster manager start.'
     );
   }
 
   const token = await readToken(config);
   const status = await requestJson(config, '/v1/status', { token });
-  const { running, queued } = status.tasks || {};
-  if (!Number.isSafeInteger(running) || !Number.isSafeInteger(queued) || running < 0 || queued < 0) {
-    throw cliError('INVALID_MANAGER_RESPONSE', 'Manager did not return valid task counts for upgrade');
+  const activeTasks = Number(status.tasks?.running || 0) + Number(status.tasks?.queued || 0);
+  if (activeTasks > 0) {
+    throw cliError(
+      'MANAGER_VERSION_MISMATCH',
+      `Manager ${current.version || 'unknown'} has ${activeTasks} active task(s) and cannot be replaced by CLI ${VERSION}`,
+      'Let the active tasks finish or stop them, then run taskmaster manager start --upgrade.'
+    );
   }
   const { profiles } = await requestJson(config, '/v1/profiles', { token });
   if (!Array.isArray(profiles)) {
     throw cliError('INVALID_MANAGER_RESPONSE', 'Manager did not return its Profiles for version maintenance');
   }
   const occupiedProfiles = profiles.filter((profile) => profile.lease || ['opening', 'open', 'closing'].includes(profile.state));
-  if (running + queued > 0 || occupiedProfiles.length) {
-    const error = cliError(
-      'MANAGER_UPGRADE_DECISION_REQUIRED',
-      `Manager ${current.version || 'unknown'} has ${running + queued} active task(s) and ${occupiedProfiles.length} occupied Profile(s)`,
-      'Ask the Owner to choose: wait for the work to finish, or explicitly stop this Manager and its tasks/Profile windows and replace it. Stopped work may have unconfirmed external effects; inspect them before retrying. Never choose automatically.'
+  if (occupiedProfiles.length) {
+    throw cliError(
+      'MANAGER_VERSION_MISMATCH',
+      `Manager ${current.version || 'unknown'} has ${occupiedProfiles.length} occupied Profile(s) and cannot be replaced by CLI ${VERSION}`,
+      'Close the occupied Profiles, then run taskmaster manager start --upgrade. Existing task and Profile controls remain available.'
     );
-    error.details = { managerVersion: current.version || null, managerPid: current.pid || null,
-      stateId: current.stateId || null, running, queued, occupiedProfiles: occupiedProfiles.length,
-      choices: ['wait', 'stop_selected_manager_and_replace'] };
-    throw error;
   }
   await requestJson(config, '/v1/manager/stop', { method: 'POST', body: { onlyIfIdle: true }, token });
   if (!(await waitForManagerStop(config, 20_000, current.pid))) {
@@ -691,7 +676,7 @@ export async function ensureManager(config, { startManager = startBackgroundMana
     );
   }
   await prepareStateForStart(config, { upgrade: maintainVersion });
-  const started = await startManager(maintainVersion ? { ...config, activateSkill: true } : config);
+  const started = await startManager(config);
   await rememberSharedState(config, started);
   return started;
 }
@@ -702,55 +687,12 @@ async function apiContext(options) {
   return { config, token: await readToken(config), manager };
 }
 
-function requireCurrentManager(manager) {
-  if (manager?.version !== VERSION) {
-    throw cliError('MANAGER_VERSION_MISMATCH',
-      `Running Manager ${manager?.version || 'unknown'} does not match CLI ${VERSION}`,
-      'Finish active work with its existing controls, then run taskmaster manager start --upgrade with the current launcher.');
-  }
-}
-
-async function currentWorkContext(options) {
-  const context = await apiContext(options);
-  requireCurrentManager(context.manager);
-  await currentWorkSkill();
-  return context;
-}
-
-async function currentWorkSkill() {
-  let skill;
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    try {
-      try { skill = await assertSelectedSkillVersion(VERSION); }
-      catch (error) {
-        if (error.code !== 'SKILL_VERSION_MISMATCH') throw error;
-        await replaceSelectedSkill(VERSION);
-        skill = await assertSelectedSkillVersion(VERSION);
-      }
-      break;
-    } catch (error) {
-      if (error.code !== 'SKILL_UPGRADE_BUSY' || attempt === 7) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 75));
-    }
-  }
-  if (skill?.state === 'not-installed' && (process.env.CODEX_THREAD_ID || process.env.ERIC_TASK_MASTER_AGENT_ID)) {
-    throw cliError('SKILL_NOT_INSTALLED', 'This Agent has no selected Task Master Skill',
-      'Import the Skill bundled with the current application, read its SKILL.md, then retry. No work was submitted.');
-  }
-  assertAgentSkillLoaded(VERSION);
-}
-
 async function parseJsonInput(value, field = 'input') {
   if (value === undefined) return {};
   let source = String(value);
-  if (source === '-') {
-    if (process.stdin.isTTY) throw cliError('STDIN_INPUT_REQUIRED', 'Pipe UTF-8 JSON to --input - or use --input @FILE');
-    const chunks = []; let bytes = 0;
-    for await (const chunk of process.stdin) { bytes += chunk.length; if (bytes > 8 * 1024 * 1024) throw cliError('INPUT_TOO_LARGE', 'JSON stdin exceeds 8 MiB'); chunks.push(chunk); }
-    source = Buffer.concat(chunks).toString('utf8');
-  } else if (source.startsWith('@')) source = await readFile(path.resolve(source.slice(1)), 'utf8');
+  if (source.startsWith('@')) source = await readFile(path.resolve(source.slice(1)), 'utf8');
   try {
-    const parsed = JSON.parse(source.replace(/^\uFEFF/u, ''));
+    const parsed = JSON.parse(source);
     if (parsed === undefined) throw new Error();
     return parsed;
   } catch {
@@ -870,15 +812,13 @@ async function runCommand(args, options, json) {
   const body = {
     modulePath,
     ...(options.profile ? { profileId: options.profile } : {}),
-    mode: options.mode || 'batch',
-    ...(options['skill-mode'] ? { skillMode: options['skill-mode'] } : {}),
     ...(options.label ? { label: options.label } : {}),
     input: await parseJsonInput(options.input),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     ...(outputBudget === undefined ? {} : { outputBudget }),
     ...(requestKey === undefined ? {} : { requestKey })
   };
-  const context = await currentWorkContext(options);
+  const context = await apiContext(options);
   if (requestKey !== undefined && !context.manager.capabilities?.includes('task.request-key')) {
     throw cliError(
       'MANAGER_CAPABILITY_UNAVAILABLE',
@@ -936,8 +876,7 @@ async function statusCommand(taskId, options, json) {
 }
 
 async function profileCommand(action, args, options, json) {
-  const createsOrChangesProfile = ['create', 'default', 'rename', 'mode', 'delete', 'open'].includes(action);
-  const context = createsOrChangesProfile ? await currentWorkContext(options) : await apiContext(options);
+  const context = await apiContext(options);
   if (action === 'list') {
     const result = await requestJson(context.config, '/v1/profiles', { token: context.token });
     emit(result, json);
@@ -955,10 +894,10 @@ async function profileCommand(action, args, options, json) {
   const identifier = args[0];
   if (!identifier) throw cliError('PROFILE_REQUIRED', `profiles ${action} requires NAME_OR_ID`);
   let result;
-  if (action === 'default' || action === 'rename' || action === 'mode') {
+  if (action === 'default' || action === 'rename') {
     const body = action === 'default'
       ? { isDefault: true }
-      : action === 'mode' ? { modePolicy: options.mode } : { name: options.name || args[1] };
+      : { name: options.name || args[1] };
     if (action === 'rename' && !body.name) throw cliError('PROFILE_NAME_REQUIRED', 'profiles rename requires --name');
     result = await requestJson(context.config, `/v1/profiles/${encodeURIComponent(identifier)}`, {
       method: 'PATCH', body, token: context.token
@@ -1036,16 +975,13 @@ function openUrl(url) {
   child.unref();
 }
 
-async function serveCommand(config, json, { onReady = async () => {}, activateSkill = false } = {}) {
-  const { createManager } = await import('./manager.mjs');
-  const manager = await createManager({
+async function serveCommand(config, json, { onReady = async () => {} } = {}) {
+  const manager = await startManager({
     host: config.host, port: config.port, dataDir: config.stateDir,
     identityDir: config.stateDirAliases[0] || config.identityDir,
     scope: config.shared ? 'shared' : 'project', stateDirAliases: config.stateDirAliases
   });
   try {
-    if (activateSkill) await replaceSelectedSkill(VERSION);
-    await manager.start();
     await writeStateEndpoint(manager.stateLocation.stateDirEffective, {
       pid: process.pid, version: VERSION, baseUrl: manager.baseUrl
     });
@@ -1085,7 +1021,6 @@ async function managerCommand(action, options, json) {
   if (action === 'foreground') {
     try {
       const current = await health(config);
-      requireCurrentManager(current);
       emit({ ok: true, manager: current, reused: true }, json);
       return;
     } catch (error) { if (error.code !== 'MANAGER_UNREACHABLE') throw error; }
@@ -1109,15 +1044,8 @@ async function managerCommand(action, options, json) {
     return serveCommand(config, json);
   }
   if (action === 'start') {
-    const skillPlan = options.upgrade === true ? await planSkillUpgrade(VERSION) : null;
     const current = await ensureManager(config, { maintainVersion: options.upgrade === true });
-    requireCurrentManager(current);
-    let skill;
-    if (skillPlan) {
-      skill = await replaceSelectedSkill(VERSION);
-      if (skill.state !== 'not-installed') await assertSelectedSkillVersion(VERSION);
-    }
-    emit({ ok: true, manager: current, ...(skill ? { skill } : {}) }, json);
+    emit({ ok: true, manager: current }, json);
     return;
   }
   if (action === 'status') {
@@ -1210,95 +1138,6 @@ async function managerCommand(action, options, json) {
   throw cliError('UNKNOWN_COMMAND', `Unknown manager command: ${action}`);
 }
 
-function cliFailurePayload(error) {
-  return { ok: false, error: { code: error.code || 'TASKMASTER_FAILED', message: redactSensitiveText(error.message || 'Task Master failed'),
-    ...(error.details === undefined ? {} : { details: redactSensitiveValue(error.details) }) },
-  ...(error.nextAction ? { nextAction: redactSensitiveText(error.nextAction) } : {}) };
-}
-
-export function parseOperationsReplyDetail(value = 'compact') {
-  if (!['compact', 'full'].includes(value)) throw cliError('INVALID_REPLY_DETAIL', '--detail must be compact or full');
-  return value;
-}
-
-async function operationsStream(context, identifier, options) {
-  assertAllowedOptions(options, ['wait-ms', 'detail']);
-  const detail = parseOperationsReplyDetail(options.detail);
-  if (process.stdin.isTTY) throw cliError('STDIN_INPUT_REQUIRED', 'ops stream reads one JSON command envelope per stdin line');
-  const waitMs = parseIntegerOption(options['wait-ms'] ?? 30000, { name: '--wait-ms', minimum: 0, maximum: 30000 });
-  const endpoint = `${context.config.baseUrl}|${context.manager.pid}|${context.manager.stateId}|${context.manager.stateDirectoryId}`;
-  const write = (value) => new Promise((resolve, reject) => process.stdout.write(`${JSON.stringify(value)}\n`, (error) => error ? reject(error) : resolve()));
-  const { operationCommandLines } = await import('./lib/operations-stream.mjs');
-  try {
-    for await (const line of operationCommandLines(process.stdin)) {
-      if (!line.trim()) continue;
-      try {
-        let body;
-        try { body = JSON.parse(line.replace(/^\uFEFF/u, '')); }
-        catch { throw cliError('INVALID_JSON', 'Operation command line is not valid JSON'); }
-        if (!body || typeof body !== 'object' || Array.isArray(body)) throw cliError('INVALID_COMMAND', 'Operation command must be a JSON object');
-        const manager = await health(context.config);
-        requireCurrentManager(manager);
-        if (`${context.config.baseUrl}|${manager.pid}|${manager.stateId}|${manager.stateDirectoryId}` !== endpoint) {
-          throw cliError('MANAGER_SESSION_CHANGED', 'The stream Manager changed; inspect stored operation outcomes before opening another stream');
-        }
-        await currentWorkSkill();
-        const result = await requestJson(context.config, `/v1/operations/${encodeURIComponent(identifier)}/commands?waitMs=${waitMs}&detail=${detail}`,
-          { token: context.token, method: 'POST', body, timeoutMs: 45000 });
-        await write(result.command ? { ok: result.ok, ...result.command } : result.result && typeof result.result === 'object' ? { ok: result.ok, ...result.result } : result);
-      } catch (error) {
-        await write(cliFailurePayload(error));
-        process.exitCode = 1;
-        if (!error.code || /^(?:MANAGER_|SKILL_|AGENT_SKILL_|AUTH_REQUIRED|HTTP_5)/u.test(error.code)) break;
-      }
-    }
-  } catch (error) {
-    await write(cliFailurePayload(error));
-    process.exitCode = 1;
-  }
-}
-
-async function operationsCommand(action, args, options, json) {
-  const detail = parseOperationsReplyDetail(options.detail);
-  const startsOrChangesWork = ['start', 'command', 'stream', 'resume', 'update', 'decide'].includes(action);
-  const context = startsOrChangesWork ? await currentWorkContext(options) : await apiContext(options);
-  const identifier = args[0];
-  if (!['start', 'list', 'stop-all'].includes(action) && !identifier) throw cliError('OPERATION_REQUIRED', 'ops command requires OP_ID');
-  if (action === 'stream') return operationsStream(context, identifier, options);
-  const base = '/v1/operations';
-  if (action === 'listen') {
-    let after = parseIntegerOption(options.after ?? 0, { name: '--after', minimum: 0 });
-    const timeoutMs = options.timeout === undefined ? null : parseIntegerOption(options.timeout, { name: '--timeout', minimum: 1, maximum: 43200000 });
-    const started = Date.now();
-    for (;;) {
-      const remaining = timeoutMs === null ? 30000 : Math.min(30000, Math.max(0, timeoutMs - (Date.now() - started)));
-      const result = await requestJson(context.config, `${base}/${encodeURIComponent(identifier)}/events?after=${after}&waitMs=${remaining}&detail=${detail}`, { token: context.token, timeoutMs: 45000 });
-      after = result.nextCursor;
-      if (result.events.length || ['stopped', 'revoked', 'failed'].includes(result.operationStatus)) { emit(result, json); return result; }
-      if (timeoutMs !== null && Date.now() - started >= timeoutMs) { const value = { ...result, timedOut: true }; emit(value, json); return value; }
-      // Local long polling only. Empty intervals produce no model-facing output.
-    }
-  }
-  let pathname = identifier ? `${base}/${encodeURIComponent(identifier)}` : base;
-  let method = 'GET'; let body;
-  if (action === 'start') { pathname = base; method = 'POST'; body = { ...(options.input ? await parseJsonInput(options.input) : {}), ...(options.profile ? { profile: options.profile } : {}), ...(options.goal ? { goal: options.goal } : {}) }; body.mode = options.mode || body.mode || 'operations'; }
-  else if (action === 'list') pathname = base;
-  else if (action === 'stop-all') { pathname = `${base}/stop-all`; method = 'POST'; body = {}; }
-  else if (action === 'events') {
-    const after = parseIntegerOption(options.after ?? 0, { name: 'after', minimum: 0 });
-    const waitMs = parseIntegerOption(options['wait-ms'] ?? 0, { name: 'wait-ms', minimum: 0, maximum: 30000 });
-    pathname += `/events?after=${after}&waitMs=${waitMs}`;
-  } else if (action === 'command') { pathname += `/commands?waitMs=${parseIntegerOption(options['wait-ms'] ?? 30000, { name: '--wait-ms', minimum: 0, maximum: 30000 })}`; method = 'POST'; body = await parseJsonInput(options.input); }
-  else if (['ack', 'decide', 'reconcile', 'update', 'pause', 'resume', 'takeover', 'revoke', 'stop'].includes(action)) {
-    pathname += '/actions'; method = 'POST'; body = { ...(options.input ? await parseJsonInput(options.input) : {}), action, ...(options.mode ? { mode: options.mode } : {}) };
-  } else if (action === 'get' && options.command) pathname += `?commandId=${encodeURIComponent(options.command)}`;
-  else if (action !== 'get') throw cliError('UNKNOWN_COMMAND', `Unknown ops command: ${action}`);
-  pathname += `${pathname.includes('?') ? '&' : '?'}detail=${detail}`;
-  const result = await requestJson(context.config, pathname, { token: context.token, method, body, timeoutMs: 45000 });
-  const value = result.operation ? { ok: result.ok, ...result.operation } : result.command ? { ok: result.ok, ...result.command } : result.result && typeof result.result === 'object' ? { ok: result.ok, ...result.result } : result;
-  emit(value, json); return value;
-}
-
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   const options = parsed.options;
@@ -1310,11 +1149,11 @@ async function main() {
     return emit(HELP);
   }
   if (command === 'serve') {
-    assertAllowedOptions(options, ['shared', 'state-alias', 'state-request', 'activate-skill']);
-    return serveCommand(await settings(options, { serving: true }), json, { activateSkill: options['activate-skill'] === true });
+    assertAllowedOptions(options, ['shared', 'state-alias', 'state-request']);
+    return serveCommand(await settings(options, { serving: true }), json);
   }
   if (command === 'run') {
-    assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'request-key', 'timeout', 'mode', 'skill-mode']);
+    assertAllowedOptions(options, ['detach', 'input', 'label', 'max-bytes', 'max-entries', 'max-files', 'profile', 'request-key', 'timeout']);
     return runCommand(args, options, json);
   }
   if (command === 'follow') {
@@ -1333,15 +1172,9 @@ async function main() {
     assertAllowedOptions(options, ['limit', 'max-bytes', 'offset', 'read']);
     return filesCommand(args[0], options, json);
   }
-  if (command === 'ops') {
-    const action = args.shift() || 'list';
-    if (action === 'schema' || action === 'help') { assertAllowedOptions(options, ['section']); return emit(operationsSchema({ section: options.section }), json); }
-    assertAllowedOptions(options, ['input', 'after', 'wait-ms', 'mode', 'command', 'profile', 'goal', 'timeout', 'detail']);
-    return operationsCommand(action, args, options, json);
-  }
   if (command === 'profiles') {
     const action = args.shift() || 'list';
-    assertAllowedOptions(options, action === 'create' || action === 'rename' ? ['name'] : action === 'mode' ? ['mode'] : []);
+    assertAllowedOptions(options, action === 'create' || action === 'rename' ? ['name'] : []);
     return profileCommand(action, args, options, json);
   }
   if (command === 'manager') {
@@ -1363,7 +1196,15 @@ async function main() {
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(CLI_PATH)) main().catch((error) => {
   const parsed = parseArgs(process.argv.slice(2));
   const json = parsed.options.json === true || parsed.options.json === 'true';
-  const payload = cliFailurePayload(error);
+  const payload = {
+    ok: false,
+    error: {
+      code: error.code || 'TASKMASTER_FAILED',
+      message: redactSensitiveText(error.message || 'Task Master failed'),
+      ...(error.details === undefined ? {} : { details: redactSensitiveValue(error.details) })
+    },
+    ...(error.nextAction ? { nextAction: redactSensitiveText(error.nextAction) } : {})
+  };
   process.stderr.write(`${json ? JSON.stringify(payload) : JSON.stringify(payload, null, 2)}\n`);
   process.exitCode = 1;
 });

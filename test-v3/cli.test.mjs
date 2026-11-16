@@ -56,17 +56,6 @@ function lastJson(source) {
   return JSON.parse(lines.at(-1));
 }
 
-test('lightweight CLI requests do not load the Manager service graph', async () => {
-  const hook = `export async function resolve(specifier, context, nextResolve) {
-    if (specifier.endsWith('/manager.mjs')) throw new Error('EAGER_MANAGER_IMPORT');
-    return nextResolve(specifier, context);
-  }`;
-  const preload = `import { register } from 'node:module'; register(${JSON.stringify(`data:text/javascript,${encodeURIComponent(hook)}`)}, import.meta.url);`;
-  const result = await runCli(['--help'], { nodeArgs: ['--import', `data:text/javascript,${encodeURIComponent(preload)}`] });
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /Eric Task Master/u);
-});
-
 async function reservePort() {
   const server = http.createServer();
   await new Promise((resolve, reject) => {
@@ -897,9 +886,8 @@ test('explicit Manager maintenance waits for process exit and never interrupts a
     maintainVersion: true,
     startManager: async () => { throw new Error('must not start'); }
   }), (error) => {
-    assert.equal(error.code, 'MANAGER_UPGRADE_DECISION_REQUIRED');
-    assert.match(error.nextAction, /Owner to choose/u);
-    assert.deepEqual(error.details.choices, ['wait', 'stop_selected_manager_and_replace']);
+    assert.equal(error.code, 'MANAGER_VERSION_MISMATCH');
+    assert.match(error.nextAction, /finish or stop/u);
     return true;
   });
 
@@ -911,9 +899,9 @@ test('explicit Manager maintenance waits for process exit and never interrupts a
   await assert.rejects(ensureManager({
     ...activeConfig, baseUrl: `http://127.0.0.1:${manual.address().port}`
   }, { maintainVersion: true }), (error) => {
-    assert.equal(error.code, 'MANAGER_UPGRADE_DECISION_REQUIRED');
+    assert.equal(error.code, 'MANAGER_VERSION_MISMATCH');
     assert.match(error.message, /occupied Profile/u);
-    assert.match(error.nextAction, /Owner to choose/u);
+    assert.match(error.nextAction, /controls remain available/u);
     return true;
   });
 
@@ -923,30 +911,24 @@ test('explicit Manager maintenance waits for process exit and never interrupts a
     ...activeConfig, baseUrl: `http://127.0.0.1:${legacy.address().port}`
   }, { maintainVersion: true }), (error) => {
     assert.equal(error.code, 'MANAGER_CAPABILITY_UNAVAILABLE');
-    assert.match(error.nextAction, /Ask the Owner/u);
+    assert.match(error.nextAction, /explicitly run taskmaster manager stop/u);
     return true;
   });
 });
 
-test('different-version Managers retain task controls but refuse new work until the upgrade', async (t) => {
+test('compatible different-version Managers remain usable for task controls and ordinary runs without maintenance', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-compatible-'));
-  const skillEnvironment = {
-    ERIC_TASK_MASTER_AGENT_ID: 'cli-version-compatibility-test',
-    ERIC_TASK_MASTER_AGENT_SKILL_VERSION: VERSION,
-    ERIC_TASK_MASTER_SKILL_DIR: path.join(ROOT, 'skills', 'eric-task-master')
-  };
   t.after(() => removeTestTree(root));
   await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'c'.repeat(48) }));
   const requests = [];
   const submissions = [];
   const task = { id: 'task_existing', state: 'finished', eventSequence: 0 };
   let capabilities = [];
-  let managerVersion = '3.0.1';
   const server = http.createServer(async (request, response) => {
     requests.push(`${request.method} ${request.url}`);
     response.setHeader('content-type', 'application/json');
     if (request.url === '/v1/health') {
-      response.end(JSON.stringify({ service: 'eric-task-master', version: managerVersion, apiVersion: 3, capabilities }));
+      response.end(JSON.stringify({ service: 'eric-task-master', version: '3.0.1', apiVersion: 3, capabilities }));
       return;
     }
     if (request.url === '/v1/status') {
@@ -970,35 +952,26 @@ test('different-version Managers retain task controls but refuse new work until 
   const common = ['--state-dir', root, '--port', String(server.address().port), '--json'];
   for (const args of [
     ['status', task.id], ['follow', task.id], ['files', task.id], ['stop', task.id],
-    ['resume', task.id], ['delete', task.id]
+    ['resume', task.id], ['delete', task.id], ['run', 'job.mjs', '--detach']
   ]) {
     const result = await runCli([...args, ...common]);
     assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
   }
   assert.equal(requests.some((request) => request.includes('/v1/status')), false, 'ordinary commands do not preflight idle state');
   assert.equal(requests.some((request) => request.includes('/v1/manager/stop')), false);
-  const mismatch = await runCli(['run', 'job.mjs', '--detach', ...common]);
-  assert.equal(mismatch.code, 1);
-  assert.equal(lastJson(mismatch.stderr).error.code, 'MANAGER_VERSION_MISMATCH');
-  assert.equal(submissions.length, 0, 'a mismatched Manager never receives a new task');
-  const profileMismatch = await runCli(['profiles', 'open', 'existing-profile', ...common]);
-  assert.equal(profileMismatch.code, 1);
-  assert.equal(lastJson(profileMismatch.stderr).error.code, 'MANAGER_VERSION_MISMATCH');
-  assert.equal(requests.some((request) => request.includes('/v1/profiles')), false, 'a mismatched Manager never opens a new Profile');
-  managerVersion = VERSION;
-  const unsupported = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', '--detach', ...common], { env: skillEnvironment });
+  const unsupported = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', '--detach', ...common]);
   assert.equal(unsupported.code, 1);
   assert.equal(lastJson(unsupported.stderr).error.code, 'MANAGER_CAPABILITY_UNAVAILABLE');
   assert.match(lastJson(unsupported.stderr).nextAction, /controls remain available/u);
-  assert.equal(submissions.length, 0, 'an unsupported request key is never silently ignored');
+  assert.equal(submissions.length, 1, 'an unsupported request key is never silently ignored');
 
   capabilities = ['task.request-key'];
   requests.length = 0;
-  const accepted = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', ...common], { env: skillEnvironment });
+  const accepted = await runCli(['run', 'job.mjs', '--request-key', 'logical-submit', ...common]);
   assert.equal(accepted.code, 0, accepted.stderr);
   assert.equal(submissions.at(-1).requestKey, 'logical-submit');
   assert.equal(requests.filter((request) => request.includes('/v1/health')).length, 1, 'run reuses its connection for follow');
-  const invalid = await runCli(['run', 'job.mjs', '--request-key', ...common], { env: skillEnvironment });
+  const invalid = await runCli(['run', 'job.mjs', '--request-key', ...common]);
   assert.equal(invalid.code, 1);
   assert.equal(lastJson(invalid.stderr).error.code, 'INVALID_REQUEST_KEY');
 });
@@ -1303,7 +1276,7 @@ test('a retained shared location preserves its legacy identity and Profiles afte
     [[profile.id, 'Retained shared Profile', true]]);
 });
 
-test('ordinary manager start refuses a different version and explicit maintenance cannot downgrade it', async (t) => {
+test('ordinary manager start reuses newer versions and explicit maintenance cannot downgrade them', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cli-no-downgrade-'));
   t.after(() => removeTestTree(root));
   await writeFile(path.join(root, 'config.json'), JSON.stringify({ managerToken: 'm'.repeat(48) }));
@@ -1317,8 +1290,8 @@ test('ordinary manager start refuses a different version and explicit maintenanc
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const args = ['manager', 'start', '--state-dir', root, '--port', String(server.address().port), '--json'];
   const reused = await runCli(args);
-  assert.equal(reused.code, 1);
-  assert.equal(lastJson(reused.stderr).error.code, 'MANAGER_VERSION_MISMATCH');
+  assert.equal(reused.code, 0, reused.stderr);
+  assert.equal(lastJson(reused.stdout).manager.version, '99.0.0');
   const maintenance = await runCli([...args, '--upgrade']);
   assert.equal(maintenance.code, 1);
   assert.equal(lastJson(maintenance.stderr).error.code, 'MANAGER_DOWNGRADE_REFUSED');
