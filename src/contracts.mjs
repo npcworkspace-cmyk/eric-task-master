@@ -1,6 +1,6 @@
 import { redactSensitiveText, redactSensitiveValue } from './lib/redaction.mjs';
 
-export const VERSION = '4.2.1';
+export const VERSION = '3.1.11';
 export const API_VERSION = 3;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 19946;
@@ -29,7 +29,6 @@ export function publicProfile(profile, defaultProfileId = null) {
   return {
     id: profile.id,
     name: profile.name,
-    modePolicy: profile.modePolicy || 'auto',
     state: PROFILE_STATES.includes(profile.state) ? profile.state : 'error',
     isDefault: profile.id === defaultProfileId,
     createdAt: profile.createdAt ?? null,
@@ -74,10 +73,6 @@ export function publicTask(task) {
     title: redactSensitiveText(String(task.label ?? 'task')).slice(0, 160),
     profileId: task.profileId,
     profileName: task.profileName ?? null,
-    mode: task.mode || 'batch',
-    modeReason: task.modeReason || 'script-default',
-    ...(task.builtin === 'fast-operations' ? { operationId: task.operationId || null, cursorEnabled: task.cursorEnabled ?? task.mode === 'operations',
-      cursorApplyState: task.cursorApplyState || 'initial', cursorRequested: task.cursorRequested ?? task.cursorEnabled ?? task.mode === 'operations', cursorApplyError: task.cursorApplyError || null } : {}),
     moduleName: task.moduleName ?? null,
     outputBudget: task.outputBudget && typeof task.outputBudget === 'object'
       ? redactSensitiveValue(task.outputBudget)

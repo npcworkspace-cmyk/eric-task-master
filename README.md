@@ -2,28 +2,168 @@
   <img src="docs/assets/task-master-banner.png" alt="Eric Task Master" width="100%">
 </p>
 
-# Eric Task Master 4.2.1
+# Eric Task Master
 
-**Your Agent plans the work. Task Master keeps the browser work running.**
+The supported baseline has been restored to **3.1.11**: write a small `.mjs` task, run it through the CLI, and follow its progress and results. This version does **not** include the `ops / operations` mode introduced in 3.2.0. Start new deployments from [Latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) and use the matching 3.1.11 runtime and Skill; later versions remain available only as release history.
 
-Durable local Chrome execution for terminal-capable AI Agents: one CLI for batch jobs, persistent operations, human takeover and retained results. Runs on your computer, using your selected Task Master Profile. The Agent supplies judgment; Task Master supplies execution and lifecycle control.
+**Keep the task running after the Agent leaves the chat.**
 
-[![Version 4.2.1](https://img.shields.io/badge/version-4.2.1-FF4B23?style=flat-square)](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)
-[![Release gate](https://github.com/npcworkspace-cmyk/eric-task-master/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/npcworkspace-cmyk/eric-task-master/actions/workflows/ci.yml)
-[![Windows · macOS · Linux](https://img.shields.io/badge/platforms-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-555555?style=flat-square)](#download)
-[![License MIT](https://img.shields.io/badge/license-MIT-555555?style=flat-square)](LICENSE)
+Eric Task Master is an always-on local browser task foundation. The Agent understands the goal and writes the smallest useful script; Task Master keeps real Chrome sessions, processes, progress, and outputs running beyond a single Agent turn. It does not replace the Agent or lock work into a fixed workflow—it turns temporary browser actions into durable, parallel, and reusable automation.
 
-**[Download latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)** · [简体中文](README.zh-CN.md) · [4.2.1 release notes](docs/releases/4.2.1.md) · [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill)
+Codex, Claude Code, WorkBuddy, Hermes, Pi, and any other Agent that can run a local CLI and read JSON can use the same interface.
 
-[Quick start](#quick-start) · [Modes](#two-execution-modes) · [Download](#download) · [Documentation](#documentation) · [NPC ↗](https://www.npctech.site/)
+English | [简体中文](README.zh-CN.md) | [Latest Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) | [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) | **[NPC Website ↗](https://www.npctech.site/)**
 
----
+Built by **NPC**, a global PR and brand team with client-side experience—the creators of the Media Bridge media-resource platform and Task Master AI tool.
 
-## Quick start
+[Explore NPC ↗](https://www.npctech.site/) · [Media Bridge · media.npctech.site ↗](https://media.npctech.site/)
 
-1. Get the runtime and matching Skill from **[Latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest)**. Install stable Google Chrome; Node.js and Playwright are included in the runtime. Already installed? [Check and upgrade in place](#installation-and-upgrades)—keep your Profiles and task data.
-2. Run `taskmaster panel`, retain or select your default Profile, and give the [driving Skill](skills/eric-task-master/SKILL.md) to your Agent. Sign in manually only when your task needs it, then close the manual Profile window before automation.
-3. Save a trusted `job.mjs` and run it with your verified launcher:
+## Use your imagination
+
+Automated public-data collection and web task execution are only some possibilities. You can also organize information in bulk, compare data across sites, fill forms and update back-office records, download and archive files, manage content and e-commerce workflows, monitor pages, and test browser flows.
+
+Most work you can do on a webpage can be designed as a workflow by the AI Agent you already use, then executed reliably on your own computer with Task Master.
+
+- **Long research and data collection:** search, read, organize, and persist results across many pages without depending on one Agent turn.
+- **Unattended batch work:** keep a bounded script running in the background or overnight with its own pacing, checkpoints, and recovery logic.
+- **Multiple accounts and workspaces:** retain each signed-in session in a separate Chrome Profile and let different Agents use different Profiles concurrently.
+- **Web operations and repetitive workflows:** automate back-office entry, forms, content processes, product work, and account workflows through a task-specific script or Skill.
+- **Monitoring, inspection, and QA:** observe page changes, verify workflows, record exceptions, and make intermediate results available while the task is still running.
+- **Reusable professional capabilities:** package a proven script, domain rules, and result checks as a Skill that other Agents and computers can reuse.
+
+It is designed for web work with a clear objective that needs real Chrome, may run for a long time, and must not lose its results. A new idea can start as a disposable script; a proven workflow can grow into a reusable Skill.
+
+## Why not only use an Agent's built-in browser
+
+Built-in Agent browsers are excellent for immediate interaction, but they are not designed to own long-running, recoverable work with persistent identity. Direct Playwright is flexible, but every Agent then has to rebuild process management, Profiles, progress, output, and cleanup.
+
+Task Master supplies that missing operational layer:
+
+- **The Agent can exit while the job continues:** the local Manager and Worker keep running.
+- **Sign in once and reuse the session:** named Profiles use the computer's stable Chrome and preserve browser state.
+- **Multiple Agents can work without fighting for one window:** different Profiles run concurrently; each Profile has one writer at a time.
+- **Results arrive during execution:** progress and files remain readable even if a task stops before reaching its full target.
+- **Human verification does not destroy the task:** Chrome stays open, the user is notified, and work can resume from the retained session.
+- **Lifecycle cleanup is built in:** stop and delete terminate owned processes, release Profiles, and reclaim stale leases only after old process inactivity is confirmed.
+
+## One foundation, three levels of use
+
+### 1. Manager: the durable execution layer
+
+The Manager owns browser processes, Profile leases, task state, progress, output files, stop, resume, and cleanup. A human sees current work in the local Dashboard; Agents operate the same state through the CLI.
+
+### 2. `.mjs`: the fastest free-form task
+
+For a new request, the Agent writes the smallest useful JavaScript file and runs it immediately. The script can use Playwright, `page.evaluate()`, CDP, HTTP, local files, custom concurrency, pacing, retries, and checkpoints directly. The Manager does not impose another browser-action framework.
+
+### 3. Skill: a reusable professional capability
+
+Once a workflow proves useful, its instructions, task script, business rules, and result checks can become a Skill. Task Master stays general while vertical capabilities evolve independently, so the core never has to absorb every website and business process.
+
+The layers work independently or together: run a small script for a one-off need, use a dedicated Skill for established work, and let both share the same durable execution foundation.
+
+## Platform value
+
+Task Master is intended to be more than a way to control one browser. It is a local task execution platform shared by multiple Agents:
+
+- **One common entry point:** terminal-capable Agents use the same CLI without a host-specific plugin or protocol.
+- **Tasks are independent of conversations:** the Manager owns the job after submission; the originating chat does not need to stay alive.
+- **Capabilities are independent of the core:** business changes update a script or Skill instead of continually expanding the Manager.
+- **Open result files:** outputs remain ordinary files that can be analyzed, audited, transformed, and delivered by other tools.
+- **Less repeated work:** reusing signed-in state, task state, and specialized Skills reduces the time and tokens spent re-reading pages, rebuilding context, and rewriting controllers.
+- **A path from one-off work to scale:** validate with a minimal script, then preserve high-value workflows as Skills and build a personal or team automation library.
+
+The same foundation can support web research, data collection, content and account workflows, e-commerce administration, lead development, page monitoring, browser QA, and other work an Agent can express in JavaScript.
+
+## How it works
+
+```text
+Reusable Skill ─┐
+Disposable .mjs ├─> Agent ─> taskmaster CLI ─> local Manager ─> Worker ─> Chrome Profile
+Natural language┘                              │
+                                               └─> progress, events, result files
+
+Human ───────────────────────────────> local Dashboard: task control and Profile management
+```
+
+Agent-to-Manager communication is a local CLI with machine-readable JSON:
+
+1. `run --detach` submits the script and input, then returns a task ID immediately;
+2. `follow` reads progress, state, and an event cursor;
+3. `files` lists task artifacts, and `files --read` reads a selected result file;
+4. `stop`, `resume`, and `delete` control the task lifecycle.
+
+The Manager binds only to `127.0.0.1`. There is no MCP registration, browser extension, pairing code, or separate controller installation for each Agent.
+
+## Deploy in three steps
+
+### Step 1: check for the Manager, install only if missing
+
+For Windows deployment, first use the Skill's [read-only launcher locator](skills/eric-task-master/scripts/find-launcher.ps1), even when an inherited PATH contains an older launcher. It prefers the verified running Manager, then the selected shared location and installation registration. On macOS/Linux, use the installed or known portable launcher. Verify the absolute launcher with `--help` and retain it for the session. If it works, keep existing Profiles and install/update only the Agent Skill. An unresolved lookup or state-location error requires reporting the evidence, not reinstalling, merging state, or recreating Profiles. See the [installation guide](docs/INSTALLERS.md).
+
+Agents running as the same OS user share one selected Manager and Profile pool by default, regardless of working directory. For a separate data project, explicitly pass `--state-dir ABSOLUTE_DIRECTORY` on every command; it discovers its own port unless `--port` is supplied. Normal startup reuses the Manager without replacing its version. Only an Owner explicitly requesting an idle runtime upgrade uses `manager start --upgrade`. Native install/uninstall refuse an in-use runtime; Skill updates never stop the shared Manager.
+
+Stable Google Chrome is required in either case. Only when no Manager is present, download two files from the [latest GitHub Release](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest):
+
+1. the Manager installer **or portable ZIP** matching the operating system and CPU;
+2. `eric-task-master-skill-v<VERSION>.zip`.
+
+| Platform | Installer | Portable package |
+| --- | --- | --- |
+| Windows 10/11 x64 | `eric-task-master-v<VERSION>-windows-x64-setup.exe` | `eric-task-master-v<VERSION>-windows-x64-portable.zip` |
+| macOS Apple silicon | `eric-task-master-v<VERSION>-macos-arm64.pkg` | `eric-task-master-v<VERSION>-macos-arm64-portable.zip` |
+| macOS Intel | `eric-task-master-v<VERSION>-macos-x64.pkg` | `eric-task-master-v<VERSION>-macos-x64-portable.zip` |
+| Debian/Ubuntu x64 | `eric-task-master-v<VERSION>-linux-x64.deb` | `eric-task-master-v<VERSION>-linux-x64-portable.zip` |
+| Debian/Ubuntu arm64 | `eric-task-master-v<VERSION>-linux-arm64.deb` | `eric-task-master-v<VERSION>-linux-arm64-portable.zip` |
+
+The package includes Node.js, Playwright, the CLI, local Dashboard, and an on-demand background Manager. Users do not configure Node.js or download a separate Chromium.
+
+If the installer is unavailable, download `eric-task-master-v<VERSION>-<target>-portable.zip` and `SHA256SUMS` from the same Release, verify the archive, and extract it into a permanent directory:
+
+```powershell
+# Windows
+& 'C:\Tools\eric-task-master\bin\taskmaster.cmd' panel
+```
+
+```bash
+# macOS / Linux
+'/absolute/path/eric-task-master/bin/taskmaster' panel
+```
+
+Portable packages need no administrator access or system Node.js. Current Windows and macOS packages are unsigned, so the operating system may ask the user to approve them; a portable ZIP does not bypass SmartScreen or Gatekeeper. See the [installation guide](docs/INSTALLERS.md) for target selection, upgrades, and compatibility details.
+
+### Step 2: prepare the default Profile
+
+Run:
+
+```bash
+taskmaster panel
+```
+
+If a default Profile already exists, keep using it. Otherwise create one in the Dashboard, open its native Chrome window, and sign in. Close the window, then make that Profile the default. Automated tasks reuse the same browser state. Individual sites may still request verification later.
+
+Reinstalling the Manager keeps Profiles in the separate user-state directory. If the Profile registry was lost but its v3 Profile directories remain, Manager 3.1.5+ lists them again as `Recovered profile_<id>` without changing their browser files; select the intended default in the Dashboard. See [state recovery](docs/STATE-BACKUP-RECOVERY.md) for the scope and safety limits.
+
+### Step 3: give the Skill to the Agent
+
+Import `eric-task-master-skill-v<VERSION>.zip` with the Agent's Skill manager. For folder-based installation, extract it first and confirm that `SKILL.md` is at the Skill root. If the Agent has no Skill mechanism, give it this repository and ask it to read `skills/eric-task-master/SKILL.md`.
+
+From then on, state the task. The Agent follows one fixed path: write the smallest `.mjs`, run it once, return the Dashboard URL, and keep following useful results.
+
+## The fixed Agent path
+
+```bash
+taskmaster run ./job.mjs --input '@./input.json' --detach --json
+taskmaster panel --json
+taskmaster follow TASK_ID --wait-ms 60000 --json
+taskmaster files TASK_ID --json
+```
+
+The first `follow` call needs no cursor. On later calls, continue with the returned `after` value: `taskmaster follow TASK_ID --after AFTER --wait-ms 60000 --json`. Omit `--profile` to use the default Profile selected in the Dashboard. `run` starts the Manager in the background when needed. Every command supports `--json`, giving different Agents the same stable interface.
+
+`panel --json` returns the fixed Dashboard link without opening a browser. Reuse that link across tasks; use `taskmaster panel` only to explicitly open the panel. Task browser windows close when their task ends; a manually opened Dashboard stays open.
+
+Minimal task:
 
 ```js
 export async function run({ page, input, outputDir, progress, signal }) {
@@ -34,216 +174,70 @@ export async function run({ page, input, outputDir, progress, signal }) {
 }
 ```
 
+Only the submitted `.mjs` entry is frozen. Keep it self-contained: use Node.js built-ins, bare `playwright`, task `input`, absolute paths, or `outputDir`. Relative sibling imports and resources beside the source entry are not copied automatically.
+
+## Essential commands
+
 ```bash
-taskmaster run ./job.mjs --input '{"url":"https://example.com"}' --detach --json
-taskmaster panel --json
+taskmaster status --json
+taskmaster profiles list --json
+taskmaster profiles create NAME --json
+taskmaster profiles default NAME_OR_ID --json
+taskmaster run ./job.mjs --input '@./input.json' --detach --json
 taskmaster follow TASK_ID --wait-ms 60000 --json
 taskmaster files TASK_ID --json
+taskmaster files TASK_ID --read RELATIVE_PATH --json
+taskmaster stop TASK_ID --json
+taskmaster resume TASK_ID --json
+taskmaster delete TASK_ID --json
+taskmaster panel
 ```
 
-Replace `TASK_ID` with the returned ID; continue later `follow` calls with its `after` cursor. UTF-8 JSON files (`--input @ABSOLUTE_FILE`) avoid host-specific shell quoting. `panel --json` returns the Dashboard URL without opening a window.
+## Long work, verification, and results
 
-## Two execution modes
+- Task scripts should write valuable data incrementally under `outputDir` instead of saving everything only at the end.
+- `progress()` reports the current action and processed count; `follow` continues from its event cursor after an Agent reconnects.
+- When a script detects a verification page, it can call `wait({ reason: 'verification' })`. The Manager retains Chrome and the Worker, notifies the user, captures diagnostic screenshots, and automatically pauses with the session retained after a bounded wait.
+- The Agent or human can resume the task; during screenshot probes, the Agent resumes against the current `probeId` returned by `follow`. Task Master does not automatically identify or solve CAPTCHAs.
+- The Dashboard shows only current queued, running, waiting, and stopping work. Terminal cards disappear automatically, while records and outputs remain readable through the CLI or available for explicit cleanup.
+- **Clean space** clears idle Profile caches and finished-task temporary scripts. Historical output is a separate opt-in; signed-in state, extension data, and active work are preserved.
 
-| | `batch` | `operations` |
-| --- | --- | --- |
-| Best for | A known one-off or repeated script | Interactive steps, observation, conditions and scheduled events |
-| Interface | Submit a small `.mjs` | Send bounded JSON commands through the same CLI |
-| Lifetime | Ends when the finite job completes | Retains the task and Chrome context until stopped or a limit is reached |
-| Shared foundation | Persistent Profile, progress and result files | Same Profile access, readback and durable action evidence |
+## Why it stays maintainable and extensible
 
-An explicit mode in the task prompt applies only to that task and overrides the saved Profile default. Otherwise the Profile policy applies; `auto` selects from the declared Skill mode or waiting/follow-up intent, falling back to batch. `auto` is a selection policy, not a third execution engine.
+- **A thin core:** the Manager owns tasks, processes, Profiles, progress, and results—not website-specific rules.
+- **Clear upgrade boundaries:** application files are stored separately from Profiles, signed-in state, task records, and outputs.
+- **A bundled runtime:** Agents use the Manager's tested browser automation dependencies; they do not install or select a Playwright version themselves.
+- **No script registration:** a new one-off task runs directly and does not become an asset or Task Type to maintain.
+- **Skills evolve separately:** website adapters, domain knowledge, and result validation can be released, replaced, and reused independently.
+- **One cross-platform contract:** Windows, macOS, and Linux use the same CLI and task-file model.
 
-Human takeover is a pause lock, not a mode. It keeps the browser, blocks automated mutation and requires explicit resume plus a fresh observation. Automation cannot release the takeover lock itself. A mode change never changes identity or permission.
+## Task Master Skills community
 
-## What's new in 4.2.1
+Looking for a workflow an Agent can use now? Visit the [Task Master Skills library](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) for creator discovery, community research, and other capabilities. A Skill can include the working instructions, task script, and result checks for a specific job. Skills are optional; any trusted script can still run directly.
 
-| Change | What it means in practice |
-| --- | --- |
-| Compact decisions, complete evidence | Small current-command replies and explicit delta baselines; full receipts remain available without replaying actions |
-| Stable native targets | References follow the original connected node rather than its old position; replaced or detached controls stop explicitly |
-| Stronger dispatch boundaries | The original page/document/control binding survives confirmation waits; checks, waits and dispatch share one monotonic deadline |
-| Current-scene reference retention | Both bounded caches keep controls returned in the current observation, even after extensive same-document changes |
-| Persistent connection and handoff records | Keep one operation/Profile across CLI connections; a client without the old scene starts with a fresh observation |
+Have a workflow that saves time? Package its useful parts as a Skill. Start with a [workflow idea](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/issues/new?template=skill-proposal.md), improve an existing Skill, or follow the [contribution guide](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md) to prepare a pull request. Reviewed contributions can become downloadable releases that others can install and use.
 
-These are execution and evidence guarantees within the documented boundaries—not universal website compatibility, AI-to-AI reasoning transfer, or exactly-once delivery by external services. See the [release notes](docs/releases/4.2.1.md), [output contract](docs/OPERATIONS-OUTPUT.md) and [persistence guide](docs/OPERATIONS-PERSISTENCE.md).
+Our goal is to let one person and their Agents organize large batches of useful work. Every shared workflow, tested fix, and clearer instruction helps the next person automate more and makes personal or small-team automation increasingly practical.
 
-## Download
+**The two projects have separate roles:**
 
-**New deployments start at [Latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest).** Select the runtime and Skill from that same release; do not substitute an old local archive. The names below describe 4.2.1. If Latest is newer, follow that release's guide and filenames instead. The [versioned 4.2.1 page](https://github.com/npcworkspace-cmyk/eric-task-master/releases/tag/v4.2.1) is a reproducible reference, not the default future deployment target.
+- [Eric Task Master](https://github.com/npcworkspace-cmyk/eric-task-master): the durable local task execution foundation.
+- [Task Master Skills](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill): a place to find, build, and share reusable professional workflows.
 
-| Platform | Native installer | Portable ZIP |
-| --- | --- | --- |
-| Windows 10/11 x64 | `eric-task-master-v4.2.1-windows-x64-setup.exe` | `eric-task-master-v4.2.1-windows-x64-portable.zip` |
-| macOS Apple silicon | `eric-task-master-v4.2.1-macos-arm64.pkg` | `eric-task-master-v4.2.1-macos-arm64-portable.zip` |
-| macOS Intel | `eric-task-master-v4.2.1-macos-x64.pkg` | `eric-task-master-v4.2.1-macos-x64-portable.zip` |
-| Debian/Ubuntu x64 | `eric-task-master-v4.2.1-linux-x64.deb` | `eric-task-master-v4.2.1-linux-x64-portable.zip` |
-| Debian/Ubuntu arm64 | `eric-task-master-v4.2.1-linux-arm64.deb` | `eric-task-master-v4.2.1-linux-arm64-portable.zip` |
+## Trust model
 
-Download the matching `eric-task-master-skill-v4.2.1.zip`, `SHA256SUMS` and `UNSIGNED-BUILD.txt` from the same release. Verify checksums before installation. Windows and macOS packages are unsigned; portable ZIPs do not bypass SmartScreen or Gatekeeper.
+Task scripts run as trusted local code with the current operating-system user's permissions. Task Master does not pretend to provide a security sandbox. Run only Agents, Skills, and scripts you trust.
 
-<a id="install"></a>
+The Manager control plane binds to local `127.0.0.1`, redacts credentials from Manager-owned diagnostics, never automatically replays an entire failed script, and never launches two writers against the same Profile directory. Task scripts themselves have network and filesystem access; their actual behavior remains the script author's responsibility.
 
-## Installation and upgrades
+## Project principle
 
-<details>
-<summary><strong>Locate an existing installation, replace safely, and verify activation</strong></summary>
+> **Receive the task → write the smallest free script → run one CLI command → stream useful results.**
 
-### Install 4.2.1
-
-### 1. Locate an existing installation first
-
-For a new Agent, **check for the Manager, install only if missing**. If the requested version is already deployed, **install/update only the Agent Skill**. Replace an older installation with authorization, not a second Manager or a replacement Profile pool; if work is active, let the Owner choose whether to wait or stop it.
-
-To deploy or update through an Agent, give it the [latest release link](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest) and ask it to install or update Task Master and its matching Skill. The Agent should verify the release files and preserve existing state; if it cannot install or reload Skills in its host, it must report that limitation.
-
-On Windows, use the Skill's [read-only launcher locator](skills/eric-task-master/scripts/find-launcher.ps1); on macOS/Linux, use the installed or known portable launcher. Verify the absolute launcher with `--help` and keep using that path. An unresolved location or state error is not permission to reinstall, merge state or recreate Profiles.
-
-Agents running as the same OS user share one selected Manager and Profile pool by default. For an isolated project, explicitly pass `--state-dir ABSOLUTE_DIRECTORY` on every command. Normal startup reuses a matching running Manager; it does not silently replace a different version.
-
-**An upgrade is complete only when the launcher, running Manager and installed driving Skill match.** An idle Manager can be stopped and replaced automatically. If it is busy, the Owner chooses whether to wait or explicitly stop its work and replace it; never force-stop by default. The new Manager synchronizes the selected installed Skill from its same-version bundle, retaining a backup. If the result says `not-installed`, import that Skill for the intended Agent. A nondefault Skill folder is selected with `ERIC_TASK_MASTER_SKILL_DIR`. Preserve existing Profiles, task records and outputs; see [installation](docs/INSTALLERS.md) and [state recovery](docs/STATE-BACKUP-RECOVERY.md).
-
-The Manager rejects outdated clients before they create or change work. A recognized Agent whose Skill was refreshed must load the new instructions before retrying; each Agent acknowledges separately, while existing safe stop and read controls remain available. Installation alone is not activation. A known Windows `v3` launcher path is converted to a forwarding entry so an older terminal reaches the current installation; unknown or unsafe paths are not silently changed.
-
-The Windows replacement installer attempts activation automatically; exit code 20 means the files were installed but activation is incomplete. Other packages and retries use the new absolute launcher with `manager start --upgrade --json`. Verify the running Manager and selected Skill rather than inferring completion from a successful file copy.
-
-### 2. Download the matching runtime and Skill
-
-Install stable Google Chrome and choose the current platform package from [Latest](https://github.com/npcworkspace-cmyk/eric-task-master/releases/latest). Use the [download table](#download) to identify the package type; never combine a newer runtime with an older Skill archive.
-
-Also download **`eric-task-master-skill-v4.2.1.zip`**, `SHA256SUMS` and `UNSIGNED-BUILD.txt` from the same release. Verify checksums before installation. Windows and macOS packages are unsigned; portable ZIPs do not bypass SmartScreen or Gatekeeper.
-
-The runtime includes Node.js, Playwright, the CLI, Dashboard, background Manager, same-version driving Skill and optional online Codex adapter. It uses your installed stable Chrome rather than bundling Chromium. A portable package needs no system Node.js or administrator installation; extract it to a permanent directory and use its launcher:
-
-```powershell
-# Windows portable example
-& 'C:\Tools\eric-task-master\bin\taskmaster.cmd' panel
-```
-
-```bash
-# macOS / Linux portable example
-'/absolute/path/eric-task-master/bin/taskmaster' panel
-```
-
-### 3. Select the browser and give the Skill to your Agent
-
-Open `taskmaster panel`. For ordinary script work, retain an existing Profile or create a named Profile, open its native Chrome window, sign in when needed, close the manual window and select the intended default. Do not replace an existing Profile to solve a discovery error.
-
-**Task Master always uses its own persistent Profiles, for both batch and operations.** Select a Profile or reuse its saved default; one operation can read and handle multiple tabs without creating a Profile per task. Host-specific rules for choosing Task Master versus another browser tool belong to that host, not to this product. General ops use the same Profile access as batch scripts; website identity selectors and narrow permission envelopes are optional guards. The Agent still verifies the actual account, target and business result required by the user's task.
-
-Import the runtime's `app/skills/eric-task-master/` or `eric-task-master-skill-v4.2.1.zip` in the Agent's Skill manager. For folder-based installation, confirm `SKILL.md` is at the Skill root. Agents without a Skill manager can read [the driving Skill](skills/eric-task-master/SKILL.md) directly. Before declaring deployment complete, read back version 4.2.1 from Skill metadata, the absolute launcher's `--help`, and the running `manager status --json`.
-
-</details>
-
-## Batch task lifecycle
-
-The [quick-start example](#quick-start) starts the Manager when needed and returns a task ID. Omit `--profile` to use the chosen default. Keep the returned ID and `after` cursor to inspect the same work later instead of submitting it again.
-
-Only the submitted `.mjs` entry is frozen; sibling files are not automatically copied. Keep it self-contained or use explicit absolute resources. Save valuable data incrementally under `outputDir`, not only at completion.
-
-## Start a persistent operation
-
-Use the selected/default Profile and the user's authorized goal. Ordinary operations do not require website identity selectors or a hand-built permission table; optional strict account/resource, origin, action and expiry guards remain available in the [operations guide](docs/FAST-OPERATIONS.md). The Agent still checks the actual website account, target and result. An example is not authorization for unrelated real-account work.
-
-```bash
-taskmaster ops start --goal "Complete the authorized browser task" --json
-taskmaster ops schema --section actions --json
-taskmaster ops command OP_ID --input '@observe.json' --json
-taskmaster ops get OP_ID --json
-taskmaster ops listen OP_ID --after CURSOR --json
-taskmaster ops takeover OP_ID --json
-taskmaster ops stop OP_ID --json
-```
-
-`observe.json` can contain `{ "kind":"observe", "payload":{ "maxChars":6000, "maxItems":40 } }`. Navigate to the first URL with an authorized navigate action, or observe an existing tab before targeting its controls. Command replies include the next compact scene; reuse it rather than adding an observation between every action. `ops stream OP_ID --json` keeps the command connection open when the host supports persistent stdin; see [stream framing](docs/OPERATIONS-STREAM.md).
-
-Read the matching reply before claiming completion; a durable reservation or completed click is not proof of business delivery. Preserve operation IDs, command/action IDs and event cursors. After disconnects, inspect current state and unresolved actions before continuing. `ops stop-all` stops operations sessions only, not unrelated script jobs, and cannot undo effects already accepted by a service.
-
-## Human verification and retained results
-
-- A script can enter `wait({ reason: 'verification' })`. Chrome remains open; the runtime requests desktop notifications and takes bounded diagnostic screenshots. After 20 minutes it pauses and requires manual resume.
-- The Agent or person judges the page. Task Master does not solve CAPTCHAs or assume a verification challenge has cleared.
-- Finished task cards leave the Dashboard, but records and outputs remain available through the CLI until explicitly removed.
-- **Clean space** preserves signed-in state, extension data and active work. Historical outputs are a separate opt-in deletion category.
-
-## A small core, reusable workflows
-
-```text
-Agent + optional Skill
-        │ plans, scripts, decisions
-        ▼
-taskmaster CLI → local Manager → Worker → selected Chrome Profile
-                      │
-                      ├─ task state, progress and result files
-                      └─ operations, schedules and durable events
-
-Human → local Dashboard → task control, Profiles and takeover
-```
-
-The Manager owns process lifetime, Profile leases, task state, progress, results and cleanup. Scripts and Skills own site behavior and business logic. Different Profiles can run concurrently; each Profile has one writer at a time. The Dashboard stays focused on Tasks and Profiles. The Manager contains no model and is not a general-purpose autonomous Agent.
-
-<details>
-<summary><strong>Persistent operations, scheduled events and result reconciliation</strong></summary>
-
-Keep one task, Worker and Chrome context alive across bounded commands. Observe a selected region, use fresh page-bound targets, execute a small action group, verify the expected result, then wait. Local condition observers handle quiet waiting without requesting a model decision on every poll. Ordinary `.mjs` jobs retain direct access to bundled Playwright, CDP, HTTP, Node.js utilities, custom retries and checkpoints; there is no required script registration or website-specific task type.
-
-Schedules record time, timezone, allowed windows, expiry and run limits. Missed work follows a bounded misfire policy instead of an unlimited backlog. Events distinguish **pending, delivered, received and handled**: delivery is neither a decision nor proof of business success.
-
-A live Agent can consume events through CLI long polling. An explicitly configured host adapter can deliver them to another process. The optional [online Codex CLI adapter](docs/CODEX-HOST-ADAPTER.md) invokes a separately installed, signed-in Codex CLI only for an event, with a persistent model-call budget. Its decisions are limited to allowlisted **read-only observation or safe stop**—not publishing, sending messages or changing business records.
-
-Operations retain configured account/resource, origin, action and expiry guards. The Manager records actions before execution and durably acknowledges initiation before an effect. Readback determines whether the expected result is confirmed or unknown. An uncertain write is not automatically retried: reconcile the original expected result on the same authorized resource first. Optional single-send transport adds narrow protection for known small same-origin JSON POST requests on explicitly selected Task Master Profiles; neither it nor the ledger guarantees universal exactly-once behavior.
-
-</details>
-
-## Use your imagination
-
-Research and public-data collection, repetitive browser jobs, local page monitoring, authorized content/advertising/website workflows, QA, downloads and archiving can all start with a small script. Save useful results as the work progresses, then turn validated patterns into reusable Skills.
-
-Any Agent that can run a local CLI and read JSON can use the same contract, including Codex, Claude Code, WorkBuddy, Hermes and Pi. No host-specific plugin, MCP registration or browser extension is required for the core runtime. This is an interface requirement, not a claim that every host, model or website has passed real-world acceptance; validate the intended workflow and authorization separately.
-
-## Verification and limits
-
-Current source changes are recorded in the [4.2.1 release notes](docs/releases/4.2.1.md). Cross-platform native packages, portable startup and published bytes have separate [release gates](docs/RELEASE-GATE.md); a source-tree pass does not establish all three.
-
-<details>
-<summary><strong>Earlier online-host evidence: the 4.0.0 acceptance window</strong></summary>
-
-The optional online Codex CLI adapter completed an isolated Windows four-hour acceptance window on 2026-11-15: **14,401,755.9 ms**, **238 samples**, maximum sampling gap **61.01 seconds**. Two new real CLI Agent calls produced a scoped observation after interrupted delivery and a safe stop refusing unauthorized publication. Idle adapter model calls were zero; no simulator business writes occurred, and isolated cleanup passed. The scheduled-entry assertion was reused from earlier evidence with unchanged adapter/core hashes; its elapsed time was not reused.
-
-This is source-tree, online-host evidence. It does **not** establish original desktop-chat wakeup, recovery while the computer sleeps or the host is closed, real-platform business writes, or cross-platform installer success. Native package/portable verification and published asset checks are separate release gates. See [4.0.0 release notes](docs/releases/4.0.0.md) and [adapter evidence and limits](docs/CODEX-HOST-ADAPTER.md).
-
-</details>
-
-## Trust and safety boundaries
-
-Task scripts are trusted local code running with the OS user's permissions, not a security sandbox. They can access the network and filesystem; run only Agents, Skills and scripts you trust. Operations safeguards do not turn arbitrary scripts into restricted code.
-
-The Manager binds to `127.0.0.1`, redacts Manager-owned diagnostics and does not automatically replay an entire failed script. Review task-written files and screenshots before sharing. No mode, schedule, page instruction or adapter receipt can grant new authorization. Token/cost limits that depend on unavailable measurements must not be presented as enforced spend controls.
-
-Submitted work can continue after an Agent turn ends **while the local computer and runtime remain running**. This does not promise execution through sleep, shutdown or a closed Agent host, nor automatic recovery of every browser session after a restart. Existing installations do not auto-upgrade merely because a new Release or Skill is published.
-
-## Documentation
-
-| Start here | Go deeper |
-| --- | --- |
-| [Install and upgrade](docs/INSTALLERS.md) | [State backup and recovery](docs/STATE-BACKUP-RECOVERY.md) |
-| [Driving Skill](skills/eric-task-master/SKILL.md) | [Persistent operations](docs/FAST-OPERATIONS.md) |
-| [Output and delta contract](docs/OPERATIONS-OUTPUT.md) | [Persistence and evidence](docs/OPERATIONS-PERSISTENCE.md) |
-| [Streaming commands](docs/OPERATIONS-STREAM.md) | [Optional Codex host adapter](docs/CODEX-HOST-ADAPTER.md) |
-| [4.2.1 release notes](docs/releases/4.2.1.md) | [Build and release gates](docs/RELEASE-GATE.md) |
-
-## Build and share Skills
-
-The [Task Master Skills library](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill) hosts reusable workflow instructions, scripts and result checks. Skills are optional: start with a small script, validate the workflow, then share what proved useful.
-
-Submit a [workflow idea](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/issues/new?template=skill-proposal.md) or follow the [contribution guide](https://github.com/npcworkspace-cmyk/eric-task-master-task-pack-skill/blob/main/CONTRIBUTING.md). The runtime stays general; professional workflows evolve independently.
-
----
-
-Built by **NPC**, a global PR and brand team with client-side experience—the creators of the Media Bridge media-resource platform and Task Master AI tool.
-
-[Explore NPC ↗](https://www.npctech.site/) · [Media Bridge · npcpressbridge.com ↗](https://npcpressbridge.com/)
+If a feature cannot make work start faster, run more reliably, or finish more cleanly—but adds a required step before the first browser action—it does not belong in the Manager.
 
 ## License
 
 MIT
+
+Keywords: AI agent browser automation, AI automation platform, Playwright automation, Chrome automation, long-running Agent tasks, unattended automation, local AI Agent, multi-Agent automation, browser Profile manager, CLI automation, RPA, web research, data collection, workflow Skills, cross-platform Agent tools.

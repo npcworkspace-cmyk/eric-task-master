@@ -71,8 +71,6 @@ test('release requires successful CI and CodeQL runs for the exact current main 
   assert.ok(publish.indexOf('git/ref/heads/main') < create, 'current main must be rechecked before release creation');
   assert.ok(publish.indexOf('git/ref/tags/${TAG}') < create, 'tag absence must be rechecked before release creation');
   assert.match(publish, /commits\/refs\/tags\/\$\{TAG\}/u);
-  assert.match(publish, /--notes-file "docs\/releases\/\$\{CONFIRM_VERSION\}\.md"/u);
-  assert.match(publish, /--draft=false --latest/u);
   assert.ok(!release.includes('commits/${TAG}'), 'same-name branches must never shadow release tags');
 });
 

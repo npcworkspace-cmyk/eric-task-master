@@ -12,7 +12,6 @@ permissions:
 env:
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
   NODE_VERSION: "22.22.3"
-  ERIC_TASK_MASTER_SKILL_DIR: ${{ github.workspace }}/skills/eric-task-master
 
 jobs:
   verify:

@@ -135,11 +135,7 @@ export async function sha256File(path) {
 
 export async function copyApplication(sourceRoot, destination) {
   const directories = ['src', 'dashboard'];
-  const files = ['package.json', 'package-lock.json', 'LICENSE',
-    'scripts/codex-host-adapter.mjs', 'docs/CODEX-HOST-ADAPTER.md',
-    'docs/OPERATIONS-OUTPUT.md', 'docs/OPERATIONS-PERSISTENCE.md', 'docs/OPERATIONS-STREAM.md',
-    'skills/eric-task-master/SKILL.md', 'skills/eric-task-master/LICENSE',
-    'skills/eric-task-master/scripts/find-launcher.ps1'];
+  const files = ['package.json', 'package-lock.json', 'LICENSE'];
   await mkdir(destination, { recursive: true });
   for (const entry of directories) {
     const source = join(sourceRoot, entry);
@@ -148,7 +144,6 @@ export async function copyApplication(sourceRoot, destination) {
   for (const entry of files) {
     const source = join(sourceRoot, entry);
     if (!(await exists(source))) throw new Error(`Runtime source is missing ${entry}`);
-    await mkdir(dirname(join(destination, entry)), { recursive: true });
     await copyFile(source, join(destination, entry));
   }
 }

@@ -1,4 +1,3 @@
-const DASHBOARD_RUNTIME_VERSION = '4.2.1';
 const READ_REQUEST_TIMEOUT_MS = 10_000;
 const MUTATION_REQUEST_TIMEOUT_MS = 60_000;
 const PROFILE_OPEN_REQUEST_TIMEOUT_MS = 100_000;
@@ -19,7 +18,7 @@ const I18N = Object.freeze({
     'intro.npcTitle': 'NPC 核子力',
     'intro.npcBody': '甲方操盘手出身的全球公关与品牌团队，也是媒体资源平台「媒介桥」和 AI 工具「任务大师」的打造者。',
     'intro.npcLink': '了解 NPC ↗',
-    'intro.mediaLink': '媒介桥 · npcpressbridge.com ↗',
+    'intro.mediaLink': '媒介桥 · media.npctech.site ↗',
     'intro.possibilitiesTitle': '发挥你的想象力',
     'intro.possibilitiesExamples': '不限于公开数据自动化采集、网页任务执行，还可以做批量资料整理、跨站信息核对、表单填写与后台录入、文件下载归档、内容与电商运营、网页监测和流程测试……',
     'intro.possibilitiesPromise': '网页上能做的事，基本都可以让你手头的 AI Agent 配合任务大师来设计流程，并在本机稳定执行。',
@@ -129,25 +128,6 @@ const I18N = Object.freeze({
     'profiles.open': '打开',
     'profiles.close': '关闭',
     'profiles.rename': '改名',
-    'profiles.mode': '默认执行策略',
-    'profiles.modeSaved': '默认执行策略已保存',
-    'tasks.mode': '执行模式 / 原因',
-    'tasks.cursor': '显示操作光标',
-    'tasks.cursorSaved': '操作光标显示偏好已保存',
-    'tasks.cursorUnconfirmed': '应用未确认，可重试此显示设置',
-    'mode.auto': '自动选择',
-    'mode.batch': '批量',
-    'mode.operations': '运营',
-    'modeReason.script-default': '普通脚本默认',
-    'modeReason.task-intent': '本次手动指定',
-    'modeReason.profile-policy': 'Profile 默认策略',
-    'modeReason.skill-intent': 'Skill 推荐',
-    'modeReason.operational-intent': '按任务用途选择',
-    'modeReason.explicit-resume': '手动恢复',
-    'modeReason.recovered-reconciliation': '重启后核查恢复',
-    'modeReason.manual-takeover': '人工接管',
-    'modeReason.pause': '已暂停',
-    'modeReason.takeover': '人工接管',
     'profiles.renamePrompt': '请输入新的 Profile 名称（最多 80 个字符）',
     'profiles.inUse': '任务使用中',
     'profileState.closed': '已关闭',
@@ -184,7 +164,7 @@ const I18N = Object.freeze({
     'intro.npcTitle': 'NPC · Nuclear Power Creative',
     'intro.npcBody': 'A global PR and brand team with client-side experience, and the creators of the Media Bridge platform and the Task Master AI tool.',
     'intro.npcLink': 'Explore NPC ↗',
-    'intro.mediaLink': 'Media Bridge · npcpressbridge.com ↗',
+    'intro.mediaLink': 'Media Bridge · media.npctech.site ↗',
     'intro.possibilitiesTitle': 'Use your imagination',
     'intro.possibilitiesExamples': 'Go beyond automated public-data collection and web tasks: organize research in batches, compare information across sites, fill forms and update back-office systems, download and archive files, manage content and e-commerce operations, monitor pages, and test workflows…',
     'intro.possibilitiesPromise': 'Most work you can do on the web can be designed with your AI Agent and Task Master, then run reliably on your own computer.',
@@ -294,25 +274,6 @@ const I18N = Object.freeze({
     'profiles.open': 'Open',
     'profiles.close': 'Close',
     'profiles.rename': 'Rename',
-    'profiles.mode': 'Execution mode',
-    'profiles.modeSaved': 'Mode policy saved',
-    'tasks.mode': 'Mode / reason',
-    'tasks.cursor': 'Show action cursor',
-    'tasks.cursorSaved': 'Action cursor preference saved',
-    'tasks.cursorUnconfirmed': 'Application unconfirmed; retry only this display setting',
-    'mode.auto': 'auto',
-    'mode.batch': 'batch',
-    'mode.operations': 'operations',
-    'modeReason.script-default': 'script-default',
-    'modeReason.task-intent': 'task-intent',
-    'modeReason.profile-policy': 'profile-policy',
-    'modeReason.skill-intent': 'skill-intent',
-    'modeReason.operational-intent': 'operational-intent',
-    'modeReason.explicit-resume': 'explicit-resume',
-    'modeReason.recovered-reconciliation': 'recovered-reconciliation',
-    'modeReason.manual-takeover': 'manual-takeover',
-    'modeReason.pause': 'pause',
-    'modeReason.takeover': 'takeover',
     'profiles.renamePrompt': 'Enter a new Profile name (up to 80 characters)',
     'profiles.inUse': 'Task in progress',
     'profileState.closed': 'Closed',
@@ -471,7 +432,7 @@ async function request(path, { method = 'GET', body, requestTimeoutMs } = {}) {
       const response = await fetch(path, {
         method: upperMethod,
         credentials: 'same-origin',
-        headers: { 'x-taskmaster-runtime-version': DASHBOARD_RUNTIME_VERSION, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+        headers: body === undefined ? undefined : { 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal
       });
@@ -864,24 +825,11 @@ function labelledValue(label, value, duration = false, taskId = '') {
   }
   return group;
 }
-function modeReasonText(reason) {
-  return I18N[state.language]?.[`modeReason.${reason}`] || String(reason);
-}
 
 function taskActionButtons(task) {
   const actions = element('div', 'task-actions');
   const status = normalizeTaskState(task);
   const pending = state.pending.has(`task:${task.id}`);
-  if (task.operationId && typeof task.cursorEnabled === 'boolean') {
-    const label = element('label', 'labelled-value', t('tasks.cursor'));
-    const checkbox = element('input'); checkbox.type = 'checkbox'; checkbox.checked = task.cursorEnabled;
-    checkbox.setAttribute('aria-label', `${t('tasks.cursor')} ${taskTitle(task)}`); checkbox.disabled = pending;
-    checkbox.addEventListener('change', () => { void runMutation(`task:${task.id}`, 'tasks', () => request(`/v1/operations/${encodeURIComponent(task.operationId)}/actions`, {
-      method: 'POST', body: { action: 'update', showCursor: checkbox.checked }
-    }), t('tasks.cursorSaved')); });
-    label.prepend(checkbox); actions.append(label);
-    if (task.cursorApplyState === 'unconfirmed') actions.append(element('small', 'task-activity', t('tasks.cursorUnconfirmed')));
-  }
   if (!TERMINAL_STATES.has(status)) {
     const stop = button(t('tasks.stop'), 'npc-btn-secondary compact-button', () => void sendTaskAction(task, 'stop'));
     stop.disabled = pending;
@@ -938,7 +886,6 @@ function renderTasks() {
     const facts = element('div', 'task-facts');
     facts.append(
       labelledValue(t('tasks.profile'), taskProfileName(task)),
-      labelledValue(t('tasks.mode'), `${t(`mode.${task.mode || 'batch'}`)} · ${modeReasonText(task.modeReason || 'script-default')}`),
       labelledValue(t('tasks.elapsed'), formatDuration(taskElapsed(task)), true, task.id),
       labelledValue(t('tasks.updated'), formatClock(task.updatedAt || task.progress?.updatedAt || task.createdAt))
     );
@@ -977,7 +924,6 @@ function renderProfiles() {
     const facts = element('div', 'profile-facts');
     facts.append(
       labelledValue(t('profiles.browser'), t('profiles.chrome')),
-      labelledValue(t('profiles.mode'), t(`mode.${profile.modePolicy || 'auto'}`)),
       labelledValue(t('profiles.recent'), profileLastUsed(profile))
     );
 
@@ -985,17 +931,6 @@ function renderProfiles() {
     const rename = button(t('profiles.rename'), 'npc-btn-secondary compact-button', () => void renameProfile(profile));
     rename.disabled = pending || status === 'inUse';
     actions.append(rename);
-    const modeLabel = element('label', 'profile-mode-picker', t('profiles.mode'));
-    const modeSelect = element('select', 'compact-button');
-    modeSelect.setAttribute('aria-label', `${t('profiles.mode')} ${profile.name || profile.id}`);
-    for (const mode of ['auto', 'batch', 'operations']) {
-      const option = element('option', '', t(`mode.${mode}`)); option.value = mode; option.selected = mode === (profile.modePolicy || 'auto'); modeSelect.append(option);
-    }
-    modeSelect.disabled = pending || status === 'inUse' || status === 'open';
-    modeSelect.addEventListener('change', () => { void runMutation(`profile:${profile.id}`, 'profiles', () => request(`/v1/profiles/${encodeURIComponent(profile.id)}`, {
-      method: 'PATCH', body: { modePolicy: modeSelect.value }
-    }), t('profiles.modeSaved')); });
-    modeLabel.append(modeSelect); actions.append(modeLabel);
     if (!isDefaultProfile(profile)) {
       const makeDefault = button(t('profiles.setDefault'), 'npc-btn-secondary compact-button', () => void setDefaultProfile(profile));
       makeDefault.disabled = pending;

@@ -62,17 +62,11 @@ async function staticChecks() {
   const worker = await readFile(path.join(ROOT, 'src', 'runtime', 'task-worker.mjs'), 'utf8');
   const browser = await readFile(path.join(ROOT, 'src', 'runtime', 'browser-engine.mjs'), 'utf8');
   const skill = await readFile(path.join(ROOT, 'skills', 'eric-task-master', 'SKILL.md'), 'utf8');
-  const dashboard = await readFile(path.join(ROOT, 'dashboard', 'dashboard.js'), 'utf8');
-  const dashboardHtml = await readFile(path.join(ROOT, 'dashboard', 'index.html'), 'utf8');
   const workflow = await readFile(path.join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
 
   invariant(packageJson.version === VERSION, 'package.json and runtime versions differ');
   invariant(lock.version === VERSION && lock.packages?.['']?.version === VERSION, 'package-lock version differs');
-  invariant(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(VERSION), 'release must use a stable semantic version');
-  invariant(skill.includes(`version: "${VERSION}"`), 'portable Skill version differs from the runtime');
-  invariant(skill.includes(`ERIC_TASK_MASTER_AGENT_SKILL_VERSION=${VERSION}`), 'Agent Skill acknowledgement version differs from the runtime');
-  invariant(dashboard.includes(`const DASHBOARD_RUNTIME_VERSION = '${VERSION}';`) &&
-    dashboardHtml.includes(`/dashboard/dashboard.js?v=${VERSION}`), 'Dashboard version differs from the runtime');
+  invariant(/^3\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(VERSION), 'v3 release must use a stable semantic version');
   invariant(packageJson.bin?.taskmaster === './src/cli.mjs', 'CLI binary contract changed');
   invariant(JSON.stringify(Object.keys(packageJson.dependencies || {})) === JSON.stringify(['playwright']),
     'Playwright must be the only production dependency');
@@ -103,16 +97,11 @@ async function staticChecks() {
     .map((file) => path.relative(skillRoot, file).split(path.sep).join('/')).sort();
   invariant(JSON.stringify(skillEntries) === JSON.stringify(['LICENSE', 'SKILL.md', 'scripts/find-launcher.ps1']),
     'portable Skill must contain its guide, license, and read-only Windows locator only');
-  invariant(skill.split(/\r?\n/u).length <= 110, 'portable Skill is no longer a compact guide');
+  invariant(skill.split(/\r?\n/u).length <= 70, 'portable Skill is no longer one-page');
   invariant(!/@modelcontextprotocol|surface-probe|full-human|journey|task type|task pack/iu.test(skill),
     'portable Skill exposes a removed v2 concept');
   invariant(cli.includes("if (command === 'run')") && cli.includes("if (command === 'panel')"),
     'CLI fast path is missing');
-  invariant(cli.includes("if (command === 'ops')") && manager.includes("pathname === '/v1/operations'"), 'User-approved operations entry points are missing');
-  invariant(worker.includes("operations-durable-ack") && worker.includes("config.builtin === 'fast-operations'"), 'Operations must use existing worker with durable acknowledgement');
-  for (const relative of ['src/lib/operations-contracts.mjs', 'src/lib/operations-store.mjs', 'src/lib/operations-scheduler.mjs', 'src/lib/host-dispatch.mjs', 'src/runtime/operations-service.mjs', 'src/runtime/fast-session.mjs']) {
-    invariant(await exists(relative), `Approved operations contract is missing: ${relative}`);
-  }
   invariant(!/connect|register-mcp|modelcontextprotocol/iu.test(cli), 'CLI contains a removed connection path');
   invariant(manager.includes("pathname === '/v1/tasks'") && manager.includes("pathname === '/v1/profiles'"),
     'minimal Manager API is missing');

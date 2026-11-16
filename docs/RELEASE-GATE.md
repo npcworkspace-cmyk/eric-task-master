@@ -25,8 +25,6 @@ Every CI job runs `npm run check`, stages a self-contained Manager with bundled 
 
 Each job also extracts the target's portable ZIP after native uninstall, then runs its launcher and a real Chrome task using bundled Node in isolated state. Payload hashes, POSIX executable permissions, paths containing spaces, host Node environment isolation, and process/Profile cleanup must pass.
 
-Starting with 4.0.0, every runtime also includes the version-matched driving Skill, optional online Codex CLI host adapter and its guide. The staged verifier loads the actual packaged adapter and checks the bundled Skill version. This proves distribution completeness, not real Codex authentication or online model execution on every target.
-
 Each artifact contains its native packages, portable ZIP, bundle manifest, SPDX inventory, target checksum file, and acceptance evidence. CI and CodeQL run once per pull-request update and again for `main` pushes; both also support manual diagnostics. Feature-branch pushes do not trigger a duplicate copy alongside their pull request. Every platform and required check remains mandatory. Only a successful `main` **push** run is eligible for release.
 
 ## Publication
@@ -43,8 +41,6 @@ gh workflow run release.yml \
 ```
 
 The workflow downloads `release-*` from the proven CI run; it does not rebuild the native Manager packages. It checks every manifest against the requested version and SHA, creates the small Agent Skill archive, regenerates `SHA256SUMS`, and revalidates current `main`, both exact workflow runs, release immutability, and tag absence immediately before publication. A `RELEASE_ADMIN_TOKEN` secret with read-only repository Administration access is required to verify the immutable-release policy. Published versions and assets are never replaced.
-
-The candidate must contain `docs/releases/<version>.md`. That reviewed file becomes the public release description, and the stable publication is explicitly marked Latest. README download links, package/runtime/Skill versions, the standalone Skill ZIP and installed deployment readback must identify the same requested version. Existing running Managers are never silently replaced by a Skill update.
 
 ## Read-only verification of an existing Release
 

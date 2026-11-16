@@ -65,7 +65,6 @@ jobs:
           test "${CONFIRM_IMMUTABLE}" = true
           test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
           test "$(node -p "JSON.parse(require('node:fs').readFileSync('package.json','utf8')).version")" = "${CONFIRM_VERSION}"
-          test -f "docs/releases/${CONFIRM_VERSION}.md" || { echo "Versioned release notes are missing" >&2; exit 1; }
 
           MAIN_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
           test "${MAIN_SHA}" = "${RELEASE_SHA}" || { echo "Release SHA is not current main" >&2; exit 1; }
@@ -150,9 +149,10 @@ jobs:
             --draft \
             --target "${RELEASE_SHA}" \
             --title "Eric Task Master ${TAG}" \
-            --notes-file "docs/releases/${CONFIRM_VERSION}.md" \
+            --generate-notes \
+            --notes "Native packages are unsigned; verify SHA256SUMS and read UNSIGNED-BUILD.txt before installation." \
             --repo "${GITHUB_REPOSITORY}"
-          gh release edit "${TAG}" --draft=false --latest --repo "${GITHUB_REPOSITORY}"
+          gh release edit "${TAG}" --draft=false --repo "${GITHUB_REPOSITORY}"
           test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/refs/tags/${TAG}" --jq .sha)" = "${RELEASE_SHA}"
           test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .immutable)" = true
