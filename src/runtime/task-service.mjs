@@ -201,6 +201,7 @@ export function createTaskService({
   let closePromise = null;
   let reaper = null;
   let operationDurableHandler = null;
+  let operationReadyHandler = null;
   let readyResolve;
   let readyReject;
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
@@ -904,6 +905,15 @@ export function createTaskService({
         }
       }
     });
+    const currentTask = tasks.get(taskId);
+    if (message?.type === 'waiting' && !closing && !abandoningState && children.get(taskId) === entry &&
+        !entry.stopRequested && currentTask?.builtin && currentTask.state === 'waiting' &&
+        currentTask.waiting?.reason === 'operations-command' && operationReadyHandler) {
+      // A wake-up hint only, after persistence and outside mutationTail. The
+      // operation service still validates its durable pending reservation.
+      const handler = operationReadyHandler;
+      void Promise.resolve().then(() => handler(taskId)).catch(() => {});
+    }
     if (cleanupFailed) {
       await containTaskWorker(taskId, entry, {
         code: 'TASK_BROWSER_CLOSE_FAILED',
@@ -1947,6 +1957,7 @@ export function createTaskService({
   const service = {
     createOperation: (body) => create({ ...body, modulePath: fileURLToPath(new URL('./fast-session.mjs', import.meta.url)) }, { builtin: true }),
     setOperationDurableHandler: (handler) => { operationDurableHandler = handler; },
+    setOperationReadyHandler: (handler) => { operationReadyHandler = handler; },
     operationControl: async (id, control) => {
       if (control.action === 'cursor') {
         const entry = children.get(id);

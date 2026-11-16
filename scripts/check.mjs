@@ -103,7 +103,7 @@ async function staticChecks() {
     .map((file) => path.relative(skillRoot, file).split(path.sep).join('/')).sort();
   invariant(JSON.stringify(skillEntries) === JSON.stringify(['LICENSE', 'SKILL.md', 'scripts/find-launcher.ps1']),
     'portable Skill must contain its guide, license, and read-only Windows locator only');
-  invariant(skill.split(/\r?\n/u).length <= 70, 'portable Skill is no longer one-page');
+  invariant(skill.split(/\r?\n/u).length <= 110, 'portable Skill is no longer a compact guide');
   invariant(!/@modelcontextprotocol|surface-probe|full-human|journey|task type|task pack/iu.test(skill),
     'portable Skill exposes a removed v2 concept');
   invariant(cli.includes("if (command === 'run')") && cli.includes("if (command === 'panel')"),

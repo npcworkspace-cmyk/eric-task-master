@@ -7,12 +7,14 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createManager } from '../src/manager.mjs';
 import { ProfileStore } from '../src/lib/profile-store.mjs';
+import { VERSION } from '../src/contracts.mjs';
 import { removeTestTree } from './test-fs.mjs';
 
 const cli = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
-function runCli(args, stateDir, port) {
+function runCli(args, stateDir, port, input) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [cli, ...args, '--state-dir', stateDir, '--port', String(port), '--json'], { windowsHide: true, env: { ...process.env, NODE_OPTIONS: '', USERPROFILE: path.join(stateDir, 'agent'), HOME: path.join(stateDir, 'agent') }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [cli, ...args, '--state-dir', stateDir, '--port', String(port), '--json'], { windowsHide: true, env: { ...process.env, NODE_OPTIONS: '', ERIC_TASK_MASTER_SKILL_DIR: fileURLToPath(new URL('../skills/eric-task-master/', import.meta.url)), ERIC_TASK_MASTER_AGENT_SKILL_VERSION: VERSION }, stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stdin.end(input);
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; }); child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', reject); child.on('close', (code) => { const source = code ? stderr : stdout; try { resolve({ code, result: JSON.parse(source.trim().split(/\r?\n/u).at(-1)) }); } catch { reject(new Error(source)); } });
@@ -26,8 +28,10 @@ test('ops CLI uses protected Manager routes; Profile policy persists across rest
   const mode = await runCli(['profiles', 'mode', profile.id, '--mode', 'operations'], stateDir, manager.address.port);
   assert.equal(mode.code, 0); assert.equal(mode.result.profile.modePolicy, 'operations');
   const list = await runCli(['ops', 'list'], stateDir, manager.address.port); assert.equal(list.code, 0); assert.deepEqual(list.result.operations, []);
-  const unsupported = await runCli(['ops', 'start', '--input', JSON.stringify({ goal: 'No browser fallback' })], stateDir, manager.address.port);
-  assert.equal(unsupported.code, 1); assert.equal(unsupported.result.error.code, 'BROWSER_ADAPTER_UNAVAILABLE');
+  const unsupported = await runCli(['ops', 'start', '--input', JSON.stringify({ goal: 'Only owned Profiles', browserSelection: { kind: 'local-browser' } })], stateDir, manager.address.port);
+  assert.equal(unsupported.code, 1); assert.equal(unsupported.result.error.code, 'INVALID_BROWSER_SELECTION');
+  const stdin = await runCli(['ops', 'start', '--input', '-'], stateDir, manager.address.port, '\uFEFF' + JSON.stringify({ goal: '跨 Agent 标准输入', browserSelection: { kind: 'unsupported' } }));
+  assert.equal(stdin.result.error.code, 'INVALID_BROWSER_SELECTION', 'JSON stdin must reach product validation rather than fail shell/JSON parsing');
   const response = await fetch(`${manager.baseUrl}/v1/operations`); assert.equal(response.status, 401);
   await manager.operationsService.store.update((data) => {
     data.operations.push({ id: 'op_compact', taskId: null, goal: 'Compact CLI fixture', status: 'paused', mode: 'operations', manualLock: false,
@@ -77,6 +81,10 @@ test('ops schema is usable offline without creating or contacting a Manager', as
   assert.equal(schema.code, 0); assert.deepEqual(schema.result.executionModes, ['batch', 'operations']); assert.equal(schema.result.selectionPolicy, 'auto');
   for (const name of ['start', 'observe', 'bootstrap', 'batch', 'ack', 'decision', 'reconcile', 'dialogAcknowledgement', 'hostAdapter', 'hostInput', 'hostReceipt']) assert.ok(schema.result.examples[name]);
   assert.ok(schema.result.commandKinds.includes('control'));
+  const actions = await runCli(['ops', 'schema', '--section', 'actions'], absentStateDir, 1);
+  assert.equal(actions.code, 0); assert.ok(actions.result.actionTypes.includes('key')); assert.ok(Buffer.byteLength(JSON.stringify(actions.result)) < 6500);
+  const compatibility = await runCli(['ops', 'schema', '--section', 'compatibility'], absentStateDir, 1);
+  assert.match(compatibility.result.agentCompatibility.hermes, /notify=true/u);
   const acknowledgement = schema.result.examples.dialogAcknowledgement;
   assert.equal(acknowledgement.kind, 'control'); assert.equal(acknowledgement.pageId, 'COPY_FRESH_PAGE_ID'); assert.equal(acknowledgement.pageVersion, 'COPY_FRESH_PAGE_VERSION');
   assert.equal(acknowledgement.payload.action, 'acknowledge-dialog'); assert.ok(acknowledgement.payload.reason.trim());

@@ -111,6 +111,32 @@ class CleanupFailingWorker extends FakeWorker {
   }
 }
 
+test('operation-ready hint runs after persisted waiting state and outside the mutation queue', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-ready-hint-'));
+  const alive = new Set(), workers = [];
+  const profileStore = new ProfileStore({ filePath: path.join(root, 'profiles.json'), profilesRoot: path.join(root, 'profiles'), processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive' });
+  await profileStore.init(); const profile = await profileStore.create({ name: 'Ready hint fixture' });
+  const workerFactory = () => { const worker = new FakeWorker(98780 + workers.length, alive); workers.push(worker); return worker; };
+  const stateDir = path.join(root, 'tasks');
+  const service = createTaskService({ stateDir, profileStore, workerFactory, profileWorkerFactory: workerFactory, processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive' });
+  t.after(async () => { await service.close(); await removeTestTree(root); });
+  const observed = [];
+  service.setOperationReadyHandler(async (id) => {
+    const current = await service.get(id);
+    const disk = JSON.parse(await readFile(path.join(stateDir, 'tasks.json'), 'utf8'));
+    observed.push({ id, state: current.state, persisted: disk.tasks.find(item => item.id === id).waiting.reason });
+  });
+  const task = await service.createOperation({ profileId: profile.id, mode: 'operations', input: { operationId: 'op_hint' } });
+  await until(() => workers[0]?.config);
+  workers[0].emit('message', { type: 'waiting', waiting: { id: 'w1', reason: 'operations-command' } });
+  await until(() => observed.length === 1, 1000);
+  assert.deepEqual(observed[0], { id: task.id, state: 'waiting', persisted: 'operations-command' });
+  service.setOperationReadyHandler(null);
+  workers[0].emit('message', { type: 'waiting', waiting: { id: 'w2', reason: 'operations-command' } });
+  await until(async () => (await service.get(task.id)).waiting.id === 'w2');
+  assert.equal(observed.length, 1);
+});
+
 test('TaskService cursor state changes only after Worker ACK and remains unconfirmed on IPC failure or lost ACK', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taskmaster-cursor-control-ack-')); const alive = new Set();
   const profileStore = new ProfileStore({ filePath: path.join(root, 'profiles.json'), profilesRoot: path.join(root, 'profiles'), processAlive: (pid) => alive.has(pid), profileUsageProbe: async () => 'inactive' });

@@ -1,4 +1,7 @@
 const SENSITIVE_KEY_PATTERN = /^(?:authorization|proxy[-_]?authorization|headers?|cookies?|set[-_]?cookie|manager[-_]?token|(?:access|refresh|id|auth|bearer|session)[-_]?token|tokens?|session(?:[-_]?id)?|api[-_]?key|apikey|x[-_]?api[-_]?key|client[-_]?secret|private[-_]?key|credentials?|jwt|passwords?|passwd|secrets?)$/i;
+const COMPACT_SENSITIVE_KEY_PATTERN = /^(?:authorization|proxyauthorization|headers?|cookies?|setcookie|managertoken|(?:access|refresh|id|auth|bearer|session)?tokens?|session(?:id)?|apikey|xapikey|clientsecret|privatekey|credentials?|jwt|passwords?|passwd|secrets?)$/;
+const SENSITIVE_KEY_SUFFIX = /(?:apikey|token|sessionid|privatekey|credential|jwt|password|passwd|secret)$/;
+const NAMED_SECRET_DESCRIPTOR = /(?:^|[-_])(auth|authorization|bearer|cookie|credential|jwt|password|secret|session|token)(?:$|[-_])/iu;
 
 const NAMED_SECRET = /((?:^|[^a-z0-9_-])["']?(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|manager[-_]?token|(?:access|refresh|id|auth|bearer|session)[-_]?token|token|session(?:[-_]?id)?|api[-_]?key|apikey|x[-_]?api[-_]?key|client[-_]?secret|private[-_]?key|credential|jwt|password|passwd|secret)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\r\n}]+)/gi;
 const PREFIXED_SECRET = /((?:^|[\s,;{])["']?(?:[a-z0-9]+[-_])+(?:api[-_]?key|token|session[-_]?id|private[-_]?key|credential|jwt|password|passwd|secret)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\r\n}]+)/gi;
@@ -6,6 +9,7 @@ const QUERY_SECRET = /([?&](?:authorization|auth|token|access_token|refresh_toke
 const AUTH_HEADER = /((?:^|[^a-z0-9_-])(?:authorization|proxy[-_]?authorization)\s*[:=]\s*)(?:bearer\s+|basic\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;\r\n}]+)/gi;
 const COOKIE_HEADER = /((?:^|[\r\n])\s*(?:cookie|set-cookie)\s*:\s*)[^\r\n]*/gi;
 const BEARER_VALUE = /(\bbearer\s+)[a-z0-9._~+/=-]+/gi;
+const TEXT_REDACTIONS = [AUTH_HEADER, COOKIE_HEADER, PREFIXED_SECRET, NAMED_SECRET, QUERY_SECRET, BEARER_VALUE];
 const HTTP_URL = /https?:\/\/[^\s"'<>]+/gi;
 const FILE_URL = /file:\/\/\/[^\s"'<>]+/gi;
 const WINDOWS_ABSOLUTE_PATH = /(^|[^A-Za-z0-9+.-])([A-Za-z]:[\\/][^\s"'<>]*)/gm;
@@ -17,18 +21,62 @@ export function isSensitiveKey(key) {
   if (!normalized) return false;
   if (SENSITIVE_KEY_PATTERN.test(normalized)) return true;
   const compact = normalized.replace(/[-_\s]/g, '').toLowerCase();
-  return /^(?:authorization|proxyauthorization|headers?|cookies?|setcookie|managertoken|(?:access|refresh|id|auth|bearer|session)?tokens?|session(?:id)?|apikey|xapikey|clientsecret|privatekey|credentials?|jwt|passwords?|passwd|secrets?)$/.test(compact)
-    || /(?:apikey|token|sessionid|privatekey|credential|jwt|password|passwd|secret)$/.test(compact);
+  return COMPACT_SENSITIVE_KEY_PATTERN.test(compact) || SENSITIVE_KEY_SUFFIX.test(compact);
 }
 
 export function redactSensitiveText(value) {
-  return String(value)
-    .replace(AUTH_HEADER, '$1[REDACTED]')
-    .replace(COOKIE_HEADER, '$1[REDACTED]')
-    .replace(PREFIXED_SECRET, '$1[REDACTED]')
-    .replace(NAMED_SECRET, '$1[REDACTED]')
-    .replace(QUERY_SECRET, '$1[REDACTED]')
-    .replace(BEARER_VALUE, '$1[REDACTED]');
+  let result = String(value);
+  for (const pattern of TEXT_REDACTIONS) result = result.replace(pattern, '$1[REDACTED]');
+  return result;
+}
+
+// Data only: the browser executes these same canonical rules before slicing.
+// Keeping the source/order shared prevents a split token leaking across chunks.
+export function sensitiveTextRules() {
+  return TEXT_REDACTIONS.map(pattern => ({ source: pattern.source, flags: pattern.flags, replacement: '$1[REDACTED]' }));
+}
+
+export function sensitiveDescriptorRules() {
+  const data = pattern => ({ source: pattern.source, flags: pattern.flags });
+  return { direct: data(SENSITIVE_KEY_PATTERN), compact: [COMPACT_SENSITIVE_KEY_PATTERN, SENSITIVE_KEY_SUFFIX].map(data), named: data(NAMED_SECRET_DESCRIPTOR) };
+}
+
+// A redacted span (including its key/header prefix) is atomic. A field chunk
+// target may be exceeded; the containing observation/reply budget stays hard.
+export function sliceRedactedText(value, offset, maxChars) {
+  if (offset >= value.length || maxChars <= 0) return '';
+  const stable = text => redactSensitiveText(text) === text;
+  if (!stable(value.slice(offset))) throw Object.assign(new Error('Requested source offset would create a new secret boundary; restart from offset 0'), { code: 'UNSAFE_TEXT_OFFSET' });
+  const marker = '[REDACTED]';
+  const spans = [];
+  for (const pattern of TEXT_REDACTIONS) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(value))) if (match[0].includes(marker)) spans.push([match.index, match.index + match[0].length]);
+  }
+  for (let at = value.indexOf(marker); at >= 0; at = value.indexOf(marker, at + marker.length)) spans.push([at, at + marker.length]);
+  const merged = [];
+  for (const span of spans.sort((a, b) => a[0] - b[0])) {
+    const previous = merged.at(-1);
+    if (previous && span[0] < previous[1]) previous[1] = Math.max(previous[1], span[1]);
+    else merged.push(span);
+  }
+  const target = Math.min(value.length, offset + maxChars);
+  const snap = (end, forward) => {
+    for (const [start, finish] of merged) if (start < end && finish > end) { end = forward ? finish : start > offset ? start : finish; break; }
+    return end;
+  };
+  const safeEnd = end => end > offset && stable(value.slice(offset, end)) && stable(value.slice(end));
+  // Check a bounded neighborhood. Tiny chunks may need a context-atomic floor;
+  // explicit unsafe starts are rejected rather than silently moved.
+  const checked = new Set();
+  for (const forward of [false, true]) for (let shift = 0; shift <= 32; shift++) {
+    const end = snap(Math.min(value.length, Math.max(offset, target + (forward ? shift : -shift))), forward);
+    if (checked.has(end)) continue;
+    checked.add(end);
+    if (safeEnd(end)) return value.slice(offset, end);
+  }
+  throw Object.assign(new Error('No redaction-stable chunk boundary fits; request a larger full field read'), { code: 'CONTEXT_INSUFFICIENT' });
 }
 
 function hasSecretNamedValueShape(value) {
@@ -45,8 +93,7 @@ function hasSecretNamedValueShape(value) {
     typeof value.httpOnly === 'boolean' || typeof value.secure === 'boolean' ||
     typeof value.sameSite === 'string'
   );
-  return looksLikeCookie || isSensitiveKey(descriptor) ||
-    /(?:^|[-_])(auth|authorization|bearer|cookie|credential|jwt|password|secret|session|token)(?:$|[-_])/iu.test(descriptor);
+  return looksLikeCookie || isSensitiveKey(descriptor) || NAMED_SECRET_DESCRIPTOR.test(descriptor);
 }
 
 function sanitizePublicHttpUrl(value) {

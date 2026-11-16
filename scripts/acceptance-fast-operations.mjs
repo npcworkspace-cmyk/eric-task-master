@@ -187,8 +187,8 @@ try {
   assert.equal((await h.state()).effects.length, effectCount);
   record('submit-then-disconnect persists unknown effect; stale readback rejected; refreshed readback reconciles without replay', { uncertainActionIds: uncertain, effectsAfterRetry: effectCount, pageVersion: current.pageVersion });
   await h.stop(site.id);
-  const storeSource = await readFile(path.join(h.stateDir, 'operations', 'operations.json'), 'utf8');
-  assert.ok(!storeSource.includes('secret-sentinel'));
+  const storeSources = await Promise.all(['operations.json', 'operations.journal.jsonl'].map(name => readFile(path.join(h.stateDir, 'operations', name), 'utf8')));
+  assert.ok(storeSources.every(source => !source.includes('secret-sentinel')));
   record('saved operation ledger excludes secret sentinels');
 } catch (error) { failure = { code: error.code || 'FAST_ACCEPTANCE_FAILED', message: error.message, stack: error.stack }; }
 finally { if (h) cleanup = await h.finish(); }

@@ -344,11 +344,11 @@ export async function createManager({
           return;
         }
         if (pathname === '/v1/operations' && request.method === 'GET') {
-          sendJson(response, 200, { ok: true, operations: await operationsService.list() }); return;
+          sendJson(response, 200, { ok: true, operations: await operationsService.list({ detail: operationsService.replyDetail(url.searchParams.get('detail')) }) }); return;
         }
         if (pathname === '/v1/operations' && request.method === 'POST') {
           requireCurrentClient(request);
-          sendJson(response, 201, { ok: true, operation: await operationsService.start(await readJson(request)) }); return;
+          sendJson(response, 201, { ok: true, operation: await operationsService.start(await readJson(request), { detail: operationsService.replyDetail(url.searchParams.get('detail')) }) }); return;
         }
         if (pathname === '/v1/operations/stop-all' && request.method === 'POST') {
           sendJson(response, 200, { ok: true, ...(await operationsService.stopAll()) }); return;
@@ -356,14 +356,26 @@ export async function createManager({
         const operationsMatch = /^\/v1\/operations\/([^/]+)(?:\/(commands|events|actions))?$/u.exec(pathname);
         if (operationsMatch) {
           const id = decodeURIComponent(operationsMatch[1]); const section = operationsMatch[2];
-          if (!section && request.method === 'GET') { sendJson(response, 200, { ok: true, operation: await operationsService.get(id, { commandId: url.searchParams.get('commandId') || null }) }); return; }
-          if (section === 'commands' && request.method === 'POST') { requireCurrentClient(request); sendJson(response, 202, { ok: true, command: await operationsService.command(id, await readJson(request)) }); return; }
+          if (!section && request.method === 'GET') { sendJson(response, 200, { ok: true, operation: await operationsService.get(id, { commandId: url.searchParams.get('commandId') || null, detail: operationsService.replyDetail(url.searchParams.get('detail')) }) }); return; }
+          if (section === 'commands' && request.method === 'POST') {
+            requireCurrentClient(request);
+            const body = await readJson(request), detail = operationsService.replyDetail(url.searchParams.get('detail'), body);
+            const waitMs = integerParam(url.searchParams.get('waitMs'), 0, { maximum: 30000 });
+            try {
+              const command = await operationsService.command(id, body);
+              sendJson(response, waitMs ? 200 : 202, { ok: true, command: await operationsService.commandReply(id, command, { waitMs, detail }) });
+            } catch (error) {
+              if (!error.operationReceipt) throw error;
+              sendJson(response, 200, { ok: true, command: error.operationReceipt });
+            }
+            return;
+          }
           if (section === 'actions' && request.method === 'POST') {
             const body = await readJson(request);
             if (!['stop', 'pause', 'takeover', 'revoke', 'ack'].includes(body.action)) requireCurrentClient(request);
-            sendJson(response, 200, { ok: true, result: await operationsService.action(id, body) }); return;
+            sendJson(response, 200, { ok: true, result: await operationsService.action(id, body, { detail: operationsService.replyDetail(url.searchParams.get('detail'), body.command) }) }); return;
           }
-          if (section === 'events' && request.method === 'GET') { sendJson(response, 200, { ok: true, ...(await operationsService.events(id, { after: integerParam(url.searchParams.get('after'), 0), waitMs: integerParam(url.searchParams.get('waitMs'), 0, { maximum: 30000 }) })) }); return; }
+          if (section === 'events' && request.method === 'GET') { sendJson(response, 200, { ok: true, ...(await operationsService.events(id, { after: integerParam(url.searchParams.get('after'), 0), waitMs: integerParam(url.searchParams.get('waitMs'), 0, { maximum: 30000 }), detail: operationsService.replyDetail(url.searchParams.get('detail')) })) }); return; }
         }
         if (request.method === 'POST' && pathname === '/v1/cleanup') {
           requireCurrentClient(request);

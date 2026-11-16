@@ -20,6 +20,8 @@ export async function launchChromeProfile(playwright, profile, overrides = {}) {
     throw browserError('PROFILE_PATH_UNAVAILABLE', 'The Chrome Profile path is unavailable');
   }
   try {
+    const { registerFastReferenceSelector } = await import('./fast-reference-selector.mjs');
+    await registerFastReferenceSelector(playwright);
     return await playwright.chromium.launchPersistentContext(
       profile.userDataDir,
       chromeLaunchOptions(overrides)
